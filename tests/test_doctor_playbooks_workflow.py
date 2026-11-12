@@ -175,7 +175,9 @@ def test_doctor_restart_and_reconnect_commands_use_available_callbacks() -> None
         restart_chat_services=lambda: "services restarting",
     )
     assert restarted.acknowledgement == "Restarting"
-    assert restarted.message == "services restarting"
+    assert "restart requested" in restarted.message
+    assert restarted.effect == "operation_requested"
+    assert restarted.repair_verified is False
     assert runtime.cancelled
 
     signalled = []
@@ -187,7 +189,8 @@ def test_doctor_restart_and_reconnect_commands_use_available_callbacks() -> None
         signal_current_process_restart=lambda: signalled.append("restart"),
     )
     assert reconnect.acknowledgement == "Reconnecting"
-    assert reconnect.message == "Reconnecting to Telegram now."
+    assert "reconnect requested" in reconnect.message
+    assert "not been verified" in reconnect.message
     assert signalled == ["restart"]
 
     manual = execute_doctor_playbook_command(
@@ -203,8 +206,8 @@ def test_doctor_common_remediation_commands_update_expected_statuses(monkeypatch
     from nullion import doctor_playbooks
 
     cases = {
-        "doctor:retry_model_api": ("Retrying", "next message"),
-        "doctor:pause_chat": ("Paused", "resume"),
+        "doctor:retry_model_api": ("Retry next request", "next message"),
+        "doctor:pause_chat": ("Stop request guidance", "/stop"),
         "doctor:switch_fallback_model": ("Model switch needed", "fallback provider"),
         "doctor:retry_later": ("Retry later", "quota"),
         "doctor:reconnect_slack": ("Slack action needed", "Slack test message"),
@@ -215,7 +218,7 @@ def test_doctor_common_remediation_commands_update_expected_statuses(monkeypatch
         "doctor:clear_stale_approvals": ("Clear stale approvals", "deny"),
         "doctor:create_backup": ("Create backup", "backup"),
         "doctor:repair_checkpoint": ("Repair checkpoint", "checkpoint"),
-        "doctor:restart_plugin": ("Acknowledged", "Action noted"),
+        "doctor:restart_plugin": ("Plugin action needed", "was not run"),
     }
     for command, (ack, expected_text) in cases.items():
         result = doctor_playbooks.execute_doctor_playbook_command(
@@ -241,7 +244,7 @@ def test_doctor_common_remediation_commands_update_expected_statuses(monkeypatch
     assert diagnosed.message == "diagnosis: healthy"
 
 
-def test_doctor_terminal_and_unknown_actions_are_left_or_dismissed() -> None:
+def test_doctor_terminal_and_unknown_actions_are_left_unchanged() -> None:
     from nullion.doctor_playbooks import execute_doctor_playbook_command
 
     terminal = RuntimeDouble(_action(status="completed"))
@@ -260,5 +263,7 @@ def test_doctor_terminal_and_unknown_actions_are_left_or_dismissed() -> None:
         command="doctor:made_up",
         source_label="web",
     )
-    assert unknown.acknowledgement == "Dismissed"
-    assert unknown.message == "Action dismissed."
+    assert unknown.acknowledgement == "Unsupported action"
+    assert "No action was run" in unknown.message
+    assert unknown.action["status"] == "pending"
+    assert unknown.effect == "unsupported"

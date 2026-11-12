@@ -356,7 +356,7 @@ def test_websocket_manual_cron_emits_foreground_fallback_card_before_suppression
 
     status_events = [event for event in events if event.get("type") == "task_status"]
     assert any(event.get("group_id", "").startswith(f"grp-{cron_job.id}-") for event in status_events)
-    assert any("⏰ SCHEDULED TASK:" in str(event.get("text") or "") for event in status_events)
+    assert any("**SCHEDULED TASK:" in str(event.get("text") or "") for event in status_events)
     assert any(
         "Working on 1 task" in str(event.get("text") or "")
         and "Web Foreground Cron Card Smoke" in str(event.get("text") or "")

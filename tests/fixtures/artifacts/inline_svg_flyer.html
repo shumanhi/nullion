@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Community Night Market — STAGE FORMAT QA</title>
+<style>
+:root{--ink:#10292a;--cream:#fff6df;--coral:#ef5a47;--gold:#f2b544;--teal:#167c78;--navy:#17324d}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#172b35;font-family:Inter,Arial,sans-serif;color:var(--ink)}
+.poster{width:min(100%,900px);min-height:1120px;margin:0 auto;background:var(--cream);position:relative;overflow:hidden;display:grid;grid-template-rows:auto 1fr auto;box-shadow:0 20px 80px #07151c}
+.top{padding:40px 64px 20px;position:relative;z-index:2}.eyebrow{font-size:14px;font-weight:800;letter-spacing:.22em;text-transform:uppercase;color:var(--teal)}
+h1{font-family:Georgia,serif;font-size:82px;line-height:.88;letter-spacing:-.055em;margin:18px 0 12px;max-width:760px;color:var(--navy)}
+h1 em{font-style:italic;color:var(--coral)}.dek{font-size:21px;line-height:1.45;max-width:570px;margin:18px 0 0}
+.art{position:relative;min-height:535px;margin-top:-38px}.art svg{width:100%;height:100%;display:block}.details{background:var(--navy);color:white;padding:30px 64px 32px;display:grid;grid-template-columns:1.25fr 1fr 1fr;gap:26px;position:relative;z-index:3}.label{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#8ed7cf;font-weight:800;margin-bottom:7px}.value{font-family:Georgia,serif;font-size:23px;line-height:1.15}.fine{grid-column:1/-1;border-top:1px solid #ffffff38;padding-top:16px;font-size:13px;display:flex;justify-content:space-between;gap:20px}.badge{position:absolute;right:52px;top:42px;width:118px;height:118px;border-radius:50%;background:var(--gold);display:grid;place-items:center;text-align:center;font-weight:900;font-size:13px;line-height:1.15;transform:rotate(8deg);border:3px solid var(--navy)}
+@media(max-width:700px){.poster{min-height:100vh}.top{padding:34px 28px 10px}h1{font-size:54px}.badge{width:88px;height:88px;right:18px;top:28px;font-size:10px}.art{min-height:420px}.details{padding:28px;grid-template-columns:1fr}.fine{flex-direction:column}.dek{max-width:78%;font-size:17px}}
+@media print{body{background:white}.poster{width:100%;height:100vh;min-height:0;box-shadow:none}}
+</style></head>
+<body><main class="poster">
+<section class="top"><div class="eyebrow">A fictional gathering for neighbors</div><h1>Community<br><em>Night Market</em></h1><p class="dek">Lantern light, local flavor, handmade goods, and an easygoing evening under the city sky.</p></section>
+<div class="badge">FREE<br>ENTRY</div>
+<section class="art" aria-label="Illustration of a lively night market under lanterns">
+<svg viewBox="0 0 900 560" role="img" aria-labelledby="artTitle"><title id="artTitle">Colorful illustrated night market stalls and lanterns</title>
+<rect width="900" height="560" fill="#fff6df"/><path d="M0 385 C170 320 290 370 440 318 C610 258 718 312 900 242 L900 560 L0 560Z" fill="#b9ded3"/>
+<circle cx="713" cy="103" r="68" fill="#f2b544"/><circle cx="687" cy="84" r="68" fill="#fff6df"/>
+<path d="M0 82 Q450 176 900 72" fill="none" stroke="#17324d" stroke-width="4"/>
+<g stroke="#17324d" stroke-width="3"><path d="M95 99v44"/><path d="M233 120v50"/><path d="M382 126v47"/><path d="M543 119v51"/><path d="M704 99v53"/><path d="M827 79v48"/></g>
+<g stroke="#17324d" stroke-width="3"><ellipse cx="95" cy="153" rx="24" ry="29" fill="#ef5a47"/><ellipse cx="233" cy="182" rx="22" ry="28" fill="#f2b544"/><ellipse cx="382" cy="186" rx="23" ry="30" fill="#167c78"/><ellipse cx="543" cy="182" rx="24" ry="29" fill="#ef5a47"/><ellipse cx="704" cy="165" rx="22" ry="28" fill="#f2b544"/><ellipse cx="827" cy="140" rx="23" ry="30" fill="#167c78"/></g>
+<g stroke="#17324d" stroke-width="5" stroke-linejoin="round"><path d="M68 392h220l-27-92H96z" fill="#ef5a47"/><path d="M90 392v112h176V392" fill="#fff"/><path d="M337 371h226l-32-100H369z" fill="#167c78"/><path d="M360 371v133h180V371" fill="#fff"/><path d="M614 402h222l-26-88H643z" fill="#f2b544"/><path d="M636 402v102h179V402" fill="#fff"/></g>
+<g fill="#17324d"><circle cx="136" cy="346" r="10"/><circle cx="177" cy="346" r="10"/><circle cx="218" cy="346" r="10"/><rect x="112" y="427" width="54" height="50" rx="4"/><circle cx="427" cy="325" r="19"/><path d="M405 351h44l12 75h-68z"/><circle cx="709" cy="360" r="11"/><circle cx="748" cy="360" r="11"/></g>
+<g fill="#ef5a47"><circle cx="303" cy="467" r="18"/><path d="M282 491h42l15 69h-72z"/></g><g fill="#167c78"><circle cx="581" cy="453" r="17"/><path d="M561 476h40l14 84h-68z"/></g>
+<path d="M0 513 Q230 484 450 519 T900 504 V560H0Z" fill="#17324d"/>
+</svg></section>
+<footer class="details"><div><div class="label">When</div><div class="value">Saturday, June 12<br>5:00–10:00 PM</div></div><div><div class="label">Where</div><div class="value">Lantern Square<br>Riverside District</div></div><div><div class="label">What</div><div class="value">Food · Craft<br>Music · Neighbors</div></div><div class="fine"><span>All ages · Rain or shine · Transit encouraged</span><strong>STAGE FORMAT QA</strong></div></footer>
+</main></body></html>

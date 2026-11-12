@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -39,6 +40,8 @@ class _StructuredDispatchModel:
         self.calls: list[dict[str, object]] = []
 
     def create(self, **kwargs):  # noqa: ANN003
+        protocol_reply = workflow_provider_reply(kwargs, completion=True)
+        if protocol_reply is not None: return protocol_reply
         self.calls.append(kwargs)
         system = str(kwargs.get("system") or "")
         if "relationship" in system and "target_index" in system:
@@ -188,6 +191,8 @@ def test_account_source_discovery_asks_before_reading_vague_account_source_e2e(m
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             visible = {str(tool.get("name") or "") for tool in (kwargs.get("tools") or ())}
             self.tool_sets.append(visible)
             if len(self.tool_sets) == 1:
@@ -289,6 +294,8 @@ def test_account_source_selection_overrides_unhelpful_scope_reply_e2e(monkeypatc
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             visible = {str(tool.get("name") or "") for tool in (kwargs.get("tools") or ())}
             self.tool_sets.append(visible)
             if len(self.tool_sets) == 1:
@@ -418,6 +425,8 @@ def test_generic_gateway_skill_pack_context_exposes_connector_path_e2e(tmp_path,
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             visible = {str(tool.get("name") or "") for tool in (kwargs.get("tools") or ())}
             self.tool_sets.append(visible)
             if len(self.tool_sets) == 1:
@@ -552,6 +561,8 @@ def test_account_tool_answer_is_not_replaced_by_generic_message_list_e2e(monkeyp
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             visible = {str(tool.get("name") or "") for tool in (kwargs.get("tools") or ())}
             self.tool_sets.append(visible)
             if len(self.tool_sets) == 1:
@@ -740,6 +751,8 @@ def test_language_neutral_routing_uses_structural_signals_across_runtime_contrac
 
     class AttachmentFormatModel:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             return {
                 "content": [
                     {
@@ -1164,6 +1177,8 @@ def test_completed_messaging_turn_follow_up_uses_structured_recent_context(tmp_p
             self.calls: list[dict[str, object]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls.append(kwargs)
             system = str(kwargs.get("system") or "")
             if "relationship" in system and "target_index" in system:
@@ -1288,6 +1303,8 @@ def test_completed_messaging_turn_follow_up_keeps_full_context_across_a_third_me
             self.calls: list[dict[str, object]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls.append(kwargs)
             system = str(kwargs.get("system") or "")
             if "relationship" in system and "target_index" in system:

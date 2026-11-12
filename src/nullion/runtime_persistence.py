@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from contextlib import closing, contextmanager
+from collections.abc import Iterable
 import json
+import errno
 import logging
 import os
 import shutil
 import sqlite3
 import threading
 import hashlib
-from time import perf_counter
+from time import perf_counter, sleep
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -80,23 +84,53 @@ except ImportError:  # pragma: no cover - POSIX fallback
     msvcrt = None
 
 
+_RUNTIME_FILE_LOCK_OWNERS = threading.local()
+
+
 @contextmanager
-def _runtime_store_file_lock(target: Path):
+def _runtime_store_file_lock(target: Path, *, timeout_seconds: float | None = None):
+    target = Path(target).expanduser().resolve()
+    identity = (os.getpid(), os.path.normcase(str(target)))
+    owned = getattr(_RUNTIME_FILE_LOCK_OWNERS, 'paths', None)
+    if owned is None:
+        owned = _RUNTIME_FILE_LOCK_OWNERS.paths = set()
+    if identity in owned:
+        # flock ownership belongs to an open handle, not a Python thread.
+        # Reopening the same lock here would wait on our own outer handle.
+        # Only the outer context releases it; other threads/processes still
+        # acquire the OS lock and forked children have a different identity.
+        yield
+        return
     lock_path = target.with_name(f".{target.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock_file:
+        deadline = None if timeout_seconds is None else perf_counter() + max(0.0, timeout_seconds)
+        def acquire(action):
+            while True:
+                try:
+                    action()
+                    return
+                except OSError as exc:
+                    if deadline is None or exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                        raise
+                    remaining = deadline - perf_counter()
+                    if remaining <= 0:
+                        raise sqlite3.OperationalError("database is locked") from exc
+                    sleep(min(0.01, remaining))
         if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            acquire(lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | (fcntl.LOCK_NB if deadline is not None else 0)))
         elif msvcrt is not None:
             lock_file.seek(0)
             if not lock_file.read(1):
                 lock_file.write("0")
                 lock_file.flush()
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            acquire(lambda: msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK if deadline is not None else msvcrt.LK_LOCK, 1))
+        owned.add(identity)
         try:
             yield
         finally:
+            owned.discard(identity)
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             elif msvcrt is not None:
@@ -548,7 +582,7 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
     if not _is_sqlite_runtime_path(checkpoint_path) or not checkpoint_path.exists():
         return result
 
-    with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
+    with sqlite_connection(str(checkpoint_path), timeout=10) as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(_sqlite_runtime_ddl())
         rows = conn.execute(
@@ -604,7 +638,7 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
         return result
 
     now = datetime.now(UTC).isoformat()
-    with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
+    with sqlite_connection(str(checkpoint_path), timeout=10) as conn:
         conn.execute("PRAGMA secure_delete=ON")
         conn.executescript(_sqlite_runtime_ddl())
         conn.executescript(_sqlite_memory_migration_failure_ddl())
@@ -624,7 +658,7 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
                 payload=encrypted_payload,
                 reason=reason,
             )
-    with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
+    with sqlite_connection(str(checkpoint_path), timeout=10) as conn:
         conn.execute("VACUUM")
 
     result["encrypted_rows"] = sum(1 for update in updates if update[3])
@@ -1382,7 +1416,7 @@ def read_persisted_memory_entries(path: str | Path) -> list[UserMemoryEntry] | N
     if not target.is_file() or not _is_sqlite_runtime_path(target):
         return None
     collections = tuple(sorted(_ENCRYPTED_SQLITE_COLLECTIONS))
-    with sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=0.2) as conn:
+    with sqlite_connection(target.as_uri() + "?mode=ro", uri=True, timeout=0.2) as conn:
         conn.execute("BEGIN")
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('memory','runtime_meta')")}
         if "memory" not in tables:
@@ -1429,7 +1463,7 @@ def save_user_memory_entry(entry: UserMemoryEntry, path: str | Path) -> Path:
         raise ValueError("Scoped memory writes require a SQLite runtime store")
     collection = {UserMemoryKind.FACT: 'user_facts', UserMemoryKind.PREFERENCE: 'preferences',
                   UserMemoryKind.ENVIRONMENT_FACT: 'environment_facts'}[entry.kind]
-    with _runtime_store_file_lock(target), sqlite3.connect(str(target), timeout=2) as conn:
+    with _runtime_store_file_lock(target), sqlite_connection(str(target), timeout=2) as conn:
         conn.executescript(_sqlite_runtime_ddl())
         conn.execute('BEGIN IMMEDIATE')
         conn.execute('INSERT OR IGNORE INTO runtime_meta (key,value) VALUES (?,?)',
@@ -1708,7 +1742,7 @@ def _sqlite_quick_check(path: Path) -> str | None:
     if not _looks_like_sqlite_runtime_file(path):
         return None
     try:
-        with sqlite3.connect(str(path), timeout=10) as conn:
+        with sqlite_connection(str(path), timeout=10) as conn:
             row = conn.execute("PRAGMA quick_check").fetchone()
     except sqlite3.Error as exc:
         return str(exc) or exc.__class__.__name__
@@ -1854,8 +1888,8 @@ def _valid_auxiliary_sqlite_row(collection: str, payload: str) -> bool:
 
 def _read_sqlite_auxiliary_rows(source: Path) -> dict[str, list[tuple[str, str, str, str]]]:
     rows_by_table: dict[str, list[tuple[str, str, str, str]]] = {}
-    source_uri = f"file:{source}?mode=ro&immutable=1"
-    with sqlite3.connect(source_uri, uri=True, timeout=10) as conn:
+    source_uri = source.resolve().as_uri() + "?mode=ro&immutable=1"
+    with sqlite_connection(source_uri, uri=True, timeout=10) as conn:
         for table_name, collections in _SQLITE_AUXILIARY_COLLECTIONS_BY_TABLE.items():
             if not _sqlite_table_exists(conn, table_name):
                 continue
@@ -1951,7 +1985,7 @@ def restore_sqlite_auxiliary_rows_from_candidates(
         return 0
     target_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with sqlite3.connect(str(target_path), timeout=10) as conn:
+        with sqlite_connection(str(target_path), timeout=10) as conn:
             conn.executescript(_sqlite_runtime_ddl())
             for table_name, rows in best_rows.items():
                 collections = tuple(dict.fromkeys(row[0] for row in rows))
@@ -2022,6 +2056,8 @@ def _sqlite_collection_item_key(collection: str, index: int, item: object) -> st
     if collection in _ENCRYPTED_SQLITE_COLLECTIONS:
         return f"{index:012d}"
     if isinstance(item, dict):
+        if collection == "task_frames" and isinstance(item.get("frame_id"), str) and item["frame_id"]:
+            return item["frame_id"]
         if collection == "builder_route_observations":
             observation_id = item.get("observation_id")
             if isinstance(observation_id, str) and observation_id:
@@ -2155,58 +2191,55 @@ def _save_runtime_store_sqlite(
         backup_ms = (perf_counter() - backup_started_at) * 1000
 
     now = datetime.now(UTC).isoformat()
+    # Encoding can traverse large tool histories and encrypted memory. Finish
+    # it before acquiring a SQLite write transaction so readers remain usable.
+    encoded_collections = []
+    for table_name, collections in _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE.items():
+        for collection in collections:
+            rows = payload.get(collection, [])
+            if not isinstance(rows, list):
+                rows = []
+            encoded_rows = {
+                _sqlite_collection_item_key(collection, index, row):
+                    _encode_sqlite_runtime_payload(collection, target, row)
+                for index, row in enumerate(rows)
+            }
+            encoded_collections.append((table_name, collection, encoded_rows))
     sqlite_write_started_at = perf_counter()
-    with sqlite3.connect(str(target), timeout=10) as conn:
-        # Keep runtime checkpoints self-contained so backup/restore can copy one file.
+    with sqlite_connection(str(target), timeout=10) as conn:
+        # Backups remain self-contained SQLite files.
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_sqlite_runtime_ddl())
-        conn.execute(
-            "INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
-            ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)),
-        )
-        conn.execute('INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)', ('memory_revision', uuid4().hex))
-        for table_name, collections in _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE.items():
-            for collection in collections:
-                rows = payload.get(collection, [])
-                if not isinstance(rows, list):
-                    rows = []
-                encoded_rows: dict[str, str] = {}
-                for index, row in enumerate(rows):
-                    encoded_rows[_sqlite_collection_item_key(collection, index, row)] = _encode_sqlite_runtime_payload(
-                        collection,
-                        target,
-                        row,
-                    )
-                existing_rows = {
-                    str(item_key): str(row_payload)
-                    for item_key, row_payload in conn.execute(
-                        f"SELECT item_key, payload FROM {table_name} WHERE collection = ?",
-                        (collection,),
-                    )
-                }
-                stale_keys = (
-                    set()
-                    if collection in _SQLITE_APPEND_ONLY_COLLECTIONS
-                    else set(existing_rows) - set(encoded_rows)
+        conn.execute("BEGIN IMMEDIATE")
+        mutations = []
+        # Compare before dirtying pages. In rollback-journal mode, cache spills
+        # otherwise keep an exclusive reader lock during later history scans.
+        for table_name, collection, encoded_rows in encoded_collections:
+            existing_rows = {
+                str(item_key): str(row_payload)
+                for item_key, row_payload in conn.execute(
+                    f"SELECT item_key, payload FROM {table_name} WHERE collection = ?",
+                    (collection,),
                 )
-                if stale_keys:
-                    conn.executemany(
-                        f"DELETE FROM {table_name} WHERE collection = ? AND item_key = ?",
-                        [(collection, item_key) for item_key in stale_keys],
-                    )
-                changed_rows = [
-                    (collection, item_key, row_payload, now)
-                    for item_key, row_payload in encoded_rows.items()
-                    if existing_rows.get(item_key) != row_payload
-                ]
-                if changed_rows:
-                    conn.executemany(
-                        f"""INSERT OR REPLACE INTO {table_name}
-                            (collection, item_key, payload, updated_at)
-                            VALUES (?, ?, ?, ?)""",
-                        changed_rows,
-                    )
+            }
+            stale_keys = (set() if collection in _SQLITE_APPEND_ONLY_COLLECTIONS
+                          else set(existing_rows) - set(encoded_rows))
+            changed_rows = [(collection, item_key, row_payload, now)
+                for item_key, row_payload in encoded_rows.items()
+                if existing_rows.get(item_key) != row_payload]
+            mutations.append((table_name, collection, stale_keys, changed_rows))
+        conn.execute("INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
+                     ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)))
+        conn.execute("INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)",
+                     ("memory_revision", uuid4().hex))
+        for table_name, collection, stale_keys, changed_rows in mutations:
+            if stale_keys:
+                conn.executemany(f"DELETE FROM {table_name} WHERE collection = ? AND item_key = ?",
+                    [(collection, item_key) for item_key in stale_keys])
+            if changed_rows:
+                conn.executemany(f"INSERT OR REPLACE INTO {table_name} (collection,item_key,payload,updated_at) VALUES (?,?,?,?)",
+                    changed_rows)
     sqlite_write_ms = (perf_counter() - sqlite_write_started_at) * 1000
     record_count = sum(
         len(rows) if isinstance(rows, list) else 0
@@ -2231,19 +2264,159 @@ def _save_runtime_store_sqlite(
     return target
 
 
+def _conversation_checkpoint_state_rows(store, conversation_id, conn):
+    """Snapshot one current thread without scanning unrelated runtime history."""
+    def persisted(collection, identity):
+        table = _SQLITE_RUNTIME_TABLES[collection]
+        row = conn.execute(f"SELECT payload FROM {table} WHERE collection=? AND item_key=?",
+                           (collection, identity)).fetchone()
+        if row is None and collection == "task_frames":
+            row = conn.execute(f"SELECT payload FROM {table} WHERE collection=? "
+                "AND json_extract(payload, '$.frame_id')=? ORDER BY json_extract(payload, '$.updated_at') DESC LIMIT 1",
+                (collection, identity)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    # A stopped frame is no longer in active_task_frames. Persist its explicit
+    # identity as well as clearing the active pointer, including background
+    # frames which do not own a chat head.
+    closed_rows = []
+    seen_closed = set()
+    for event in store.list_recent_conversation_events(conversation_id, limit=128):
+        if event.get("event_type") != "conversation.session_stopped":
+            continue
+        identity = event.get("frame_id")
+        frame = store.task_frames.get(identity) if isinstance(identity, str) else None
+        if frame is None or frame.conversation_id != conversation_id or identity in seen_closed:
+            continue
+        seen_closed.add(identity)
+        payload = _serialize_task_frame(frame)
+        if payload.get("status") != "cancelled":
+            continue
+        previous = persisted("task_frames", identity)
+        if not previous or str(previous.get("updated_at") or "") <= str(payload.get("updated_at") or ""):
+            closed_rows.append(("task_frames", payload))
+    head = store.get_conversation_head(conversation_id)
+    if not head or not head.get("active_turn_id"):
+        return closed_rows
+    current = store.get_conversation_turn(head["active_turn_id"])
+    if current is None or current.conversation_id != conversation_id:
+        return closed_rows
+    previous_head = persisted("conversation_heads", conversation_id)
+    stale_head = False
+    if previous_head and previous_head.get("active_turn_id") != current.turn_id:
+        previous_turn = persisted("conversation_turns", previous_head.get("active_turn_id"))
+        if current.parent_turn_id != previous_head.get("active_turn_id"):
+            if previous_turn and _parse_dt(previous_turn.get("created_at")) > current.created_at:
+                # A late writer may append evidence, but cannot rewind the thread.
+                stale_head = True
+            ancestor = previous_turn
+            for _ in range(64):
+                if not ancestor:
+                    break
+                if ancestor.get("turn_id") == current.turn_id:
+                    stale_head = True
+                    break
+                parent = ancestor.get("parent_turn_id")
+                ancestor = persisted("conversation_turns", parent) if parent else None
+    rows = closed_rows + ([] if stale_head else [("conversation_heads", _serialize_conversation_head(conversation_id, head))])
+    seen = set()
+    branches = set()
+    for _ in range(64):
+        if current is None or current.turn_id in seen or current.conversation_id != conversation_id:
+            break
+        seen.add(current.turn_id)
+        payload = _serialize_conversation_turn(current)
+        previous = persisted("conversation_turns", current.turn_id)
+        if (previous and payload["status"] in {"accepted", "running", "in_progress"}
+                and previous.get("status") not in {"accepted", "running", "in_progress"}):
+            payload = previous
+        rows.append(("conversation_turns", payload))
+        if current.branch_id not in branches:
+            branches.add(current.branch_id)
+            branch = store.get_conversation_branch(current.branch_id)
+            if branch is not None and branch.conversation_id == conversation_id:
+                payload = _serialize_conversation_branch(branch)
+                previous = persisted("conversation_branches", current.branch_id)
+                if previous and payload["status"] == "active" and previous.get("status") != "active":
+                    payload = previous
+                rows.append(("conversation_branches", payload))
+        current = store.get_conversation_turn(current.parent_turn_id) if current.parent_turn_id else None
+    for collection, key, values in (
+        ("conversation_commits", "idempotency_keys", store.list_committed_idempotency_keys(conversation_id)),
+        ("conversation_ingress_ids", "ingress_ids", store.list_conversation_ingress_ids(conversation_id)),
+    ):
+        previous = persisted(collection, conversation_id) or {}
+        rows.append((collection, {"conversation_id": conversation_id,
+                                  key: sorted(set(previous.get(key) or ()) | set(values))}))
+    frame_id = store.active_task_frames.get(conversation_id)
+    frame = store.task_frames.get(frame_id) if frame_id else None
+    if not stale_head and frame is not None and frame.conversation_id == conversation_id:
+        payload = _serialize_task_frame(frame)
+        previous = persisted("task_frames", _sqlite_collection_item_key("task_frames", 0, payload))
+        if previous and str(previous.get("updated_at") or "") > str(payload.get("updated_at") or ""):
+            payload = previous
+        rows.append(("task_frames", payload))
+        reset = conn.execute("SELECT payload FROM conversation_events WHERE collection=? "
+            "AND json_extract(payload, '$.conversation_id')=? "
+            "AND json_extract(payload, '$.event_type') IN (?,?) "
+            "ORDER BY json_extract(payload, '$.created_at') DESC LIMIT 1",
+            ("conversation_events", conversation_id, "conversation.session_reset", "conversation.session_stopped")).fetchone()
+        reset_at = _parse_dt(json.loads(reset[0]).get("created_at")) if reset else None
+        updated_at = _parse_dt(payload.get("updated_at"))
+        if reset_at is None or (updated_at is not None and updated_at > reset_at):
+            rows.append(("active_task_frames", _serialize_active_task_frame(conversation_id, str(payload["frame_id"]))))
+    return rows
+
+
+
+def checkpoint_runtime_events(store: RuntimeStore, path: str | Path, events: Iterable[Event],
+                              *, audit_records: Iterable[AuditRecord] = (), timeout_seconds: float = 0.1) -> Path:
+    """Persist exact audit events without serializing unrelated runtime state."""
+    target = Path(path)
+    if not _is_sqlite_runtime_path(target):
+        return save_runtime_store(store, target, merge_existing=True)
+    deadline = perf_counter() + max(0.0, timeout_seconds)
+    now = datetime.now(UTC).isoformat()
+    rows = [("events", event.event_id,
+             _encode_sqlite_runtime_payload("events", target, _serialize_event(event)), now)
+            for event in events]
+    audit_rows = [("audit_records", record.record_id,
+                   _encode_sqlite_runtime_payload("audit_records", target, _serialize_audit(record)), now)
+                  for record in audit_records]
+    if not rows and not audit_rows:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _runtime_store_file_lock(target, timeout_seconds=max(0.0, deadline-perf_counter())), \
+            sqlite_connection(str(target), timeout=max(0.0, deadline-perf_counter())) as conn:
+        conn.executescript(_sqlite_runtime_ddl())
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("INSERT OR REPLACE INTO runtime_events "
+                         "(collection,item_key,payload,updated_at) VALUES (?,?,?,?)", rows)
+        if audit_rows:
+            conn.executemany("INSERT OR REPLACE INTO runtime_audit_records "
+                "(collection,item_key,payload,updated_at) VALUES (?,?,?,?)", audit_rows)
+        conn.commit()
+    return target
+
+
 def checkpoint_runtime_conversation_events(
     store: RuntimeStore,
     path: str | Path,
     *,
     limit: int = 128,
+    timeout_seconds: float = 10,
+    conversation_id: str | None = None,
+    conversation_events: Iterable[dict[str, object]] | None = None,
 ) -> Path:
     target = Path(path)
     if not _is_sqlite_runtime_path(target):
         return save_runtime_store(store, target, merge_existing=True)
     started_at = perf_counter()
+    deadline = started_at + max(0.0, timeout_seconds)
     target.parent.mkdir(parents=True, exist_ok=True)
-    rows = (store.list_recent_conversation_events(limit=limit)
-            if limit > 0 else store.list_conversation_events())
+    rows = (list(conversation_events) if conversation_events is not None else
+        store.list_recent_conversation_events(conversation_id, limit=limit)
+        if limit > 0 else store.list_conversation_events(conversation_id))
     now = datetime.now(UTC).isoformat()
     encoded_rows = [
         (
@@ -2254,10 +2427,12 @@ def checkpoint_runtime_conversation_events(
         )
         for index, row in enumerate(rows)
     ]
-    with sqlite3.connect(str(target), timeout=10) as conn:
+    with _runtime_store_file_lock(target, timeout_seconds=max(0.0, deadline - perf_counter())), \
+            sqlite_connection(str(target), timeout=max(0.0, deadline - perf_counter())) as conn:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_sqlite_runtime_ddl())
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
             ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)),
@@ -2283,6 +2458,33 @@ def checkpoint_runtime_conversation_events(
                         VALUES (?, ?, ?, ?)""",
                     changed_rows,
                 )
+        if conversation_id:
+            for collection, payload in _conversation_checkpoint_state_rows(store, conversation_id, conn):
+                identity = _sqlite_collection_item_key(collection, 0, payload)
+                encoded = _encode_sqlite_runtime_payload(collection, target, payload)
+                table = _SQLITE_RUNTIME_TABLES[collection]
+                previous = conn.execute(f"SELECT payload FROM {table} WHERE collection=? AND item_key=?",
+                                        (collection, identity)).fetchone()
+                if previous is None or previous[0] != encoded:
+                    conn.execute(f"INSERT OR REPLACE INTO {table} (collection,item_key,payload,updated_at) VALUES (?,?,?,?)",
+                                 (collection, identity, encoded, now))
+            if store.active_task_frames.get(conversation_id) is None:
+                resets = [row for row in rows if row.get("event_type") in {"conversation.session_reset", "conversation.session_stopped"}
+                          and row.get("conversation_id") == conversation_id and row.get("created_at")]
+                if resets:
+                    reset_at = max(_parse_dt(row["created_at"]) for row in resets)
+                    table = _SQLITE_RUNTIME_TABLES["active_task_frames"]
+                    prior = conn.execute(f"SELECT payload FROM {table} WHERE collection=? AND item_key=?",
+                        ("active_task_frames", conversation_id)).fetchone()
+                    frame_id = json.loads(prior[0]).get("frame_id") if prior else None
+                    frame = conn.execute(f"SELECT payload FROM {_SQLITE_RUNTIME_TABLES['task_frames']} WHERE collection=? "
+                        "AND json_extract(payload, '$.frame_id')=? ORDER BY json_extract(payload, '$.updated_at') DESC LIMIT 1",
+                        ("task_frames", frame_id)).fetchone() if frame_id else None
+                    # A late reset writer must not remove a newer active frame.
+                    updated_at = _parse_dt(json.loads(frame[0]).get("updated_at")) if frame else None
+                    if not frame or (updated_at is not None and updated_at <= reset_at):
+                        conn.execute(f"DELETE FROM {table} WHERE collection=? AND item_key=?",
+                                     ("active_task_frames", conversation_id))
     _log_runtime_sqlite_timing("conversation-event-save", started_at, target, records=len(rows))
     return target
 
@@ -2299,7 +2501,7 @@ def _load_runtime_store_sqlite_payload(
         "format_version": RUNTIME_STORE_FORMAT_VERSION,
         **{key: [] for key in _RUNTIME_STORE_COLLECTION_KEYS},
     }
-    with sqlite3.connect(str(source), timeout=10) as conn:
+    with sqlite_connection(str(source), timeout=10) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_sqlite_runtime_ddl())
@@ -2596,8 +2798,13 @@ def _runtime_store_from_payload(payload: dict[str, object]) -> RuntimeStore:
         conversation_id, ingress_ids = _deserialize_conversation_ingress_ids(dict(ingress_record))
         for ingress_id in ingress_ids:
             store.add_conversation_ingress_id(conversation_id, ingress_id)
-    for conversation_event in payload.get("conversation_events", []):
-        store.add_conversation_event(dict(conversation_event))
+    # Hydration builds indexes from committed history; it is not new execution.
+    # An active cron observer would otherwise retag and persist every historical
+    # diagnostic while a checkpoint is loading or validating its own rows.
+    from nullion.runtime_store import conversation_event_observer
+    with conversation_event_observer(None):
+        for conversation_event in payload.get("conversation_events", []):
+            store.add_conversation_event(dict(conversation_event))
     _mark_memory_snapshot_persisted(store, payload)
     return store
 

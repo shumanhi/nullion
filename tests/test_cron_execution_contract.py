@@ -87,14 +87,25 @@ def test_selected_write_still_uses_delegate_approval_boundary(tmp_path):
     assert calls == []
 
 
-def test_failure_notice_describes_remaining_steps_and_redacts_sensitive_data():
+def test_failure_notice_keeps_private_remaining_steps_out_of_public_copy():
     result = {'cron_completion_required':True, 'reached_iteration_limit':True,
         'cron_remaining_work':['確認済みの記録と予定を照合', 'Read /Users/example/private/state.json token=abcdefghijklmno']}
     text = _cron_report_failure_notice(result)
-    assert 'execution limit' in text and '確認済みの記録と予定を照合' in text
+    assert 'execution limit' in text and '確認済みの記録と予定を照合' not in text
+    assert result['cron_remaining_work'][0] == '確認済みの記録と予定を照合'
     assert '/Users/example/private' not in text and 'abcdefghijklmno' not in text
     assert len(_cron_safe_remaining_work(['a']*4)) == 1
     assert not _cron_safe_remaining_work('untyped')
+
+
+@pytest.mark.parametrize('enabled', [True, False, None])
+@pytest.mark.parametrize('verification_failed', [True, False])
+def test_failure_notice_promises_a_scheduled_retry_only_when_recurrence_is_enabled(enabled, verification_failed):
+    result = {'cron_schedule_enabled':enabled, 'cron_verification_failed':verification_failed}
+    notice = _cron_report_failure_notice(result)
+    assert ('next scheduled run' in notice) is (enabled is True)
+    if enabled is False:
+        assert 'schedule is paused' in notice and 'manually' in notice
 
 
 def test_missing_skill_reference_returns_exact_installed_paths_without_guessing(monkeypatch):
@@ -123,6 +134,48 @@ def test_interrupted_scope_response_cannot_grant_actions(tmp_path,monkeypatch,co
     result=build_cron_connector_scope_decision(model_client=Model(),user_message='確認',principal_id='web:fixture',
         registry=registry,resolve_execution_contract=True,checkpoint_path=str(tmp_path/'runtime.db'))
     assert not result.valid and not result.write_tool_names
+
+
+@pytest.mark.parametrize('scheduled', [False, True])
+def test_source_scope_uses_real_json_schema_and_separate_saved_setup_budget(tmp_path, monkeypatch, scheduled):
+    from jsonschema import Draft202012Validator
+    registry, _ = registry_with_account_actions()
+    monkeypatch.setattr('nullion.cron_execution_tools._connected_connector_provider_summaries', lambda _:(
+        {'provider_id':'skill_pack_connector_records','permission_mode':'write'},))
+    class Model:
+        def create(self, **kw):
+            packet = json.loads(kw['messages'][0]['content'][0]['text'])
+            schema = packet['response_schema']
+            Draft202012Validator.check_schema(schema)
+            value = {'requires_account_connector':True,
+                'provider_ids':['skill_pack_connector_records'], 'confidence':1}
+            if scheduled:
+                assert kw['timeout'] == 30
+                value.update(write_tool_names=['schedule_add'], delivery_mode='report_each_run')
+            else:
+                assert kw['timeout'] == 5
+            Draft202012Validator(schema).validate(value)
+            return {'content':[{'type':'text','text':json.dumps(value)}]}
+    result = build_cron_connector_scope_decision(model_client=Model(), user_message='記録の期限を確認。',
+        principal_id='web:budget', registry=registry, resolve_execution_contract=scheduled,
+        checkpoint_path=str(tmp_path/'runtime.db'))
+    assert result.valid and not result.failure_reason
+
+
+def test_source_scope_timeout_diagnostic_does_not_leak_exception_payload(tmp_path, monkeypatch, caplog):
+    registry, _ = registry_with_account_actions()
+    monkeypatch.setattr('nullion.cron_execution_tools._connected_connector_provider_summaries', lambda _:(
+        {'provider_id':'skill_pack_connector_records','permission_mode':'write'},))
+    class Model:
+        def create(self, **kw):
+            raise TimeoutError('private-provider-payload secret=must-not-appear')
+    result = build_cron_connector_scope_decision(model_client=Model(), user_message='記録の期限を確認。',
+        principal_id='web:budget', registry=registry, resolve_execution_contract=True,
+        checkpoint_path=str(tmp_path/'runtime.db'))
+    assert not result.valid and not result.allow_connector_tools and not result.write_tool_names
+    assert result.failure_reason == 'provider_timeout' and result.error_type == 'TimeoutError'
+    assert 'provider_timeout' in caplog.text
+    assert 'private-provider-payload' not in caplog.text and 'must-not-appear' not in caplog.text
 
 
 @pytest.mark.parametrize('label', ['Deferred report','期限の確認','Informe aplazado'])

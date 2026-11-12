@@ -156,7 +156,9 @@ def test_telegram_web_approval_actions_name_all_web_domains() -> None:
     assert "Allow globally" not in labels
 
 
-def test_calendar_create_approval_display_uses_event_arguments() -> None:
+def test_calendar_create_approval_display_uses_event_arguments(monkeypatch) -> None:
+    from nullion import preferences
+    monkeypatch.setattr(preferences, 'load_preferences', lambda: preferences.Preferences(timezone='America/New_York'))
     from nullion.telegram_app import _approval_card_actions, _approval_card_text
 
     approval = create_approval_request(
@@ -188,7 +190,7 @@ def test_calendar_create_approval_display_uses_event_arguments() -> None:
     assert display.title == "📅 Add this calendar event?"
     assert display.detail.startswith("Calendar event:")
     assert "> Title: Horse Meat Disco NYC Pride" in card
-    assert "> When: Jun 26, 2026, 10:00 PM to Jun 27, 2026, 12:00 AM (America/New_York)" in card
+    assert "> When: Jun 26, 2026, 10:00 PM EDT to Jun 27, 2026, 12:00 AM EDT (event timezone: America/New_York)" in card
     assert "> Where: The Ruins at Knockdown Center, Maspeth, Queens" in card
     assert "> Calendar: primary" in card
     assert "write-capable" not in card

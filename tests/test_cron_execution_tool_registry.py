@@ -90,7 +90,7 @@ def test_cron_execution_registry_hides_scheduler_capabilities() -> None:
     assert denied.status == "denied"
     assert denied.output["reason"] == "cron_execution_capability_denied"
     assert set(denied.output["denied_tools"]) == CRON_EXECUTION_BLOCKED_TOOLS
-    assert set(denied.output["denied_capability_tags"]) == CRON_EXECUTION_BLOCKED_CAPABILITY_TAGS
+    assert set(denied.output["denied_capability_tags"]) == {"scheduler"}
     assert set(denied.output["tool_capability_tags"]) == {"scheduler", "cron"}
 
     legacy_denied = cron_registry.invoke(

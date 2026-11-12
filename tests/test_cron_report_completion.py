@@ -173,7 +173,8 @@ def test_html_review_compacts_images_without_changing_delivered_bytes():
     class Client:
         def create(self, **kwargs):
             request = kwargs['messages'][0]['content'][0]['text']
-            assert len(request) < 2000
+            # Includes the request-bound conditional-delivery schema, never image bytes.
+            assert len(request) < 2400
             payload = json.loads(request)
             assert 'AAA 20' in payload['existing_html'] and 'alt="図"' in payload['existing_html']
             assert 'chars=300000' in payload['existing_html']
@@ -288,7 +289,10 @@ def test_review_continuation_preserves_whitespace_inside_exact_edit():
 
 
 @pytest.mark.parametrize('first', [response(), response('partial', completion={'status': 'incomplete', 'reason': 'max_output_tokens'})])
-def test_report_completion_retries_only_model_and_keeps_source_evidence(first):
+def test_report_completion_retries_only_model_and_keeps_source_evidence(first, monkeypatch):
+    # This protocol-only retry consumes no simulated wall time. Elapsed
+    # inspection/transport time is covered by the shared-deadline regression.
+    monkeypatch.setattr('nullion.cron_delivery.time.monotonic', lambda: 0.0)
     replies = iter([first, report_response('更新期限: 2028-04-09、45 USD。予定の作成はなし。')])
     calls = []
     class Client:
@@ -302,7 +306,8 @@ def test_report_completion_retries_only_model_and_keeps_source_evidence(first):
     assert result['cron_agent_final_repair_attempts'] == 2
     assert '45 USD' in result['text']
     assert [call['max_tokens'] for call in calls] == [4000, 8000]
-    assert all(call['tools'] == [] and call['timeout'] == 45 for call in calls)
+    assert all(call['tools'] == [] for call in calls)
+    assert [call['timeout'] for call in calls] == [45, 60]
     assert result['tool_results'] == [source_result()]
     assert all('2028-04-09' in call['messages'][0]['content'][0]['text'] for call in calls)
 
@@ -530,7 +535,7 @@ def test_manual_cron_report_failure_is_not_successful_even_when_notice_was_sent(
     assert result.output['reason'] == 'cron_report_incomplete'
     assert result.output['delivery_status'] == 'sent'
     assert 'approval' not in result.error.lower()
-    assert crons.get_cron(job.id).last_result == 'manual run failed: cron_report_incomplete'
+    assert crons.get_cron(job.id).last_result == 'error: cron_report_incomplete'
 
 
 def test_all_hydrated_email_obligations_survive_many_earlier_searches():

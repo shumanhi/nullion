@@ -165,10 +165,11 @@ class CronPlannerStatusPreview:
 
 
 def _with_scheduled_task_preview_header(text: str, subject: str = "") -> str:
+    from nullion.chat_text import UserMessage, render_user_message
     subject_text = " ".join(str(subject or "").split())
-    header = f"⏰ SCHEDULED TASK: {subject_text}" if subject_text else "⏰ SCHEDULED TASK"
+    header = f"SCHEDULED TASK: {subject_text}" if subject_text else "SCHEDULED TASK"
     body = str(text or "").strip()
-    return f"{header}\n\n{body}" if body else header
+    return render_user_message(UserMessage(title=header,paragraphs=(body,) if body else (),kind='scheduled'))
 
 
 def build_cron_planner_status_preview(

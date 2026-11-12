@@ -1,4 +1,5 @@
 """Real chat route, SQLite restart, saved code execution and visible replies."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 from datetime import UTC, datetime
 import json
 import os
@@ -55,6 +56,18 @@ def test_chat_create_run_restart_and_reuse_with_new_arguments(tmp_path,monkeypat
     class Create(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            if 'material-requirements planner' in str(kw.get('system') or ''):
+                return response(json.dumps({'all_material_requirements_enumerated':True,
+                    'requested_artifact_extensions':[], 'material_requirements':[
+                        {'requirement':'Search the existing catalog before saving.', 'requirement_kind':'constraint',
+                         'evidence_subject_id':'catalog-search', 'delivery_required':False,
+                         'eligible_evidence_tool_names':['local_tool_search']},
+                        {'requirement':'Persist the reusable definition with schemas.', 'requirement_kind':'action',
+                         'evidence_subject_id':'saved-definition', 'eligible_evidence_tool_names':['local_tool_save']},
+                        {'requirement':'Execute the exact revision and return its computed total.', 'requirement_kind':'fact',
+                         'evidence_subject_id':'execution-result', 'eligible_evidence_tool_names':['local_tool_run']}]}))
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if 'select_attachment_format' in {t['name'] for t in kw.get('tools',[])}:
                 return tool('select_attachment_format',{'extension':'.json','output_kind':'internal',
                     'confidence':1,'embedded_media_extensions':[]})
@@ -70,7 +83,7 @@ def test_chat_create_run_restart_and_reuse_with_new_arguments(tmp_path,monkeypat
                 return tool('local_tool_save',definition())
             if self.steps==4:
                 saved=last_output(kw,'local_tool_save');self.revision=saved['revision']
-                assert saved['persisted'] and not saved['verified']
+                assert saved['persisted'] and not saved['execution_verified']
                 return tool('local_tool_run',{'name':'sum_values','revision':self.revision,'arguments':{'values':[2,3]}})
             assert self.steps==5
             result=last_output(kw,'local_tool_run')
@@ -97,6 +110,11 @@ def test_chat_create_run_restart_and_reuse_with_new_arguments(tmp_path,monkeypat
                     assert not errors,errors
                 finally:browser.close();playwright.stop()
     send(create_app(runtime,AgentOrchestrator(model_client=model),registry),prompt,'Total: 5.','web:tool-create')
+    created=next(e for e in reversed(runtime.store.list_conversation_events()) if e.get('event_type')=='conversation.chat_turn')
+    assert created.get('response_fulfilled') is True,created
+    assert [r['tool_name'] for r in created['tool_results']]==['request_tool_scope','local_tool_search','local_tool_save','local_tool_run']
+    reviews=[e for e in runtime.store.list_conversation_events() if e.get('event_type')=='conversation.completion_review']
+    assert len(reviews)==1 and reviews[0]['disposition']=='complete',reviews
     runtime.checkpoint(force=True)
     # New runtime and registry, independent conversation/surface, no prior model messages.
     fresh=bootstrap_persistent_runtime(tmp_path/'runtime.db')
@@ -104,6 +122,8 @@ def test_chat_create_run_restart_and_reuse_with_new_arguments(tmp_path,monkeypat
     class Reuse(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.steps+=1
@@ -111,7 +131,7 @@ def test_chat_create_run_restart_and_reuse_with_new_arguments(tmp_path,monkeypat
             if self.steps==2:return tool('local_tool_search',{'query':'sum_values'})
             if self.steps==3:
                 found=last_output(kw,'local_tool_search')['tools'][0]
-                assert found['revision']==model.revision and found['verified']
+                assert found['revision']==model.revision and found['execution_verified']
                 return tool('local_tool_read',{'name':found['name'],'revision':found['revision']})
             if self.steps==4:
                 exact=last_output(kw,'local_tool_read')
@@ -196,6 +216,8 @@ def test_simple_chat_never_scans_catalog_or_adds_a_model_round(tmp_path,monkeypa
     class Plain(ScriptedProvider):
         calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.calls+=1
@@ -227,6 +249,8 @@ def test_chat_approval_resumes_saved_revision_without_granting_blanket_shell(tmp
     class Model(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.steps+=1

@@ -35,7 +35,7 @@ class CaptionCallbackMessage(ReplyMessage):
 
     async def edit_text(self, text, **kwargs):
         class BadRequest(Exception):
-            pass
+            status_code = 400
 
         raise BadRequest("There is no text in the message to edit")
 
@@ -217,9 +217,11 @@ def test_telegram_doctor_callback_is_idempotent_for_closed_action(tmp_path):
         chat_id="100001",
     )
 
-    assert acknowledgement == "Already closed"
-    assert "already cancelled" in reply
-    assert "Doctor: Telegram typing indicator failed" in reply
+    assert acknowledgement == "Already dismissed"
+    assert "Doctor alert is already dismissed." in reply
+    assert "No new action was run." in reply
+    assert "Telegram typing indicator failed" not in reply
+    assert runtime.store.get_doctor_action("act-closed")["status"] == "cancelled"
 
 
 def test_telegram_doctor_notification_dedupes_same_action_id(tmp_path):

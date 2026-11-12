@@ -34,13 +34,9 @@ def current_reminder_chat_id() -> str | None:
 def reminder_timezone(timezone_name: str | None = None) -> tzinfo:
     """Return the timezone reminders should use for user-facing times."""
     try:
-        from nullion.preferences import detect_system_timezone, load_preferences, resolve_timezone
+        from nullion.preferences import load_preferences, resolve_timezone
 
         saved_timezone = str(timezone_name or load_preferences().timezone or "").strip()
-        if saved_timezone.upper() == "UTC":
-            detected_timezone = detect_system_timezone(default="UTC")
-            if detected_timezone != "UTC":
-                return resolve_timezone(detected_timezone)
         return resolve_timezone(saved_timezone)
     except Exception:
         return UTC
@@ -66,9 +62,9 @@ def format_reminder_due_at(due_at: datetime | None, *, timezone_name: str | None
         return "scheduled"
     if due_at.tzinfo is None:
         due_at = due_at.replace(tzinfo=UTC)
-    local_due_at = due_at.astimezone(reminder_timezone(timezone_name))
-    hour = local_due_at.strftime("%I").lstrip("0") or "12"
-    return f"{local_due_at.day} {local_due_at.strftime('%b')} at {hour}:{local_due_at:%M} {local_due_at:%p}"
+    from nullion.preferences import format_user_datetime
+    return format_user_datetime(due_at, timezone_name=timezone_name, date_style='day_month',
+        include_timezone=False).replace(', ', ' at ', 1)
 
 
 def reminder_due_at_output(due_at: datetime, *, timezone_name: str | None = None) -> dict[str, str]:

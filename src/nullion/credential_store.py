@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 import json
 import os
 import sqlite3
@@ -199,7 +201,7 @@ def save_encrypted_credentials(creds: dict[str, Any], *, db_path: str | Path | N
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(creds, sort_keys=True).encode("utf-8")
     encrypted = _cipher_for(target).encrypt(payload).decode("ascii")
-    with sqlite3.connect(str(target), timeout=10) as conn:
+    with sqlite_connection(str(target), timeout=10) as conn:
         conn.executescript(_DDL)
         conn.execute(
             """INSERT OR REPLACE INTO encrypted_credentials
@@ -215,7 +217,7 @@ def load_encrypted_credentials(*, db_path: str | Path | None = None) -> dict[str
     if not target.exists():
         return None
     try:
-        with sqlite3.connect(str(target), timeout=10) as conn:
+        with sqlite_connection(str(target), timeout=10) as conn:
             conn.executescript(_DDL)
             row = conn.execute(
                 "SELECT payload FROM encrypted_credentials WHERE credential_id = ?",

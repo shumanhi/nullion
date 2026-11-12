@@ -104,7 +104,9 @@ def test_error_page_quotes_are_blocked_and_honor_explicit_terminal_report(tmp_pa
         observations=[{'label': '画面', 'value': 'アクセスできません', 'quote': 'アクセスできません',
                        'source_url': 'https://first.example'}], unknowns=['時間']))
     output = evidence.result(error=None, elapsed=1, steps=1, done=True)
-    assert output['observations'] == []
+    assert len(output['observations']) == 1
+    assert output['observations'][0]['quote'] == 'アクセスできません'
+    assert output['observations'][0]['evidence_kind'] == 'source_blocker'
     assert output['report_status'] == 'blocked'
     assert output['continuation'] is None
     assert output['blocker']

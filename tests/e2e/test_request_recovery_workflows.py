@@ -1,4 +1,5 @@
 """Recovery through the real chat route, executor and persisted file boundary."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 
@@ -33,6 +34,8 @@ def test_discovery_recovery_preserves_original_action_plan(tmp_path,monkeypatch,
     class Model(ScriptedProvider):
         phase=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.phase+=1
@@ -81,6 +84,8 @@ def test_new_followup_can_discover_an_edit_without_inheriting_old_read_authority
     class Model(ScriptedProvider):
         mode='read';phase=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:
                 if self.mode=='edit' and 'relationship' in str(kw.get('system','')) and 'target_index' in str(kw.get('system','')):
@@ -138,6 +143,8 @@ def test_explicit_delivery_updates_original_file_and_downloads_updated_bytes(tmp
     class Model(ScriptedProvider):
         phase=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.phase+=1

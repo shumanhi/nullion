@@ -25,7 +25,7 @@ def test_save_search_read_restart_revision_and_schema(tmp_path,monkeypatch):
     saved=call(registry,'local_tool_save',definition())
     assert saved.status=='completed',saved
     revision=saved.output['revision']
-    assert saved.output['verified'] is False
+    assert saved.output['execution_verified'] is False and 'verified' not in saved.output
     assert 'source' not in saved.output and 'artifact_paths' not in saved.output
     fresh=create_core_tool_registry(workspace_root=tmp_path)
     found=call(fresh,'local_tool_search',{'query':'sum_values'})
@@ -40,6 +40,28 @@ def test_save_search_read_restart_revision_and_schema(tmp_path,monkeypatch):
     updated=call(fresh,'local_tool_save',changed)
     assert updated.status=='completed' and updated.output['revision']!=revision
     assert call(fresh,'local_tool_read',{'name':'sum_values','revision':revision}).status=='completed'
+
+
+def test_catalog_receipts_prove_search_save_and_read_without_claiming_execution(tmp_path,monkeypatch):
+    from nullion.agent_orchestrator import _completion_review_evidence_result_is_positive
+    from nullion.tools import ToolResult
+    _,registry,_=terminal_setup(tmp_path,monkeypatch)
+    empty=call(registry,'local_tool_search',{'query':'sum_values'})
+    assert empty.output['count']==0 and empty.output['tools']==[] and empty.output['has_more'] is False
+    assert _completion_review_evidence_result_is_positive(empty),empty
+    saved=call(registry,'local_tool_save',definition())
+    read=call(registry,'local_tool_read',{'name':'sum_values'})
+    found=call(registry,'local_tool_search',{'query':'sum_values'})
+    assert found.output['count']==1
+    for receipt in (saved,read):
+        assert receipt.output['execution_verified'] is False and 'verified' not in receipt.output
+        assert _completion_review_evidence_result_is_positive(receipt),receipt
+    assert found.output['tools'][0]['execution_verified'] is False
+    assert _completion_review_evidence_result_is_positive(found)
+    # Neither catalog success nor an action receipt rescues a failed call or
+    # a result that explicitly says its current execution was unverified.
+    assert not _completion_review_evidence_result_is_positive(ToolResult('failed','local_tool_save','failed',saved.output))
+    assert not _completion_review_evidence_result_is_positive(ToolResult('unverified','local_tool_run','completed',{'verified':False,'result':{'total':30}}))
 
 
 @pytest.mark.parametrize('change',[
@@ -74,7 +96,7 @@ def test_nested_execution_preserves_policy_and_rejects_direct_registry(tmp_path,
     failed=ToolExecutor(store=runtime.store,registry=registry).invoke(ToolInvocation('bad-output','local_tool_run','web:review',args))
     assert failed.status=='failed' and failed.output['reason']=='invalid_tool_output'
     assert len(backend.calls)==1
-    assert call(registry,'local_tool_read',{'name':'sum_values'}).output['verified'] is False
+    assert call(registry,'local_tool_read',{'name':'sum_values'}).output['execution_verified'] is False
     assert call(registry,'local_tool_run',args).output['reason']=='execution_authority_required'
     scoped=ToolExecutor(store=runtime.store,registry=registry,allowed_tool_names=['local_tool_run']).invoke(
         ToolInvocation('limited','local_tool_run','web:review',args))

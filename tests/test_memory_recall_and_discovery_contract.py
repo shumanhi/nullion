@@ -20,6 +20,25 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv('NULLION_KEY_STORAGE', 'file')
 
 
+def test_explicit_task_workspace_memory_excludes_notification_recipient(tmp_path,monkeypatch):
+    monkeypatch.setenv('NULLION_MEMORY_ENABLED','1')
+    runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db')
+    for identity,owner,value in [('own','workspace:alpha','Alpha profile'),
+        ('receiver','telegram:recipient','Receiver private profile'),
+        ('other','workspace:workspace_admin','Other workspace profile')]:
+        runtime.store.add_user_memory_entry(UserMemoryEntry(identity,owner,UserMemoryKind.FACT,
+            'profile_name',value))
+    runtime.checkpoint(force=True)
+    def must_not_resolve_receiver(*args):
+        raise AssertionError('A saved task has an explicit workspace owner')
+    monkeypatch.setattr(chat_operator,'_memory_owner_for_chat',must_not_resolve_receiver)
+    context=chat_operator._memory_context_for_chat(runtime,chat_id='telegram:recipient',
+        workspace_id='alpha',reinforce=False,query='プロフィールを確認。')
+    assert 'Alpha profile' in context
+    assert 'Receiver private profile' not in context and 'Other workspace profile' not in context
+    assert runtime.store.get_user_memory_entry('own').use_score==0
+
+
 @pytest.mark.parametrize('prefix', ['The document is', '文書はこちら', 'El documento es'])
 def test_selected_file_answer_survives_prior_broad_searches(prefix, tmp_path):
     target = tmp_path / 'cedar-itinerary.pdf'

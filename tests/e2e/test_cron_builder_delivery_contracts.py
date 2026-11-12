@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -21,6 +22,8 @@ class FakeAttachmentFormatModel:
         self.extension = extension
 
     def create(self, **kwargs):  # noqa: ANN003
+        protocol_reply = workflow_provider_reply(kwargs, completion=True)
+        if protocol_reply is not None: return protocol_reply
         tools = kwargs.get("tools") or []
         if tools and tools[0].get("name") == "select_attachment_format":
             return {
@@ -75,7 +78,7 @@ def test_platform_delivery_attaches_real_pdf_referenced_by_sandbox_link(
         "[Download the NYC to San Francisco Train Guide PDF](sandbox:NYC_to_San_Francisco_by_Train_Guide.pdf)"
     )
 
-    delivery = prepare_reply_for_platform_delivery(reply, principal_id="telegram:100001")
+    delivery = prepare_reply_for_platform_delivery(reply, principal_id="telegram:514132807")
 
     assert delivery.attachments == (pdf_artifact,)
     assert delivery.media_directive_count == 1
@@ -105,7 +108,7 @@ def test_telegram_cron_delivery_uploads_bare_media_filename_and_records_receipt(
 
     class Message:
         def __init__(self) -> None:
-            self.chat = SimpleNamespace(id=100001)
+            self.chat = SimpleNamespace(id=514132807)
             self.message_id = 700
             self.documents: list[dict] = []
             self.replies: list[tuple[str, dict]] = []
@@ -126,7 +129,7 @@ def test_telegram_cron_delivery_uploads_bare_media_filename_and_records_receipt(
                 "Run complete.\n\n"
                 "MEDIA nullion_public_awareness_github_traffic_monitor.html"
             ),
-            principal_id="telegram:100001",
+            principal_id="telegram:514132807",
         )
     )
 
@@ -257,7 +260,7 @@ def test_cron_single_agent_runner_exposes_structured_connector_tools_without_gat
 
     result = run_single_agent_cron_turn(
         job,
-        "telegram:100001",
+        "telegram:514132807",
         label="Scheduled task",
         orchestrator=FakeOrchestrator(),
         runtime=runtime,
@@ -302,10 +305,6 @@ def test_cron_record_budget_preserves_research_tools_and_delivers_html(
     from nullion.tools import ToolRegistry, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
     monkeypatch.setenv("NULLION_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setattr(
-        "nullion.cron_execution_tools.build_cron_connector_scope_decision",
-        lambda **_kwargs: SimpleNamespace(allow_connector_tools=False, provider_ids=()),
-    )
 
     report_path = tmp_path / "data" / "workspaces" / "workspace_admin" / "artifacts" / "traffic-report.html"
     report_html = (
@@ -319,6 +318,8 @@ def test_cron_record_budget_preserves_research_tools_and_delivers_html(
             self.tool_sets: list[tuple[str, ...]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             review = sourced_report_model_reply(kwargs, source_tools=['browser_extract_items'],
                 producer_tool='file_write', expected_tokens=['GitHub Traffic Trend', 'X / Twitter', 'Reddit'])
             if review is not None:
@@ -477,7 +478,7 @@ def test_cron_record_budget_preserves_research_tools_and_delivers_html(
         schedule="0 8 * * *",
         task="Build the configured report from current-run structured source records.",
         delivery_channel="telegram",
-        delivery_target="100001",
+        delivery_target="514132807",
         artifact_delivery_options={
             "requires_attachment_delivery": True,
             "required_artifact_extensions": [".html"],
@@ -490,7 +491,7 @@ def test_cron_record_budget_preserves_research_tools_and_delivers_html(
 
     callbacks = CronRunDeliveryCallbacks(
         effective_channel=lambda _job: "telegram",
-        delivery_target=lambda _job, _channel: "100001",
+        delivery_target=lambda _job, _channel: "514132807",
         run_agent_turn=lambda cron_job, conversation_id, cancellation_checker=None: run_single_agent_cron_turn(
             cron_job,
             conversation_id,
@@ -505,7 +506,7 @@ def test_cron_record_budget_preserves_research_tools_and_delivers_html(
         block_reason=lambda result, text, artifacts: cron_delivery_block_reason(result, text, artifacts),
         save_web_delivery=lambda *_args, **_kwargs: False,
         send_platform_delivery=lambda _job, _channel, _target, text: deliveries.append(
-            prepare_reply_for_platform_delivery(text, principal_id="telegram:100001")
+            prepare_reply_for_platform_delivery(text, principal_id="telegram:514132807")
         )
         or True,
     )
@@ -554,7 +555,8 @@ def test_telegram_background_artifact_delivery_awaits_document_upload_and_record
         async def __aexit__(self, *_args) -> None:  # noqa: ANN002
             return None
 
-        async def send_document(self, *, chat_id, document, caption=None):  # noqa: ANN001
+        async def send_document(self, *, chat_id, document, caption=None, **kwargs):  # noqa: ANN001
+            assert kwargs['connect_timeout'] > 0 and kwargs['pool_timeout'] > 0
             self.documents.append({"chat_id": chat_id, "data": document.read(), "caption": caption})
             return SimpleNamespace(message_id=991)
 
@@ -562,21 +564,22 @@ def test_telegram_background_artifact_delivery_awaits_document_upload_and_record
             self.messages.append({"chat_id": chat_id, "text": text, "kwargs": kwargs})
             return SimpleNamespace(message_id=992)
 
-    monkeypatch.setitem(sys.modules, "telegram", SimpleNamespace(Bot=FakeBot))
+    import telegram as telegram_sdk
+    monkeypatch.setattr(telegram_sdk, "Bot", FakeBot)
 
     delivered = asyncio.run(
         telegram_app._send_operator_telegram_message(
             "token",
-            "100001",
+            "514132807",
             f"MEDIA:{artifact.name}",
-            principal_id="telegram:100001",
+            principal_id="telegram:514132807",
         )
     )
 
     assert delivered is True
     assert len(FakeBot.instances) == 1
     assert FakeBot.instances[0].documents == [
-        {"chat_id": "100001", "data": artifact.read_bytes(), "caption": None}
+        {"chat_id": "514132807", "data": artifact.read_bytes(), "caption": None}
     ]
     receipts = [
         json.loads(line)
@@ -602,11 +605,11 @@ def test_telegram_chat_turn_uploads_named_workspace_artifact_instead_of_filename
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime-named-artifact.db")
     settings = load_settings(
         env={
-            "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "100001",
+            "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "514132807",
             "NULLION_TELEGRAM_CHAT_ENABLED": "true",
         }
     )
-    artifact_root = artifact_root_for_principal("telegram:100001")
+    artifact_root = artifact_root_for_principal("telegram:514132807")
     artifact_root.mkdir(parents=True, exist_ok=True)
     artifact = artifact_root / "nullion_bug_tracker_2026-05-08.xlsx"
     artifact.write_bytes(b"PK\x03\x04xlsx e2e bytes")
@@ -636,7 +639,7 @@ def test_telegram_chat_turn_uploads_named_workspace_artifact_instead_of_filename
     reply = chat_operator._render_chat_turn(
         runtime,
         message="/chat 添付 42",
-        chat_id="100001",
+        chat_id="514132807",
         settings=settings,
         agent_orchestrator=FilenameOnlyOrchestrator(),
         append_activity_trace=False,
@@ -644,7 +647,7 @@ def test_telegram_chat_turn_uploads_named_workspace_artifact_instead_of_filename
 
     class Message:
         def __init__(self) -> None:
-            self.chat = SimpleNamespace(id=100001)
+            self.chat = SimpleNamespace(id=514132807)
             self.message_id = 7198
             self.documents: list[dict] = []
             self.replies: list[tuple[str, dict]] = []
@@ -656,7 +659,7 @@ def test_telegram_chat_turn_uploads_named_workspace_artifact_instead_of_filename
             self.replies.append((text, kwargs))
 
     message = Message()
-    asyncio.run(telegram_app._deliver_reply(message, reply, principal_id="telegram:100001"))
+    asyncio.run(telegram_app._deliver_reply(message, reply, principal_id="telegram:514132807"))
 
     assert isinstance(reply, str) and reply.strip()
     assert (
@@ -690,7 +693,7 @@ def test_telegram_file_delivery_followup_does_not_reattach_existing_artifact(
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime-artifact-followup.db")
     settings = load_settings(
         env={
-            "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "100001",
+            "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "514132807",
             "NULLION_TELEGRAM_CHAT_ENABLED": "true",
         }
     )
@@ -707,20 +710,20 @@ def test_telegram_file_delivery_followup_does_not_reattach_existing_artifact(
 
     chat_operator._remember_chat_turn(
         runtime,
-        chat_id="100001",
+        chat_id="514132807",
         user_message="structured cron run",
         assistant_reply=f"Run complete.\nMEDIA {artifact.name}",
     )
-    parent_turn_id = runtime.store.get_conversation_head("telegram:100001")["active_turn_id"]
-    parent_branch_id = runtime.store.get_conversation_head("telegram:100001")["active_branch_id"]
+    parent_turn_id = runtime.store.get_conversation_head("telegram:514132807")["active_turn_id"]
+    parent_branch_id = runtime.store.get_conversation_head("telegram:514132807")["active_branch_id"]
     unrelated_artifact = artifact.parent / "unrelated_train_guide.pdf"
     unrelated_artifact.write_bytes(b"%PDF-1.4\n%wrong follow-up target\n")
     runtime.store.add_conversation_event(
         {
-            "conversation_id": "telegram:100001",
+            "conversation_id": "telegram:514132807",
             "event_type": "conversation.chat_turn",
             "created_at": "2026-05-07T22:30:00+00:00",
-            "chat_id": "100001",
+            "chat_id": "514132807",
             "turn_id": "turn-unrelated-artifact",
             "parent_turn_id": None,
             "branch_id": "branch-unrelated-artifact",
@@ -755,7 +758,7 @@ def test_telegram_file_delivery_followup_does_not_reattach_existing_artifact(
     reply = chat_operator._render_chat_turn(
         runtime,
         message="/chat 添付ファイルをもう一度送って",
-        chat_id="100001",
+        chat_id="514132807",
         settings=settings,
         agent_orchestrator=NormalOrchestrator(),
         activity_callback=activity.append,
@@ -767,7 +770,7 @@ def test_telegram_file_delivery_followup_does_not_reattach_existing_artifact(
     assert "MEDIA:" not in reply
     assert artifact.name not in reply
     assert unrelated_artifact.name not in reply
-    assert runtime.store.get_conversation_head("telegram:100001")["active_branch_id"] == parent_branch_id
+    assert runtime.store.get_conversation_head("telegram:514132807")["active_branch_id"] == parent_branch_id
     assert sorted(path.name for path in artifact.parent.iterdir()) == before_files
     assert "Reusing existing artifact" not in [event["label"] for event in activity]
 
@@ -786,7 +789,7 @@ def test_telegram_bug_report_followup_does_not_reattach_stale_artifacts(
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime-bug-report-followup.db")
     settings = load_settings(
         env={
-            "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "100001",
+            "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "514132807",
             "NULLION_TELEGRAM_CHAT_ENABLED": "true",
         }
     )
@@ -799,19 +802,19 @@ def test_telegram_bug_report_followup_does_not_reattach_stale_artifacts(
 
     chat_operator._remember_chat_turn(
         runtime,
-        chat_id="100001",
+        chat_id="514132807",
         user_message="file the bug report",
         assistant_reply=f"Created the bug report.\nMEDIA:{bug_report}",
     )
-    head = runtime.store.get_conversation_head("telegram:100001")
+    head = runtime.store.get_conversation_head("telegram:514132807")
     parent_turn_id = head["active_turn_id"]
     branch_id = head["active_branch_id"]
     runtime.store.add_conversation_event(
         {
-            "conversation_id": "telegram:100001",
+            "conversation_id": "telegram:514132807",
             "event_type": "conversation.chat_turn",
             "created_at": "2026-05-08T11:55:00+00:00",
-            "chat_id": "100001",
+            "chat_id": "514132807",
             "turn_id": "turn-stale-monitor",
             "parent_turn_id": parent_turn_id,
             "branch_id": branch_id,
@@ -845,7 +848,7 @@ def test_telegram_bug_report_followup_does_not_reattach_stale_artifacts(
     reply = chat_operator._render_chat_turn(
         runtime,
         message="/chat Where is the report bug file?",
-        chat_id="100001",
+        chat_id="514132807",
         settings=settings,
         agent_orchestrator=NormalOrchestrator(),
         append_activity_trace=False,
@@ -870,8 +873,8 @@ def test_unrequested_codex_log_media_is_not_delivered_as_chat_attachment(
     from nullion.tools import ToolResult
 
     monkeypatch.setenv("NULLION_DATA_DIR", str(tmp_path / "data"))
-    principal_id = "telegram:100001"
-    conversation_id = "telegram:100001"
+    principal_id = "telegram:514132807"
+    conversation_id = "telegram:514132807"
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime-diagnostic-log.db")
     artifact_root = artifact_root_for_principal(principal_id)
     log_artifact = artifact_root / "codex_20260508_113329.log"
@@ -934,8 +937,8 @@ def test_chat_json_file_delivery_survives_ellipsis_text_without_for_attachment_f
 
     monkeypatch.setenv("NULLION_DATA_DIR", str(tmp_path / "data"))
 
-    principal_id = "telegram:100001"
-    conversation_id = "telegram:100001"
+    principal_id = "telegram:514132807"
+    conversation_id = "telegram:514132807"
     prompt = (
         "fetch yahoo.com for latest news and send me as a json file "
         "...for all the titles....strucure doesnt matter , just valid json"
@@ -1211,7 +1214,7 @@ def test_cron_execution_cannot_create_or_run_other_crons_during_scheduled_run() 
         assert denied.output["reason"] == "cron_execution_capability_denied"
         assert (
             set(denied.output["denied_capability_tags"])
-            == CRON_EXECUTION_BLOCKED_CAPABILITY_TAGS
+            == {"scheduler"}
         )
 
 

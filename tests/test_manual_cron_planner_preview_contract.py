@@ -171,7 +171,7 @@ def test_web_manual_cron_run_emits_real_planner_preview_status(tmp_path, monkeyp
     assert all(payload.get("conversation_id") == "web:conversation-preview" for payload in status_payloads)
     summaries = [str(payload.get("text") or "") for payload in status_payloads if payload.get("status_kind") == "task_summary"]
 
-    assert any(text.startswith("⏰ SCHEDULED TASK") for text in summaries)
+    assert any(text.startswith("**SCHEDULED TASK") for text in summaries)
     assert all("Planning execution" not in text for text in summaries)
     assert any("For: Planner preview cron" in text for text in summaries)
 
@@ -247,8 +247,9 @@ def test_web_manual_cron_run_uses_clean_fallback_planner_summary_on_timeout(tmp_
         time.sleep(0.01)
     assert status_payloads, "fallback planner preview should still emit a planner card"
     first_summary = str(status_payloads[0]["text"])
-    assert "⏰ SCHEDULED TASK" in first_summary
+    assert "**SCHEDULED TASK" in first_summary
     assert "Planning execution" not in first_summary
+
 
 
 def test_cron_planner_preview_persistent_cache_survives_memory_clear(tmp_path, monkeypatch) -> None:

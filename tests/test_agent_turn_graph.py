@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import base64
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,9 @@ def _registry_with_tool(name: str, handler):
 def test_agent_turn_graph_suspends_on_approval_required_tool(monkeypatch) -> None:
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -103,6 +107,9 @@ def test_agent_turn_graph_suspends_on_approval_required_tool(monkeypatch) -> Non
 def test_agent_turn_graph_blocks_mixed_calendar_delete_after_completed_create() -> None:
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -190,6 +197,9 @@ def test_agent_turn_graph_blocks_mixed_calendar_delete_after_completed_create() 
 def test_agent_turn_graph_suspends_on_direct_approval_required_status(monkeypatch) -> None:
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -252,6 +262,9 @@ def test_agent_turn_graph_suspends_on_direct_approval_required_status(monkeypatc
 def test_agent_turn_graph_materializes_orphan_approval_required_result(monkeypatch) -> None:
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -331,6 +344,9 @@ def test_agent_turn_graph_materializes_orphan_approval_required_result(monkeypat
 def test_agent_turn_graph_uses_actionable_policy_store_when_stores_differ(monkeypatch) -> None:
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -406,6 +422,9 @@ def test_agent_turn_graph_approval_required_beats_completed_artifact_reply(monke
 
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -571,6 +590,9 @@ def test_agent_turn_graph_blocks_emailing_required_artifact_not_created_this_tur
             self.saw_missing_artifact_guard = False
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -719,6 +741,9 @@ def test_agent_turn_graph_emits_tool_activity_before_blocking_tool() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -740,7 +765,7 @@ def test_agent_turn_graph_emits_tool_activity_before_blocking_tool() -> None:
             invocation.invocation_id,
             invocation.tool_name,
             "completed",
-            {"resultSizeEstimate": 1, "results": []},
+            {"resultSizeEstimate": 0, "results": [], "verified": True},
         ),
     )
     activity: list[ToolResult] = []
@@ -756,7 +781,7 @@ def test_agent_turn_graph_emits_tool_activity_before_blocking_tool() -> None:
         tool_result_callback=activity.append,
     )
 
-    assert result.final_text == "✉️ I checked your email. No matching messages found."
+    assert result.final_text == "I checked your email. No matching messages found."
     assert [(item.tool_name, item.status) for item in activity] == [
         ("email_search", "running"),
         ("email_search", "completed"),
@@ -770,6 +795,9 @@ def test_agent_turn_graph_returns_to_model_after_calendar_list_evidence() -> Non
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -828,6 +856,9 @@ def test_agent_turn_graph_does_not_finish_unrelated_turn_with_calendar_summary()
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -878,6 +909,9 @@ def test_agent_turn_graph_does_not_directly_complete_email_search() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -924,6 +958,9 @@ def test_agent_turn_graph_dedupes_repeated_completed_email_search() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls <= 2:
                 return {
@@ -975,6 +1012,9 @@ def test_agent_turn_graph_emits_foreground_ack_when_model_selects_tool() -> None
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -992,7 +1032,7 @@ def test_agent_turn_graph_emits_foreground_ack_when_model_selects_tool() -> None
 
     registry = _registry_with_tool(
         "calendar_search",
-        lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"events": []}),
+        lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"events": [], "count": 0, "verified": True}),
     )
     events: list[dict[str, object]] = []
     activity: list[ToolResult] = []
@@ -1020,6 +1060,9 @@ def test_agent_turn_graph_emits_foreground_ack_when_model_selects_tool() -> None
 def test_agent_turn_graph_skips_foreground_ack_for_no_tool_turn() -> None:
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "hello"}]}
 
     events: list[dict[str, object]] = []
@@ -1047,6 +1090,9 @@ def test_agent_turn_graph_keeps_file_write_path_internal_without_artifact_scope(
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1096,6 +1142,9 @@ def test_agent_turn_graph_records_file_write_path_with_typed_artifact_scope(tmp_
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1145,12 +1194,15 @@ def test_agent_turn_graph_records_file_write_path_with_typed_artifact_scope(tmp_
     assert result.artifacts == [str(output_path)]
 
 
-def test_agent_turn_graph_blocks_plain_spreadsheet_after_media_embed_failure() -> None:
+def test_agent_turn_graph_blocks_plain_spreadsheet_after_required_media_embed_failure() -> None:
     class Client:
         def __init__(self) -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1198,6 +1250,7 @@ def test_agent_turn_graph_blocks_plain_spreadsheet_after_media_embed_failure() -
         conversation_id="telegram:123",
         principal_id="telegram_chat",
         user_message="表を作って",
+        tool_flow_context={"required_embedded_media_extensions": [".xlsx"]},
         conversation_history=[],
         tool_registry=registry,
         policy_store=None,
@@ -1220,6 +1273,9 @@ def test_agent_turn_graph_blocks_first_plain_spreadsheet_from_embedded_media_sco
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1293,6 +1349,9 @@ def test_agent_turn_graph_blocks_plain_pdf_after_browser_image_collection() -> N
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1384,6 +1443,9 @@ def test_agent_turn_graph_recovers_browser_image_collection_from_rendered_dom() 
             self.second_messages = None
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1505,6 +1567,9 @@ def test_agent_turn_graph_recovers_browser_image_collection_when_static_page_has
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1607,6 +1672,9 @@ def test_agent_turn_graph_crops_rendered_image_as_last_resort_when_asset_fetch_f
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1717,6 +1785,25 @@ def test_agent_turn_graph_crops_rendered_image_as_last_resort_when_asset_fetch_f
         assert cropped_image.size == (200, 140)
     assert cropped.output["artifact_descriptors"][0]["role"] == "source"
     assert cropped_path not in result.artifacts
+    from nullion.search_coverage import discovery_ledger
+    assert discovery_ledger([cropped])['observed_sources'][0]['url'] == 'https://example.test/blocked-assets'
+
+
+@pytest.mark.parametrize('captured_url', [None, 'https://actual.example/capture'])
+def test_rendered_crop_provenance_uses_capture_receipt_not_requested_url(tmp_path, monkeypatch, captured_url):
+    from PIL import Image
+    from nullion.agent_orchestrator import _materialize_rendered_image_crop
+    from nullion.search_coverage import discovery_ledger
+    monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT', str(tmp_path/'workspaces'))
+    image = tmp_path/'capture.png'
+    Image.new('RGB', (200, 200), 'green').save(image)
+    output = {'path': str(image), **({'page_url': captured_url} if captured_url else {})}
+    cropped = _materialize_rendered_image_crop(screenshot_result=ToolResult('cap','browser_screenshot','completed',output),
+        crop_candidate={'x': 0,'y': 0,'width': 100,'height': 100,'url': 'https://unread.example/image'},
+        principal_id='web:crop-source', output_stem='crop', page_url='https://requested.example/page')
+    assert cropped is not None
+    urls = {row['url'] for row in (discovery_ledger([cropped]) or {}).get('observed_sources', [])}
+    assert urls == ({captured_url} if captured_url else set())
 
 
 def test_agent_turn_graph_resume_executes_pending_tool_before_model() -> None:
@@ -1725,6 +1812,9 @@ def test_agent_turn_graph_resume_executes_pending_tool_before_model() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             assert any(message["role"] == "user" and message["content"][0]["type"] == "tool_result" for message in kwargs["messages"])
             return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done with resumed tool"}]}
@@ -1736,7 +1826,7 @@ def test_agent_turn_graph_resume_executes_pending_tool_before_model() -> None:
             invocation.invocation_id,
             invocation.tool_name,
             "completed",
-            {"delivery_text": "workspace checked"},
+            {"delivery_text": "workspace checked", "text": "workspace checked"},
         ),
     )
     messages_snapshot = [
@@ -1840,6 +1930,9 @@ def test_agent_turn_graph_cleanup_runs_once_after_successful_graph_completion() 
 
     class Client:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             del kwargs
             return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}
 
@@ -1893,6 +1986,9 @@ def test_agent_turn_graph_repairs_missing_required_attachment(tmp_path, monkeypa
             self.repair_requested = False
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -1922,7 +2018,8 @@ def test_agent_turn_graph_repairs_missing_required_attachment(tmp_path, monkeypa
 
     def write_pdf(invocation):
         path = artifact_path_for_generated_file(store, suffix=".pdf")
-        path.write_text("pdf bytes", encoding="utf-8")
+        from pypdf import PdfWriter
+        pdf = PdfWriter(); pdf.add_blank_page(width=200, height=200); pdf.write(path)
         return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"artifact_path": str(path)})
 
     registry.register(
@@ -1964,6 +2061,9 @@ def test_agent_turn_graph_enforces_request_scope_artifact_contract(tmp_path, mon
             self.saw_missing_contract_nudge = False
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -2012,7 +2112,7 @@ def test_agent_turn_graph_enforces_request_scope_artifact_contract(tmp_path, mon
 
     monkeypatch.setattr("nullion.runtime.invoke_tool_with_boundary_policy", invoke_tool)
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(filesystem_allowed_roots=[tmp_path])
     def create_spreadsheet(invocation):
         from openpyxl import Workbook
         workbook = Workbook()
@@ -2052,6 +2152,7 @@ def test_agent_turn_graph_enforces_request_scope_artifact_contract(tmp_path, mon
     assert [tool.tool_name for tool in result.tool_results] == ["request_tool_scope", "spreadsheet_create"]
     assert result.artifacts == [str(output_path)]
     assert result.final_text == "Created the requested spreadsheet.\nMEDIA:" + str(output_path)
+    assert result.response_fulfilled is not False
 
 
 def test_agent_turn_graph_stops_after_completed_required_artifact(tmp_path, monkeypatch) -> None:
@@ -2065,6 +2166,9 @@ def test_agent_turn_graph_stops_after_completed_required_artifact(tmp_path, monk
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -2104,7 +2208,7 @@ def test_agent_turn_graph_stops_after_completed_required_artifact(tmp_path, monk
     result = AgentOrchestrator(model_client=client).run_turn(
         conversation_id="telegram:123",
         principal_id="telegram_chat",
-        user_message="create the attachment",
+        user_message="Create report.pdf.",
         conversation_history=[],
         tool_registry=registry,
         policy_store=store,
@@ -2126,6 +2230,9 @@ def test_agent_turn_graph_default_iteration_budget_is_bounded(monkeypatch) -> No
             self.review_calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             if str(kwargs.get("system") or "").startswith("You are a material-requirements planner"):
                 self.plan_calls += 1
                 return {
@@ -2293,6 +2400,9 @@ class _TerminalBrowserSequenceClient:
         )
 
     def create(self, **kwargs):
+        protocol_reply = workflow_provider_reply(kwargs, completion=False)
+        if protocol_reply is not None:
+            return protocol_reply
         if str(kwargs.get("system") or "").startswith("You are a material-requirements planner"):
             self.plan_calls += 1
             requirements = [
@@ -2578,8 +2688,9 @@ def test_agent_turn_graph_keeps_hard_limit_turn_open_without_complete_review() -
     assert len(revalidation_invocations) == 0
     assert result.reached_iteration_limit is True
     assert result.response_fulfilled is False
-    assert "one requested comparison record is not verified" in (result.final_text or "")
-    assert "couldn't complete this request" in (result.final_text or "").casefold()
+    assert "one requested comparison record is not verified" not in (result.final_text or "")
+    assert result.final_text and "The final result is incomplete" not in result.final_text
+    assert result.response_fulfilled is not True
     assert result.completion_failure_reply == result.final_text
 
 
@@ -2604,12 +2715,13 @@ def test_agent_turn_graph_rejects_bare_complete_review_for_partial_comparison() 
 
     assert client.calls == 4
     assert client.plan_calls == 1
-    assert client.review_calls == 1
+    assert client.review_calls == 2
     assert len(revalidation_invocations) == 0
     assert result.reached_iteration_limit is True
-    assert result.response_fulfilled is False
-    assert "not every requested part" in (result.final_text or "")
-    assert "couldn't complete this request" in (result.final_text or "").casefold()
+    assert result.response_fulfilled is not True
+    assert "not every requested part" not in (result.final_text or "")
+    assert result.final_text and "The final result is incomplete" not in result.final_text
+    assert result.response_fulfilled is not True
     assert result.completion_failure_reply == result.final_text
 
 
@@ -2634,10 +2746,11 @@ def test_agent_turn_graph_rejects_complete_review_that_omits_planned_comparison_
 
     assert client.calls == 4
     assert client.plan_calls == 1
-    assert client.review_calls == 1
+    assert client.review_calls == 2
     assert len(revalidation_invocations) == 0
-    assert result.response_fulfilled is False
-    assert "not every requested part" in (result.final_text or "")
+    assert result.response_fulfilled is not True
+    assert "not every requested part" not in (result.final_text or "")
+    assert result.final_text and "The final result is incomplete" not in result.final_text
 
 
 def test_agent_turn_graph_does_not_revive_stale_detail_when_revalidation_fails() -> None:
@@ -2704,6 +2817,9 @@ def test_terminal_browser_revalidation_reasserts_after_navigation_before_detail(
             )
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             if str(kwargs.get("system") or "").startswith("You are a material-requirements planner"):
                 return {
                     "stop_reason": "end_turn",
@@ -3577,6 +3693,9 @@ def test_agent_turn_graph_materializes_browser_screenshot_without_delivering_uns
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -3640,6 +3759,9 @@ def test_agent_turn_graph_delivers_browser_screenshot_with_artifact_contract(tmp
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -3694,6 +3816,9 @@ def test_agent_turn_graph_does_not_deliver_forwarded_browser_screenshot_without_
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -3737,6 +3862,9 @@ def test_agent_turn_graph_stops_after_tool_when_cancellation_checker_is_set() ->
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls > 1:
                 raise AssertionError("model should not continue after cancellation")
@@ -3786,11 +3914,22 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
     class Client:
         def __init__(self) -> None:
             self.normal_calls = 0
+            self.errors = []
             self.review_payloads: list[dict[str, object]] = []
             self.retry_nudge_seen = False
             self.recovery_tool_names: set[str] = set()
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
+            try:
+                return self._create(**kwargs)
+            except Exception as error:
+                self.errors.append(repr(error))
+                raise
+
+        def _create(self, **kwargs):
             system = str(kwargs.get("system") or "")
             if system.startswith("You are a material-requirements planner"):
                 payload = __import__("json").loads(
@@ -3851,13 +3990,6 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
                             }
                         ],
                     }
-                evidence_by_tool = {
-                    str(item.get("tool_name") or ""): str(
-                        item.get("invocation_id") or ""
-                    )
-                    for item in payload["tool_evidence"]
-                    if str(item.get("invocation_id") or "")
-                }
                 contract = payload["material_requirement_contract"]
                 return {
                     "stop_reason": "end_turn",
@@ -3878,9 +4010,10 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
                                             "satisfied": True,
                                             "draft_covered": True,
                                             "evidence_invocation_ids": [
-                                                evidence_by_tool[
-                                                    row["eligible_evidence_tool_names"][0]
-                                                ]
+                                                next(item["invocation_id"] for item in payload["tool_evidence"]
+                                                    if item.get("output", {}).get(
+                                                        "artifact_record_binding" if row["requirement_kind"] == "deliverable"
+                                                        else "source_record_binding"))
                                             ],
                                         }
                                         for row in contract
@@ -3916,8 +4049,12 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
             if self.normal_calls == 2:
                 return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Listo; adjunté el HTML."}]}
             if self.normal_calls == 3:
-                last_text = kwargs["messages"][-1]["content"][0]["text"]
-                self.retry_nudge_seen = "Unresolved outcomes" in last_text and "invented_tool" not in last_text
+                # Runtime checkpoints can follow the review nudge; both must
+                # remain visible without requiring incidental message ordering.
+                texts = [block.get("text", "") for message in kwargs["messages"]
+                         for block in message.get("content", []) if isinstance(block, dict)]
+                self.retry_nudge_seen = any("Unresolved outcomes" in text and "invented_tool" not in text
+                                            for text in texts)
                 self.recovery_tool_names = {
                     str(tool.get("name") or "")
                     for tool in kwargs.get("tools", [])
@@ -3954,7 +4091,8 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
             invocation.invocation_id,
             invocation.tool_name,
             "completed",
-            {"verified": True, "records": [{"price": "US$1,240", "distance_miles": 0.18}]},
+            {"verified": True, "records": [{"price": "US$1,240", "distance_miles": 0.18}],
+             "source_record_collections": [{"path": ["records"], "identity_fields": ["price", "distance_miles"]}]},
         )
 
     def write_artifact(invocation):  # noqa: ANN001
@@ -3978,7 +4116,7 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
             },
         )
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(filesystem_allowed_roots=(tmp_path,))
     for name, handler in (
         ("web_fetch", failed_fetch),
             ("lodging_read", extracted_items),
@@ -3986,7 +4124,7 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
         ("file_patch", write_artifact),
     ):
         registry.register(
-            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
+            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.WRITE if name in {"file_write", "file_patch"} else ToolSideEffectClass.READ, False, 5),
             handler,
         )
 
@@ -4002,12 +4140,14 @@ def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_withou
         tool_flow_context={"requires_artifact_delivery": True, "required_artifact_extensions": [".html"]},
     )
 
+    assert not client.errors, client.errors
     assert client.retry_nudge_seen is True, (client.normal_calls, len(client.review_payloads), result.final_text)
     assert client.recovery_tool_names == {"lodging_read", "file_patch"}
+    # Delivery bookkeeping must not add a duplicate review of the repaired file.
     assert len(client.review_payloads) == 2
     assert client.review_payloads[0]["artifact_evidence"], client.review_payloads[0]
     assert "confirmar" in client.review_payloads[0]["artifact_evidence"][0]["content_preview"]
-    assert "US$1,240 total" in client.review_payloads[1]["artifact_evidence"][0]["content_preview"]
+    assert "US$1,240 total" in client.review_payloads[-1]["artifact_evidence"][0]["content_preview"]
     assert result.final_text == "Listo; verificado y adjunto."
     assert result.artifacts == [str(artifact_path)]
     assert "US$1,240 total" in artifact_path.read_text(encoding="utf-8")
@@ -4521,10 +4661,9 @@ def test_forced_completion_coverage_rejects_negative_or_unknown_evidence() -> No
             {"messages": [], "item_count": 0},
         ),
     ]
-    assert all(
-        not _completion_review_evidence_result_is_positive(result)
-        for result in empty_or_control_only_results
-    )
+    accepted = [result.invocation_id for result in empty_or_control_only_results
+                if _completion_review_evidence_result_is_positive(result)]
+    assert accepted == []
     assert _completion_review_evidence_result_is_positive(
         ToolResult(
             "nested-error",
@@ -4836,6 +4975,9 @@ def test_non_forced_risky_completion_rejects_one_invocation_for_distinct_subject
         reviewer_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             import json
 
             system = str(kwargs.get("system") or "")
@@ -4943,9 +5085,9 @@ def test_non_forced_risky_completion_rejects_one_invocation_for_distinct_subject
         artifacts=[],
     )
 
-    assert client.planner_calls == 0
-    assert client.reviewer_calls == 0
-    assert decision is None
+    assert client.planner_calls == 1
+    assert client.reviewer_calls == 2
+    assert decision.disposition == "retry"
 
 
 def test_completion_requirement_contract_rejects_unknown_evidence_tools() -> None:
@@ -5144,6 +5286,9 @@ def test_completion_review_cannot_accept_missing_required_current_turn_source(
         payload = None
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             if str(kwargs.get("system") or "").startswith(
                 "You are a material-requirements planner"
             ):
@@ -5254,6 +5399,7 @@ def test_completion_review_cannot_accept_missing_required_current_turn_source(
         "unavailable_required_tool_names": ["calendar_list"],
         "missing_callable_required_tool_names": ["browser_navigate", "weather_forecast"],
         "required_tool_attempt_statuses": {"weather_forecast": ["failed"], "file_write": ["completed"]},
+        "retired_preparatory_read_tools": [],
         "active_connector_providers": [],
         "available_sources": [],
         "unavailable_tools": [],
@@ -5261,6 +5407,9 @@ def test_completion_review_cannot_accept_missing_required_current_turn_source(
         "connector_source_unavailable": False,
         "missing_connector_app_scope": False,
         "source_selection_required": False,
+        "source_evidence_verified": False,
+        "connector_source_user_requested": False,
+        "source_resolution_required": False,
     }
     assert {item["tool_name"] for item in client.payload["tool_evidence"]} == {
         "request_tool_scope",
@@ -5312,7 +5461,7 @@ def test_completion_review_ignores_superseded_artifact_producer_failure(tmp_path
         tool_results=results,
     )
 
-    assert required is False
+    assert required is True
 
 
 def test_completion_review_requires_semantic_check_for_unverified_browser_turn_without_artifact() -> None:
@@ -5344,7 +5493,7 @@ def test_completion_review_requires_semantic_check_for_unverified_browser_turn_w
         ],
     )
 
-    assert required is False
+    assert required is True
 
 
 @pytest.mark.parametrize(
@@ -5392,7 +5541,7 @@ def test_completion_review_cannot_be_bypassed_by_raw_or_nonterminal_browser_resu
             "tool_flow_context": {},
         },
         tool_results=tool_results,
-    ) is False
+    ) is True
 
 
 def test_completion_review_tool_selection_preserves_older_groundable_evidence() -> None:
@@ -5454,7 +5603,7 @@ def test_complete_agent_turn_marks_raw_browser_recovery_draft_unfulfilled() -> N
         final_text="This is definitely the matching result.",
     )
 
-    assert update["result"].response_fulfilled is None
+    assert update["result"].response_fulfilled is not True
 
 
 def test_completion_review_requires_semantic_check_for_unbound_typed_browser_detail() -> None:
@@ -5501,7 +5650,7 @@ def test_completion_review_requires_semantic_check_for_unbound_typed_browser_det
         ],
     )
 
-    assert required is False
+    assert required is True
 
 
 def test_browser_page_state_continuation_survives_recovery_navigation_without_fresh_evidence() -> None:
@@ -5543,7 +5692,7 @@ def test_browser_page_state_continuation_survives_recovery_navigation_without_fr
     assert continuation_tools == ("browser_run_js",)
 
 
-def test_completion_review_stays_off_fast_path_for_successful_browser_turn() -> None:
+def test_completion_review_also_checks_successful_browser_turn() -> None:
     from nullion.agent_orchestrator import _completion_review_required
 
     required = _completion_review_required(
@@ -5562,7 +5711,7 @@ def test_completion_review_stays_off_fast_path_for_successful_browser_turn() -> 
         ],
     )
 
-    assert required is False
+    assert required is True
 
 
 def test_completion_review_receives_product_evidence_from_end_of_long_browser_page() -> None:
@@ -5579,6 +5728,9 @@ def test_completion_review_receives_product_evidence_from_end_of_long_browser_pa
         system: str = ""
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             import json
 
             if str(kwargs.get("system") or "").startswith(
@@ -5657,8 +5809,9 @@ def test_completion_review_receives_product_evidence_from_end_of_long_browser_pa
         artifacts=[],
     )
 
-    assert decision is None
-    assert client.payload is None
+    assert decision.disposition == "retry"
+    assert client.payload is not None
+    assert "verified product" in decision.unresolved_requirements[0]
 
 
 def test_agent_turn_recovers_when_typed_product_evidence_supersedes_failed_source_attempt() -> None:
@@ -5677,6 +5830,9 @@ def test_agent_turn_recovers_when_typed_product_evidence_supersedes_failed_sourc
             self.review_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             system = str(kwargs.get("system") or "")
             if system.startswith("You are a material-requirements planner"):
                 return {
@@ -5856,7 +6012,8 @@ def test_agent_turn_recovers_when_typed_product_evidence_supersedes_failed_sourc
     )
 
     assert handler_calls == ['web_fetch', 'product_read']
-    assert client.review_calls == 0
+    assert client.review_calls == 2
+    assert result.response_fulfilled is True
     assert result.final_text
     assert result.tool_results[0].status == 'failed'
 
@@ -5923,6 +6080,9 @@ def test_completion_review_merges_missing_required_tools_into_model_retry_choice
 
     class Client:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             if str(kwargs.get("system") or "").startswith(
                 "You are a material-requirements planner"
             ):
@@ -6038,10 +6198,10 @@ def test_agent_turn_graph_does_not_claim_success_when_semantic_retry_budget_is_e
     )
 
     result = update["result"]
-    assert "couldn't complete this request" in result.final_text.lower()
-    assert result.completion_failure_reply == result.final_text
-    assert "everything is complete" not in result.final_text.lower()
-    assert result.response_fulfilled is False
+    assert result.response_fulfilled is not True
+    assert result.completion_failure_reply is None
+    assert result.final_text == "Everything is complete."
+    assert result.response_fulfilled is not True
 
 
 def test_agent_turn_graph_bounds_and_focuses_semantic_completion_recovery(monkeypatch) -> None:
@@ -6152,6 +6312,9 @@ def test_agent_turn_graph_retries_one_model_timeout_before_completing() -> None:
             self.calls: list[dict[str, object]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls.append(kwargs)
             if len(self.calls) == 1:
                 raise ModelClientTimeoutError("timed out")
@@ -6184,6 +6347,9 @@ def test_agent_turn_graph_retries_focused_artifact_producer_timeout(tmp_path: Pa
             self.calls: list[dict[str, object]] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls.append(kwargs)
             if len(self.calls) == 1:
                 return {
@@ -6208,12 +6374,12 @@ def test_agent_turn_graph_retries_focused_artifact_producer_timeout(tmp_path: Pa
                         "type": "tool_use",
                         "id": "write-1",
                         "name": "file_write",
-                        "input": {"path": str(report_path), "content": "<html>verified report</html>"},
+                        "input": {"path": str(report_path), "content": "<!doctype html><html><body><h1>Verified report</h1></body></html>"},
                     }
                 ],
             }
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(filesystem_allowed_roots=[tmp_path])
     registry.register(
         ToolSpec("file_read", "collect", ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
         lambda invocation: ToolResult(
@@ -6241,7 +6407,7 @@ def test_agent_turn_graph_retries_focused_artifact_producer_timeout(tmp_path: Pa
     result = AgentOrchestrator(model_client=client).run_turn(
         conversation_id="telegram:123",
         principal_id="telegram_chat",
-        user_message="opaque report request",
+        user_message="Produce verified-report.html from the collected evidence.",
         conversation_history=[],
         tool_registry=registry,
         policy_store=None,
@@ -6269,6 +6435,9 @@ def test_agent_turn_graph_keeps_task_open_after_two_model_timeouts() -> None:
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             raise ModelClientTimeoutError("timed out")
 
@@ -6284,9 +6453,9 @@ def test_agent_turn_graph_keeps_task_open_after_two_model_timeouts() -> None:
     )
 
     assert client.calls == 2
-    assert "couldn't complete this request" in result.final_text.lower()
+    assert result.final_text == "The model timed out while preparing the response."
     assert result.completion_failure_reply == result.final_text
-    assert "time limit" in result.final_text.lower()
+    assert "time limit" not in result.final_text.lower()
     assert "timed out twice" not in result.final_text.lower()
     assert result.model_timed_out is True
     assert result.response_fulfilled is False

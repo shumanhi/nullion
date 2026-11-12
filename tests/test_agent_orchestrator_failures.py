@@ -1,3 +1,4 @@
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
@@ -1855,6 +1856,9 @@ def test_scheduler_read_turn_finishes_after_unique_match_despite_stale_run_contr
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -2524,6 +2528,9 @@ def test_artifact_producer_focus_is_ephemeral_across_model_iterations() -> None:
             self.timeouts: list[float] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls.append([tool["name"] for tool in kwargs["tools"]])
             self.timeouts.append(float(kwargs["timeout"]))
             return {"content": [], "stop_reason": "end_turn"}
@@ -3289,7 +3296,10 @@ def test_completed_required_artifact_stops_remaining_queued_helper_writes(tmp_pa
     )
 
     assert calls == [str(html_path)]
-    assert update["artifacts"] == [str(html_path)]
+    assert html_path.exists()
+    assert update["result"].response_fulfilled is not True
+    assert update["artifacts"] == [str(html_path)]  # Working files remain available for review.
+    assert update["result"].artifacts == [str(html_path)]  # Preserve the selected valid artifact.
     assert not svg_path.exists()
 
 
@@ -5473,6 +5483,9 @@ def test_completed_scheduler_run_stops_before_followup_mutation_tools() -> None:
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -5570,6 +5583,9 @@ def test_delegated_scheduler_run_starts_only_enabled_cron_after_listing() -> Non
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -5673,6 +5689,9 @@ def test_user_selected_scheduler_run_uses_run_cron_resolver_after_listing() -> N
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -5771,6 +5790,9 @@ def test_delegated_scheduler_run_does_not_guess_between_multiple_enabled_crons()
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -5868,6 +5890,9 @@ def test_scheduler_inspect_scope_hides_blocked_run_cron_from_tool_results() -> N
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -5947,6 +5972,9 @@ def test_current_scope_hides_blocked_local_file_write_from_tool_results() -> Non
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -6129,6 +6157,9 @@ def test_artifact_turn_blocks_additional_file_search_and_moves_to_creation(monke
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls >= 3:
                 return {"stop_reason": "end_turn", "content": [{"type": "text", "text": f"Created the file.\nMEDIA:{output_path}"}]}
@@ -6399,6 +6430,9 @@ def test_scheduler_mutation_scope_cannot_finish_with_read_only_listing() -> None
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -6485,6 +6519,9 @@ def test_plain_calendar_read_with_events_does_not_finish_with_done() -> None:
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -6560,6 +6597,9 @@ def test_scheduled_market_quote_continues_to_artifact_delivery_step() -> None:
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -6635,13 +6675,19 @@ def test_scheduled_market_quote_continues_to_artifact_delivery_step() -> None:
     assert "MEDIA:artifacts/pre_market_report_2026-07-09.html" in result.final_text
 
 
-def test_plain_market_quote_still_finishes_from_compact_tool_summary() -> None:
+def test_unscoped_market_quote_returns_to_model_before_completion() -> None:
     class Client:
         def __init__(self) -> None:
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
+            if self.calls == 2:
+                return {"stop_reason": "end_turn", "content": [{"type":"text", "text":
+                    "Market prices from live quote data: MSFT (Microsoft Corporation): $383.34"}]}
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -6696,7 +6742,7 @@ def test_plain_market_quote_still_finishes_from_compact_tool_summary() -> None:
         max_iterations=3,
     )
 
-    assert client.calls == 1
+    assert client.calls == 2
     assert [tool.tool_name for tool in result.tool_results] == ["market_quote"]
     assert "Market prices from live quote data" in result.final_text
     assert "MSFT (Microsoft Corporation): $383.34" in result.final_text
@@ -6710,6 +6756,9 @@ def test_market_quote_continues_when_turn_requires_artifact_delivery(tmp_path) -
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls >= 3:
                 return {"stop_reason": "end_turn", "content": [{"type": "text", "text": f"Created the workbook.\nMEDIA:{workbook}"}]}
@@ -6808,6 +6857,9 @@ def test_scheduled_task_duplicate_calendar_read_does_not_finish_with_raw_listing
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls in {1, 2}:
                 return {
@@ -6978,6 +7030,9 @@ def test_bare_scheduler_run_scope_cannot_gain_reminder_mutation_effects() -> Non
             self.nudges: list[str] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages and messages[-1].get("role") == "user":
@@ -7168,6 +7223,9 @@ def test_connector_capability_failures_recover_to_browser_scope_before_giving_up
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             self.tool_sets.append({tool["name"] for tool in (kwargs.get("tools") or [])})
             if self.calls == 1:
@@ -7257,6 +7315,7 @@ def test_connector_capability_failures_recover_to_browser_scope_before_giving_up
         max_iterations=5,
     )
 
+    assert result.response_fulfilled is not True
     assert result.final_text == "Recovered with browser."
     assert [tool.tool_name for tool in result.tool_results] == [
         "connector_request",
@@ -7625,6 +7684,9 @@ def test_agent_recovers_email_read_source_failure_to_email_search(monkeypatch) -
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             visible = {tool["name"] for tool in (kwargs.get("tools") or [])}
             self.tool_sets.append(visible)
             if len(self.tool_sets) == 1:
@@ -7731,6 +7793,9 @@ def test_agent_returns_structured_source_summary_after_invalid_read_when_source_
             self.calls: list[dict] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls.append(kwargs)
             if len(self.calls) == 1:
                 return {
@@ -7815,10 +7880,11 @@ def test_agent_returns_structured_source_summary_after_invalid_read_when_source_
     )
 
     assert [tool.tool_name for tool in result.tool_results] == ["email_search", "email_read"]
-    assert result.final_text.startswith("✉️ I found structured source evidence")
+    assert result.final_text.startswith("I found structured source evidence")
     assert "Payment sent" in result.final_text
     assert "message id" not in result.final_text.lower()
     assert "record id" not in result.final_text.lower()
+
 
 
 def test_agent_rejects_malformed_connector_scope_without_fallback_tools(monkeypatch) -> None:
@@ -7841,6 +7907,9 @@ def test_agent_rejects_malformed_connector_scope_without_fallback_tools(monkeypa
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             visible = {tool["name"] for tool in (kwargs.get("tools") or [])}
             self.tool_sets.append(visible)
             if len(self.tool_sets) == 1:
@@ -7913,8 +7982,9 @@ def test_agent_rejects_malformed_connector_scope_without_fallback_tools(monkeypa
     assert result.tool_results[0].output["source_evidence_verified"] is False
     assert result.tool_results[0].output["missing_connector_app_scope"] is False
     assert "choose which authorized source" in result.final_text
-    assert "1. Connected account: Email records" in result.final_text
+    assert "1. Connector provider: Email records" in result.final_text
     assert "2. Provide another source or details instead" in result.final_text
+    assert "Calendar records" not in result.final_text
 
 
 def test_unknown_tool_recovery_prefers_local_files_scope_for_file_tools() -> None:
@@ -8015,6 +8085,9 @@ def test_unknown_browser_tool_recovery_blocks_missing_tool_and_continues_with_br
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
             system = str(kwargs.get("system") or "")
             if system.startswith("You are a material-requirements planner"):
                 return {
@@ -8259,6 +8332,9 @@ def test_cron_tool_failure_recovers_to_visible_same_family_tool_without_scope_ad
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             names = {tool["name"] for tool in kwargs.get("tools") or []}
             if self.calls == 1:

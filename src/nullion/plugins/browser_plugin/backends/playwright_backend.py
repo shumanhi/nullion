@@ -1027,7 +1027,9 @@ class PlaywrightBackend:
             text = (await el.inner_text()).strip()
             tag = await el.evaluate("e => e.tagName.toLowerCase()")
             href = await el.get_attribute("href") or ""
-            results.append({"tag": tag, "text": text[:200], "href": href})
+            results.append({"tag": tag, "text": text[:200], "href": href,
+                "text_length": len(text), "text_truncated": len(text) > 200,
+                "total_matches": len(elements), "matches_truncated": len(elements) > 50})
         return results
 
     async def run_js(self, session_id: str, script: str) -> Any:

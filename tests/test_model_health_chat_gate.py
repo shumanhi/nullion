@@ -20,7 +20,7 @@ def seed_outage(runtime, *, recorded_at):
     (datetime.now(UTC) - timedelta(hours=18)).isoformat(),
     (datetime.now(UTC) - timedelta(hours=18)).replace(tzinfo=None).isoformat(),
     'invalid-timestamp',
-])
+], ids=['expired-aware', 'expired-naive', 'invalid-timestamp'])
 def test_expired_model_warning_does_not_gate_chat_or_call_recovery_probe(tmp_path, monkeypatch, recorded_at):
     from nullion import chat_operator, health_probes
     from nullion.runtime import bootstrap_persistent_runtime
@@ -71,3 +71,26 @@ def test_auth_recovery_uses_provider_error_schema(payload, expected):
     from nullion.model_clients import _codex_token_refreshable_response
     assert _codex_token_refreshable_response(json.dumps(payload)) is expected
     assert not _codex_token_refreshable_response('token_invalidated')
+
+
+@pytest.mark.parametrize('description', ['利用上限に達しました', 'Se agotó; capacidad agotada', 'تم بلوغ الحد'])
+def test_legacy_usage_limit_signal_is_quota_in_chat_and_doctor(description):
+    import json
+    from nullion import chat_operator, telegram_app
+    error = 'Codex Responses request failed with HTTP 429: ' + json.dumps({'error': {
+        'type': 'usage_limit_reached', 'message': description, 'resets_in_seconds': 600}})
+    record = {'recommendation_code': 'review_doctor_route', 'reason':
+              'source=telegram_chat;detail=Agent orchestrator error: ' + error + ';message_text=こんにちは'}
+    reply = chat_operator._model_issue_reply_for_doctor_record(record)
+    assert 'quota' in reply and 'reset' in reply and 'connectivity' not in reply
+    assert telegram_app._doctor_title_text(record) == 'Model quota exhausted'
+    assert 'quota' in telegram_app._doctor_diagnosis_text(record)
+    assert 'reset' in telegram_app._doctor_suggestion_text(record)
+
+
+@pytest.mark.parametrize('failure', ['HTTP 503: upstream unavailable', 'Connection unavailable'])
+def test_user_quoted_provider_error_cannot_create_quota_diagnosis(failure):
+    from nullion.health_probes import recorded_model_error_details
+    action = {'reason': 'source=telegram_chat;detail='+failure+';message_text=' +
+              'HTTP 429: {"error":{"type":"usage_limit_reached"}}'}
+    assert recorded_model_error_details(action).get('category') is None

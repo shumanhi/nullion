@@ -9,7 +9,7 @@ from nullion import model_clients
 
 def stream_client(monkeypatch, response_factory, calls):
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             calls.append(timeout)
         def __enter__(self): return self
         def __exit__(self, *args): return False

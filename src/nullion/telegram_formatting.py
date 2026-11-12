@@ -4,26 +4,21 @@ from __future__ import annotations
 
 import html
 import re
+from functools import lru_cache
 from urllib.parse import urlparse
+
+import mistune
 
 from nullion.chat_text import make_markdown_tables_chat_readable
 from nullion.messaging_adapters import sanitize_external_inline_markup
 
 
-_BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*")
-_ITALIC_PATTERN = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
-_INLINE_CODE_PATTERN = re.compile(r"`([^`\n]+)`")
 _FENCED_CODE_BLOCK_PATTERN = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
-_MARKDOWN_LINK_PATTERN = re.compile(r"(?<!!)\[([^\]\n]{1,240})\]\((https?://[^\s<>()]+)\)", re.IGNORECASE)
-_RAW_URL_PATTERN = re.compile(r"(?i)\bhttps?://[^\s<>()\"'`]+")
 _LANGUAGE_TOKEN_PATTERN = re.compile(r"^[a-z0-9_+-]{1,32}$", re.IGNORECASE)
-_FENCE_PLACEHOLDER_PREFIX = "__NULLION_TELEGRAM_FENCE_"
-_INLINE_CODE_PLACEHOLDER_PREFIX = "__NULLION_TELEGRAM_CODE_"
-_QUOTE_PLACEHOLDER_PREFIX = "__NULLION_TELEGRAM_QUOTE_"
-_LINK_PLACEHOLDER_PREFIX = "__NULLION_TELEGRAM_LINK_"
+_FENCE_PLACEHOLDER_PREFIX = "NULLIONTELEGRAMFENCE_"
+_QUOTE_PLACEHOLDER_PREFIX = "NULLIONTELEGRAMQUOTE_"
 _LONG_VISIBLE_URL_CHARS = 72
 _URL_TRAILING_PUNCTUATION = ".,;:!?]}'\""
-_URL_TRAILING_MARKUP_DELIMITERS = ("***", "___", "**", "__")
 
 
 def _replace_fenced_code_blocks(text: str) -> tuple[str, list[str]]:
@@ -43,18 +38,6 @@ def _replace_fenced_code_blocks(text: str) -> tuple[str, list[str]]:
     return rewritten, formatted_blocks
 
 
-def _replace_inline_code_spans(text: str) -> tuple[str, list[str]]:
-    formatted_codes: list[str] = []
-
-    def replace(match: re.Match[str]) -> str:
-        code = str(match.group(1) or "")
-        formatted_codes.append(f"<code>{html.escape(code)}</code>")
-        return f"{_INLINE_CODE_PLACEHOLDER_PREFIX}{len(formatted_codes) - 1}__"
-
-    rewritten = _INLINE_CODE_PATTERN.sub(replace, text)
-    return rewritten, formatted_codes
-
-
 def _telegram_link_label(url: str) -> str:
     if len(url) <= _LONG_VISIBLE_URL_CHARS:
         return url
@@ -71,44 +54,76 @@ def _telegram_link_anchor(url: str, label: str) -> str:
     return f'<a href="{safe_url}">{safe_label}</a>'
 
 
-def _replace_links(text: str) -> tuple[str, list[str]]:
-    formatted_links: list[str] = []
+class _TelegramInlineParser(mistune.InlineParser):
+    # Unlike HTML, Telegram displays indentation in its plain text stream.
+    # Keep indentation after breaks so nested lists retain their hierarchy.
+    SPECIFICATION = {
+        **mistune.InlineParser.SPECIFICATION,
+        "softbreak": r" *\n",
+        "linebreak": r"(?:\\| {2,})\n",
+    }
 
-    def add_link(url: str, label: str) -> str:
-        formatted_links.append(_telegram_link_anchor(url, label))
-        return f"{_LINK_PLACEHOLDER_PREFIX}{len(formatted_links) - 1}__"
 
-    def replace_markdown(match: re.Match[str]) -> str:
-        label = str(match.group(1) or "").strip()
-        url = str(match.group(2) or "").strip()
-        return add_link(url, label or _telegram_link_label(url))
+@lru_cache(maxsize=1)
+def _inline_parser():
+    # Already a shipped dependency. Parse Markdown syntax, never user intent.
+    from mistune.plugins.formatting import strikethrough
 
-    rewritten = _MARKDOWN_LINK_PATTERN.sub(replace_markdown, text)
+    return mistune.Markdown(renderer=None, inline=_TelegramInlineParser(), plugins=[strikethrough]).inline
 
-    def replace_raw(match: re.Match[str]) -> str:
-        token = str(match.group(0) or "")
-        url = token
-        suffix = ""
-        while url:
-            stripped = url.rstrip(_URL_TRAILING_PUNCTUATION)
-            if stripped != url:
-                suffix = f"{url[len(stripped):]}{suffix}"
-                url = stripped
-                continue
-            delimiter = next(
-                (candidate for candidate in _URL_TRAILING_MARKUP_DELIMITERS if url.endswith(candidate)),
-                None,
-            )
-            if delimiter is None:
-                break
-            url = url[: -len(delimiter)]
-            suffix = f"{delimiter}{suffix}"
-        if not url:
-            return token
-        return f"{add_link(url, _telegram_link_label(url))}{suffix}"
 
-    rewritten = _RAW_URL_PATTERN.sub(replace_raw, rewritten)
-    return rewritten, formatted_links
+def _render_text(text: str) -> str:
+    output = []
+    cursor = 0
+    for match in re.finditer(r"https?://[^\s<>()\"'`]+", text, re.IGNORECASE):
+        url = match.group().rstrip(_URL_TRAILING_PUNCTUATION)
+        output.append(html.escape(text[cursor:match.start()]))
+        output.append(_telegram_link_anchor(url, _telegram_link_label(url)))
+        output.append(html.escape(match.group()[len(url):]))
+        cursor = match.end()
+    output.append(html.escape(text[cursor:]))
+    return "".join(output)
+
+
+def _render_inline(text: str, *, allow_code: bool = True) -> str:
+    def render(tokens, autolink=True, code_allowed=allow_code):
+        output = []
+        for token in tokens:
+            kind = token["type"]
+            children = token.get("children", [])
+            if kind in {"strong", "emphasis", "strikethrough"}:
+                tag = {"strong": "b", "emphasis": "i", "strikethrough": "s"}[kind]
+                content = render(children, autolink, code_allowed)
+                # Telegram forbids emphasis inside/around code entities.
+                output.extend(part if part.startswith("<code>") else f"<{tag}>{part}</{tag}>"
+                              for part in re.split(r"(<code>[\s\S]*?</code>)", content) if part)
+            elif kind == "codespan":
+                literal = html.escape(token.get('raw', ''))
+                output.append(f"<code>{literal}</code>" if code_allowed else literal)
+            elif kind in {"softbreak", "linebreak"}:
+                output.append("\n")
+            elif kind == "link":
+                url = token.get("attrs", {}).get("url", "")
+                label = render(children, False, False)
+                if urlparse(url).scheme.lower() in {"http", "https"}:
+                    if len(children) == 1 and children[0].get("raw") == url:
+                        label = html.escape(_telegram_link_label(url))
+                    output.append(f'<a href="{html.escape(url, quote=True)}">{label}</a>')
+                else:
+                    output.append(label)
+            elif children:
+                output.append(render(children, autolink, code_allowed))
+            elif kind == "text":
+                raw = token.get("raw", "")
+                output.append(_render_text(raw) if autolink else html.escape(raw))
+            else:
+                output.append(html.escape(token.get("raw", "")))
+        return "".join(output)
+
+    # Emphasis cannot cross a paragraph boundary. Single newlines, including
+    # a source's soft wrap inside emphasis, remain valid inline Markdown.
+    return "".join(part if re.fullmatch(r"\n[ \t]*\n", part) else render(_inline_parser()(part, {}))
+                   for part in re.split(r"(\n[ \t]*\n)", text))
 
 
 def _replace_blockquotes(text: str) -> tuple[str, list[str]]:
@@ -125,7 +140,7 @@ def _replace_blockquotes(text: str) -> tuple[str, list[str]]:
             quote_lines.pop()
         if not quote_lines:
             return
-        escaped = html.escape("\n".join(quote_lines))
+        escaped = _render_inline("\n".join(quote_lines), allow_code=False)
         formatted_quotes.append(f"<blockquote>{escaped}</blockquote>")
         output.append(f"{_QUOTE_PLACEHOLDER_PREFIX}{len(formatted_quotes) - 1}__")
         quote_lines.clear()
@@ -146,7 +161,7 @@ def _replace_blockquotes(text: str) -> tuple[str, list[str]]:
 def _normalize_markdown_bullets(text: str) -> str:
     lines: list[str] = []
     for line in str(text).splitlines():
-        match = re.match(r"^(?P<indent>\s*)-\s+(?P<body>\S.*)$", line)
+        match = re.match(r"^(?P<indent>[ \t]*)[-+*]\s+(?P<body>\S.*)$", line)
         if match:
             lines.append(f"{match.group('indent')}• {match.group('body')}")
             continue
@@ -158,31 +173,168 @@ def _normalize_markdown_bullets(text: str) -> str:
 
 def format_telegram_text(text: str) -> tuple[str, dict[str, str]]:
     text = sanitize_external_inline_markup(text)
-    text_with_placeholders, formatted_blocks = _replace_fenced_code_blocks(text)
-    text_with_placeholders = make_markdown_tables_chat_readable(text_with_placeholders)
-    text_with_placeholders = _normalize_markdown_bullets(text_with_placeholders)
-    text_with_placeholders, formatted_codes = _replace_inline_code_spans(text_with_placeholders)
-    text_with_placeholders, formatted_links = _replace_links(text_with_placeholders)
-    text_with_placeholders, formatted_quotes = _replace_blockquotes(text_with_placeholders)
-    text_with_placeholders = re.sub(r"(?m)^#{1,6} +(.+)$", r"**\1**", text_with_placeholders)
-    escaped = html.escape(text_with_placeholders)
-    formatted = _BOLD_PATTERN.sub(lambda match: f"<b>{match.group(1)}</b>", escaped)
-    formatted = _ITALIC_PATTERN.sub(lambda match: f"<i>{match.group(1)}</i>", formatted)
+    prose, formatted_blocks = _replace_fenced_code_blocks(text)
+    prose = make_markdown_tables_chat_readable(prose)
+    prose = _normalize_markdown_bullets(prose)
+    prose, formatted_quotes = _replace_blockquotes(prose)
+    prose = re.sub(r"(?m)^#{1,6} +(.+)$", r"**\1**", prose)
+    formatted = _render_inline(prose)
     for index, block in enumerate(formatted_blocks):
-        placeholder = f"{_FENCE_PLACEHOLDER_PREFIX}{index}__"
-        formatted = formatted.replace(placeholder, block)
-    for index, code in enumerate(formatted_codes):
-        placeholder = f"{_INLINE_CODE_PLACEHOLDER_PREFIX}{index}__"
-        formatted = formatted.replace(placeholder, code)
-    for index, link in enumerate(formatted_links):
-        placeholder = f"{_LINK_PLACEHOLDER_PREFIX}{index}__"
-        formatted = formatted.replace(placeholder, link)
+        formatted = formatted.replace(f"{_FENCE_PLACEHOLDER_PREFIX}{index}__", block)
     for index, quote in enumerate(formatted_quotes):
-        placeholder = f"{_QUOTE_PLACEHOLDER_PREFIX}{index}__"
-        formatted = formatted.replace(placeholder, quote)
-    if formatted != escaped:
+        formatted = formatted.replace(f"{_QUOTE_PLACEHOLDER_PREFIX}{index}__", quote)
+    if formatted != html.escape(prose):
         return formatted, {"parse_mode": "HTML"}
-    return text_with_placeholders, {}
+    return prose, {}
 
 
-__all__ = ["format_telegram_text"]
+def telegram_html_to_plain(text: str, *, include_link_targets: bool = False) -> str:
+    from html.parser import HTMLParser
+
+    class VisibleText(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts = []
+            self.links = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "a" and include_link_targets:
+                self.links.append((len(self.parts), dict(attrs).get("href", "")))
+
+        def handle_endtag(self, tag):
+            if tag == "a" and self.links:
+                start, target = self.links.pop()
+                if target and target not in "".join(self.parts[start:]):
+                    self.parts.append(f" ({target})")
+
+        def handle_data(self, data):
+            self.parts.append(data)
+
+    parser = VisibleText()
+    parser.feed(text)
+    parser.close()
+    return "".join(parser.parts)
+
+
+def telegram_plain_text(text: str) -> str:
+    rendered, options = format_telegram_text(text)
+    return telegram_html_to_plain(rendered, include_link_targets=True) if options else rendered
+
+
+def telegram_text_units(text: str) -> int:
+    """Telegram entity offsets and text budgets use UTF-16 code units."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
+def _plain_chunks(text: str, limit: int) -> list[tuple[str, dict[str, str]]]:
+    chunks = []
+    while text:
+        count = 0
+        used = 0
+        for char in text:
+            size = 2 if ord(char) > 0xFFFF else 1
+            if used + size > limit:
+                break
+            used += size
+            count += 1
+        chunks.append((text[:count], {}))
+        text = text[count:]
+    return chunks
+
+
+def format_telegram_chunks(text: str, *, limit: int = 3900) -> list[tuple[str, dict[str, str]]]:
+    """Render once, then split HTML with balanced, reopened formatting spans.
+
+    Splitting Markdown before parsing can orphan emphasis, links or code. Count
+    serialized characters conservatively, including reopened tags and entities.
+    """
+    if limit < 80:
+        raise ValueError("Telegram formatted chunk limit must be at least 80")
+    formatted, options = format_telegram_text(text)
+    if telegram_text_units(formatted) <= limit:
+        return [(formatted, options)] if formatted else []
+    if not options:
+        # Escape plain text before the same entity-aware splitter so astral
+        # Unicode and literal angle brackets receive the same safe budget.
+        formatted = html.escape(formatted)
+    tokens = re.findall(r"<[^>]+>|&(?:\#\d+|\#x[0-9a-fA-F]+|[a-zA-Z]+);|[^<&\n]+|\n|[<&]", formatted)
+    line_costs = [0] * len(tokens)
+    cost = 0
+    for index in range(len(tokens) - 1, -1, -1):
+        cost = telegram_text_units(tokens[index]) + (0 if tokens[index] == "\n" else cost)
+        line_costs[index] = cost
+    stack: list[tuple[str, str]] = []
+    chunks: list[tuple[str, dict[str, str]]] = []
+    current = ""
+    has_content = False
+    line_start = True
+
+    def suffix():
+        return "".join(f"</{tag}>" for tag, _ in reversed(stack))
+
+    def flush():
+        nonlocal current, has_content
+        if has_content:
+            chunks.append((current + suffix(), {"parse_mode": "HTML"}))
+        current = "".join(opener for _, opener in stack)
+        has_content = False
+
+    for index, token in enumerate(tokens):
+        if line_start and has_content and any(tag == "pre" for tag, _ in stack):
+            # Keep ordinary code lines together. Escaped tags/entities are
+            # separate tokens, but they still belong to the same literal line.
+            empty_size = telegram_text_units("".join(opener for _, opener in stack) + suffix())
+            if (line_costs[index] <= limit - empty_size
+                    and line_costs[index] > limit - telegram_text_units(current + suffix())):
+                flush()
+        if token.startswith("<"):
+            closing = token.startswith("</")
+            tag = token.lstrip("</").split()[0].rstrip(">")
+            if closing:
+                stack.pop()
+                current += token
+            else:
+                if telegram_text_units(current + token + suffix()) + len(tag) + 3 >= limit:
+                    flush()
+                # An unusually large href cannot fit as an HTML tag. Use a
+                # safe plain representation rather than generating invalid HTML.
+                if telegram_text_units(current + token + suffix()) + len(tag) + 3 >= limit:
+                    plain = telegram_html_to_plain(formatted)
+                    return _plain_chunks(plain, limit)
+                current += token
+                stack.append((tag, token))
+            continue
+        while token:
+            room = limit - telegram_text_units(current + suffix())
+            first_size = len(token) if token.startswith("&") else telegram_text_units(token[0])
+            if room < first_size:
+                flush()
+                room = limit - telegram_text_units(current + suffix())
+                if room < first_size:
+                    # Reopened tags can consume the whole budget. Do not split
+                    # an entity/surrogate or loop forever with an empty chunk.
+                    return _plain_chunks(telegram_html_to_plain(formatted), limit)
+            count = 0
+            used = 0
+            for char in token:
+                size = 2 if ord(char) > 0xFFFF else 1
+                if used + size > room:
+                    break
+                count += 1
+                used += size
+            if count < len(token) and not token.startswith("&"):
+                boundary = max(token.rfind("\n", 0, count), token.rfind(" ", 0, count))
+                if boundary >= count // 2:
+                    count = boundary + 1
+            part = token[:count]
+            current += part
+            line_start = part.endswith("\n")
+            token = token[count:]
+            has_content = True
+            if token:
+                flush()
+    flush()
+    return chunks
+
+
+__all__ = ["format_telegram_text", "format_telegram_chunks", "telegram_plain_text"]

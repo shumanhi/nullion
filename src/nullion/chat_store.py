@@ -31,6 +31,8 @@ Usage
 """
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 import json
 import logging
 import os
@@ -187,6 +189,9 @@ def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict
             and (not message.get("runtime_turn_id") or not collapsed[-1].get("runtime_turn_id")
                  or message["runtime_turn_id"] == collapsed[-1]["runtime_turn_id"])
             and bool(message.get("is_error")) == bool(collapsed[-1].get("is_error"))
+            and not ((message.get("metadata") or {}).get("live_notice_id")
+                     and (collapsed[-1].get("metadata") or {}).get("live_notice_id")
+                     and message["metadata"]["live_notice_id"] != collapsed[-1]["metadata"]["live_notice_id"])
         ):
             if _metadata_weight(message.get("metadata")) > _metadata_weight(collapsed[-1].get("metadata")):
                 collapsed[-1] = {**collapsed[-1], "metadata": message.get("metadata")}
@@ -284,10 +289,6 @@ def _local_history_timezone() -> timezone | ZoneInfo:
 
         configured = str(getattr(load_preferences(), "timezone", "") or "").strip()
         name = configured or detect_system_timezone(default="UTC")
-        if name.upper() == "UTC":
-            detected = detect_system_timezone(default="UTC")
-            if detected:
-                name = detected
         return ZoneInfo(name)
     except Exception:
         return timezone.utc
@@ -489,19 +490,11 @@ class ChatStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            conn = sqlite3.connect(str(self._path), timeout=10)
+        with self._lock, sqlite_connection(str(self._path), timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            try:
-                yield conn
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
+            yield conn
 
     # ── Conversation management ───────────────────────────────────────────────
 
@@ -795,10 +788,15 @@ class ChatStore:
             ).fetchone()
             if latest is not None:
                 latest_metadata = self._decrypt_text(latest["metadata"]) if latest["metadata"] else None
+                different_notice = False
+                if metadata and metadata.get("live_notice_id") and latest_metadata:
+                    previous_notice = (json.loads(latest_metadata) or {}).get("live_notice_id")
+                    different_notice = bool(previous_notice and previous_notice != metadata["live_notice_id"])
                 if (
                     latest["role"] == role
                     and (self._decrypt_text(latest["text"]) or "") == safe_text
                     and bool(latest["is_error"]) == bool(is_error)
+                    and not different_notice
                 ):
                     if latest_metadata == metadata_text:
                         return latest["id"]

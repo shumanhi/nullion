@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from nullion import agent_orchestrator as agent
+from nullion.execution_outcome import prepare_answer
 from nullion.source_observation_contract import (
     compact_source_observations, render_source_answer, source_answer_context,
     source_report_status, terminal_source_report_tools,
@@ -33,7 +34,8 @@ def test_terminal_report_keeps_cause_and_uncertainty_without_certifying_claims(e
     assert 'requires login' in text and 'Independent evidence' in text
     assert '42' not in text  # Irrelevant or unverified source claims need not be presented.
     preserved = agent._complete_agent_turn({'user_message': '検証して', 'tool_results': [result],
-        'source_answer_checkpoint': {'presentation': draft, 'tool_result_count': 1}},
+        'source_answer_checkpoint': {'presentation': draft, 'tool_result_count': 1,
+            'composed_answer': prepare_answer('検証して', text, [result])}},
         final_text='Generic failure', response_fulfilled=False)['result']
     assert 'requires login' in preserved.final_text and not preserved.response_fulfilled
 

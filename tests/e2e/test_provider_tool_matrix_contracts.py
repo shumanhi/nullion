@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -519,6 +520,8 @@ def test_anthropic_provider_serializes_messages_tools_and_thinking_without_live_
 
     class Messages:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             captured.update(kwargs)
             return SimpleNamespace(
                 stop_reason="end_turn",
@@ -715,6 +718,8 @@ def test_model_test_exercises_provider_specific_outputs_using_fake_clients(
             self.create_called = False
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             del kwargs
             self.create_called = True
             return outputs_by_provider[self.provider]

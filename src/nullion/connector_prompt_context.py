@@ -12,12 +12,12 @@ import time
 logger = logging.getLogger(__name__)
 
 _ACTIVE_CONNECTOR_APP_ID_CACHE_NAMESPACE = "connector.active_app_ids"
-_ACTIVE_CONNECTOR_APP_ID_CACHE_VERSION = "v2"
+_ACTIVE_CONNECTOR_APP_ID_CACHE_VERSION = "v3-inventory-provenance"
 _ACTIVE_CONNECTOR_APP_ID_CACHE_TTL_SECONDS = 10 * 60
 _ACTIVE_CONNECTOR_APP_ID_CACHE_KEY = {"kind": "active_connector_app_ids"}
 _ACTIVE_CONNECTOR_EMPTY_MEMORY_CACHE_TTL_SECONDS = 5
 _ACTIVE_CONNECTOR_MEMORY_CACHE_LOCK = threading.RLock()
-_ACTIVE_CONNECTOR_APP_ID_MEMORY_CACHE: tuple[dict[str, tuple[str, ...]], ...] | None = None
+_ACTIVE_CONNECTOR_APP_ID_MEMORY_CACHE: tuple[dict[str, object], ...] | None = None
 _ACTIVE_CONNECTOR_APP_ID_MEMORY_CACHE_EXPIRES_AT = 0.0
 _ACTIVE_CONNECTOR_PROVIDER_CONTEXT_MEMORY_CACHE: tuple[dict[str, object], ...] | None = None
 _ACTIVE_CONNECTOR_PROVIDER_CONTEXT_MEMORY_CACHE_EXPIRES_AT = 0.0
@@ -33,8 +33,8 @@ def _memory_cache_ttl_seconds(value: object) -> int:
 
 def _active_connector_provider_summaries(
     providers: Iterable[Mapping[str, object]],
-) -> tuple[dict[str, tuple[str, ...]], ...]:
-    summaries: list[dict[str, tuple[str, ...]]] = []
+) -> tuple[dict[str, object], ...]:
+    summaries: list[dict[str, object]] = []
     for provider in providers:
         if not isinstance(provider, Mapping):
             continue
@@ -54,9 +54,11 @@ def _active_connector_provider_summaries(
         )
         if not app_ids and not structured_tools:
             continue
-        summary: dict[str, tuple[str, ...]] = {}
+        summary: dict[str, object] = {}
         if app_ids:
             summary["active_app_ids"] = app_ids
+        if provider.get("app_inventory_kind") == "supported_catalogue":
+            summary["app_inventory_kind"] = "supported_catalogue"
         if structured_tools:
             summary["structured_tools"] = structured_tools[:24]
         summaries.append(summary)
@@ -72,7 +74,7 @@ def _set_active_connector_app_id_memory_cache(providers: Iterable[Mapping[str, o
         _ACTIVE_CONNECTOR_APP_ID_MEMORY_CACHE_EXPIRES_AT = time.monotonic() + _memory_cache_ttl_seconds(value)
 
 
-def _get_active_connector_app_id_memory_cache() -> tuple[dict[str, tuple[str, ...]], ...] | None:
+def _get_active_connector_app_id_memory_cache() -> tuple[dict[str, object], ...] | None:
     with _ACTIVE_CONNECTOR_MEMORY_CACHE_LOCK:
         if _ACTIVE_CONNECTOR_APP_ID_MEMORY_CACHE is None:
             return None
@@ -136,7 +138,7 @@ def cache_active_connector_app_ids(providers: Iterable[Mapping[str, object]]) ->
 def cached_active_connector_app_id_providers(
     *,
     allow_persistent: bool = True,
-) -> tuple[dict[str, tuple[str, ...]], ...]:
+) -> tuple[dict[str, object], ...]:
     memory_cached = _get_active_connector_app_id_memory_cache()
     if memory_cached is not None:
         return memory_cached
@@ -235,6 +237,8 @@ def active_connector_provider_context_snapshot(
         skill_pack_id = str(provider.get("skill_pack_id") or "").strip()
         if skill_pack_id:
             snapshot["skill_pack_id"] = skill_pack_id
+        if provider.get("app_inventory_kind") == "supported_catalogue":
+            snapshot["app_inventory_kind"] = "supported_catalogue"
         if active_app_ids:
             snapshot["active_app_ids"] = active_app_ids
         if reference_path_count:
@@ -257,7 +261,8 @@ def format_active_connector_provider_context_for_prompt(
 
     lines = [
         "Associated connector skill context:",
-        "- These entries are runtime facts from active connector providers and installed skill-pack references.",
+        "- These entries describe configured connector providers and installed skill-pack references. A configured gateway does not prove every supported app has a connected account.",
+        "- When app_inventory_kind=supported_catalogue, active_app_ids are supported routing identifiers, not verified connected accounts. Do not ask the user to choose accounts merely because multiple apps appear in that catalogue. Use the relevant registered read tool for an unambiguous requested source; ask a numbered question only if the user selection or verified connection evidence leaves multiple relevant accounts.",
         "- If the user asks whether an external app/source/account can be accessed and that app/source appears in active_app_ids or attached reference paths, do not answer that it is unavailable merely because no first-class native tool is visible.",
         "- First request connector scope with source_user_requested=true and connector_app_ids for the matching normalized app ids when request_tool_scope is visible; then use the exposed structured account tools, skill_pack_read, and connector_request as appropriate.",
         "- If the exact access path is still unavailable or authorization is missing, say there is no direct native connector/access yet, then offer the Builder path plainly: Builder can create or save a reusable skill or connector workflow for that source once the user approves or connects the needed account. Do not substitute terminal_exec or an unrelated generic connector for external account access.",
@@ -267,6 +272,8 @@ def format_active_connector_provider_context_for_prompt(
             f"provider_id={provider.get('provider_id')}",
             f"display_name={provider.get('display_name')}",
         ]
+        if provider.get("app_inventory_kind"):
+            details.append(f"app_inventory_kind={provider.get('app_inventory_kind')}")
         if provider.get("permission_mode"):
             details.append(f"permission_mode={provider.get('permission_mode')}")
         if provider.get("skill_pack_id"):

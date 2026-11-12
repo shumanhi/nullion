@@ -181,7 +181,7 @@ def test_installer_workflow_runs_all_platform_harnesses() -> None:
     workflow = yaml.load((ROOT / '.github/workflows/pr-suite.yml').read_text(), Loader=yaml.BaseLoader)
     expected = {'linux-installer': ('ubuntu-latest', './scripts/installer-docker-linux.sh'),
                 'windows-installer': ('windows-2022', '.\\scripts\\installer-docker-windows.ps1'),
-                'macos-installer': ('macos-14', './scripts/installer-macos.sh')}
+                'macos-installer': ('macos-15', './scripts/installer-macos.sh')}
     for key, (runner, command) in expected.items():
         job = workflow['jobs'][key]
         assert job['runs-on'] == runner

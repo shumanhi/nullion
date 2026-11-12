@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -75,7 +76,9 @@ def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, py
         with browser_resource_directory(nullion_runtime_home() / "browser-task-scratch") as scratch, browser_resource_directory(browser_temporary_root()) as sdk_temp:
             job = Path(scratch) / 'job.json'
             result_file = Path(scratch) / 'result.json'
+            from nullion.tools import tool_execution_owner
             job.write_text(json.dumps({'task': task.model_dump(), 'principal_id': principal_id, 'timeout': timeout,
+                'owner': tool_execution_owner(),
                 'fallback_site_packages': site.getsitepackages(), 'model': str(getattr(client, 'model', 'configured-model')), 'bridge_url': f'http://127.0.0.1:{bridge.server_port}/model', 'token': token,
                 'resource_lease': str(Path(scratch) / '.lease'),
                 'policy': {'allowed_domains': list(policy.allowed_domains), 'blocked_domains': list(policy.blocked_domains), 'block_private': policy.block_private}}, ensure_ascii=False))
@@ -86,10 +89,34 @@ def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, py
             try:
                 with (Path(scratch) / 'worker.log').open('wb') as log:
                     process = subprocess.Popen([python or os.environ['NULLION_BROWSER_USE_PYTHON'], str(Path(__file__).resolve()), str(job), str(result_file)], env=env, stdout=log, stderr=log, start_new_session=True)
-                    process.wait(timeout=timeout + 25)
-                if process.returncode != 0 or not result_file.is_file():
+                    from nullion.tools import tool_execution_cancelled
+                    deadline = time.monotonic() + timeout + 25
+                    published=None
+                    while process.poll() is None:
+                        if tool_execution_cancelled():
+                            raise InterruptedError('Browser task was cancelled by its owning request')
+                        if result_file.is_file():
+                            try:published=json.loads(result_file.read_text())
+                            except (OSError,ValueError):published=None
+                            if isinstance(published,dict):break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(process.args, timeout + 25)
+                        try:
+                            process.wait(timeout=min(.25, remaining))
+                        except subprocess.TimeoutExpired:
+                            pass
+                # A worker can publish and exit between polls. Native report
+                # publication and SDK shutdown are separate outcomes. Owner
+                # cancellation wins even when the child has already exited.
+                if tool_execution_cancelled():
+                    raise InterruptedError('Browser task was cancelled by its owning request')
+                if published is None and not result_file.is_file():
                     raise RuntimeError('Isolated browser worker failed before producing a report')
-                result = json.loads(result_file.read_text())
+                result=published if published is not None else json.loads(result_file.read_text())
+                if not isinstance(result,dict):raise RuntimeError('Invalid isolated browser report')
+                if process.returncode not in (None,0):
+                    logger.warning('Browser worker exited with code=%s after publishing its native report',process.returncode)
                 if 'worker_error' in result:
                     if result['worker_error'].get('reason') == 'storage_exhausted':
                         import errno
@@ -130,14 +157,30 @@ class BridgeModelClient:
             return json.load(response)
 
 
-async def _worker(job):
+def _publish_worker_result(path,result):
+    temporary=path.with_name(path.name+'.tmp')
+    temporary.write_text(json.dumps(result,ensure_ascii=False))
+    temporary.chmod(0o600)
+    os.replace(temporary,path)
+
+
+async def _worker(job,result_path=None):
     from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy
     from nullion.plugins.browser_plugin.browser_use_adapter import BrowserTask, run_browser_task
     policy = BrowserPolicy()
     policy.allowed_domains = frozenset(job['policy']['allowed_domains'])
     policy.blocked_domains = frozenset(job['policy']['blocked_domains'])
     policy.block_private = job['policy']['block_private']
-    return await run_browser_task(BrowserTask.model_validate(job['task']), client=BridgeModelClient(job), principal_id=job['principal_id'], policy=policy, timeout=job['timeout'])
+    try:
+        result=await run_browser_task(BrowserTask.model_validate(job['task']), client=BridgeModelClient(job), principal_id=job['principal_id'], policy=policy, timeout=job['timeout'])
+    except Exception as exc:
+        from nullion.tools import filesystem_error_metadata
+        result={'worker_error':{'type':type(exc).__name__,'message':str(exc)[:300],
+            **filesystem_error_metadata(exc,reason='browser_task_unavailable')}}
+    # Publish before asyncio.run drains third-party background tasks. A
+    # cancellation-resistant SDK cleanup cannot erase this native report.
+    if result_path is not None:_publish_worker_result(result_path,result)
+    return result
 
 
 if __name__ == '__main__':
@@ -148,8 +191,8 @@ if __name__ == '__main__':
     try:
         from portalocker import Lock, LOCK_SH
         with Lock(job["resource_lease"], mode="r+", flags=LOCK_SH, timeout=0):
-            result = asyncio.run(_worker(job))
+            result = asyncio.run(_worker(job,Path(sys.argv[2])))
     except Exception as exc:
         from nullion.tools import filesystem_error_metadata
         result = {'worker_error': {'type': type(exc).__name__, 'message': str(exc)[:300], **filesystem_error_metadata(exc, reason='browser_task_unavailable')}}
-    Path(sys.argv[2]).write_text(json.dumps(result, ensure_ascii=False))
+    if not Path(sys.argv[2]).is_file():_publish_worker_result(Path(sys.argv[2]),result)

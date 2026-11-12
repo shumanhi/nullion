@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from tests.workflow_provider_protocol import group_provider_reply
 
 from nullion.chat_streaming import (
     ChatPlatformCapabilities,
@@ -631,8 +632,10 @@ def task(task_id: str, status: TaskStatus = TaskStatus.QUEUED, *, result: TaskRe
 
 
 @pytest.mark.asyncio
-async def test_result_aggregator_delivers_status_summary_final_and_artifacts() -> None:
+async def test_result_aggregator_delivers_status_summary_final_and_artifacts(tmp_path) -> None:
     deliveries: list[tuple[str, str, dict]] = []
+    prepared = tmp_path / 'a.txt'
+    prepared.write_text('alpha', encoding='utf-8')
 
     async def deliver(conversation_id: str, text: str, **kwargs) -> None:
         deliveries.append((conversation_id, text, kwargs))
@@ -643,7 +646,7 @@ async def test_result_aggregator_delivers_status_summary_final_and_artifacts() -
         conversation_id="c1",
         original_message="Do work",
         tasks=[
-            task("t1", TaskStatus.COMPLETE, result=TaskResult("t1", "success", output="alpha", artifacts=["/tmp/a.txt"])),
+            task("t1", TaskStatus.COMPLETE, result=TaskResult("t1", "success", output="alpha", artifacts=[str(prepared)])),
             task("t2", TaskStatus.COMPLETE, result=TaskResult("t2", "success", output="beta")),
         ],
         planner_metadata={"disposition": "parallel", "tasks": ["a", "b"]},
@@ -662,7 +665,7 @@ async def test_result_aggregator_delivers_status_summary_final_and_artifacts() -
         "📊 **PLANNER RESULT**\n\nFor: Do work\n\nCompleted 2/2 task(s). • Task t1: alpha • Task t2: beta",
         {"group_id": "g1"},
     ) in deliveries
-    assert ("c1", "/tmp/a.txt", {"group_id": "g1", "is_artifact": True}) in deliveries
+    assert ("c1", str(prepared), {"group_id": "g1", "is_artifact": True}) in deliveries
 
     deliveries.clear()
     await aggregator._handle(ProgressUpdate(agent_id="a1", task_id="t1", group_id="g1", kind="task_complete"))
@@ -877,7 +880,7 @@ async def test_scheduled_result_aggregator_does_not_attach_unrequested_result_pd
 async def test_scheduled_result_aggregator_keeps_structured_artifact_delivery(tmp_path) -> None:
     deliveries: list[tuple[str, str, dict]] = []
     html = tmp_path / "report.html"
-    html.write_text("<h1>Report</h1>", encoding="utf-8")
+    html.write_text("<!doctype html><html><body><h1>Report</h1></body></html>", encoding="utf-8")
     report_task = task(
         "deliver",
         TaskStatus.COMPLETE,
@@ -933,7 +936,11 @@ async def test_scheduled_result_aggregator_prefers_final_summary_artifact_over_i
     monkeypatch.setattr(result_aggregator, "artifact_root_for_principal", lambda principal_id: artifact_root)
 
     class SummaryModel:
-        def create(self, **_kwargs):  # noqa: ANN003
+        def create(self, **kwargs):
+            raw = self._create(**kwargs)
+            return group_provider_reply(kwargs, raw) or raw
+
+        def _create(self, **_kwargs):  # noqa: ANN003
             return {
                 "content": [
                     {
@@ -1461,7 +1468,7 @@ async def test_result_aggregator_materializes_missing_text_artifact(monkeypatch,
         str(output_path),
         {"group_id": "g-file", "is_artifact": True},
     ) in deliveries
-    assert any("requested file is attached" in text for _, text, kwargs in deliveries if kwargs == {"group_id": "g-file"})
+    assert all("Review warning:" not in text for _, text, kwargs in deliveries if kwargs == {"group_id": "g-file"})
     assert finalize_delegated_artifacts(group) == [str(output_path)]
     assert not output_paths[1].exists()
 
@@ -1534,7 +1541,11 @@ async def test_result_aggregator_prefers_summary_named_artifact_over_intermediat
     monkeypatch.setattr(result_aggregator, "artifact_root_for_principal", lambda principal_id: artifact_root)
 
     class SummaryModel:
-        def create(self, **_kwargs):  # noqa: ANN003
+        def create(self, **kwargs):
+            raw = self._create(**kwargs)
+            return group_provider_reply(kwargs, raw) or raw
+
+        def _create(self, **_kwargs):  # noqa: ANN003
             return {
                 "content": [
                     {
@@ -1614,7 +1625,11 @@ async def test_result_aggregator_falls_back_to_artifact_scoped_task_output(monke
     monkeypatch.setattr(result_aggregator, "artifact_root_for_principal", lambda principal_id: artifact_root)
 
     class SummaryModel:
-        def create(self, **_kwargs):  # noqa: ANN003
+        def create(self, **kwargs):
+            raw = self._create(**kwargs)
+            return group_provider_reply(kwargs, raw) or raw
+
+        def _create(self, **_kwargs):  # noqa: ANN003
             return {"content": [{"type": "text", "text": "Done — generated the requested file."}]}
 
     group = TaskGroup(
@@ -1668,7 +1683,11 @@ async def test_result_aggregator_does_not_deliver_unrequested_research_html(monk
     monkeypatch.setattr(result_aggregator, "artifact_root_for_principal", lambda principal_id: artifact_root)
 
     class SummaryModel:
-        def create(self, **_kwargs):  # noqa: ANN003
+        def create(self, **kwargs):
+            raw = self._create(**kwargs)
+            return group_provider_reply(kwargs, raw) or raw
+
+        def _create(self, **_kwargs):  # noqa: ANN003
             return {
                 "content": [
                     {
@@ -2849,7 +2868,7 @@ async def test_deep_agent_runner_does_not_cut_off_scheduled_background_task(monk
 
     result = await DeepAgentMiniAgentRunner().run(
         config,
-        anthropic_client=None,
+        anthropic_client=SimpleNamespace(create=lambda **kwargs: {"content": [{"type": "text", "text": __import__("json").dumps({"status": "success", "answer": "finished after scheduler timeout window"})}]}),
         tool_registry=SimpleNamespace(cleanup_scope=lambda scope_id: None),
         policy_store=None,
         approval_store=None,

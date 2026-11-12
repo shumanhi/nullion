@@ -156,10 +156,11 @@ def test_tray_helpers_and_actions(tmp_path, monkeypatch) -> None:
 
     messages: list[str] = []
     tray.notify = lambda message: messages.append(message)  # type: ignore[method-assign]
-    tray.refresh_status = lambda: messages.append("refresh")  # type: ignore[method-assign]
+    tray.refresh_status = lambda **kwargs: messages.append("refresh")  # type: ignore[method-assign]
     monkeypatch.setattr(tray_app, "_request_json", lambda *args, **kwargs: {"message": "restarted chat"})
     monkeypatch.setattr(tray_app.threading, "Thread", lambda target, daemon=True: SimpleNamespace(start=lambda: target()))
     monkeypatch.setattr(tray_app.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(tray._stop, "wait", lambda seconds: False)
     tray.restart_nullion()
     tray.restart_chat_services()
     assert "Restart requested." in messages
@@ -228,7 +229,9 @@ async def test_slack_message_command_delivery_and_download(tmp_path, monkeypatch
         async def chat_postMessage(self, **kwargs):
             self.messages.append(kwargs)
             if len(self.messages) == 1:
-                raise RuntimeError("formatted send failed")
+                error=RuntimeError('Formatting rejected')
+                error.status_code=400
+                raise error
 
     formatting_failure_client = FormattingFailureSlackClient()
     await slack_app._post_slack_message_with_plain_fallback(
@@ -432,7 +435,9 @@ async def test_discord_message_delivery_typing_and_download(tmp_path, monkeypatc
                 kwargs["content"] = args[0]
             self.messages.append(kwargs)
             if len(self.messages) == 1:
-                raise RuntimeError("formatted send failed")
+                error=RuntimeError('Formatting rejected')
+                error.status_code=400
+                raise error
 
     formatting_failure_channel = FormattingFailureChannel()
     await discord_app._send_discord_chunks_with_plain_fallback(formatting_failure_channel, "Hello **Ada**")

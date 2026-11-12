@@ -1,3 +1,4 @@
+from tests.workflow_provider_protocol import workflow_provider_reply
 from datetime import UTC, datetime, timedelta
 import os
 import time
@@ -37,6 +38,8 @@ def test_real_chat_boundary_recovers_from_invalid_health_probe_flag(tmp_path, mo
         probe_calls = 0
         chat_calls = 0
         def create(self, *, messages, tools, max_tokens=None, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if max_tokens == 16:
                 self.probe_calls += 1
                 # Slow external boundary must not re-enter ordinary chat.

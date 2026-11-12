@@ -81,6 +81,49 @@ def resolve_timezone(timezone_name: str | None = None) -> tzinfo:
     name = _validated_timezone_name(timezone_name) or "UTC"
     return ZoneInfo(name) if name != "UTC" else UTC
 
+
+def time_presentation_context(prefs: Preferences | None = None) -> dict[str, str]:
+    """Shared display policy; timestamps and scheduler expressions stay typed."""
+    prefs = prefs or load_preferences()
+    date_format = getattr(prefs, 'date_format', 'YYYY-MM-DD')
+    return {'timezone': _validated_timezone_name(getattr(prefs, 'timezone', None)) or detect_system_timezone(),
+            'time_format': '24h' if getattr(prefs, 'time_format', None) == '24h' else '12h',
+            'date_format': date_format if date_format in {'YYYY-MM-DD', 'MM/DD/YYYY', 'DD/MM/YYYY'} else 'YYYY-MM-DD'}
+
+
+def format_clock_time(hour: int, minute: int, *, second: int | None = None,
+                      time_format: str = '12h') -> str:
+    seconds = f':{second:02d}' if second is not None else ''
+    if time_format == '24h':
+        return f'{hour:02d}:{minute:02d}{seconds}'
+    return f'{hour % 12 or 12}:{minute:02d}{seconds} {"AM" if hour < 12 else "PM"}'
+
+
+def format_user_datetime(value: datetime | str, *, prefs: Preferences | None = None,
+                         timezone_name: str | None = None, date_style: str = 'short',
+                         include_timezone: bool = True, include_seconds: bool = False,
+                         naive_is_local: bool = False) -> str:
+    """Display a structured instant using saved preferences, never host locale."""
+    policy = time_presentation_context(prefs)
+    zone = resolve_timezone(timezone_name or policy['timezone'])
+    instant = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=zone if naive_is_local else UTC)
+    local = instant.astimezone(zone)
+    if date_style == 'day_month':
+        date = f'{local.day} {local:%b}'
+    elif date_style == 'long':
+        date = f'{local:%B} {local.day}, {local.year}'
+    elif date_style == 'configured':
+        date = local.strftime({'YYYY-MM-DD': '%Y-%m-%d', 'MM/DD/YYYY': '%m/%d/%Y',
+                              'DD/MM/YYYY': '%d/%m/%Y'}[policy['date_format']])
+    else:
+        date = f'{local:%b} {local.day}, {local.year}'
+    clock = format_clock_time(local.hour, local.minute,
+        second=local.second if include_seconds else None, time_format=policy['time_format'])
+    zone_label = f' {local.tzname()}' if include_timezone else ''
+    return f'{date}, {clock}{zone_label}'
+
 _DEFAULTS: dict = {
     # Personality
     "persona":             "",           # user-written prompt fragment, max 280 chars
@@ -199,9 +242,9 @@ def load_preferences() -> Preferences:
         sentinel_mode         = sentinel_mode,
         sentinel_risk_level   = sentinel_risk_level,
         outbound_request_mode = outbound_request_mode,
-        timezone              = str(data.get("timezone",              _DEFAULTS["timezone"])),
+        timezone              = _validated_timezone_name(data.get("timezone")) or detect_system_timezone(),
         date_format           = str(data.get("date_format",           _DEFAULTS["date_format"])),
-        time_format           = str(data.get("time_format",           _DEFAULTS["time_format"])),
+        time_format           = '24h' if data.get('time_format') == '24h' else '12h',
     )
 
 
@@ -259,6 +302,19 @@ _CODE_LINES = {
 }
 
 
+def build_request_time_context(prefs: Preferences, *, now: datetime | None = None) -> dict[str, str]:
+    """Typed request clock from already loaded preferences; no IO or model call."""
+    accepted = now or datetime.now(UTC)
+    if accepted.tzinfo is None:
+        accepted = accepted.replace(tzinfo=UTC)
+    zone = resolve_timezone(prefs.timezone)
+    local = accepted.astimezone(zone)
+    return {"timezone": str(getattr(zone, "key", zone)),
+        "accepted_at_utc": accepted.astimezone(UTC).isoformat(),
+        "accepted_local_datetime": local.isoformat(),
+        "accepted_local_date": local.date().isoformat()}
+
+
 def _format_current_time_hint(prefs: Preferences, *, now: datetime | None = None) -> str:
     current_utc = now or datetime.now(UTC)
     if current_utc.tzinfo is None:
@@ -272,7 +328,53 @@ def _format_current_time_hint(prefs: Preferences, *, now: datetime | None = None
     )
 
 
-def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None) -> str:
+@dataclass(frozen=True)
+class PresentationPolicy:
+    emoji_level: str = 'none'
+    response_length: str = 'balanced'
+    response_structure: str = 'free'
+    markdown_style: str = 'light'
+    tone: str = 'friendly'
+    language_complexity: str = 'standard'
+
+
+def presentation_policy(prefs) -> PresentationPolicy:
+    rules = {'emoji_level':_EMOJI_LINES, 'response_length':_LENGTH_LINES,
+        'response_structure':_STRUCTURE_LINES, 'markdown_style':_MARKDOWN_LINES,
+        'tone':_TONE_LINES, 'language_complexity':_COMPLEXITY_LINES}
+    defaults = PresentationPolicy()
+    return PresentationPolicy(**{name:getattr(prefs,name) if isinstance(getattr(prefs,name,None), str) and getattr(prefs,name) in choices
+        else getattr(defaults,name) for name,choices in rules.items()})
+
+
+def build_presentation_prompt(prefs: Preferences) -> str:
+    """One style policy for user-visible content; no consent or task authority."""
+    policy = presentation_policy(prefs)
+    get = lambda name, default: getattr(policy, name, default)
+    lines = ["## Shared presentation policy (user-visible prose only):",
+        _EMOJI_LINES.get(get('emoji_level', 'none'), _EMOJI_LINES['none']),
+        _LENGTH_LINES.get(get('response_length', 'balanced'), _LENGTH_LINES['balanced']),
+        _STRUCTURE_LINES.get(get('response_structure', 'free'), _STRUCTURE_LINES['free']),
+        _MARKDOWN_LINES.get(get('markdown_style', 'light'), _MARKDOWN_LINES['light']),
+        _TONE_LINES.get(get('tone', 'friendly'), _TONE_LINES['friendly']),
+        _COMPLEXITY_LINES.get(get('language_complexity', 'standard'), _COMPLEXITY_LINES['standard']),
+        "Keep multiple findings readable with meaningful groups and one finding per item. "
+        "Keep summaries short without dropping required facts. Present exactly one numbered options list for actual choices "
+        "and accept numeric replies; keep recommendations, evidence, and explanatory steps outside that pick-list as bullets or prose. "
+        "Confirmation and consent questions are choices too: offer numbered affirmative and decline options, "
+        "rather than requiring the user to type an exact word such as confirm. Preserve required platform approval controls and identity checks. "
+        "Apply these preferences to human text fields only, never protocol keys, evidence quotes, identifiers, URLs, code, or artifact bytes."]
+    if get('emoji_level', 'none') == 'expressive':
+        lines.append('Use relevant emoji accents on headings when useful; keep evidence quotes and literal values unchanged.')
+    return '\n'.join(lines)
+
+
+def current_presentation_prompt() -> str:
+    return build_presentation_prompt(load_preferences())
+
+
+def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None,
+                             include_presentation: bool = True) -> str:
     """Build a concise system-prompt snippet from the user's preferences."""
     lines: list[str] = []
 
@@ -282,20 +384,9 @@ def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None)
         lines.append(prefs.persona.strip())
         lines.append("")
 
-    lines.append("## Formatting and tone rules:")
-
-    lines.append(_EMOJI_LINES.get(prefs.emoji_level, _EMOJI_LINES["none"]))
-    lines.append(_LENGTH_LINES.get(prefs.response_length, _LENGTH_LINES["balanced"]))
-    lines.append(_STRUCTURE_LINES.get(prefs.response_structure, _STRUCTURE_LINES["free"]))
-    lines.append(_MARKDOWN_LINES.get(prefs.markdown_style, _MARKDOWN_LINES["light"]))
-    lines.append(_TONE_LINES.get(prefs.tone, _TONE_LINES["friendly"]))
-    lines.append(_COMPLEXITY_LINES.get(prefs.language_complexity, _COMPLEXITY_LINES["standard"]))
+    if include_presentation:
+        lines.append(build_presentation_prompt(prefs))
     lines.append(_CODE_LINES.get(prefs.code_examples, _CODE_LINES["relevant"]))
-    lines.append(
-        "When asking the user to choose from options or provide one of several inputs, "
-        "present exactly one numbered options list and accept a numeric reply. "
-        "Keep recommendations, evidence, and explanatory steps outside that pick-list as bullets or prose."
-    )
 
     if prefs.proactive_suggestions:
         lines.append("When relevant, proactively suggest related ideas, follow-ups, or improvements the user hasn't asked for.")
@@ -310,7 +401,11 @@ def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None)
 
     tz_hint = f"The user's timezone is {prefs.timezone}." if prefs.timezone else ""
     date_hint = f"Format dates as {prefs.date_format}."
-    time_hint = f"Use {prefs.time_format} time format."
+    time_hint = (f"Use {prefs.time_format} time format. "
+        "Display times in the user's saved timezone, including reports, alerts, source timestamps and deadlines. "
+        "For 12h, use AM/PM (for example, 4:05 PM), never a 24-hour clock. "
+        "Convert source-zone times accurately, retaining the original zone only when relevant or requested. "
+        "Keep date-only/all-day values as dates and machine timestamps in structured tool arguments.")
     lines.append(" ".join(filter(None, [tz_hint, date_hint, time_hint])))
     lines.append(_format_current_time_hint(prefs, now=now))
 

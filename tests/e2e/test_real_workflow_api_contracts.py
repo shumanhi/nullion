@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import is_tool_scope_request, workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import asyncio
 import base64
 import json
@@ -49,6 +50,7 @@ def test_profile_preferences_users_cron_and_oauth_workflow_use_isolated_state(
     home = tmp_path / "home"
     env_file = tmp_path / ".env"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NULLION_HOME", str(home / ".nullion"))
     monkeypatch.setenv("NULLION_ENV_FILE", str(env_file))
     monkeypatch.setenv("CODEX_REFRESH_TOKEN", "refresh-e2e")
     monkeypatch.setenv("CODEX_OAUTH_TOKEN", "access-e2e")
@@ -419,7 +421,7 @@ def test_cron_scheduler_execution_runs_due_jobs_with_fake_platform_sender_and_wo
                 "[Scheduled task delivery context] task=Cron with explicit workspace routing; "
                 "channel=telegram; artifacts=none"
             ),
-            "assistant": "⏰ **SCHEDULED TASK: Cron with explicit workspace routing**\n\nscheduled output: Run synthetic workspace cron workflow",
+            "assistant": "**SCHEDULED TASK: Cron with explicit workspace routing**\n\nscheduled output: Run synthetic workspace cron workflow",
         }
     ]
     updated_job = crons.get_cron(job.id)
@@ -512,8 +514,8 @@ def test_cron_scheduler_generates_pdf_and_delivers_single_clean_attachment(
     assert len(sent_deliveries) == 1
     channel, sent_text, delivery = sent_deliveries[0]
     assert channel == "telegram"
-    assert sent_text == f"⏰ **SCHEDULED TASK: CNN screenshot PDF**\n\nCNN screenshot PDF created successfully.\n\nMEDIA:{pdf_path}"
-    assert delivery.text == "⏰ **SCHEDULED TASK: CNN screenshot PDF**\n\nCNN screenshot PDF created successfully."
+    assert sent_text == f"**SCHEDULED TASK: CNN screenshot PDF**\n\nCNN screenshot PDF created successfully.\n\nMEDIA:{pdf_path}"
+    assert delivery.text == "**SCHEDULED TASK: CNN screenshot PDF**\n\nCNN screenshot PDF created successfully."
     assert delivery.attachments == (pdf_path,)
     assert delivery.media_directive_count == 1
     assert pdf_path.read_bytes().startswith(b"%PDF")
@@ -523,7 +525,7 @@ def test_cron_scheduler_generates_pdf_and_delivers_single_clean_attachment(
             sent_text,
             principal_id=principal_id,
         )
-        assert platform_delivery.text == "⏰ **SCHEDULED TASK: CNN screenshot PDF**\n\nCNN screenshot PDF created successfully."
+        assert platform_delivery.text == "**SCHEDULED TASK: CNN screenshot PDF**\n\nCNN screenshot PDF created successfully."
         assert platform_delivery.attachments == (pdf_path,)
         assert platform_delivery.unavailable_attachment_count == 0
     stored = crons.get_cron(job.id)
@@ -593,6 +595,8 @@ def test_telegram_screenshot_request_e2e_creates_and_uploads_real_png_attachment
             self.agent_calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True, action=not requested)
+            if protocol_reply is not None: return protocol_reply
             tool_names = {tool["name"] for tool in kwargs.get("tools") or () if isinstance(tool, dict)}
             if "select_attachment_format" in tool_names:
                 return {
@@ -606,7 +610,7 @@ def test_telegram_screenshot_request_e2e_creates_and_uploads_real_png_attachment
                         }
                     ],
                 }
-            if int(kwargs.get("max_tokens") or 0) == 96 and not tool_names:
+            if is_tool_scope_request(kwargs):
                 return {
                     "content": [
                         {
@@ -789,8 +793,11 @@ def test_telegram_browser_text_answer_survives_an_optional_failed_assertion(
             self.review_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            if 'semantic completion reviewer' in str(kwargs.get('system') or ''): self.review_calls += 1
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get("system") or "")
-            if int(kwargs.get("max_tokens") or 0) == 96 and not kwargs.get("tools"):
+            if is_tool_scope_request(kwargs):
                 return {
                     "content": [
                         {
@@ -1005,7 +1012,7 @@ def test_telegram_browser_text_answer_survives_an_optional_failed_assertion(
         "review_calls": model.review_calls,
         "tool_results": chat_turns[-1].get("tool_results") if chat_turns else None,
     }
-    assert model.review_calls == 0
+    assert model.review_calls == 1
     assert "Dermaharmony" in reply
     assert "5% sulfur" in reply
     assert "$9.99" in reply
@@ -1080,8 +1087,10 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
             self.review_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get("system") or "")
-            if int(kwargs.get("max_tokens") or 0) == 96 and not kwargs.get("tools"):
+            if is_tool_scope_request(kwargs):
                 return {
                     "content": [
                         {
@@ -1118,13 +1127,16 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
                     ]
                 }
             if system.startswith("You are a material-requirements planner"):
+                plan_packet=json.loads(kwargs["messages"][0]["content"][0]["text"])
                 return {
                     "content": [
                         {
                             "type": "text",
                             "text": json.dumps(
                                 {
+                                    **fixture_source_plan(plan_packet),
                                     "all_material_requirements_enumerated": True,
+                                    "requested_artifact_extensions": [],
                                     "material_requirements": [
                                         {
                                             "requirement": (
@@ -1158,6 +1170,7 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
                             "type": "text",
                             "text": json.dumps(
                                 {
+                                    **fixture_source_assessment(review_payload),
                                     "disposition": "complete",
                                     "unresolved_requirements": [],
                                     "retry_tool_names": [],
@@ -1516,7 +1529,8 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
     assert terminal_form_action["output"]["session_id"] == final_browser_read["output"]["session_id"]
     assert len(terminal_mutation_invocation_ids) == 1
     assert "terminal_revalidation" not in final_browser_read["output"]
-    assert model.review_calls == 0
+    assert model.review_calls == 1, [row for row in runtime.store.list_conversation_events("telegram:100001")
+        if row.get("event_type") in {"conversation.completion_requirement_contract", "conversation.completion_review"}]
     click_result = next(
         item
         for item in chat_turns[-1]["tool_results"]
@@ -1581,6 +1595,8 @@ def test_agent_browser_turns_run_concurrently_with_isolated_task_sessions() -> N
             self.agent_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get("system") or "")
             if system.startswith("You are a semantic completion reviewer"):
                 return {
@@ -1712,7 +1728,7 @@ def test_agent_browser_turns_run_concurrently_with_isolated_task_sessions() -> N
     assert len(set(result_sessions)) == 2
 
 
-def test_successful_browser_turns_avoid_completion_review_latency() -> None:
+def test_browser_turns_review_once_without_duplicate_delivery_latency() -> None:
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.tools import ToolRegistry, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
@@ -1721,18 +1737,13 @@ def test_successful_browser_turns_avoid_completion_review_latency() -> None:
             self.review_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
-            system = str(kwargs.get("system") or "")
-            if system.startswith("You are a semantic completion reviewer"):
+            if 'semantic completion reviewer' in str(kwargs.get('system') or ''):
                 self.review_calls += 1
-                time.sleep(1.25)
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": '{"disposition":"complete","unresolved_requirements":[],"retry_tool_names":[]}',
-                        }
-                    ]
-                }
+                if self.review_calls > self.expected_reviews:
+                    time.sleep(1.25)
+                    raise AssertionError('Delivery repeated an already-bound review')
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             recent_messages = json.dumps((kwargs.get("messages") or [])[-3:], default=str)
             if "Fast browser result" in recent_messages:
                 return {
@@ -1778,6 +1789,7 @@ def test_successful_browser_turns_avoid_completion_review_latency() -> None:
 
     elapsed_ms: list[float] = []
     for index in range(5):
+        model.expected_reviews = index + 1
         started = time.perf_counter()
         result = orchestrator.run_turn(
             conversation_id=f"browser-latency-{index}",
@@ -1788,6 +1800,10 @@ def test_successful_browser_turns_avoid_completion_review_latency() -> None:
             policy_store=None,
             approval_store=None,
         )
+        result = orchestrator.review_turn_result(result,
+            conversation_id=f"browser-latency-{index}", principal_id=f"browser-latency-{index}",
+            user_message="Prüfe das gerenderte Ergebnis und nenne den aktuellen Artikel.",
+            conversation_history=[], tool_registry=registry, policy_store=None, approval_store=None)
         elapsed_ms.append((time.perf_counter() - started) * 1000)
         assert result.final_text == "Fast browser result: item available for $12.00.", {
             "index": index,
@@ -1798,7 +1814,7 @@ def test_successful_browser_turns_avoid_completion_review_latency() -> None:
 
     average_ms = sum(elapsed_ms) / len(elapsed_ms)
     p95_ms = max(elapsed_ms)
-    assert model.review_calls == 0
+    assert model.review_calls == 5
     assert invocations == ["browser_extract_text"] * 5
     assert average_ms < 650, f"successful browser average latency regressed: avg={average_ms:.1f}ms samples={elapsed_ms!r}"
     assert p95_ms < 1200, f"successful browser p95 latency regressed: p95={p95_ms:.1f}ms samples={elapsed_ms!r}"
@@ -1841,7 +1857,10 @@ def test_telegram_screenshot_request_e2e_recovers_from_cdp_context_management_fa
                 method = message["method"]
                 received_methods.append(method)
                 result: dict[str, object] = {}
-                if method == "Page.getLayoutMetrics":
+                if method == "Runtime.evaluate":
+                    result = {"result": {"type": "object", "value": {
+                        "url": "https://cnn.com", "readyState": "complete"}}}
+                elif method == "Page.getLayoutMetrics":
                     result = {
                         "layoutViewport": {"clientWidth": 800, "clientHeight": 600},
                         "contentSize": {"width": 800, "height": 600},
@@ -1897,8 +1916,10 @@ def test_telegram_screenshot_request_e2e_recovers_from_cdp_context_management_fa
             self.agent_calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             tool_names = {tool["name"] for tool in kwargs.get("tools") or () if isinstance(tool, dict)}
-            if int(kwargs.get("max_tokens", 0)) == 96 and not tool_names:
+            if is_tool_scope_request(kwargs):
                 return {"content": [{"type": "text", "text": json.dumps({
                     "requested_outcome": "unspecified", "web_action": "browser_interaction",
                     "scheduler_action": "none", "skill_pack_action": "none", "connector_app_ids": [],
@@ -2161,7 +2182,7 @@ def test_cron_scheduler_execution_uses_workspace_derived_targets_when_delivery_t
         (
             "telegram",
             "workspace-member-telegram",
-            "⏰ **SCHEDU",
+            "**SCHEDULE",
         )
     ]
 
@@ -2706,7 +2727,7 @@ def test_cron_delivery_contract_e2e_matrix_covers_text_file_both_silent_and_defa
         expected_delivery_text = (
             scheduled_task_delivery_text(job, case["delivery_text"])
             if case["delivery_text"] is not None
-            else "⏰ **SCHEDULED TASK: " + job.name + "**"
+            else "**SCHEDULED TASK: " + job.name + "**"
         )
         assert delivery.text == expected_delivery_text, case["name"]
         assert len(delivery.attachments) == case["attachment_count"], case["name"]
@@ -3467,11 +3488,11 @@ def test_cron_html_artifact_delivery_crosses_each_messaging_platform_boundary(
         {
             "channel": channel,
             "target": target,
-            "text": f"⏰ **MANUAL SCHEDULED TASK RUN: {job.name}**\n\nHTML report ready.\n\nMEDIA:{report}",
+            "text": f"**MANUAL SCHEDULED TASK RUN: {job.name}**\n\nHTML report ready.\n\nMEDIA:{report}",
         }
     ]
     delivery = prepare_reply_for_platform_delivery(sent[0]["text"], principal_id=principal_id)
-    assert delivery.text == f"⏰ **MANUAL SCHEDULED TASK RUN: {job.name}**\n\nHTML report ready."
+    assert delivery.text == f"**MANUAL SCHEDULED TASK RUN: {job.name}**\n\nHTML report ready."
     assert delivery.attachments == (report,)
     assert delivery.media_directive_count == 1
 
@@ -3486,6 +3507,8 @@ def test_cron_planner_status_preview_uses_model_structured_plan_without_prompt_k
 
     class FakeModelClient:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             captured["system"] = kwargs.get("system")
             captured["messages"] = kwargs.get("messages")
             return {
@@ -3576,6 +3599,8 @@ def test_cron_planner_status_preview_omits_runtime_delivery_only_terminal_steps(
 
     class FakeModelClient:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             captured["messages"] = kwargs.get("messages")
             return {
                 "content": [
@@ -3680,6 +3705,8 @@ def test_manual_cron_raw_payload_failure_ends_chat_turn_before_connector_reentry
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -4619,6 +4646,8 @@ def test_telegram_planner_pdf_request_dispatches_once_and_requires_confirmed_sta
 
     class AttachmentFormatModel:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             tools = kwargs.get("tools") or []
             if tools and tools[0].get("name") == "select_attachment_format":
                 return {

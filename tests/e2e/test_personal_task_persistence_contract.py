@@ -1,4 +1,5 @@
 """Personal tasks exercise the real Telegram handler, Web route and durable SQLite."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 from datetime import UTC, datetime
 import json
 import os
@@ -24,6 +25,8 @@ class Model:
         self.main_calls = 0
 
     def create(self, **kwargs):
+        protocol_reply = workflow_provider_reply(kwargs, completion=True)
+        if protocol_reply is not None: return protocol_reply
         system = str(kwargs.get('system') or '')
         names = {row['name'] for row in kwargs.get('tools', [])}
         if 'select_attachment_format' in names:
@@ -50,12 +53,13 @@ class Model:
         return response('Saved: Return parcel.' if self.operation == 'add' else 'Pending: Return parcel.')
 
 
+@pytest.mark.parametrize('database_folder',['plain','state #? %'])
 @pytest.mark.parametrize('add_prompt,list_prompt', [
     ('Add parcel return to my todo list', 'What is on my todo list?'),
     ('Añade devolver el paquete a mi lista', '¿Qué está pendiente en mi lista?'),
     ('荷物の返品を覚えておいて', '未完了の用事を見せて'),
 ])
-def test_telegram_add_and_web_recall_survive_restart_and_reset(tmp_path, monkeypatch, add_prompt, list_prompt):
+def test_telegram_add_and_web_recall_survive_restart_and_reset(tmp_path, monkeypatch, add_prompt, list_prompt, database_folder):
     from fastapi.testclient import TestClient
     from nullion import chat_operator, web_app
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -64,7 +68,8 @@ def test_telegram_add_and_web_recall_survive_restart_and_reset(tmp_path, monkeyp
     from nullion.tools import ToolRegistry
 
     monkeypatch.setenv('NULLION_MEMORY_ENABLED', '0')  # Tasks must not depend on fact-memory retention.
-    path = tmp_path / 'runtime.db'
+    directory=tmp_path/database_folder;directory.mkdir()
+    path = directory / 'runtime.db'
     runtime = bootstrap_persistent_runtime(path)
     runtime.active_tool_registry = ToolRegistry()
     settings = NullionSettings(telegram=TelegramSettings(bot_token='123456:abcdefghijklmnopqrstuv', operator_chat_id='2222', chat_enabled=True))
@@ -106,6 +111,8 @@ def test_history_recovery_restores_real_old_item_without_importing_assistant_exa
     runtime.checkpoint(force=True)
     class Recovery(Model):
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get('system') or '')
             names = {row['name'] for row in kwargs.get('tools', [])}
             if 'select_attachment_format' in names or ('relationship' in system and 'target_index' in system) or not names:
@@ -147,6 +154,8 @@ def test_personal_task_tools_keep_plain_chat_fast_without_storage_reads(tmp_path
         class Plain:
             calls = 0
             def create(self, **kwargs):
+                protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                if protocol_reply is not None: return protocol_reply
                 self.calls += 1
                 if self.calls > 1 or not kwargs.get('tools'):
                     time.sleep(2)
@@ -174,6 +183,8 @@ def test_claimed_task_save_without_receipt_cannot_complete(tmp_path, monkeypatch
     runtime.active_tool_registry = ToolRegistry()
     class NoSave(Model):
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {row['name'] for row in kwargs.get('tools', [])}
             if 'personal_task_save' in names:
                 return response('Saved: Return parcel.')

@@ -1,4 +1,5 @@
 """Recall through real routes, SQLite, browser tools and platform delivery."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 from html import unescape
 import json
@@ -95,6 +96,8 @@ def test_independent_followup_recovers_old_identifier_then_checks_live(tmp_path,
     class Model(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.steps+=1
@@ -162,6 +165,8 @@ def test_source_question_survives_and_numeric_reply_can_continue(tmp_path,monkey
         calls=0
         followup=False
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.calls+=1
@@ -199,6 +204,8 @@ def test_plain_turns_with_recall_available_do_not_search_or_classify(tmp_path,mo
     class Model(ScriptedProvider):
         calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get('tools') and 'assistant_no_tool_draft' in str(kw):
                 time.sleep(.8)
                 pytest.fail('unrelated plain turn entered a scope classifier')
@@ -268,6 +275,8 @@ def test_recall_answer_and_boundaries_complete_through_real_api(tmp_path,monkeyp
         steps=0
         followup=False
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.steps+=1
@@ -333,6 +342,8 @@ def test_history_actions_preserve_archive_and_never_backfill_deleted_turns(tmp_p
     class Model(ScriptedProvider):
         calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get("tools"):return response("{}")
             aux=self.auxiliary(kw)
             if aux is not None:return aux
@@ -390,6 +401,8 @@ def test_new_session_clears_automatic_context_but_explicit_history_still_recalls
     class Model(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             aux=self.auxiliary(kw)
             if aux is not None:return aux
             self.steps+=1

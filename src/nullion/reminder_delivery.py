@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -8,13 +10,13 @@ from functools import lru_cache
 import json
 import logging
 from pathlib import Path
-import sqlite3
 import threading
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from nullion.config import NullionSettings, load_settings
+from nullion.delivery_acknowledgement import UnconfirmedDelivery
 from nullion.connections import workspace_id_for_principal
 from nullion.scheduler import disable_task, mark_task_ran
 from nullion.users import MessagingDeliveryTarget, messaging_delivery_targets_for_workspace, resolve_telegram_user
@@ -136,20 +138,25 @@ async def _deliver_reminder(
         if _target_has_delivery_credentials(target, resolved_settings)
     )
     delivered_targets: set[str] = set()
+    uncertain_targets: set[str] = set()
     target_keys = {_target_key(target) for target in targets}
 
     for target in targets:
         try:
             if await _send_workspace_reminder_target(target, text, settings=resolved_settings):
                 delivered_targets.add(_target_key(target))
+        except UnconfirmedDelivery:
+            uncertain_targets.add(_target_key(target))
         except Exception:
             logger.warning("Workspace reminder delivery failed for %s", target.channel, exc_info=True)
 
     origin_key = _target_key_for_chat_id(getattr(reminder, "chat_id", None))
-    if origin_key and origin_key not in delivered_targets:
+    if origin_key and origin_key not in delivered_targets | uncertain_targets:
         try:
             if await send(getattr(reminder, "chat_id", ""), text):
                 delivered_targets.add(origin_key)
+        except UnconfirmedDelivery:
+            uncertain_targets.add(origin_key)
         except Exception:
             logger.warning(
                 "Reminder delivery failed (chat_id=%s, task_id=%s)",
@@ -158,6 +165,10 @@ async def _deliver_reminder(
                 exc_info=True,
             )
 
+    if uncertain_targets:
+        exc = UnconfirmedDelivery()
+        exc.confirmed_text = bool(delivered_targets)
+        raise exc
     if origin_key:
         return origin_key in delivered_targets
     if target_keys:
@@ -241,7 +252,7 @@ def _claim_due_reminder_persistently(runtime: Any, task: Any, due_time: datetime
     if not task_id:
         return None
     try:
-        with sqlite3.connect(str(checkpoint_path), timeout=10, isolation_level=None) as conn:
+        with sqlite_connection(str(checkpoint_path), timeout=10, isolation_level=None) as conn:
             conn.execute("BEGIN IMMEDIATE")
             reminder_row = conn.execute(
                 "SELECT payload FROM reminders_crons WHERE collection = ? AND item_key = ?",
@@ -373,12 +384,22 @@ async def _due_reminder_deliver_node(state: _DueReminderDeliveryState) -> dict[s
     reminder = state.get("reminder")
     if reminder is None:
         return {"sent": False}
-    sent = await _deliver_reminder(
-        reminder,
-        f"⏰ Reminder: {reminder.text}",
-        send=state["send"],
-        settings=state.get("settings"),
-    )
+    try:
+        sent = await _deliver_reminder(
+            reminder,
+            f"⏰ Reminder: {reminder.text}",
+            send=state["send"],
+            settings=state.get("settings"),
+        )
+    except UnconfirmedDelivery as exc:
+        # Keep the durable claim. Rolling it back would resend a message that
+        # may already be visible, including through the origin fallback.
+        from nullion.events import make_event
+        runtime = state["runtime"]
+        runtime.store.add_event(make_event(event_type="reminder.delivery.unknown", actor="runtime",
+            payload={"task_id": reminder.task_id, "delivery_progress": exc.progress()}))
+        runtime.checkpoint()
+        return {"sent": False, "claimed": False}
     return {"sent": bool(sent)}
 
 

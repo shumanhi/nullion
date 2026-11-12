@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -40,12 +41,23 @@ def test_scheduled_source_observations_do_not_end_before_remaining_checks(tmp_pa
         ('lookup_schedule', {'events':[{'id':'existing','time':'19:30'}]})]:
         def handler(invocation, output=output):
             called.append(invocation.tool_name)
+            if invocation.tool_name == 'lookup_schedule':
+                from nullion.runtime_persistence import load_runtime_store
+                # A concurrent refresh must not discard this execution's audit.
+                runtime.store = load_runtime_store(runtime.checkpoint_path)
             return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed', output)
         registry.register(ToolSpec(name=name, description=name, risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ, requires_approval=False, timeout_seconds=2), handler)
     class Model:
         calls=0
         def create(self, **kwargs):
+            if 'material-requirements planner' in str(kwargs.get('system') or ''):
+                packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
+                assert packet['scheduled_execution_context']['schedule'] == '0 * * * *'
+                assert packet['scheduled_execution_context']['schedule_changes_permitted'] is False
+                assert packet['scheduled_execution_context']['current_datetime']
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             assert kwargs.get('tools'), 'A completed ordinary report needs no recovery model call'
             self.calls+=1
             if self.calls<=2:
@@ -61,6 +73,54 @@ def test_scheduled_source_observations_do_not_end_before_remaining_checks(tmp_pa
     assert 'existing matching event was checked' in result['text']
     assert not result.get('cron_report_failed')
     assert len(result['tool_results'])==2
+    from nullion.runtime_persistence import load_runtime_store
+    persisted = load_runtime_store(runtime.checkpoint_path).list_conversation_events('web:checks')
+    diagnostics = [row for row in persisted if row.get('cron_run_id') == result['cron_run_id']]
+    assert {row['tool_name'] for row in diagnostics if row['event_type']=='conversation.tool_timing'} == set(called)
+    assert any(row['event_type']=='conversation.model_timing' for row in diagnostics)
+    assert any(row['event_type']=='conversation.completion_review' for row in diagnostics)
+    terminal = next(row for row in diagnostics if row['event_type']=='conversation.cron_run')
+    assert terminal['response_fulfilled'] is True
+    assert all(row['cron_id']=='checks' for row in diagnostics)
+
+
+def test_stopped_cron_preserves_diagnostics_without_repairing_or_reporting_failure(tmp_path, monkeypatch):
+    from threading import Event
+    from types import SimpleNamespace
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.crons import CronJob
+    from nullion import cron_delivery
+    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    registry = ToolRegistry()
+    cancelled = Event()
+    def handler(invocation):
+        cancelled.set()
+        return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed', {'value': 37})
+    registry.register(ToolSpec(name='source_read', description='Read source', risk_level=ToolRiskLevel.LOW,
+        side_effect_class=ToolSideEffectClass.READ, requires_approval=False, timeout_seconds=2), handler)
+    class Model:
+        def create(self, **kwargs):
+            auxiliary = workflow_provider_reply(kwargs)
+            if auxiliary is not None:
+                return auxiliary
+            return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read',
+                'name': 'source_read', 'input': {}}]}
+    monkeypatch.setattr(cron_delivery, '_repair_cron_agent_final_text_if_needed',
+        lambda *a, **k: pytest.fail('A cancelled execution entered report repair'))
+    model = Model()
+    result = cron_delivery.run_single_agent_cron_turn(
+        CronJob(id='owned-stop', name='Stop acceptance', schedule='0 * * * *', task='確認して報告。'),
+        'web:stop-acceptance', label='Manual scheduled task run', orchestrator=AgentOrchestrator(model_client=model),
+        runtime=runtime, tool_registry=registry, settings=SimpleNamespace(), model_client=model,
+        cancellation_checker=cancelled.is_set)
+    assert result['cron_run_cancelled'] is True and result['reason'] == 'stopped_by_user'
+    assert not result.get('cron_report_failed')
+    assert len(result['tool_results']) == 1 and result['tool_results'][0].status == 'completed'
+    from nullion.runtime_persistence import load_runtime_store
+    terminal = next(row for row in load_runtime_store(runtime.checkpoint_path).list_conversation_events()
+        if row.get('event_type') == 'conversation.cron_run')
+    assert terminal['cancelled'] is True and terminal['report_failed'] is False
 
 
 class DeleteCandidateClient:
@@ -69,6 +129,8 @@ class DeleteCandidateClient:
         self.calls = []
 
     def create(self, **kwargs):
+        protocol_reply = workflow_provider_reply(kwargs, completion=True)
+        if protocol_reply is not None: return protocol_reply
         self.calls.append(kwargs)
         if not kwargs.get("tools"):
             payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
@@ -136,6 +198,8 @@ def test_plain_turn_latency_with_scheduler_installed_avoids_delete_classifier(tm
             self.classifier_calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             if not kwargs.get("tools"):
                 self.classifier_calls += 1
@@ -187,6 +251,8 @@ def test_real_cron_runner_recovers_saved_design_and_delivers_html_bytes(tmp_path
             self.recovery_payload = None
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kwargs.get("tools"):
                 payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
                 assert payload["instructions"] == instructions
@@ -217,7 +283,8 @@ def test_real_cron_runner_recovers_saved_design_and_delivers_html_bytes(tmp_path
     assert len(paths) == 1 and Path(paths[0]).read_text() == html
     rendered_delivery = cron_delivery_text_from_result(result)
     assert "MEDIA:" in rendered_delivery and paths[0] in rendered_delivery
-    assert "Report attached" in rendered_delivery
+    assert result['response_fulfilled'] is True
+    assert 'Partial report attached' not in rendered_delivery
     from playwright.sync_api import sync_playwright
     with sync_playwright() as browser_api:
         browser = browser_api.chromium.launch()
@@ -284,7 +351,10 @@ def test_alert_checkpoint_changes_only_after_verified_report_delivery(tmp_path, 
                       _build_file_write_handler(workspace_root=tmp_path,allowed_roots=[tmp_path],include_principal_workspace=False))
     class Client:
         calls=0
+        repairs=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kwargs.get('tools'):
                 completion = _monitor_completion_response(kwargs)
                 if completion is not None:
@@ -294,6 +364,12 @@ def test_alert_checkpoint_changes_only_after_verified_report_delivery(tmp_path, 
                     return text_response(json.dumps({'decision':'send','reason':'verified_match'}))
                 prompt=kwargs['messages'][0]['content'][0]['text']
                 assert 'November 7' in prompt and 'https://example.com/tickets' in prompt
+                self.repairs += 1
+                if not repair_ok:
+                    # A composer's pessimistic completion claim is not the
+                    # delivery authority when independent evidence is valid.
+                    # Exercise an actual failed composition protocol instead.
+                    return text_response('{"requirements_satisfied":')
                 return text_response(json.dumps({'requirements_satisfied':repair_ok,'source_state':'available',
                     'evidence_refs':['e0'],'report':report}))
             self.calls+=1
@@ -352,6 +428,7 @@ def test_alert_checkpoint_changes_only_after_verified_report_delivery(tmp_path, 
     if not repair_ok:
         assert result['cron_delivery_status'] == 'silent'
         assert not sent and not wire
+        assert client.repairs == 2
 
 
 @pytest.mark.parametrize('instructions', ['Check the saved sources and report matching upcoming events.', '保存された情報源を確認して今後の該当公演を報告。', 'Comprueba las fuentes guardadas e informa eventos próximos coincidentes.'])
@@ -378,6 +455,8 @@ def test_scheduled_run_continues_after_failed_search_and_browser_discovery(tmp_p
     class Client:
         step=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kwargs.get('tools'):
                 completion = _monitor_completion_response(kwargs)
                 if completion is not None:
@@ -435,12 +514,16 @@ def test_email_triage_recovers_mixed_source_refs_and_delivers_report(tmp_path, m
     class Client:
         step=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kwargs.get('tools'):
                 prompt=kwargs['messages'][0]['content'][0]['text']
                 evidence=json.loads(prompt.split('Verified compact tool evidence from this run:\n')[1].split('\n\n')[0])
                 assert {'email_search','email_read','calendar_list'} <= {r.get('tool_name') for r in evidence},evidence
                 refs=[r['evidence_id'] for r in evidence]
                 repairs.append(refs)
+                if not complete_report:
+                    return text_response('{"requirements_satisfied":')
                 return text_response(json.dumps({'requirements_satisfied':complete_report,'source_state':'available','evidence_refs':refs,'report':report}))
             self.step+=1
             if self.step <= 3:
@@ -468,11 +551,527 @@ def test_email_triage_recovers_mixed_source_refs_and_delivers_report(tmp_path, m
     assert outcome['cron_delivery_status']=='sent',outcome
     assert bool(outcome.get('cron_report_failed')) is not complete_report,outcome
     assert not outcome.get('cron_report_partial'),outcome
-    assert len(repairs)==(1 if complete_report else 4)
+    assert len(repairs)==(1 if complete_report else 2)
     if not complete_report:
         assert outcome['response_fulfilled'] is False
         assert all('Partial report' not in text and 'November 7' not in text for text,_ in wire)
-        assert outcome['cron_completion_continuations']==1
+        assert not outcome.get('cron_completion_continuations')
     assert any('November 7' in text and 'scan is incomplete' in text and options.get('parse_mode')=='HTML' for text,options in wire) is complete_report
     assert all('Please review your membership preferences' not in text for text,_ in wire)
     assert runtime.store.list_recent_conversation_events('telegram:123')[-1]['cron_id']=='email-triage'
+
+
+@pytest.mark.parametrize('instructions', ['Include current metrics and their daily history.', '現在の数値と日別履歴を含めてください。'])
+def test_cron_html_recovery_keeps_late_read_data_after_many_page_results(tmp_path,monkeypatch,instructions):
+    from types import SimpleNamespace
+    from nullion import crons
+    from nullion.tools import ToolSpec,ToolRiskLevel,ToolSideEffectClass,ToolResult
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.cron_delivery import run_single_agent_cron_turn,cron_delivery_artifact_paths_from_result
+    runtime,registry=runtime_and_registry(tmp_path,monkeypatch)
+    current={'visits':29,'audience':7,'daily':[{'date':f'2026-01-{i:02d}','count':i} for i in range(1,15)]}
+    source=tmp_path/'current.json';source.write_text(json.dumps(current))
+    registry.register(ToolSpec('browser_extract_text','Read a public page',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,2),
+        lambda inv:ToolResult(inv.invocation_id,inv.tool_name,'completed',{'text':'Public source '+str(inv.arguments['index'])+': '+('finding '*220)}))
+    job=crons.add_cron('Dataset report','0 12 * * *',instructions,artifact_delivery_options={
+        'required_artifact_extensions':['.html'],'requires_attachment_delivery':True,'deliver_required_extensions_only':True})
+    class Model:
+        calls=0
+        packet=None
+        def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
+            if not kw.get('tools'):
+                self.packet=json.loads(kw['messages'][0]['content'][0]['text'])
+                evidence=self.packet['verified_tool_evidence']
+                data=[r['source_data'] for r in evidence if 'source_data' in r]
+                assert current in data, evidence
+                return text_response('<!doctype html><html><body><h1>Dataset</h1><p>Visits 29; audience 7.</p><table>'+''.join(f'<tr><td>{r["date"]}</td><td>{r["count"]}</td></tr>' for r in current['daily'])+'</table></body></html>')
+            self.calls+=1
+            if self.calls==1:
+                return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(i),'name':'browser_extract_text','input':{'index':i}} for i in range(24)]}
+            if self.calls==2:
+                return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'data','name':'file_read','input':{'path':str(source)}}]}
+            raise TimeoutError('External answer generation interrupted')
+    model=Model()
+    outcome=run_single_agent_cron_turn(job,'web:dataset-report',label='Scheduled task',orchestrator=AgentOrchestrator(model_client=model),
+        runtime=runtime,tool_registry=registry,settings=SimpleNamespace(enabled_skill_packs=()),model_client=model)
+    assert model.packet and outcome['artifact_delivery_satisfied'],outcome
+    paths=cron_delivery_artifact_paths_from_result(outcome)
+    assert len(paths)==1
+    document=Path(paths[0]).read_text()
+    assert 'Visits 29; audience 7' in document and '<td>14</td>' in document
+    assert 'unavailable' not in document and 'finding finding' not in document
+
+
+def test_file_write_invalid_bracketed_source_is_validation_not_handler_exception(tmp_path,monkeypatch):
+    from nullion.tools import ToolInvocation
+    runtime,registry=runtime_and_registry(tmp_path,monkeypatch)
+    malformed=registry.invoke(ToolInvocation('invalid-reference','file_write','web:author',{
+        'path':str(tmp_path/'report.html'),'content':'<!doctype html><html><body><a href="https://[missing-host/">Source</a></body></html>'}))
+    assert malformed.status=='failed' and malformed.output['reason']=='placeholder_source_urls'
+    assert 'Invalid IPv6 URL' not in str(malformed.error)
+    valid=registry.invoke(ToolInvocation('valid-reference','file_write','web:author',{
+        'path':str(tmp_path/'report.html'),'content':'<!doctype html><html><body><h1>観測</h1><p>29 visits</p><a href="https://source.test/record">Source</a></body></html>'}))
+    assert valid.status=='completed',valid
+    assert '29 visits' in Path(valid.output['path']).read_text()
+
+
+def test_generated_source_code_does_not_apply_rendered_reference_validation(tmp_path,monkeypatch):
+    from nullion.tools import ToolInvocation
+    runtime,registry=runtime_and_registry(tmp_path,monkeypatch)
+    code='endpoint_template = "https://[host]/record"\nprint(endpoint_template)\n'
+    created=registry.invoke(ToolInvocation('source-template','file_write','web:author',{
+        'path':str(tmp_path/'build_document.py'),'content':code}))
+    assert created.status=='completed',created
+    assert Path(created.output['path']).read_text()==code
+
+
+@pytest.mark.parametrize('recovers,cancel_during_planning', [(True,False),(False,False),(False,True)])
+def test_scheduled_verifier_timeout_never_restarts_completed_work(tmp_path, monkeypatch, recovers, cancel_during_planning):
+    from types import SimpleNamespace
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.crons import CronJob
+    from nullion.cron_delivery import run_single_agent_cron_turn
+    from nullion.model_clients import ModelClientTimeoutError
+    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    from threading import Event
+    cancelled = Event()
+    registry = ToolRegistry()
+    executed = []
+    def read(inv):
+        executed.append(inv.invocation_id)
+        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'result_count': 1,
+            'results': [{'id': 'selected', 'value': 7}]})
+    registry.register(ToolSpec('lookup', 'Read selected data', ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 2), read)
+    class Provider:
+        step = 0
+        budgets = []
+        reasoning_effort = 'high'
+        def create(self, **kw):
+            if 'material-requirements planner' in str(kw.get('system') or ''):
+                self.budgets.append(kw['timeout'])
+                if not recovers or len(self.budgets) == 1:
+                    if cancel_during_planning: cancelled.set()
+                    raise ModelClientTimeoutError('Controlled high-latency provider')
+            reply = workflow_provider_reply(kw, completion=True)
+            if reply is not None:
+                return reply
+            assert kw.get('tools'), 'A failed verifier was misrouted into report repair'
+            self.step += 1
+            if self.step == 1:
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read',
+                    'name': 'lookup', 'input': {}}]}
+            return text_response('The selected value is 7.')
+    provider = Provider()
+    result = run_single_agent_cron_turn(CronJob(id='slow-review', name='確認', schedule='0 * * * *',
+        task='選択した現在の値を調べて報告。'), 'web:slow-review', label='Scheduled task',
+        orchestrator=AgentOrchestrator(model_client=provider), runtime=runtime, tool_registry=registry,
+        settings=SimpleNamespace(), model_client=provider, cancellation_checker=cancelled.is_set)
+    assert len(executed) == 1
+    assert provider.budgets == ([60] if cancel_during_planning else [60, 60])
+    assert provider.reasoning_effort == 'high'
+    expected_fulfilled = True if recovers else False if cancel_during_planning else None
+    assert result['response_fulfilled'] is expected_fulfilled
+    if recovers:
+        assert result['text'] == 'The selected value is 7.'
+    elif cancel_during_planning:
+        assert result['cron_run_cancelled'] is True and result['reason'] == 'stopped_by_user'
+    else:
+        assert not result.get('cron_report_failed')
+        assert result['text'] == 'The selected value is 7.'
+        assert result['response_presentation']['outcome_review_role'] == 'helper'
+        assert not result.get('cron_remaining_work') and not result.get('cron_completion_continuations')
+        assert result['response_presentation']['outcome_review_status'] == 'unavailable'
+    from nullion.runtime_persistence import load_runtime_store
+    rows = load_runtime_store(runtime.checkpoint_path).list_conversation_events('web:slow-review')
+    terminal = next(row for row in rows if row['event_type'] == 'conversation.cron_run')
+    assert terminal['response_fulfilled'] is expected_fulfilled
+    assert len(terminal['tool_results']) == 1
+
+
+def test_long_account_report_recovery_keeps_calendar_checks_and_delivers_once(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.crons import CronJob
+    from nullion.cron_delivery import run_single_agent_cron_turn
+    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    from datetime import UTC, datetime
+    from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
+    for kind in (BoundaryKind.OUTBOUND_NETWORK, BoundaryKind.ACCOUNT_ACCESS):
+        runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(rule_id='fixture-' + kind.value,
+            principal_id=GLOBAL_PERMISSION_PRINCIPAL, kind=kind, mode=PolicyMode.ALLOW, selector='*',
+            created_by='fixture-user', created_at=datetime.now(UTC)))
+    registry = ToolRegistry()
+    reads = []
+    def read(inv):
+        reads.append(inv.tool_name)
+        if inv.tool_name == 'calendar_list':
+            output = {'start': '2026-11-06', 'end': '2026-11-08', 'result_count': 1,
+                'results': [{'id': 'existing', 'summary': 'Renewal', 'start': {'date': '2026-11-07'}}]}
+        else:
+            output = {'message': {'id': inv.arguments['id'], 'subject': 'Renewal ' + inv.arguments['id'],
+                'date': '2026-10-26', 'body': 'Renewal is November 7. ' + ('Additional context. ' * 300)}}
+        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', output)
+    for name in ('email_read', 'calendar_list'):
+        registry.register(ToolSpec(name, 'Read selected account records', ToolRiskLevel.LOW,
+            ToolSideEffectClass.READ, False, 2), read)
+    class Provider:
+        step = 0
+        repairs = 0
+        def create(self, **kw):
+            reply = workflow_provider_reply(kw, completion=True)
+            if reply is not None:
+                return reply
+            if not kw.get('tools'):
+                prompt = kw['messages'][0]['content'][0]['text']
+                evidence = json.loads(prompt.split('Verified compact tool evidence from this run:\n')[1].split('\n\n')[0])
+                calendar = next(row for row in evidence if row.get('tool_name') == 'calendar_list')
+                assert calendar['source_scope']['start'] == '2026-11-06'
+                assert calendar['items'][0]['source_record_id'] == 'existing'
+                assert calendar['items'][0]['start']['date'] == '2026-11-07'
+                assert len([row for row in evidence if row.get('tool_name') == 'email_read']) == 24
+                self.repairs += 1
+                return text_response(json.dumps({'requirements_satisfied': True, 'source_state': 'available',
+                    'evidence_refs': [row['evidence_id'] for row in evidence],
+                    'report': 'Checked 24 renewal messages dated October 26. Renewal is November 7; an existing calendar event was verified. No duplicate created.'}))
+            self.step += 1
+            if self.step == 1:
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(i),
+                    'name': 'email_read', 'input': {'id': str(i)}} for i in range(24)]}
+            if self.step == 2:
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'calendar',
+                    'name': 'calendar_list', 'input': {'start': '2026-11-06T00:00:00-05:00', 'end': '2026-11-08T00:00:00-05:00'}}]}
+            return text_response('I checked your email.\nFrom: billing@example.test\nPreview: Renewal notice.\nDate: October 26.')
+    provider = Provider()
+    result = run_single_agent_cron_turn(CronJob(id='long-report', name='更新', schedule='0 * * * *',
+        task='Read selected renewal records, verify existing calendar events, and report without duplicates.'),
+        'web:long-report', label='Scheduled task', orchestrator=AgentOrchestrator(model_client=provider),
+        runtime=runtime, tool_registry=registry, settings=SimpleNamespace(), model_client=provider)
+    assert result['response_fulfilled'] is True and not result.get('cron_report_failed'), result
+    assert '24 renewal messages' in result['text'] and 'existing calendar event' in result['text']
+    assert provider.repairs == 1 and reads == ['email_read'] * 24 + ['calendar_list']
+
+
+def test_real_chat_email_pagination_reads_next_page_before_answer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from nullion import web_app, tools
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from datetime import UTC, datetime
+    from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    for kind in (BoundaryKind.OUTBOUND_NETWORK, BoundaryKind.ACCOUNT_ACCESS):
+        runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(rule_id='fixture-' + kind.value,
+            principal_id=GLOBAL_PERMISSION_PRINCIPAL, kind=kind, mode=PolicyMode.ALLOW, selector='*',
+            created_by='fixture-user', created_at=datetime.now(UTC)))
+    monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE', 'off')
+    monkeypatch.setattr(tools, '_connector_connection_for_invocation', lambda *_:
+        SimpleNamespace(provider_profile='https://example.test', permission_mode='read'))
+    monkeypatch.setattr(tools, '_email_messages_endpoint_for_provider', lambda *_: 'https://example.test/messages')
+    pages = []
+    def external(inv, *, provider_id, url, params=None, **kw):
+        if url.endswith('/messages'):
+            pages.append(params)
+            return {'messages': [{'id': 'second' if params.get('pageToken') else 'first'}],
+                **({} if params.get('pageToken') else {'nextPageToken': 'next-page'}), 'resultSizeEstimate': 2}
+        identity = url.rsplit('/', 1)[-1]
+        return {'id': identity, 'payload': {'headers': [{'name': 'Subject',
+            'value': '最初の通知' if identity == 'first' else '次の通知'}]}}
+    monkeypatch.setattr(tools, '_connector_json_request', external)
+    registry = tools.ToolRegistry()
+    registry.register(tools.ToolSpec('email_search', 'Search the selected email source', tools.ToolRiskLevel.LOW,
+        tools.ToolSideEffectClass.READ, False, 2, input_schema=tools._email_search_input_schema(supports_pagination=True)),
+        tools._build_connector_email_search_handler())
+    class Provider:
+        step = 0
+        def create(self, **kw):
+            if 'semantic completion reviewer' in str(kw.get('system', '')):
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
+                coverage = packet['source_pagination']
+                assert len(coverage) == 1 and coverage[0]['complete'] is True
+                assert coverage[0]['linked_pages'] == coverage[0]['linked_result_count'] == 2
+            auxiliary = workflow_provider_reply(kw, completion=True)
+            if auxiliary is not None:
+                return auxiliary
+            if 'email_search' not in {row['name'] for row in kw.get('tools', [])}:
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'scope',
+                    'name': 'request_tool_scope', 'input': {'capabilities': ['connector'],
+                        'tool_names': ['email_search'], 'required_tool_names': ['email_search'],
+                        'source_user_requested': True, 'source_evidence': '期限に関するメールの件名をすべて列挙して。'}}]}
+            self.step += 1
+            if self.step <= 2:
+                arguments={'query':'期限','provider_id':'selected','limit':1}
+                if self.step==2:
+                    continuation=None
+                    for message in kw['messages']:
+                        for block in message.get('content',[]) if isinstance(message.get('content'),list) else []:
+                            if block.get('type')!='tool_result':continue
+                            raw=block.get('content',[])
+                            raw=raw if isinstance(raw,str) else ''.join(item.get('text','') for item in raw)
+                            try:payload=json.loads(raw)
+                            except (ValueError,TypeError):continue
+                            output=payload.get('output',{})
+                            if isinstance(output,dict) and output.get('next_page_request'):
+                                continuation=output['next_page_request']
+                    assert continuation and continuation['tool_name']=='email_search'
+                    arguments=continuation['arguments']
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(self.step),
+                    'name': 'email_search', 'input': arguments}]}
+            assert len(pages) == 2
+            return text_response('Matching subjects: 最初の通知; 次の通知.')
+    provider = Provider(); runtime.model_client = provider
+    app = web_app.create_app(runtime, orchestrator=AgentOrchestrator(model_client=provider), registry=registry)
+    with TestClient(app) as client:
+        response = client.post('/api/chat', json={'conversation_id': 'web:page-coverage', 'text': '期限に関するメールの件名をすべて列挙して。', 'auto_approve': True})
+        assert response.status_code == 200, response.text
+        assert all(subject in response.json()['text'] for subject in ['最初の通知', '次の通知']), response.text
+    assert pages == [{'q': '期限', 'maxResults': 1}, {'q': '期限', 'maxResults': 1, 'pageToken': 'next-page'}]
+    turns = runtime.store.list_recent_conversation_events('web:page-coverage')
+    turn = next(row for row in reversed(turns) if row['event_type'] == 'conversation.chat_turn')
+    searches = [row for row in turn['tool_results'] if row['tool_name'] == 'email_search']
+    assert len(searches) == 2 and searches[0]['output']['has_more'] is True
+    assert searches[1]['output']['has_more'] is False and searches[1]['output']['results'][0]['id'] == 'second'
+
+
+def test_high_agent_uses_bounded_checks_without_changing_main_profile(tmp_path, monkeypatch):
+    import sqlite3
+    from dataclasses import dataclass, field
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    with sqlite3.connect(runtime.checkpoint_path) as db:
+        db.execute('CREATE TABLE profile_effects (value INTEGER)')
+    registry = ToolRegistry()
+    registry.register(ToolSpec('opaque_lookup', 'Read selected value', ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 2),
+        lambda inv: ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 7}))
+    def write(inv):
+        with sqlite3.connect(runtime.checkpoint_path) as db:
+            db.execute('INSERT INTO profile_effects VALUES (?)', (inv.arguments['value'],))
+        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 7,
+            'action_receipt': {'type': 'action_receipt', 'action': 'saved', 'object_type': 'selected_value',
+                'object_id': 'selected', 'summary': 'Saved value 7.'}})
+    registry.register(ToolSpec('opaque_save', 'Persist selected value', ToolRiskLevel.LOW, ToolSideEffectClass.WRITE, False, 2), write)
+    @dataclass
+    class Provider:
+        model: str = 'configured-model'
+        reasoning_effort: str = 'high'
+        state: dict = field(default_factory=lambda: {'step': 0, 'checks': []})
+        def create(self, **kw):
+            system = str(kw.get('system') or '')
+            if any(role in system for role in ('Workflow action preflight.', 'material-requirements planner', 'semantic completion reviewer')):
+                assert self.reasoning_effort == 'low'
+                self.state['checks'].append(system.split('.')[0])
+                return workflow_provider_reply(kw, completion=True, action=True)
+            assert self.reasoning_effort == 'high'
+            self.state['step'] += 1
+            if self.state['step'] <= 2:
+                name = 'opaque_lookup' if self.state['step'] == 1 else 'opaque_save'
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(self.state['step']),
+                    'name': name, 'input': {} if self.state['step'] == 1 else {'value': 7}}]}
+            return text_response('Saved the selected value: 7.')
+    provider = Provider()
+    result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:profiles', principal_id='web:profiles',
+        user_message='選択した値を調べて保存して。', conversation_history=[], tool_registry=registry,
+        policy_store=runtime.store, approval_store=runtime.store)
+    assert result.response_fulfilled is True and provider.reasoning_effort == 'high', result
+    assert len(provider.state['checks']) == 3
+    with sqlite3.connect(runtime.checkpoint_path) as db:
+        assert db.execute('SELECT value FROM profile_effects').fetchall() == [(7,)]
+
+
+def test_recovery_keeps_planned_conditional_action_and_normal_approval(tmp_path, monkeypatch):
+    import sqlite3
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
+    from nullion.approvals import approve, create_permission_grant
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    registry = ToolRegistry(); writes = []
+    registry.register(ToolSpec('observe', 'Read selected state', ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 2),
+        lambda inv: ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'needs_action': True, 'value': 7}))
+    def save(inv):
+        writes.append(inv.arguments['value'])
+        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 7,
+            'action_receipt': {'type': 'action_receipt', 'action': 'saved', 'object_type': 'record',
+                'object_id': 'selected', 'summary': 'Saved selected record.'}})
+    registry.register(ToolSpec('conditional_save', 'Save after condition and approval', ToolRiskLevel.HIGH,
+        ToolSideEffectClass.WRITE, True, 2), save)
+    class Provider:
+        step = 0
+        reviews = 0
+        def create(self, **kw):
+            system = str(kw.get('system') or '')
+            if 'material-requirements planner' in system:
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
+                assert 'conditional_save' in {r['name'] for r in packet['current_turn_tool_catalog']}
+            if 'semantic completion reviewer' in system:
+                self.reviews += 1
+                if self.reviews == 1:
+                    return text_response(json.dumps({'disposition': 'retry', 'unresolved_requirements': ['The selected conditional action is not committed.'],
+                        'retry_tool_names': ['observe']}))
+            auxiliary = workflow_provider_reply(kw, completion=True, action=True)
+            if auxiliary is not None: return auxiliary
+            self.step += 1
+            if self.step == 1:
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read', 'name': 'observe', 'input': {}}]}
+            if self.step == 2: return text_response('Read the selected state.')
+            if self.step == 3:
+                assert 'conditional_save' in {r['name'] for r in kw['tools']}
+                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'save', 'name': 'conditional_save', 'input': {'value': 7}}]}
+            return text_response('Saved the selected value: 7.')
+    model = Provider(); runner = AgentOrchestrator(model_client=model)
+    kwargs = dict(conversation_id='web:conditional', principal_id='web:conditional', user_message='状態を確認し、必要なら選択した項目を保存。',
+        tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store, max_iterations=6,
+        tool_flow_context={'planned_action_tool_names': ['conditional_save']})
+    first = runner.run_turn(**kwargs, conversation_history=[])
+    assert first.suspended_for_approval and not writes, first
+    request = runtime.store.get_approval_request(first.approval_id)
+    runtime.store.add_approval_request(approve(request, decided_by='fixture'))
+    runtime.store.add_permission_grant(create_permission_grant(approval_id=first.approval_id, principal_id='web:conditional',
+        permission='tool:conditional_save', granted_by='fixture'))
+    final = runner.resume_turn(**kwargs, messages_snapshot=runtime.store.get_suspended_turn(first.approval_id).messages_snapshot, previous_result=first)
+    assert writes == [7] and final.response_fulfilled is True, final
+
+
+@pytest.mark.parametrize('prompt', ['Summarize the selected records and their existing matching event.', '選択された記録と既存の一致する予定をまとめて。'])
+def test_batch_report_review_receives_hydrated_records_and_late_check(tmp_path, monkeypatch, prompt):
+    from types import SimpleNamespace
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.crons import CronJob
+    from nullion.cron_delivery import run_single_agent_cron_turn
+    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
+    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
+    registry = ToolRegistry(); reads = []; reviews = []
+    def read(inv):
+        index = inv.arguments['index']; reads.append(index)
+        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {
+            'id':str(index), 'summary':'Read complete',
+            'message':{'id':str(index), 'subject':'記録'+str(index),
+                'body':'Due 2026-11-14, amount '+str(40+index)+'. '+('Source context. '*30)},
+            'evidence_scope':{'message_sent_at':'2026-10-26T10:00:00Z'}})
+    registry.register(ToolSpec('record_read', 'Read one selected record', ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 2, input_schema={'type':'object','properties':{'index':{'type':'integer'}},'required':['index']}),read)
+    registry.register(ToolSpec('existing_check', 'Check existing matching event', ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 2),lambda inv:ToolResult(inv.invocation_id, inv.tool_name,'completed',{
+            'start':'2026-11-14T00:00:00Z','end':'2026-11-15T00:00:00Z','result_count':1,
+            'results':[{'id':'existing','summary':'Matching obligation','start':{'dateTime':'2026-11-14T09:00:00Z'}}]}))
+    class Provider:
+        calls = 0
+        def create(self, **kw):
+            if 'semantic completion reviewer' in kw.get('system',''):
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
+                records = [row for row in packet['tool_evidence'] if row['tool_name']=='record_read']
+                from nullion.agent_orchestrator import _completion_review_request_timeout
+                budget = _completion_review_request_timeout(kw['max_tokens'],
+                    request_chars=len(json.dumps(packet,ensure_ascii=False)))
+                # The common deadline includes local request preparation;
+                # a provider receives the remaining window, not a fresh one.
+                assert budget - 1 <= kw['timeout'] <= budget
+                assert len(records)==24
+                assert {row['output']['message']['id'] for row in records} == {str(i) for i in range(24)}
+                assert all('Due 2026-11-14' in row['output']['message']['body'] for row in records)
+                check = next(row for row in packet['tool_evidence'] if row['tool_name']=='existing_check')
+                assert check['output']['results'][0]['start']['dateTime']=='2026-11-14T09:00:00Z'
+                reviews.append(packet)
+            auxiliary = workflow_provider_reply(kw)
+            if auxiliary is not None:return auxiliary
+            self.calls += 1
+            if self.calls <= 24:
+                return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(self.calls),
+                    'name':'record_read','input':{'index':self.calls-1}}]}
+            if self.calls == 25:
+                return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'check','name':'existing_check','input':{}}]}
+            return text_response('Matching obligation: an existing event on 2026-11-14 at 09:00 UTC. 24 records checked, amounts 40 through 63. No duplicate was created.')
+    monkeypatch.setenv('NULLION_CRON_AGENT_MAX_ITERATIONS','32')
+    provider=Provider()
+    result=run_single_agent_cron_turn(CronJob(id='batch',name='記録',schedule='0 * * * *',task=prompt),
+        'web:batch',label='Scheduled run',orchestrator=AgentOrchestrator(model_client=provider),
+        runtime=runtime,tool_registry=registry,settings=SimpleNamespace(),model_client=provider)
+    assert not result.get('cron_report_failed') and result['response_fulfilled'] is True, json.dumps({
+        key:value for key,value in result.items() if key not in {'tool_results', 'messages_snapshot'}}, default=str)
+    assert len(reads)==24 and len(reviews)==1 and provider.calls==26
+    from nullion.runtime_persistence import load_runtime_store
+    persisted=load_runtime_store(runtime.checkpoint_path).list_conversation_events('web:batch')
+    assert any(row['event_type']=='conversation.cron_run' and row['response_fulfilled'] for row in persisted)
+
+
+@pytest.mark.parametrize('recover',[False,True])
+@pytest.mark.parametrize('has_prior',[False,True])
+@pytest.mark.parametrize('prompt',['Check for a newly observed reading.','新しい観測値を確認して。'])
+def test_independent_monitor_review_receives_native_delivery_history(tmp_path,monkeypatch,has_prior,prompt,recover):
+    from types import SimpleNamespace
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.crons import CronJob
+    from nullion.cron_delivery import run_single_agent_cron_turn,checkpoint_cron_delivery_records
+    from nullion.tools import ToolRegistry,ToolSpec,ToolRiskLevel,ToolSideEffectClass,ToolResult
+    runtime,_=runtime_and_registry(tmp_path,monkeypatch)
+    from nullion.memory import UserMemoryEntry,UserMemoryKind
+    monkeypatch.setenv('NULLION_MEMORY_ENABLED','1')
+    owner='workspace:workspace_monitor'
+    runtime.store.add_user_memory_entry(UserMemoryEntry('profile',owner,UserMemoryKind.FACT,'profile_name','Example Owner'))
+    runtime.store.add_user_memory_entry(UserMemoryEntry('foreign','workspace:workspace_admin',UserMemoryKind.FACT,'profile_name','Foreign Owner'))
+    runtime.checkpoint(force=True)
+    registry=ToolRegistry();calls=[];checks=[]
+    from datetime import UTC,datetime
+    from nullion.policy import BoundaryKind,GLOBAL_PERMISSION_PRINCIPAL,BoundaryPolicyRule,PolicyMode
+    runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(rule_id='reading-source',
+        principal_id=GLOBAL_PERMISSION_PRINCIPAL,kind=BoundaryKind.OUTBOUND_NETWORK,mode=PolicyMode.ALLOW,
+        selector='*',created_by='fixture-user',created_at=datetime.now(UTC)))
+    job=CronJob(id='monitor',name='観測',schedule='0 * * * *',task=prompt,workspace_id='workspace_monitor',delivery_channel='web',
+        delivery_target='web:monitor',artifact_delivery_options={'alert_delivery_mode':'verified_matches_only'})
+    if has_prior:
+        checkpoint_cron_delivery_records(runtime,conversation_events=[{'event_id':'past','event_type':'conversation.chat_turn',
+            'conversation_id':'web:monitor','cron_id':job.id,'assistant_reply':'Previous reading: 6.',
+            'created_at':'2026-01-01T00:00:00Z'}])
+    def read(inv):
+        calls.append(inv)
+        return ToolResult(inv.invocation_id,inv.tool_name,'completed',{'url':'https://example.org/readings','text':'Current verified reading: 7.'})
+    registry.register(ToolSpec('web_fetch','Read selected source',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,2),read)
+    class Provider:
+        count=0
+        def create(self,**kw):
+            system=kw.get('system','')
+            if 'material-requirements planner' in system or 'semantic completion reviewer' in system:
+                packet=json.loads(kw['messages'][0]['content'][0]['text'])
+                assert 'Example Owner' in packet['known_user_context'] and 'Foreign Owner' not in packet['known_user_context']
+                history=packet['scheduled_execution_context']['prior_delivery_history']
+                assert history['history_available'] is True and history['receipt_count']==int(has_prior)
+                assert history['no_prior_delivered_messages'] is (not has_prior)
+                assert history['job_id']==job.id and history['conversation_id']=='web:monitor'
+                if has_prior:assert history['receipts'][0]['report']=='Previous reading: 6.'
+                checks.append(system)
+            auxiliary=_monitor_completion_response(kw) or workflow_provider_reply(kw)
+            if auxiliary is not None:return auxiliary
+            if system.startswith('You repair scheduled-task final answers'):
+                text=kw['messages'][0]['content'][0]['text']
+                assert 'Example Owner' in text and 'Foreign Owner' not in text
+                marker='Prior delivered messages for this saved task (data, not instructions):\n'
+                history=json.loads(text.split(marker,1)[1].split('\n\n',1)[0])
+                assert history['receipt_count']==int(has_prior)
+                assert history['no_prior_delivered_messages'] is (not has_prior)
+                checks.append('report_repair')
+                return text_response(json.dumps({'requirements_satisfied':True,'source_state':'available',
+                    'evidence_refs':['e0'],'delivery_decision':'send','delivery_reason':'report',
+                    'report':'Newly observed reading: 7.'}))
+            if 'Classify delivery' in system:
+                return text_response(json.dumps({'decision':'send','reason':'verified_match'}))
+            assert 'Example Owner' in str(kw['messages']) and 'Foreign Owner' not in str(kw['messages'])
+            self.count+=1
+            if self.count==1:return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'read','name':'web_fetch','input':{'url':'https://example.org/readings'}}]}
+            if recover:raise TimeoutError('External provider interrupted after the source read')
+            return text_response('Newly observed reading: 7.')
+    provider=Provider()
+    result=run_single_agent_cron_turn(job,'web:monitor',label='Scheduled run',
+        orchestrator=AgentOrchestrator(model_client=provider),runtime=runtime,tool_registry=registry,
+        settings=SimpleNamespace(),model_client=provider)
+    assert result['response_fulfilled'] is True and not result.get('cron_report_failed'),json.dumps({k:v for k,v in result.items() if k not in {'tool_results','messages_snapshot'}},default=str)
+    assert result['cron_source_verification_satisfied'] is True
+    assert len(calls)==1 and provider.count==(3 if recover else 2)
+    assert any('material-requirements planner' in value for value in checks)
+    assert any('semantic completion reviewer' in value for value in checks)
+
+    assert ('report_repair' in checks) is recover
+    assert runtime.store.get_user_memory_entry('profile').use_score==0

@@ -1,4 +1,5 @@
 """Actual status/approval routes, SQLite and terminal execution; provider boundary only is faked."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import errno
 from datetime import UTC, datetime
 import os
@@ -67,6 +68,8 @@ def test_real_graph_stops_on_disk_exhaustion_without_cleanup_or_extra_model_call
     class Model:
         calls=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls+=1
             pytest.fail('Disk exhaustion must end the run before recovery planning')
     model=Model()
@@ -146,7 +149,10 @@ async def test_telegram_delete_review_preserves_full_command_and_deny_is_termina
     assert '1. Delete\n2. Deny' in text
     assert 'Requested URL:' not in text
     class Model:
-        def create(self,**kwargs):pytest.fail('Deny must never execute the paused operation or ask the model')
+        def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
+            pytest.fail('Deny must never execute the paused operation or ask the model')
     runner=AgentOrchestrator(model_client=Model())
     settings=load_settings(env={'NULLION_TELEGRAM_OPERATOR_CHAT_ID':'77','NULLION_TELEGRAM_CHAT_ENABLED':'true','NULLION_TELEGRAM_BOT_TOKEN':'123456:abcdefghijklmnopqrstuvwxyz'})
     service=telegram_app.ChatOperatorService(runtime=runtime,settings=settings,bot_token='fixture',operator_chat_id='77',agent_orchestrator=runner)

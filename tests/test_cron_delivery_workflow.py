@@ -12,6 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+# Bootstrap tests below patch lazy-import dependencies. Load their consumer
+# before those patches so its imported aliases cannot retain a test double
+# after monkeypatch restores the original defining module.
+import nullion.chat_operator
+
 from nullion.cron_delivery import (
     CronRunDeliveryCallbacks,
     DEFAULT_CRON_NO_OUTPUT_MESSAGE,
@@ -249,8 +254,8 @@ def test_cron_agent_prompt_declares_file_text_silent_and_default_delivery_contra
     assert "attach it with a MEDIA line" in prompt
     assert "browser_connection_notice" in prompt
     assert "do not imply that authenticated browser state was available" in prompt
-    assert "Shape the visible reply to the amount and type of content" in prompt
-    assert "Do not force every reply into bullets" in prompt
+    assert "Apply the shared user presentation policy" in prompt
+    assert "Let the chat client wrap prose naturally" in prompt
     assert "return no output when nothing changed" in prompt
     assert DEFAULT_CRON_NO_OUTPUT_MESSAGE not in prompt
     assert "without source evidence" in prompt
@@ -284,7 +289,7 @@ def test_platform_attachment_delivery_preserves_scheduled_task_heading_block(tmp
     delivery = prepare_reply_for_platform_delivery(reply, principal_id="telegram:100001")
 
     assert delivery.text == (
-        "⏰ **SCHEDULED TASK: Random website artifact generator**\n\n"
+        "**SCHEDULED TASK: Random website artifact generator**\n\n"
         "Random website artifact generator completed\n"
         "Websites used this run"
     )
@@ -368,12 +373,10 @@ def test_scheduled_task_delivery_text_formats_dense_list_for_messaging() -> None
 
     delivered = scheduled_task_delivery_text(Job(name="Email deadline triage"), body)
 
-    assert delivered.startswith("⏰ **SCHEDULED TASK: Email deadline triage**\n\n")
-    assert "📌 **Found/read relevant recent messages**\n\n• Katona" in delivered
-    assert "\n  1. Calendar already has consultation event." in delivered
-    assert "\n\n• Betterment automatic deposit" in delivered
-    assert "documents, and pay initial legal fee" not in delivered
-    assert delivered.count("\n\n• ") == 2
+    # Legacy prose is authored content, not a schema: do not guess headings,
+    # join scalar values or re-parent numbered choices by matching wording.
+    assert delivered.endswith(body)
+    assert delivered.count('SCHEDULED TASK:')==1
 
 
 def test_scheduled_task_delivery_text_keeps_simple_bullet_summary_compact() -> None:
@@ -386,13 +389,10 @@ def test_scheduled_task_delivery_text_keeps_simple_bullet_summary_compact() -> N
 
     delivered = scheduled_task_delivery_text(Job(name="Daily weather"), body)
 
-    assert delivered == (
-        "⏰ **SCHEDULED TASK: Daily weather**\n\n"
-        "📌 **Weather report**\n\n"
-        "• 94°/63° — overcast\n"
-        "• Rain outlook: 0% chance; dry.\n"
-        "• Wear: light breathable clothes; sunglasses."
-    )
+    # Legacy prose is authored content, not a schema: do not guess headings,
+    # join scalar values or re-parent numbered choices by matching wording.
+    assert delivered.endswith(body)
+    assert delivered.count('SCHEDULED TASK:')==1
 
 
 def test_scheduled_task_delivery_text_keeps_numbered_details_attached_to_parent_item() -> None:
@@ -407,11 +407,10 @@ def test_scheduled_task_delivery_text_keeps_numbered_details_attached_to_parent_
 
     delivered = scheduled_task_delivery_text(Job(name="Grouped records"), body)
 
-    assert "• First record" in delivered
-    assert "\n  1. Existing event found." in delivered
-    assert "\n  2. No duplicate created." in delivered
-    assert "\n\n• Second record summary." in delivered
-    assert "\n  3. No action needed." in delivered
+    # Legacy prose is authored content, not a schema: do not guess headings,
+    # join scalar values or re-parent numbered choices by matching wording.
+    assert delivered.endswith(body)
+    assert delivered.count('SCHEDULED TASK:')==1
 
 
 def test_scheduled_task_delivery_text_compacts_numbered_scalar_result_pairs() -> None:
@@ -429,14 +428,10 @@ def test_scheduled_task_delivery_text_compacts_numbered_scalar_result_pairs() ->
 
     delivered = scheduled_task_delivery_text(Job(name="Mid-Market Stock Alert"), body)
 
-    assert delivered == (
-        "⏰ **SCHEDULED TASK: Mid-Market Stock Alert**\n\n"
-        "📌 **Results I found**\n\n"
-        "1. Critical Metals Corp — $9.41\n"
-        "2. Microsoft Corp — $403.45\n"
-        "3. TMC the metals company Inc — $4.93\n"
-        "4. Tempus AI Inc — $50.95"
-    )
+    # Legacy prose is authored content, not a schema: do not guess headings,
+    # join scalar values or re-parent numbered choices by matching wording.
+    assert delivered.endswith(body)
+    assert delivered.count('SCHEDULED TASK:')==1
 
 
 def test_scheduled_task_delivery_text_compacts_heading_paragraph_groups_for_chat() -> None:
@@ -456,16 +451,10 @@ def test_scheduled_task_delivery_text_compacts_heading_paragraph_groups_for_chat
 
     delivered = scheduled_task_delivery_text(Job(name="Synthetic watch"), body)
 
-    assert delivered.startswith("⏰ **SCHEDULED TASK: Synthetic watch**\n\n")
-    assert "📌 **Daily synthetic update**\n\n📌 **Primary movement**" in delivered
-    assert "\n\n• Jun 17, 6:00pm — Rooftop venue, Metro City\n" in delivered
-    assert "\n• Vendor A is now from $203, down from prior $221.\n" in delivered
-    assert "\n• Link: https://example.com/very/long/link/path/that/will/be-hard-on-mobile\n" in delivered
-    assert "\n\n📌 **New broader region listing**\n\n• Jun 22, 8:00pm" in delivered
-    assert "\n\n📌 **Other nearby references checked today**\n\n• Jun 24" in delivered
-    assert "Primary movement:" not in delivered
-    assert "\n\nVendor A is now" not in delivered
-    assert "\n\nLink: https://example.com" not in delivered
+    # Legacy prose is authored content, not a schema: do not guess headings,
+    # join scalar values or re-parent numbered choices by matching wording.
+    assert delivered.endswith(body)
+    assert delivered.count('SCHEDULED TASK:')==1
 
 
 def test_scheduled_task_delivery_text_preserves_emoji_bold_heading_without_trailing_stars() -> None:
@@ -3438,13 +3427,27 @@ def test_cron_agent_iteration_budget_is_separate_from_chat_default(monkeypatch) 
     monkeypatch.setenv("NULLION_AGENT_TURN_MAX_ITERATIONS", "12")
     monkeypatch.delenv("NULLION_CRON_AGENT_MAX_ITERATIONS", raising=False)
 
-    assert default_cron_agent_max_iterations() == 32
+    assert default_cron_agent_max_iterations() == 64
 
     monkeypatch.setenv("NULLION_CRON_AGENT_MAX_ITERATIONS", "36")
     assert default_cron_agent_max_iterations() == 36
 
     monkeypatch.setenv("NULLION_CRON_AGENT_MAX_ITERATIONS", "200")
-    assert default_cron_agent_max_iterations() == 40
+    assert default_cron_agent_max_iterations() == 200
+
+
+def test_scheduled_budget_change_preserves_chat_and_validates_its_own_configuration(monkeypatch):
+    from nullion.agent_turn_limits import default_agent_turn_max_iterations
+    monkeypatch.delenv('NULLION_CRON_AGENT_MAX_ITERATIONS', raising=False)
+    monkeypatch.delenv('NULLION_AGENT_TURN_MAX_ITERATIONS', raising=False)
+    assert default_agent_turn_max_iterations() == 48
+    assert default_cron_agent_max_iterations() * 2 == 128
+    for raw, expected in [('0', 1), ('-5', 1), ('invalid', 64), ('', 64), ('96', 96)]:
+        monkeypatch.setenv('NULLION_CRON_AGENT_MAX_ITERATIONS', raw)
+        assert default_cron_agent_max_iterations() == expected
+    monkeypatch.delenv('NULLION_CRON_AGENT_MAX_ITERATIONS')
+    monkeypatch.setenv('NULLION_AGENT_TURN_MAX_ITERATIONS', '200')
+    assert default_cron_agent_max_iterations() == default_agent_turn_max_iterations() == 96
 
 
 def test_run_single_agent_cron_turn_passes_cron_iteration_budget(monkeypatch, tmp_path) -> None:
@@ -3504,7 +3507,9 @@ def test_run_single_agent_cron_turn_passes_cron_iteration_budget(monkeypatch, tm
     assert result["reason"] == "cron_required_artifact_missing"
     assert result["cron_failure_notice"] is True
     assert result["response_fulfilled"] is False
-    assert captured["max_iterations"] == 32
+    assert captured["max_iterations"] == 128
+    assert captured["tool_flow_context"]["producer_iteration_budget_fixed"] is True
+    assert callable(captured["completion_preparer"])
     assert captured["tool_flow_context"]["scheduled_task_run"] is True
     assert captured["tool_flow_context"]["requires_artifact_delivery"] is True
     assert captured["tool_flow_context"]["required_artifact_extensions"] == [".html"]
@@ -3614,96 +3619,37 @@ def test_structured_html_continuation_stops_when_stalled_unsafe_or_exhausted() -
         assert calls == expected_timeouts
 
 
-def test_run_single_agent_cron_turn_recovers_required_html_after_model_timeout(monkeypatch, tmp_path) -> None:
+def test_scheduled_content_preparation_recovers_required_html_after_model_timeout(monkeypatch, tmp_path) -> None:
+    from nullion.completion_pipeline import prepare_completion
+    from nullion.cron_delivery import _ScheduledCompletionPreparer
+    from nullion.report_completion import MARKER
     monkeypatch.setattr("nullion.artifacts.artifact_root_for_principal", lambda principal_id: str(tmp_path))
-    monkeypatch.setattr("nullion.builder_capabilities.format_installed_dependency_context", lambda runtime: "")
-    monkeypatch.setattr("nullion.runtime_config.format_runtime_config_for_prompt", lambda model_client: "")
-    monkeypatch.setattr("nullion.skill_pack_catalog.skill_pack_access_prompt", lambda *args, **kwargs: "")
-    monkeypatch.setattr(
-        "nullion.skill_pack_installer.format_cached_enabled_skill_pack_index_for_prompt",
-        lambda *args, **kwargs: "",
-    )
-    monkeypatch.setattr("nullion.system_context.build_system_context_snapshot", lambda tool_registry: object())
-    monkeypatch.setattr("nullion.system_context.format_compact_system_context_for_prompt", lambda snapshot: "")
-    monkeypatch.setattr("nullion.workspace_storage.format_workspace_storage_for_prompt", lambda principal_id: "")
-    monkeypatch.setattr(
-        "nullion.cron_execution_tools.build_cron_connector_scope_decision",
-        lambda **kwargs: SimpleNamespace(allow_connector_tools=False, provider_ids=()),
-    )
-    monkeypatch.setattr("nullion.cron_execution_tools.structured_cron_passthrough_tool_names", lambda registry: ())
-
     class RecoveryClient:
         def create(self, **kwargs):
             payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
             assert payload["instructions"] == "make the brief"
-            return {"content": [{"type": "text", "text": json.dumps({
-                "requirements_satisfied": True,
-                "html": "<!doctype html><html><body>MSFT 403.45 USD; NVDA 181.3 USD</body></html>",
-            })}]}
+            metadata = {"contract_id": payload["report_outcome_contract"]["contract_id"],
+                "status": "complete", "all_material_requirements_enumerated": True, "remaining_work": []}
+            return {"content": [{"type": "text", "text":
+                "<!doctype html><html><body>MSFT 403.45 USD; NVDA 181.3 USD<!--"
+                + MARKER + json.dumps(metadata) + "--></body></html>"}]}
+    job = Job(name="Post-market report", task="make the brief", artifact_delivery_options={
+        "requires_attachment_delivery": True, "required_artifact_extensions": [".html"],
+        "required_artifact_content_tokens": ["MSFT", "NVDA"]})
+    producer = _ScheduledCompletionPreparer(job, "telegram:100001", model_client=RecoveryClient(),
+        record_preflight=lambda *args, **kwargs: None)
+    source = ToolResult("quotes-1", "market_quote", "completed", {"quotes": [
+        {"symbol": "MSFT", "price": 403.45}, {"symbol": "NVDA", "price": 181.3}]})
+    state = {"completion_preparer": producer, "tool_registry": ToolRegistry(), "tool_results": [source],
+        "artifacts": [], "completion_interruption": {"model_timed_out": True}}
+    prepared, text, changed = prepare_completion(state, "The model response timed out.")
+    assert changed and len(prepared["artifacts"]) == 1
+    assert "MSFT 403.45" in Path(prepared["artifacts"][0]).read_text()
+    assert producer.payload["cron_structured_artifact_recovered"] is True
+    assert producer.payload["cron_agent_model_timed_out_before_structured_artifact_recovery"] is True
+    assert prepared["tool_results"][0] == source
+    assert "response_fulfilled" not in prepared, "Content production cannot certify the original goal"
 
-    class FakeOrchestrator:
-        model_client = RecoveryClient()
-
-        def run_turn(self, **kwargs):  # noqa: ANN003
-            _ = kwargs
-            return SimpleNamespace(
-                final_text="I couldn't complete this because the model timed out.",
-                tool_results=[
-                    ToolResult(
-                        "quotes-1",
-                        "market_quote",
-                        "completed",
-                        {
-                            "quotes": [
-                                {"symbol": "MSFT", "name": "Microsoft", "price": 403.45, "currency": "USD"},
-                                {"symbol": "NVDA", "name": "NVIDIA", "price": 181.3, "currency": "USD"},
-                            ]
-                        },
-                    )
-                ],
-                artifacts=[],
-                suspended_for_approval=False,
-                approval_id=None,
-                reached_iteration_limit=False,
-                raw_tool_payload_blocked=False,
-                response_fulfilled=False,
-                model_timed_out=True,
-                artifact_delivery_required=True,
-                artifact_delivery_satisfied=False,
-                required_artifact_extensions=(".html",),
-            )
-
-    result = run_single_agent_cron_turn(
-        Job(
-            name="Post-market report",
-            artifact_delivery_options={
-                "requires_attachment_delivery": True,
-                "required_artifact_extensions": ["html"],
-                "required_artifact_content_tokens": ["MSFT", "NVDA"],
-                "deliver_required_extensions_only": True,
-            },
-        ),
-        "telegram:100001",
-        label="Scheduled task",
-        orchestrator=FakeOrchestrator(),
-        runtime=SimpleNamespace(store=None),
-        tool_registry=ToolRegistry(),
-        settings=SimpleNamespace(enabled_skill_packs=()),
-    )
-
-    assert result["cron_structured_artifact_recovered"] is True
-    assert result["cron_agent_model_timed_out_before_structured_artifact_recovery"] is True
-    assert result["model_timed_out"] is False
-    assert result["response_fulfilled"] is True
-    assert result["artifact_delivery_satisfied"] is True
-    assert result["text"] == "Report attached."
-    paths = cron_delivery_artifact_paths_from_result(result)
-    assert len(paths) == 1
-    assert Path(paths[0]).suffix == ".html"
-    assert Path(paths[0]).is_file()
-    delivered = cron_delivery_text_from_result(result)
-    assert delivered.count("MEDIA:") == 1
-    assert "model timed out" not in delivered
 
 
 def test_structured_html_terminal_limit_accepts_existing_complete_report(monkeypatch, tmp_path) -> None:
@@ -3778,215 +3724,57 @@ def test_structured_html_timeout_recovery_refuses_unmatched_evidence(monkeypatch
     assert list(tmp_path.glob("*.html")) == []
 
 
-def test_run_single_agent_cron_turn_repairs_email_preview_dump_before_delivery(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("NULLION_AGENT_TURN_MAX_ITERATIONS", "12")
-    monkeypatch.delenv("NULLION_CRON_AGENT_MAX_ITERATIONS", raising=False)
-    monkeypatch.setattr("nullion.artifacts.artifact_root_for_principal", lambda principal_id: str(tmp_path))
-    monkeypatch.setattr("nullion.builder_capabilities.format_installed_dependency_context", lambda runtime: "")
-    monkeypatch.setattr("nullion.runtime_config.format_runtime_config_for_prompt", lambda model_client: "")
-    monkeypatch.setattr("nullion.skill_pack_catalog.skill_pack_access_prompt", lambda *args, **kwargs: "")
-    monkeypatch.setattr(
-        "nullion.skill_pack_installer.format_cached_enabled_skill_pack_index_for_prompt",
-        lambda *args, **kwargs: "",
-    )
-    monkeypatch.setattr("nullion.system_context.build_system_context_snapshot", lambda tool_registry: object())
-    monkeypatch.setattr("nullion.system_context.format_compact_system_context_for_prompt", lambda snapshot: "")
-    monkeypatch.setattr("nullion.workspace_storage.format_workspace_storage_for_prompt", lambda principal_id: "")
-    monkeypatch.setattr(
-        "nullion.cron_execution_tools.build_cron_connector_scope_decision",
-        lambda **kwargs: SimpleNamespace(allow_connector_tools=True, provider_ids=("gmail",)),
-    )
-    monkeypatch.setattr("nullion.cron_execution_tools.structured_cron_passthrough_tool_names", lambda registry: ())
-
-    repaired_report = (
-        "📬 **Urgent deadlines/payments due soon**\n\n"
-        "- None verified from the receipt email.\n\n"
-        "📌 **Items needing review**\n\n"
-        "- Sullivan Medical Midtown sent a payment receipt on Jun 9, 2026; no deadline or next action was verified."
-    )
-
-    class FakeModelClient:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        def create(self, **kwargs):  # noqa: ANN003
-            self.calls.append(kwargs)
-            return {"content": [{"type": "text", "text": json.dumps({"requirements_satisfied": True, "source_state": "available", "evidence_refs": ["e0"], "report": repaired_report})}]}
-
-    email_body = (
-        "Keep this receipt for your records Sullivan Medical Midtown Your receipt from Sullivan Medical Midtown "
-        "Payment Receipt Thank you for your recent payment with Todd Mcniff Md, Pc on 06/09/2026."
-    )
-    tool_result = ToolResult(
-        "email-read-1",
-        "email_read",
-        "completed",
-        {
-            "message": {
-                "headers": {
-                    "from": "Sullivan Medical Midtown <noreply@patient-message.com>",
-                    "date": "Tue, 09 Jun 2026 15:29:53 +0000",
-                    "subject": "Your receipt from Sullivan Medical Midtown",
-                },
-                "snippet": "Keep this receipt for your records Sullivan Medical Midtown Your receipt",
-                "body": email_body,
-            }
-        },
-    )
-    bad_final = (
-        "✉️ I checked your email.\n\n"
-        "**Your receipt from Sullivan Medical Midtown**\n"
-        "From: Sullivan Medical Midtown <noreply@patient-message.com>\n"
-        "Date: Tue, 09 Jun 2026 15:29:53 +0000\n\n"
-        "Preview: Keep this receipt for your records Sullivan Medical Midtown Your receipt from "
-        "Sullivan Medical Midtown"
-    )
-    model_client = FakeModelClient()
-
-    class FakeOrchestrator:
-        def __init__(self) -> None:
-            self.model_client = model_client
-
-        def run_turn(self, **kwargs):  # noqa: ANN003
-            _ = kwargs
-            return SimpleNamespace(
-                final_text=bad_final,
-                tool_results=[tool_result],
-                artifacts=[],
-                suspended_for_approval=False,
-                approval_id=None,
-                reached_iteration_limit=False,
-                raw_tool_payload_blocked=False,
-            )
-
-    events: list[tuple[str, dict[str, object]]] = []
-
-    result = run_single_agent_cron_turn(
-        Job(
-            name="Email deadline triage",
-            task="Report urgent deadlines/payments due soon and items needing review.",
-        ),
-        "telegram:100001",
-        label="Manual scheduled task run",
-        orchestrator=FakeOrchestrator(),
-        runtime=SimpleNamespace(store=None),
-        tool_registry=ToolRegistry(),
-        settings=SimpleNamespace(enabled_skill_packs=()),
-        record_event=lambda event_type, *args, **kwargs: events.append((event_type, dict(kwargs))),
-    )
-
-    assert result["cron_agent_final_repaired"] is True
-    assert result["cron_agent_final_repair_reason"] == "account_preview_dumped"
-    assert result["text"] == repaired_report
-    assert model_client.calls
-    repair_prompt = model_client.calls[0]["messages"][0]["content"][0]["text"]
-    assert "Scheduled task instructions" in repair_prompt
-    assert "Verified compact tool evidence" in repair_prompt
-
-    delivered = cron_delivery_text_from_result(result)
-
-    assert "copied an email preview instead of the scheduled-task report" not in delivered
-    assert "Urgent deadlines/payments due soon" in delivered
-    assert "no deadline or next action was verified" in delivered
-    assert any(kwargs.get("stage") == "final_repaired" for _event_type, kwargs in events)
+def test_scheduled_content_preparation_uses_typed_email_revision_without_repeating_source_reads(monkeypatch, tmp_path) -> None:
+    from nullion.agent_orchestrator import _CompletionReviewDecision
+    from nullion.completion_pipeline import prepare_completion
+    from nullion.cron_delivery import _ScheduledCompletionPreparer
+    from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass
+    report = "Urgent deadlines: none verified.\n\nA payment receipt needs no new calendar event."
+    calls = []
+    class Client:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            assert not kwargs["tools"]
+            return {"content": [{"type": "text", "text": json.dumps({"requirements_satisfied": True,
+                "source_state": "available", "evidence_refs": ["e0"], "report": report})}]}
+    source = ToolResult("email-1", "email_read", "completed", {"message": {"headers": {
+        "subject": "Payment receipt", "date": "2026-06-09"}, "body": "Your payment was received."}})
+    registry = ToolRegistry()
+    registry.register(ToolSpec("email_read", "Read selected mail", ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 2), lambda invocation: pytest.fail("Repeated a completed source read"))
+    producer = _ScheduledCompletionPreparer(Job(task="Report deadlines and review items."), "telegram:100001",
+        model_client=Client(), record_preflight=lambda *args, **kwargs: None)
+    state = {"completion_preparer": producer, "tool_registry": registry, "tool_results": [source], "artifacts": []}
+    prepared, text, changed = prepare_completion(state, "Sender, date and email preview",
+        review=_CompletionReviewDecision("retry"))
+    assert changed and text == report and prepared["tool_results"] == [source]
+    assert producer.payload["cron_agent_final_repair_reason"] == "outcome_assistance"
+    assert len(calls) == 1 and "Verified compact tool evidence" in calls[0]["messages"][0]["content"][0]["text"]
+    assert "response_fulfilled" not in prepared
 
 
-def test_run_single_agent_cron_turn_repairs_structured_evidence_fallback_before_delivery(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("NULLION_AGENT_TURN_MAX_ITERATIONS", "12")
-    monkeypatch.delenv("NULLION_CRON_AGENT_MAX_ITERATIONS", raising=False)
-    monkeypatch.setattr("nullion.artifacts.artifact_root_for_principal", lambda principal_id: str(tmp_path))
-    monkeypatch.setattr("nullion.builder_capabilities.format_installed_dependency_context", lambda runtime: "")
-    monkeypatch.setattr("nullion.runtime_config.format_runtime_config_for_prompt", lambda model_client: "")
-    monkeypatch.setattr("nullion.skill_pack_catalog.skill_pack_access_prompt", lambda *args, **kwargs: "")
-    monkeypatch.setattr(
-        "nullion.skill_pack_installer.format_cached_enabled_skill_pack_index_for_prompt",
-        lambda *args, **kwargs: "",
-    )
-    monkeypatch.setattr("nullion.system_context.build_system_context_snapshot", lambda tool_registry: object())
-    monkeypatch.setattr("nullion.system_context.format_compact_system_context_for_prompt", lambda snapshot: "")
-    monkeypatch.setattr("nullion.workspace_storage.format_workspace_storage_for_prompt", lambda principal_id: "")
-    monkeypatch.setattr(
-        "nullion.cron_execution_tools.build_cron_connector_scope_decision",
-        lambda **kwargs: SimpleNamespace(allow_connector_tools=False, provider_ids=()),
-    )
-    monkeypatch.setattr("nullion.cron_execution_tools.structured_cron_passthrough_tool_names", lambda registry: ())
 
-    tool_result = ToolResult(
-        "quote-1",
-        "stock_quote",
-        "completed",
-        {
-            "items": [
-                {"name": "Critical Metals Corp", "price": "$9.41"},
-                {"name": "Microsoft Corp", "price": "$403.45"},
-            ]
-        },
-    )
-    fallback = sanitize_user_visible_reply(
-        user_message="Generate the mid-market stock alert.",
-        reply="The watchlist is mostly quiet.",
-        tool_results=[tool_result],
-    )
-    assert fallback == "Results I found\n\n1. Critical Metals Corp\n   $9.41\n\n2. Microsoft Corp\n   $403.45"
+def test_scheduled_content_preparation_uses_typed_record_revision_without_repeating_reads(monkeypatch, tmp_path) -> None:
+    from nullion.agent_orchestrator import _CompletionReviewDecision
+    from nullion.completion_pipeline import prepare_completion
+    from nullion.cron_delivery import _ScheduledCompletionPreparer
+    report = "Verified quote rows: A at $9.41 and B at $403.45."
+    class Client:
+        def create(self, **kwargs):
+            assert not kwargs["tools"]
+            return {"content": [{"type": "text", "text": json.dumps({"requirements_satisfied": True,
+                "source_state": "available", "evidence_refs": ["e0"], "report": report})}]}
+    source = ToolResult("quote-1", "stock_quote", "completed", {"items": [
+        {"name": "A", "price": "$9.41"}, {"name": "B", "price": "$403.45"}]})
+    producer = _ScheduledCompletionPreparer(Job(task="Prepare a concise quote report."), "telegram:100001",
+        model_client=Client(), record_preflight=lambda *args, **kwargs: None)
+    state = {"completion_preparer": producer, "tool_registry": ToolRegistry(), "tool_results": [source], "artifacts": []}
+    prepared, text, changed = prepare_completion(state, "A: $9.41; B: $403.45",
+        review=_CompletionReviewDecision("retry"))
+    assert changed and text == report and prepared["tool_results"] == [source]
+    assert producer.payload["cron_agent_final_repair_reason"] == "outcome_assistance"
+    assert "response_fulfilled" not in prepared
 
-    repaired_report = (
-        "📈 Mid-market stock check\n\n"
-        "Immediate attention:\n"
-        "- CRML and MSFT are the only verified quote rows from this run.\n\n"
-        "Watchlist pulse:\n"
-        "- Need fresh quote evidence for the remaining symbols before ranking winners and laggards."
-    )
-
-    class FakeModelClient:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        def create(self, **kwargs):  # noqa: ANN003
-            self.calls.append(kwargs)
-            return {"content": [{"type": "text", "text": json.dumps({"requirements_satisfied": True, "source_state": "available", "evidence_refs": ["e0"], "report": repaired_report})}]}
-
-    model_client = FakeModelClient()
-
-    class FakeOrchestrator:
-        def __init__(self) -> None:
-            self.model_client = model_client
-
-        def run_turn(self, **kwargs):  # noqa: ANN003
-            _ = kwargs
-            return SimpleNamespace(
-                final_text=fallback,
-                tool_results=[tool_result],
-                artifacts=[],
-                suspended_for_approval=False,
-                approval_id=None,
-                reached_iteration_limit=False,
-                raw_tool_payload_blocked=False,
-            )
-
-    events: list[tuple[str, dict[str, object]]] = []
-
-    result = run_single_agent_cron_turn(
-        Job(
-            name="Mid-Market Stock Alert",
-            task="Generate a concise mid-market stock alert. No tables.",
-        ),
-        "telegram:100001",
-        label="Scheduled task",
-        orchestrator=FakeOrchestrator(),
-        runtime=SimpleNamespace(store=None),
-        tool_registry=ToolRegistry(),
-        settings=SimpleNamespace(enabled_skill_packs=()),
-        record_event=lambda event_type, *args, **kwargs: events.append((event_type, dict(kwargs))),
-    )
-
-    assert result["cron_agent_final_repaired"] is True
-    assert result["cron_agent_final_repair_reason"] == "structured_evidence_fallback"
-    assert result["text"] == repaired_report
-    assert model_client.calls
-    delivered = cron_delivery_text_from_result(result)
-    assert "Results I found" not in delivered
-    assert "Mid-market stock check" in delivered
-    assert any(kwargs.get("stage") == "final_repaired" for _event_type, kwargs in events)
 
 
 def test_manual_cron_status_card_animates_and_finishes_with_check_mark() -> None:
@@ -4816,3 +4604,14 @@ def assert_channel_without_media(channel: str, text: str, artifact: str) -> bool
     assert artifact not in text
     assert "MEDIA:" not in text
     return True
+
+
+@pytest.fixture(autouse=True)
+def expressive_delivery_preferences(monkeypatch):
+    from nullion import preferences
+    monkeypatch.setattr(preferences,'load_preferences',lambda:preferences.Preferences(emoji_level='expressive'))
+
+
+def test_cron_bootstrap_does_not_leave_artifact_aliases_bound_to_test_doubles():
+    from nullion import artifacts, chat_operator
+    assert chat_operator.artifact_root_for_principal is artifacts.artifact_root_for_principal

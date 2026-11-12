@@ -1,6 +1,8 @@
 """Durable update progress; observing an operation never starts another update."""
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from contextlib import contextmanager
 import json
 import os
@@ -18,17 +20,13 @@ class UpdateOperations:
     @contextmanager
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("""CREATE TABLE IF NOT EXISTS update_operations (
-            operation_id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL,
-            owner_pid INTEGER NOT NULL, status TEXT NOT NULL, events TEXT NOT NULL)""")
-        connection.commit()
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        with sqlite_connection(self.path, timeout=10) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("""CREATE TABLE IF NOT EXISTS update_operations (
+                operation_id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL,
+                owner_pid INTEGER NOT NULL, status TEXT NOT NULL, events TEXT NOT NULL)""")
+            connection.commit()
+            yield connection
 
     def start(self, request_key: str) -> tuple[str, bool]:
         with self._connect() as connection:

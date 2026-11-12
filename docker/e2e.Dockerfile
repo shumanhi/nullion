@@ -12,6 +12,8 @@ RUN apt-get update \
         curl \
         git \
         nodejs \
+        poppler-utils \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --upgrade pip \

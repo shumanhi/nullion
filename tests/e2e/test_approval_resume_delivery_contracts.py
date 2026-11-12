@@ -1,5 +1,6 @@
 """Approval callbacks and real terminal artifact handling at product boundaries."""
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 from datetime import UTC,datetime
 import json
@@ -42,6 +43,8 @@ def test_diagnostics_through_chat_api_do_not_attach_internal_capture(tmp_path,mo
     backend=Backend();runtime,registry=setup_terminal(tmp_path,monkeypatch,backend)
     class Model:
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={t['name'] for t in kw.get('tools',[])}
             if not names:
                 return {'stop_reason':'end_turn','content':[{'type':'text','text':json.dumps({'requested_tool_names':['terminal_exec'],'required_tool_names':['terminal_exec'],'requested_artifact_extensions':[],'confidence':1})}]}
@@ -84,7 +87,10 @@ async def test_telegram_double_callback_and_stale_callback_execute_once(tmp_path
             return TerminalExecutionResult(exit_code=0,stdout='Synthetic operation completed.\n'*200,stderr='')
     backend=Backend();runtime,registry=setup_terminal(tmp_path,monkeypatch,backend)
     class Model:
-        def create(self,**kw):return {'stop_reason':'end_turn','content':[{'type':'text','text':'Synthetic operation completed.'}]}
+        def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
+            return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Synthetic operation completed.'}]}
     runner=AgentOrchestrator(model_client=Model())
     snapshot=[{'role':'user','content':[{'type':'text','text':'合成操作を実行して'}]},
         {'role':'assistant','content':[{'type':'tool_use','id':'operation','name':'terminal_exec',

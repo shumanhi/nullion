@@ -1,5 +1,6 @@
 """Real API, SQLite, cron workflow and platform message boundaries."""
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -11,15 +12,8 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1', reason='container E2E only')
 
 
-def source_presentation_response(kwargs):
-    from nullion.prompt_injection import UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START, UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END
-    message=kwargs['messages'][0]['content'][0]['text']
-    raw=message.split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n',1)[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,1)[0]
-    context=json.loads(raw)
-    draft={'intro':'', 'points':[{'evidence_ids':[row['id']],
-        'detail':'\n'.join(row['value'].splitlines()[1:]),'relevance':'Answers the requested comparison'} for row in context['evidence'][:7]],
-        'limitation_ids':[row['id'] for row in context['limitations'][:3]]}
-    return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'present','name':'present_source_answer','input':draft}]}
+from tests.source_answer_fixture import source_presentation_response
+
 
 @pytest.mark.parametrize('prompt,requested,alternative,partial,recorded', [
     ('Find current opening times. No screenshots or other attachments are requested.', False, False, False, False),
@@ -57,6 +51,8 @@ def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, mo
     class Model:
         calls=0
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={t['name'] for t in kw.get('tools',[])}
             reviewed=source_summary_model_reply(kw)
             if reviewed is not None: return reviewed
@@ -102,7 +98,7 @@ def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, mo
     assert 'unavailable' not in payload['text'], payload
     assert bool(payload['artifacts']) is requested,payload
     if partial:
-        assert '**Not verified from this check:** ' in payload['text']
+        assert '**Not verified from this check**\n- ' in payload['text']
         from nullion.telegram_app import _deliver_reply
         sent = []
         class Message:
@@ -113,7 +109,7 @@ def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, mo
                 return SimpleNamespace(message_id=2)
         asyncio.run(_deliver_reply(Message(), payload['text'], principal_id='telegram:100'))
         assert len(sent) == 1
-        assert '<b>Not verified from this check:</b>' in sent[0][0]
+        assert '<b>Not verified from this check</b>' in sent[0][0]
         assert sent[0][1]['parse_mode'] == 'HTML'
     events=[e for e in runtime.store.list_conversation_events('web:new-user') if e.get('event_type')=='conversation.chat_turn']
     results=events[-1]['tool_results'];browses=[t for t in results if t['tool_name']=='browser_run_task']
@@ -254,6 +250,8 @@ def test_plain_chat_with_browser_installed_stays_on_fast_path(tmp_path, monkeypa
         calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Hello.'}]}
 
@@ -281,7 +279,7 @@ def test_plain_chat_with_browser_installed_stays_on_fast_path(tmp_path, monkeypa
     assert max(elapsed) < 1, elapsed
 
 
-def test_validated_scope_clears_stale_capture_requirement_in_real_turn(tmp_path, monkeypatch):
+def test_validated_scope_clears_stale_capture_requirement_in_real_turn(tmp_path, monkeypatch, source_summary_model_reply):
     from PIL import Image
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.plugins.browser_plugin import register_browser_tools, browser_use_worker
@@ -295,11 +293,15 @@ def test_validated_scope_clears_stale_capture_requirement_in_real_turn(tmp_path,
     Image.new('RGB', (30, 30)).save(capture)
     monkeypatch.setattr(browser_use_worker, 'run_isolated_browser_task', lambda task, **kwargs: {
         'result_kind': 'source_observations', 'report_status': 'completed', 'goal_status': 'answered',
-        'observations': [{'label': '予約時間', 'value': '19:30', 'quote': '19:30', 'source_url': task.url}],
+        'observations': [{'label': '予約時間', 'value': '19:30', 'quote': '19:30', 'source_url': task.url, 'semantic_role': 'entity'}],
         'unknowns': [], 'page_url': task.url, 'artifact_paths': [str(capture)]})
     class Model:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
+            if (review := source_summary_model_reply(kwargs)) is not None:
+                return review
             self.calls += 1
             if any(t['name']=='present_source_answer' for t in kwargs.get('tools',[])):
                 return source_presentation_response(kwargs)

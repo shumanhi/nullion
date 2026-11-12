@@ -16,6 +16,8 @@ lightweight built-in parser that handles the most common expressions.
 """
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from contextlib import nullcontext
 import json
 import logging
@@ -73,6 +75,7 @@ class CronJob:
     delivery_target: str = ""  # chat id, conversation id, or other channel-specific target
     html_image_delivery_mode: str = ""  # linked | auto | self_contained (blank keeps runtime default)
     artifact_delivery_options: dict[str, object] = field(default_factory=dict)
+    execution_window: dict[str, object] = field(default_factory=dict)
     schedule_timezone: str = "" # blank means legacy UTC schedule for pre-local-time jobs
     enabled:     bool  = True
     created_at:  str   = ""
@@ -120,13 +123,9 @@ def _now_iso() -> str:
 
 def _cron_timezone() -> tzinfo:
     try:
-        from nullion.preferences import detect_system_timezone, load_preferences, resolve_timezone
+        from nullion.preferences import load_preferences, resolve_timezone
 
         saved_timezone = str(load_preferences().timezone or "").strip()
-        if saved_timezone.upper() == "UTC":
-            detected_timezone = detect_system_timezone(default="UTC")
-            if detected_timezone != "UTC":
-                return resolve_timezone(detected_timezone)
         return resolve_timezone(saved_timezone)
     except Exception:
         log.debug("Could not resolve cron timezone; falling back to UTC.", exc_info=True)
@@ -230,10 +229,9 @@ def _timezone_display_name(tz: tzinfo) -> str:
     return str(getattr(tz, "key", None) or tz.tzname(datetime.now(tz)) or "local time")
 
 
-def _format_local_time(hour: int, minute: int) -> str:
-    suffix = "AM" if hour < 12 else "PM"
-    display_hour = hour % 12 or 12
-    return f"{display_hour}:{minute:02d} {suffix}"
+def _format_local_time(hour: int, minute: int, *, time_format: str = '12h') -> str:
+    from nullion.preferences import format_clock_time
+    return format_clock_time(hour, minute, time_format=time_format)
 
 
 def _parse_cron_field_values(spec: str, lo: int, hi: int) -> list[int] | None:
@@ -316,47 +314,67 @@ def _job_schedule_timezone(job: CronJob) -> tzinfo:
     return _cron_timezone()
 
 
-def _cron_expression_for_display(schedule: str, *, source_tz: tzinfo, display_tz: tzinfo) -> str:
+def _validated_schedule_timezone(value: object) -> str:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("schedule_timezone must name a valid timezone")
+    try:
+        ZoneInfo(value.strip())
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("schedule_timezone must name a valid timezone") from exc
+    return value.strip()
+
+
+def _cron_expression_for_display(schedule: str, *, source_tz: tzinfo, display_tz: tzinfo,
+                                 reference: datetime | None = None) -> str | None:
+    """Convert the upcoming weekly pattern only when it stays representable.
+
+    Monthly boundaries and DST transition weeks cannot always be described by
+    another five-field expression. Return unknown rather than invent local runs;
+    the next-run instant remains the authoritative local display in that case.
+    """
     if source_tz == display_tz:
         return schedule
     m = _CRON_RE.match(str(schedule or "").strip())
     if not m:
-        return schedule
+        return None
     min_spec, hr_spec, dom_spec, mon_spec, dow_spec = m.groups()
     minutes = _parse_cron_field_values(min_spec, 0, 59)
     hours = _parse_cron_field_values(hr_spec, 0, 23)
     dows = _parse_cron_field_values(dow_spec, 0, 7)
-    if minutes is None or hours is None or dows is None:
-        return schedule
-    if dom_spec != "*" or mon_spec != "*":
-        return schedule
-
-    converted_hours: set[int] = set()
-    converted_dows: set[int] = set()
-    source_dates = [datetime(2026, 5, 10 + offset, tzinfo=source_tz) for offset in range(7)]
-    dow_is_wildcard = len(dows) >= 7
-    for source_date in source_dates:
-        cron_dow = int(source_date.strftime("%w"))
-        if not dow_is_wildcard and cron_dow not in {0 if day == 7 else day for day in dows}:
+    if minutes is None or hours is None or dows is None or dom_spec != "*" or mon_spec != "*":
+        return None
+    anchor = reference or datetime.now(timezone.utc)
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    first = anchor.astimezone(source_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    source_dows = {0 if day == 7 else day for day in dows}
+    observed = set()
+    for offset in range(7):
+        source_date = first + timedelta(days=offset)
+        if int(source_date.strftime("%w")) not in source_dows:
             continue
         for hour in hours:
-            local_dt = source_date.replace(hour=hour, minute=0).astimezone(display_tz)
-            converted_hours.add(local_dt.hour)
-            if not dow_is_wildcard:
-                converted_dows.add(int(local_dt.strftime("%w")))
+            for minute in minutes:
+                local = source_date.replace(hour=hour, minute=minute).astimezone(display_tz)
+                observed.add((int(local.strftime("%w")), local.hour, local.minute))
+    if not observed:
+        return None
+    local_dows = {d for d, h, m in observed}
+    local_hours = {h for d, h, m in observed}
+    local_minutes = {m for d, h, m in observed}
+    if observed != {(d, h, m) for d in local_dows for h in local_hours for m in local_minutes}:
+        return None
+    def field(values, total):
+        return "*" if len(values) == total else ",".join(str(v) for v in sorted(values))
+    return f"{field(local_minutes, 60)} {field(local_hours, 24)} * * {field(local_dows, 7)}"
 
-    if not converted_hours:
-        return schedule
 
-    def _field(values: set[int]) -> str:
-        return ",".join(str(value) for value in sorted(values))
-
-    display_dow_spec = "*" if dow_is_wildcard else _field(converted_dows)
-    return f"{min_spec} {_field(converted_hours)} * * {display_dow_spec}"
-
-
-def describe_cron_schedule(schedule: str, *, tz: tzinfo | None = None) -> str:
+def describe_cron_schedule(schedule: str, *, tz: tzinfo | None = None, time_format: str | None = None) -> str:
     """Return a user-facing schedule summary for a 5-field cron expression."""
+    if time_format is None:
+        from nullion.preferences import time_presentation_context
+        time_format = time_presentation_context()['time_format']
     m = _CRON_RE.match(str(schedule or "").strip())
     if not m:
         return "Custom schedule"
@@ -383,9 +401,9 @@ def describe_cron_schedule(schedule: str, *, tz: tzinfo | None = None) -> str:
         if minutes[0]:
             phrase += f" at :{minutes[0]:02d}"
     elif len(minutes) == 1 and len(hours) == 1:
-        phrase = f"At {_format_local_time(hours[0], minutes[0])}"
+        phrase = f"At {_format_local_time(hours[0], minutes[0], time_format=time_format)}"
     elif len(minutes) == 1 and len(hours) <= 4:
-        phrase = "At " + _join_words([_format_local_time(hour, minutes[0]) for hour in hours])
+        phrase = "At " + _join_words([_format_local_time(hour, minutes[0], time_format=time_format) for hour in hours])
     else:
         phrase = "Custom schedule"
 
@@ -403,26 +421,33 @@ def describe_cron_schedule(schedule: str, *, tz: tzinfo | None = None) -> str:
     return f"{phrase} ({tz_name})"
 
 
-def describe_cron_next_run(next_run: str | None, *, tz: tzinfo | None = None) -> str:
+def describe_cron_next_run(next_run: str | None, *, tz: tzinfo | None = None, time_format: str | None = None) -> str:
     if not next_run:
         return ""
     try:
+        if time_format is None:
+            from nullion.preferences import time_presentation_context
+            time_format = time_presentation_context()['time_format']
         dt = datetime.fromisoformat(str(next_run))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         local_dt = dt.astimezone(tz or _cron_timezone())
-        return f"{local_dt.strftime('%b')} {local_dt.day}, {local_dt.year} at {_format_local_time(local_dt.hour, local_dt.minute)}"
+        return f"{local_dt.strftime('%b')} {local_dt.day}, {local_dt.year} at {_format_local_time(local_dt.hour, local_dt.minute, time_format=time_format)}"
     except Exception:
         return ""
 
 
 def cron_display_fields(job: CronJob, *, tz: tzinfo | None = None) -> dict[str, str]:
+    from nullion.preferences import time_presentation_context
+    policy = time_presentation_context()
     tz = tz or _cron_timezone()
     schedule_tz = _job_schedule_timezone(job)
-    display_schedule = _cron_expression_for_display(job.schedule, source_tz=schedule_tz, display_tz=tz)
+    display_schedule = _cron_expression_for_display(job.schedule, source_tz=schedule_tz, display_tz=tz,
+        reference=job.next_run_dt())
     return {
-        "schedule_description": describe_cron_schedule(display_schedule, tz=tz),
-        "next_run_description": describe_cron_next_run(job.next_run, tz=tz),
+        "schedule_description": (describe_cron_schedule(display_schedule, tz=tz, time_format=policy['time_format'])
+            if display_schedule is not None else "Custom schedule (next check shown in your local time)"),
+        "next_run_description": describe_cron_next_run(job.next_run, tz=tz, time_format=policy['time_format']),
     }
 
 
@@ -487,7 +512,7 @@ def _cron_delivery_started_since(cron_id: str, scheduled_for: datetime, *, now: 
     scheduled_iso = scheduled_for.astimezone(timezone.utc).isoformat()
     now_iso = now.astimezone(timezone.utc).isoformat()
     try:
-        with sqlite3.connect(str(db_path or _runtime_db_path()), timeout=10) as conn:
+        with sqlite_connection(str(db_path or _runtime_db_path()), timeout=10) as conn:
             row = conn.execute(
                 """
                 SELECT json_extract(payload, '$.created_at')
@@ -532,7 +557,7 @@ def _load_crons_db_snapshot() -> tuple[list[CronJob], datetime | None] | None:
     if not db_path.exists():
         return None
     try:
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
+        with sqlite_connection(str(db_path), timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             _ensure_cron_table(conn)
             rows = conn.execute(
@@ -616,7 +641,7 @@ def _save_crons_db(
         except Exception:
             lock_context = nullcontext()
         with lock_context:
-            with sqlite3.connect(str(db_path), timeout=10) as conn:
+            with sqlite_connection(str(db_path), timeout=10) as conn:
                 _ensure_cron_table(conn)
                 effective_deleted_ids = {
                     str(cron_id or "").strip()
@@ -723,10 +748,18 @@ def add_cron(
     html_image_delivery_mode: str = "",
     artifact_delivery_options: dict[str, object] | None = None,
     workspace_id: str = _DEFAULT_WORKSPACE_ID,
+    execution_window: dict[str, object] | None = None,
+    schedule_timezone: str | None = None,
 ) -> CronJob:
     """Create and persist a new cron job. Returns the saved CronJob."""
     from nullion.cron_delivery import normalize_cron_delivery_channel, normalize_html_image_delivery_mode
 
+    from nullion.workflow_validity import validate_execution_window
+    execution_window = validate_execution_window(execution_window)
+    from nullion.workflow_validity import execution_window_context
+    window = execution_window_context(execution_window)
+    if window and window["status"] == "expired":
+        raise ValueError("The fixed workflow window has already ended. Choose a future fixed window or explicitly request a rolling range.")
     _validate_cron_fields(name, schedule, task)
     _validate_tracker_options(artifact_delivery_options)
     jobs = load_crons()
@@ -740,11 +773,14 @@ def add_cron(
         delivery_target=str(delivery_target or "").strip(),
         html_image_delivery_mode=normalize_html_image_delivery_mode(html_image_delivery_mode),
         artifact_delivery_options=dict(artifact_delivery_options or {}),
-        schedule_timezone=_timezone_display_name(_cron_timezone()),
+        execution_window=execution_window,
+        schedule_timezone=(_validated_schedule_timezone(schedule_timezone) if schedule_timezone is not None
+                           else _timezone_display_name(_cron_timezone())),
         enabled=enabled,
         created_at=_now_iso(),
-        next_run=_compute_next_run(schedule) if enabled else None,
+        next_run=None,
     )
+    job.next_run = _compute_job_next_run(job) if enabled else None
     save_crons([job])
     log.info("Cron created: %r (%s) schedule=%r", job.name, job.id, job.schedule)
     return job
@@ -779,7 +815,16 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
     """Update mutable fields (name, schedule, task, enabled). Recomputes next_run."""
     from nullion.cron_delivery import normalize_cron_delivery_channel, normalize_html_image_delivery_mode
 
+    if "execution_window" in kwargs:
+        from nullion.workflow_validity import validate_execution_window
+        kwargs["execution_window"] = validate_execution_window(kwargs["execution_window"])
+        from nullion.workflow_validity import execution_window_context
+        window = execution_window_context(kwargs["execution_window"])
+        if window and window["status"] == "expired":
+            raise ValueError("The fixed workflow window has already ended. Choose a future fixed window or explicitly request a rolling range.")
     _validate_tracker_options(kwargs.get("artifact_delivery_options"))
+    if "schedule_timezone" in kwargs:
+        kwargs["schedule_timezone"] = _validated_schedule_timezone(kwargs["schedule_timezone"])
 
     jobs = load_crons()
     for job in jobs:
@@ -794,6 +839,8 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
                 "workspace_id",
                 "html_image_delivery_mode",
                 "artifact_delivery_options",
+                "execution_window",
+                "schedule_timezone",
             }
             for k, v in kwargs.items():
                 if k in mutable:
@@ -804,12 +851,12 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
                     elif k == "artifact_delivery_options":
                         v = dict(v) if isinstance(v, dict) else {}
                     setattr(job, k, v)
-            if "schedule" in kwargs:
+            if "schedule" in kwargs and "schedule_timezone" not in kwargs:
                 job.schedule_timezone = _timezone_display_name(_cron_timezone())
             job.workspace_id = str(job.workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID
             # Validate after applying changes so we check the final state.
             _validate_cron_fields(job.name, job.schedule, job.task)
-            if "schedule" in kwargs or "enabled" in kwargs:
+            if "schedule" in kwargs or "enabled" in kwargs or "schedule_timezone" in kwargs:
                 job.next_run = _compute_job_next_run(job) if job.enabled else None
             save_crons([job])
             return job
@@ -851,6 +898,15 @@ class CronScheduler:
         self._status_thread=threading.Thread(target=self._status_loop,daemon=True,name='nullion-tracker-status')
 
     def start(self):
+        # Reconcile persisted health before the first dashboard snapshot. This
+        # does not run jobs or send notices; live execution leases remain valid.
+        try:
+            from nullion.cron_scheduler_state import load_jobs,reclaim_stale_execution_leases
+            from nullion.tracker_status import tracker_statuses
+            reclaim_stale_execution_leases(self._store_path)
+            tracker_statuses(self._store_path, load_jobs(self._store_path))
+        except Exception:
+            log.warning('Cron health startup reconciliation deferred', exc_info=True)
         self._thread.start()
         if self._status_fn is not None:self._status_thread.start()
 
@@ -930,14 +986,8 @@ class CronScheduler:
             with scheduled_token(token):
                 result=self._fire(job)
             if isinstance(result,dict) and result.get('cron_run_skipped'):return
-            if not isinstance(result,dict):outcome='ok'
-            elif result.get('suspended_for_approval'):outcome='waiting_for_approval'
-            elif result.get('cron_run_cancelled'):outcome='cancelled'
-            elif (any(result.get(k) for k in ('cron_run_failed','cron_report_failed','cron_delivery_failed'))
-                  or (isinstance(result.get('execution_outcome'),dict) and result['execution_outcome'].get('execution_succeeded') is False)):
-                outcome='error: '+str(result.get('reason') or 'scheduled task incomplete')
-            elif result.get('cron_delivery_partial_success'):outcome='partial_success'
-            else:outcome='ok'
+            from nullion.cron_scheduler_state import execution_result_label
+            outcome = execution_result_label(result)
             save_result(self._store_path,job,outcome)
         except Exception as exc:
             log.warning('Cron %s failed: %s',job.id,exc)

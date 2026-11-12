@@ -55,7 +55,8 @@ _LOCAL_WINDOWS_PATH_RE = re.compile(
     r"(?P<path>[A-Za-z]:\\Users\\[^\\\s`\"'<>:)]+\\[^\s`\"'<>)]*)"
 )
 _PRESERVE_DIRECTIVE_PREFIXES = ("MEDIA:", "ARTIFACT:")
-_SEMANTIC_STATUS_SYMBOLS = {"☐", "☑", "☒"}
+_LOCAL_PATH_DETAIL_EVIDENCE: ContextVar[frozenset[str]] = ContextVar(
+    "local_path_detail_evidence", default=frozenset())
 _RAW_FUNCTION_CALL_RE = re.compile(
     r"<\s*(?:function|tool_request|tool_call|tool_use|request_tool_scope)\b[\s\S]*?</\s*(?:function|tool_request|tool_call|tool_use|request_tool_scope)\s*>"
     r"|#\{\s*<\s*(?:function|tool_request|tool_call|tool_use|request_tool_scope)\b[\s\S]*?</\s*(?:function|tool_request|tool_call|tool_use|request_tool_scope)\s*>\s*\}",
@@ -186,15 +187,23 @@ def sanitize_user_visible_reply(
     tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None = None,
     requested_sections: Iterable[object] | None = None, source: str = "agent",
     presentation_metadata: dict[str, object] | None = None,
+    defer_action_receipts: bool = False,
 ) -> str | None:
     """Keep the producer's source-summary provenance separate from final copy."""
-    if presentation_metadata is not None and tool_results is not None:
+    if tool_results is not None:
         tool_results = list(tool_results)
+    from nullion.request_delivery_requirements import reviewed_action_reply_matches
+    defer_action_receipts = defer_action_receipts or reviewed_action_reply_matches(tool_results, user_message, reply)
+    path_token = _LOCAL_PATH_DETAIL_EVIDENCE.set(_requested_source_local_paths(tool_results))
     candidates: list[tuple[str, str]] = []
     token = _PRESENTATION_CANDIDATES.set(candidates if presentation_metadata is not None else None)
     try:
         result = _sanitize_user_visible_reply(user_message=user_message, reply=reply,
-            tool_results=tool_results, requested_sections=requested_sections, source=source)
+            # Transport already received the reviewed answer. Evidence here
+            # preserves requested path details; it must not select another
+            # source summary or replace the answer a second time.
+            tool_results=None if source == "platform_delivery" else tool_results,
+            requested_sections=requested_sections, source=source, defer_action_receipts=defer_action_receipts)
         if presentation_metadata is not None:
             results = _coerce_tool_results(tool_results)
             for kind, candidate in reversed(candidates):
@@ -210,6 +219,7 @@ def sanitize_user_visible_reply(
         return result
     finally:
         _PRESENTATION_CANDIDATES.reset(token)
+        _LOCAL_PATH_DETAIL_EVIDENCE.reset(path_token)
 
 
 def _sanitize_user_visible_reply(
@@ -219,6 +229,7 @@ def _sanitize_user_visible_reply(
     tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None = None,
     requested_sections: Iterable[object] | None = None,
     source: str = "agent",
+    defer_action_receipts: bool = False,
 ) -> str | None:
     """Replace bare raw tool payloads with a safe user-visible explanation."""
 
@@ -248,7 +259,7 @@ def _sanitize_user_visible_reply(
     # preview, even when the browser could not verify the current state.
     raw = _account_tool_reply_over_ungrounded_result(raw, results, user_message=user_message)
     raw = _calendar_relevance_reply_over_raw_listing(user_message, raw, results)
-    if image_generation_unavailable_reply := _image_generation_scope_unavailable_reply(results):
+    if not raw.strip() and (image_generation_unavailable_reply := _image_generation_scope_unavailable_reply(results)):
         return _sanitize_reply_style(_sanitize_local_paths(image_generation_unavailable_reply))
     raw = _repair_collapsed_numbered_list_reply(raw)
     raw = _renumber_visible_numbered_list_reply(raw)
@@ -257,10 +268,20 @@ def _sanitize_user_visible_reply(
     raw = _normalize_requested_section_reply_format(requested_sections, raw, results)
     raw = _prefix_account_tool_reply(raw, results)
     raw = _strip_leading_tool_status_paragraph(raw, results)
+    native_action = any(row.status == 'completed' and isinstance(row.output,dict)
+        and isinstance(row.output.get('action_receipt'),dict)
+        and row.output['action_receipt'].get('type') == 'action_receipt' for row in results)
+    defer_receipt_supplements = bool(defer_action_receipts and native_action and raw.strip()
+        and not is_raw_tool_payload_reply(reply=raw, tool_results=results))
     # Browser observations inform the agent's answer; they are not a second
     # completion gate. Keep presentation and raw-payload protection below, but
     # never replace an answer because a page lacks assertion-bound records.
-    if _browser_tools_attempted(results) and raw.strip() and not is_raw_tool_payload_reply(
+    if not defer_receipt_supplements and (required_receipt := _required_action_receipt_reply(raw, results)):
+        return _sanitize_local_paths(required_receipt)
+    from nullion.search_coverage import discovery_ledger
+    source_ledger = discovery_ledger(results)
+    has_observed_source = bool(source_ledger and source_ledger.get('observed_sources'))
+    if (_browser_tools_attempted(results) or has_observed_source) and raw.strip() and not is_raw_tool_payload_reply(
         reply=raw, tool_results=results,
     ):
         return _sanitize_reply_style(
@@ -268,9 +289,9 @@ def _sanitize_user_visible_reply(
             account_tool_family=_primary_account_tool_family(results),
         )
     browser_results = results
-    if action_receipt_reply := _action_receipt_reply_over_drift(raw, results):
+    if not defer_receipt_supplements and (action_receipt_reply := _action_receipt_reply_over_drift(raw, results)):
         return _sanitize_local_paths(action_receipt_reply)
-    if scheduler_action_reply := _scheduler_action_reply_over_read_drift(raw, results):
+    if not defer_receipt_supplements and (scheduler_action_reply := _scheduler_action_reply_over_read_drift(raw, results)):
         return _sanitize_local_paths(scheduler_action_reply)
     if structured_evidence_reply := _structured_tool_evidence_reply_over_ignored_results(
         raw,
@@ -284,7 +305,7 @@ def _sanitize_user_visible_reply(
         user_message=user_message,
     ):
         return _sanitize_local_paths(web_search_reply)
-    if artifact_completion_reply := _artifact_completion_reply_over_drift(raw, results):
+    if artifact_completion_reply := _artifact_completion_reply_over_drift(raw, results, user_message=user_message):
         return _sanitize_local_paths(artifact_completion_reply)
     if empty_reminder_cancel_reply := _empty_reminder_cancel_reply(results):
         return empty_reminder_cancel_reply
@@ -381,90 +402,14 @@ def _label_noncontiguous_structured_source_ranks(text: str, results: Iterable[To
 def _sanitize_reply_style(text: str | None, *, account_tool_family: str | None = None) -> str | None:
     if text is None:
         return None
-    try:
-        from nullion.preferences import load_preferences
-
-        preferences = load_preferences()
-    except Exception:
-        preferences = None
-    if str(getattr(preferences, "emoji_level", "") or "").strip().lower() != "none":
-        return text
-    cleaned = _strip_emoji_characters(text)
-    return _restore_account_tool_prefix(cleaned, original=text, account_tool_family=account_tool_family)
-
-
-def _restore_account_tool_prefix(text: str, *, original: str, account_tool_family: str | None) -> str:
-    if account_tool_family == "email":
-        prefix = "✉️"
-    elif account_tool_family == "calendar":
-        prefix = "📅"
-    else:
-        prefix = ""
-    if not prefix:
-        return text
-    original_stripped = str(original or "").lstrip()
-    cleaned_stripped = str(text or "").lstrip()
-    if not original_stripped.startswith(prefix) or cleaned_stripped.startswith(prefix):
-        return text
-    leading = str(text or "")[: len(str(text or "")) - len(cleaned_stripped)]
-    return f"{leading}{prefix} {cleaned_stripped}".strip()
+    from nullion.chat_text import apply_presentation_preferences
+    return apply_presentation_preferences(text, message_kind=account_tool_family)
 
 
 def _strip_emoji_characters(text: str) -> str:
-    value = str(text or "")
-    if "`" in value:
-        from nullion.chat_text import transform_markdown_prose
-        return transform_markdown_prose(value, _strip_emoji_prose)
-    return _strip_emoji_prose(value)
-
-
-def _strip_emoji_prose(value: str) -> str:
-    chars: list[str] = []
-    line_start = True
-    preserve_line_heading_emoji = False
-    for index, char in enumerate(value):
-        if line_start:
-            preserve_line_heading_emoji = _line_has_leading_emoji_heading(value, index)
-        if char in {"\n", "\r"}:
-            line_start = True
-            preserve_line_heading_emoji = False
-            chars.append(char)
-            continue
-        if line_start and char in {" ", "\t"}:
-            chars.append(char)
-            continue
-        category = unicodedata.category(char)
-        if char == "°":
-            chars.append(char)
-            line_start = False
-            continue
-        if char in _SEMANTIC_STATUS_SYMBOLS:
-            chars.append(char)
-            line_start = False
-            continue
-        if preserve_line_heading_emoji and (category == "So" or char in {"\ufe0f", "\u200d"}):
-            chars.append(char)
-            continue
-        if category == "So" or char in {"\ufe0f", "\u200d"}:
-            continue
-        chars.append(char)
-        line_start = False
-    cleaned = "".join(chars)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"(?m)[ \t]+$", "", cleaned)
-    return cleaned.strip()
-
-
-def _line_has_leading_emoji_heading(text: str, index: int) -> bool:
-    line = str(text or "")[index:].splitlines()[0] if index < len(str(text or "")) else ""
-    stripped = line.lstrip()
-    if not stripped:
-        return False
-    first = stripped[0]
-    if unicodedata.category(first) != "So":
-        return False
-    rest = stripped[1:].lstrip("\ufe0f\u200d").lstrip()
-    return rest.startswith(("**", "__", "*", "_"))
+    # Compatibility entry point; all presentation policy lives in chat_text.
+    from nullion.chat_text import strip_emoji_characters
+    return strip_emoji_characters(text)
 
 
 def _strip_invisible_tracking_text(text: str) -> str:
@@ -479,7 +424,7 @@ def _strip_invisible_tracking_text(text: str) -> str:
     cleaned = "".join(chars)
     from nullion.chat_text import transform_markdown_prose
     def normalize_spacing(value):
-        value = re.sub(r"[ \t]{2,}", " ", value)
+        value = re.sub(r"(?<=\S)[ \t]{2,}", " ", value)
         value = re.sub(r"(?m)[ \t]+$", "", value)
         return re.sub(r"\n{4,}", "\n\n\n", value).strip()
     return transform_markdown_prose(cleaned, normalize_spacing).strip()
@@ -518,7 +463,7 @@ def _has_inline_numbered_markers(text: str) -> bool:
 def _inline_numbered_marker_matches(text: str) -> list[re.Match[str]]:
     return list(
         re.finditer(
-            r"(?<![\w.])(?P<marker>(?:\d{1,2}\.|\(\d{1,2}\))\s+)(?=[A-Z0-9`*_])",
+            r"(?<![\w.])(?P<marker>(?:\d{1,2}\.|\(\d{1,2}\))\s+)(?=\S)",
             str(text or ""),
         )
     )
@@ -527,6 +472,15 @@ def _inline_numbered_marker_matches(text: str) -> list[re.Match[str]]:
 def _repair_collapsed_numbered_list_paragraph(paragraph: str) -> str:
     matches = _inline_numbered_marker_matches(paragraph)
     if len(matches) < 2:
+        return paragraph
+    # Only repair syntactically anchored, consecutive enumerations. Numbers
+    # embedded in prose (dates, amounts, measurements, citations) are content,
+    # not choice markers, and must never acquire line breaks or new values.
+    prefix = paragraph[:matches[0].start("marker")].strip()
+    numbers = [int(match.group("marker").strip().strip("().")) for match in matches]
+    if (prefix and not prefix.endswith((":", "："))) or numbers[0] != 1:
+        return paragraph
+    if numbers != list(range(1, len(numbers) + 1)) and set(numbers) != {1}:
         return paragraph
     pieces: list[str] = []
     cursor = 0
@@ -563,7 +517,40 @@ def _renumber_visible_numbered_list_prose(value: str) -> str:
         return value
     first_number = int(matches[0].group("pnum") or matches[0].group("dnum") or "1")
     if first_number == 1:
+        # CommonMark permits every item in one ordered list to use "1.".
+        # Chat surfaces display literal markers, and numeric follow-ups must
+        # refer to the same visible ordinals saved in conversation history.
+        groups: list[list[re.Match[str]]] = []
+        for match in matches:
+            if groups:
+                previous = groups[-1][-1]
+                gap = value[previous.end():match.start()]
+                intervening = gap.split("\n", 1)[1] if "\n" in gap else gap
+                same_indent = previous.group("indent").strip("\r\n") == match.group("indent").strip("\r\n")
+                if not intervening.strip() and same_indent:
+                    groups[-1].append(match)
+                    continue
+            groups.append([match])
+        replacements = {
+            match.start("marker"): (match.end("marker"), f"({index})" if match.group("paren") else f"{index}.")
+            for group in groups if len(group) > 1 and all(
+                int(item.group("pnum") or item.group("dnum")) == 1 for item in group)
+            for index, match in enumerate(group, start=1)
+        }
+        for start, (end, replacement) in sorted(replacements.items(), reverse=True):
+            value = value[:start] + replacement + value[end:]
         return value
+    # A lone number or numbers scattered across paragraphs may be dates or
+    # explicit reference identifiers. Normalize only one contiguous ascending
+    # list whose missing initial rows are unambiguous Markdown structure.
+    numbers = [int(match.group("pnum") or match.group("dnum")) for match in matches]
+    if len(matches) < 2 or numbers != list(range(first_number, first_number + len(matches))):
+        return value
+    for previous, match in zip(matches, matches[1:]):
+        gap = value[previous.end():match.start()]
+        intervening = gap.split("\n", 1)[1] if "\n" in gap else gap
+        if intervening.strip() or previous.group("indent").strip("\r\n") != match.group("indent").strip("\r\n"):
+            return value
     pieces: list[str] = []
     cursor = 0
     expected = 1
@@ -1491,6 +1478,40 @@ def _terminal_browser_action_receipt_reply(
     return formatted
 
 
+def _required_action_receipt_reply(text: str, results: list[ToolResult]) -> str | None:
+    receipts: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for result in reversed(results):
+        if result.status != "completed":
+            break
+        output = result.output if isinstance(result.output, dict) else {}
+        receipt = output.get("action_receipt")
+        if not isinstance(receipt, dict) or receipt.get("type") != "action_receipt":
+            continue
+        identity = (str(receipt.get("object_type") or ""),
+            str(receipt.get("object_id") or receipt.get("object_name") or result.invocation_id))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if (_result_foreground_reply_suppressed(result) or _result_is_deferred_background_receipt(result)):
+            continue
+        if receipt.get("delivery_required") is not True:
+            continue
+        formatted = _format_action_receipt(output)
+        if formatted:
+            receipts.append(formatted)
+    receipts.reverse()
+    missing = [receipt for receipt in receipts if not _reply_contains_action_receipt(text, receipt)]
+    if not missing:
+        return None
+    # Required receipts supplement a synthesized answer. Replacing it loses
+    # other requested findings and invalidates the outcome review. Raw payloads
+    # still collapse to the safe receipt-only rendering.
+    if text.strip() and not is_raw_tool_payload_reply(reply=text, tool_results=results):
+        return "\n\n".join([text.strip(), *missing])
+    return "\n\n".join(receipts)
+
+
 def _action_receipt_reply_over_drift(text: str, results: list[ToolResult]) -> str | None:
     scheduler_receipts: list[str] = []
     for result in results:
@@ -1543,9 +1564,9 @@ def _action_receipt_reply_over_drift(text: str, results: list[ToolResult]) -> st
     return None
 
 
-def _artifact_completion_reply_over_drift(text: str, results: list[ToolResult]) -> str | None:
-    from nullion.artifact_lifecycle import artifact_review_unavailable_reply, artifact_terminal_failure_reply
-    if notice := artifact_terminal_failure_reply(results) or artifact_review_unavailable_reply(results):
+def _artifact_completion_reply_over_drift(text: str, results: list[ToolResult], *, user_message: str | None = None) -> str | None:
+    from nullion.artifact_lifecycle import artifact_terminal_failure_reply
+    if notice := artifact_terminal_failure_reply(results, user_message=user_message):
         return notice
     requested_extensions = _requested_artifact_extensions_from_results(results)
     if not requested_extensions:
@@ -3423,7 +3444,7 @@ def _browser_reply_with_terminal_outcomes(
     sections = [str(text or "").strip()]
     receipts: list[str] = []
     requested_artifact_extensions = _requested_artifact_extensions_from_results(results)
-    artifact_completion = _artifact_completion_reply_over_drift("", results)
+    artifact_completion = _artifact_completion_reply_over_drift("", results, user_message=user_message)
     for result in results:
         if (
             result.status != "completed"
@@ -4001,7 +4022,7 @@ def _structured_tool_evidence_reply_over_ignored_results(
 ) -> str | None:
     if any(isinstance(result.output, dict) and result.output.get("lookup_selection_unresolved") is True for result in results):
         return None
-    if _reply_contains_completed_scheduler_action_message(text, results):
+    if _reply_contains_completed_action_message(text, results):
         return None
     if _has_completed_deliverable_artifact_result(results):
         return None
@@ -4010,6 +4031,15 @@ def _structured_tool_evidence_reply_over_ignored_results(
     if _parse_bare_structured_payload(text) is not None:
         return None
     if _browser_tools_attempted(results) and str(text or "").strip():
+        return None
+    from nullion.filesystem_evidence import complete_filename_absence
+    if str(text or "").strip() and any(
+        result.tool_name == "file_search" and result.status == "completed"
+        and complete_filename_absence(result.output) for result in results
+    ):
+        # A checked absence is source evidence, not ignored positive findings.
+        # The semantic reviewer judges this bounded scope; presentation must not
+        # replace the answer using English overlap heuristics.
         return None
     from nullion.artifacts import history_artifact_reference_paths, text_references_file_path
     if any(text_references_file_path(text, path) for path in history_artifact_reference_paths(results)):
@@ -4049,14 +4079,23 @@ def _structured_tool_evidence_reply_over_ignored_results(
     return "\n\n".join(rendered)
 
 
-def _reply_contains_completed_scheduler_action_message(text: str, results: list[ToolResult]) -> bool:
+def _reply_contains_completed_action_message(text: str, results: list[ToolResult]) -> bool:
     normalized_reply = _normalized_reply_text(text)
     if not normalized_reply:
         return False
     for result in reversed(results):
-        if result.status != "completed" or result.tool_name not in _SCHEDULER_ACTION_TOOLS:
+        if result.status != "completed" or result.error:
             continue
         output = result.output if isinstance(result.output, dict) else {}
+        receipt = output.get('action_receipt')
+        if (isinstance(receipt, dict) and receipt.get('type') == 'action_receipt'
+                and not _result_foreground_reply_suppressed(result)
+                and not _result_is_deferred_background_receipt(result)):
+            receipt_text = _format_action_receipt(output)
+            if receipt_text and _reply_contains_action_receipt(text, receipt_text):
+                return True
+        if result.tool_name not in _SCHEDULER_ACTION_TOOLS:
+            continue
         message = output.get("message")
         if isinstance(message, str) and message.strip():
             normalized_message = _normalized_reply_text(message)
@@ -7091,6 +7130,10 @@ def _strip_leading_tool_status_paragraph(text: str, results: list[ToolResult]) -
     paragraphs = re.split(r"\n\s*\n", str(text or "").strip())
     if len(paragraphs) <= 1:
         return text
+    # A multiline paragraph can be a table, listing or answer body. Tool-name
+    # mentions inside that content do not make the entire block a status line.
+    if "\n" in paragraphs[0]:
+        return text
     first = _normalized_reply_text(paragraphs[0]).casefold()
     if not first:
         return text
@@ -7103,6 +7146,27 @@ def _strip_leading_tool_status_paragraph(text: str, results: list[ToolResult]) -
         tool_markers.add(name.replace("_", " ").casefold())
     if not any(marker and marker in first for marker in tool_markers):
         return text
+    for result in results:
+        output = result.output if isinstance(result.output, Mapping) else {}
+        declarations = output.get("source_record_collections")
+        for declaration in declarations[:10] if isinstance(declarations, list) else ():
+            if not isinstance(declaration, Mapping):
+                continue
+            path, identities = declaration.get("path"), declaration.get("identity_fields")
+            if not (isinstance(path, list) and 1 <= len(path) <= 4
+                    and all(isinstance(key, str) for key in path) and isinstance(identities, list)):
+                continue
+            rows = output
+            for key in path:
+                rows = rows.get(key) if isinstance(rows, Mapping) else None
+            if declaration.get("cardinality") == "one" and isinstance(rows, Mapping):
+                rows = [rows]
+            for row in rows[:100] if isinstance(rows, list) else ():
+                if isinstance(row, Mapping) and any(isinstance(key, str)
+                        and isinstance(row.get(key), (str, int, float)) and not isinstance(row.get(key), bool)
+                        and str(row[key]).strip() and str(row[key]).strip().casefold() in first
+                        for key in identities):
+                    return text
     evidence = {
         _normalized_reply_text(value).casefold()
         for result in results
@@ -8223,6 +8287,10 @@ def _image_generation_scope_unavailable_reply(results: list[ToolResult]) -> str 
         } if isinstance(output.get("capabilities"), list) else set()
         if "image_generation" not in capabilities:
             continue
+        # Tool visibility is not provider configuration. An explicit scope can
+        # select only a calendar reader while an image capability is installed.
+        if "image_generation" not in output.get("unavailable_capabilities", ()):
+            continue
         available_tools = {
             str(value or "").strip()
             for value in output.get("available_tools", [])
@@ -9127,6 +9195,26 @@ def is_safe_connector_payload_summary_reply(
     )
 
 
+def _requested_source_local_paths(tool_results) -> frozenset[str]:
+    """Preserve requested path details only when actual local reads support them."""
+    results = _coerce_tool_results(tool_results)
+    scopes = [row for row in results if row.tool_name == "request_tool_scope" and _tool_result_completed(row)]
+    if (not scopes or not isinstance(scopes[-1].output, Mapping)
+            or scopes[-1].output.get("include_local_path_details") is not True):
+        return frozenset()
+    paths = set()
+    for row in results:
+        if (row.tool_name not in {"terminal_exec", "file_read"} or not _tool_result_completed(row)
+                or not isinstance(row.output, Mapping)):
+            continue
+        for key in ("stdout", "content", "path"):
+            value = row.output.get(key)
+            if isinstance(value, str):
+                for pattern in (_LOCAL_POSIX_PATH_RE, _LOCAL_WINDOWS_PATH_RE):
+                    paths.update(match.group("path").rstrip(".,;:") for match in pattern.finditer(value))
+    return frozenset(paths)
+
+
 def _sanitize_local_paths(text: str) -> str:
     """Hide machine-local absolute paths in text that will be shown to users."""
 
@@ -9168,6 +9256,8 @@ def _coerce_tool_results(
                     status=str(value.get("status") or ""),
                     output=output if isinstance(output, dict) else {},
                     error=str(value.get("error")) if value.get("error") is not None else None,
+                    response_requirements=dict(value['response_requirements']) if isinstance(value.get('response_requirements'),Mapping) else None,
+                    recovered_by=tuple(item for item in recovered if isinstance(item,str)) if isinstance(recovered:=value.get('recovered_by'),(list,tuple)) else (),
                 )
             )
             continue
@@ -9182,6 +9272,8 @@ def _coerce_tool_results(
                 status=str(getattr(value, "status", "") or ""),
                 output=output if isinstance(output, dict) else {},
                 error=str(getattr(value, "error", "")) if getattr(value, "error", None) is not None else None,
+                response_requirements=dict(value.response_requirements) if isinstance(getattr(value,'response_requirements',None),Mapping) else None,
+                recovered_by=tuple(item for item in recovered if isinstance(item,str)) if isinstance(recovered:=getattr(value,'recovered_by',()),(list,tuple)) else (),
             )
         )
     return results
@@ -9189,6 +9281,8 @@ def _coerce_tool_results(
 
 def _local_posix_path_display(match: re.Match[str]) -> str:
     path = match.group("path").rstrip(".,;:")
+    if path in _LOCAL_PATH_DETAIL_EVIDENCE.get():
+        return match.group(0)
     suffix = match.group("path")[len(path) :]
     workspace_match = re.search(
         r"/\.nullion/workspaces/[^/]+/(?P<kind>artifacts|files|media)/(?P<name>[^/\s`\"'<>)]*)$",
@@ -9201,6 +9295,8 @@ def _local_posix_path_display(match: re.Match[str]) -> str:
 
 def _local_windows_path_display(match: re.Match[str]) -> str:
     path = match.group("path").rstrip(".,;:")
+    if path in _LOCAL_PATH_DETAIL_EVIDENCE.get():
+        return match.group(0)
     suffix = match.group("path")[len(path) :]
     name = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     return f"{name or '[local path]'}{suffix}"

@@ -7,6 +7,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import time
+import pytest
 from types import SimpleNamespace
 
 import nullion.web_app as web_app
@@ -4068,12 +4069,37 @@ def test_web_auto_skill_background_flow_auto_accepts_by_default() -> None:
     assert "function _showAutoSkillAcceptedBanner(skills)" in _HTML
 
 
-def test_task_status_card_ignores_progress_notes() -> None:
+@pytest.mark.parametrize('enabled',[False,True])
+def test_task_status_card_ignores_progress_notes(tmp_path,monkeypatch,enabled) -> None:
     assert "const statusKind = String(data.status_kind || 'task_summary');" in _HTML
     assert "if (statusKind !== 'task_summary') return;" in _HTML
     assert "if (data.conversation_id && data.conversation_id !== conversationId) return;" in _HTML
-    assert 'if status_kind != "task_summary" and not activity_trace_enabled():' in inspect.getsource(create_app)
-    assert "status_text = compact_tool_activity_text(" in inspect.getsource(create_app)
+    from fastapi.testclient import TestClient
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.tools import ToolRegistry
+    from nullion.chat_operator import set_activity_trace_enabled_for_chat
+    monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'))
+    monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'absent.env'))
+    monkeypatch.setenv('NULLION_ACTIVITY_TRACE_ENABLED','false' if enabled else 'true')
+    monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','task')
+    runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db')
+    cid='web:status-visibility'
+    set_activity_trace_enabled_for_chat(runtime,chat_id=cid,enabled=enabled)
+    class CapturingOrchestrator:
+        deliver_fn=None
+        def set_deliver_fn(self,deliver_fn):self.deliver_fn=deliver_fn
+    orchestrator=CapturingOrchestrator()
+    app=create_app(runtime,orchestrator=orchestrator,registry=ToolRegistry())
+    with TestClient(app) as client,client.websocket_connect('/ws/chat') as socket:
+        assert orchestrator.deliver_fn(cid,'Internal progress update',is_status=True,status_kind='progress_note')
+        assert orchestrator.deliver_fn(cid,'PLANNER\nFor: current request\n1 task',
+            is_status=True,status_kind='task_summary',group_id='owned-status')
+        if enabled:
+            progress=socket.receive_json()
+            assert progress['status_kind']=='progress_note' and progress['include_activity'] is True
+        planner=socket.receive_json()
+        assert planner['status_kind']=='task_summary' and planner['group_id']=='owned-status'
+        assert planner['include_activity'] is enabled
 
 
 def test_task_status_card_marks_terminal_list_as_finalizing() -> None:
@@ -4092,7 +4118,7 @@ def test_web_background_message_reuses_active_turn_bubble_for_ungrouped_replies(
     assert "const groupId = String(data.group_id || '');" in _HTML
     assert "const groupTurnId = _turnIdByTaskGroup.get(groupId) || data.turn_id || null;" in _HTML
     assert "Boolean(groupTurnId && _botTurnBubbles.has(groupTurnId))" in _HTML
-    assert "} else {\n            const bubble = renderServerDeliveredBackgroundReply(data) || existingServerDeliveredReply(data.text || '');" in _HTML
+    assert "} else {\n            const bubble = renderLiveTrackerNotice(data) || renderServerDeliveredBackgroundReply(data) || existingServerDeliveredReply(data.text || '');" in _HTML
     assert "if (!bubble) addMessage('bot', data.text || '', false, { artifacts });\n          }" in _HTML
 
 
@@ -4636,7 +4662,8 @@ def test_doctor_diagnose_button_posts_and_refreshes_existing_status_surfaces() -
 
 def test_doctor_action_results_are_visible_in_chat_not_only_card_metadata() -> None:
     update_source = _HTML.split("async function updateDoctorItem", 1)[1].split("function doctorItemHtml", 1)[0]
-    assert "addAssistantNotice(action === 'repair' ? 'Safe fix applied' : 'Doctor action result'" in update_source
+    assert "addAssistantNotice(data.notice_title || 'Doctor update'" in update_source
+    assert "Safe fix applied" not in update_source
     assert "kind === 'doctor'" in update_source
     assert "action === 'repair'" in update_source
 
@@ -6011,14 +6038,6 @@ def test_chat_restore_does_not_rerender_after_user_interaction() -> None:
     assert "document.getElementById('send-btn').addEventListener('click', () => sendMessage());" in _HTML
 
 
-def test_websocket_chat_dispatches_turns_concurrently() -> None:
-    source = Path(web_app.__file__).read_text(encoding="utf-8")
-    assert "active_turn_tasks: set[asyncio.Task] = set()" in source
-    assert "task = asyncio.create_task(process_chat_payload(payload, dependency_tasks, dispatch_decision, latency_recorder))" in source
-    assert "send_lock = asyncio.Lock()" in source
-    assert "from nullion.turn_dispatch_graph import route_turn_dispatch_with_context" in source
-    assert "route_turn_dispatch_with_context," in source
-    assert "turn_dispatch_decision=dispatch_decision" in source
 
 
 def test_websocket_chat_can_finish_later_message_first(tmp_path, monkeypatch) -> None:

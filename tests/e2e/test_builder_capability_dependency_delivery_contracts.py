@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,6 +108,8 @@ def test_websocket_spreadsheet_request_uses_valid_schema_and_delivers_real_xlsx(
         invoked_spreadsheet_tool = False
 
         def create(self, *, messages, tools, **kwargs):  # noqa: ANN001, ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             del messages, kwargs
             self.calls += 1
             converted = _assert_codex_responses_schema_compatible(list(tools))
@@ -127,7 +130,7 @@ def test_websocket_spreadsheet_request_uses_valid_schema_and_delivers_real_xlsx(
                             "id": "spreadsheet-create-1",
                             "name": "spreadsheet_create",
                             "input": {
-                                "output_path": "/workspace/artifacts/structured-results.xlsx",
+                                "output_path": "/workspace/artifacts/resultados.xlsx",
                                 "title": "structured results",
                                 "sheet_name": "matches",
                                 "columns": ["Item", "Link", "Score"],

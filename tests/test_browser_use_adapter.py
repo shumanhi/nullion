@@ -265,7 +265,7 @@ def test_partial_source_delivery_requires_facts_unknowns_and_completed_scope(mon
         'observations': [{'value': '$80', 'quote': '$80 Total'}],
         'unknowns': ['表示されていない項目', 'Dato no mostrado']})
     scope = {'missing_callable_required_tool_names': [], 'unavailable_required_tool_names': [], 'connector_source_unavailable': False}
-    monkeypatch.setattr(agent, '_completion_review_scope_contract', lambda *a: scope)
+    monkeypatch.setattr(agent, '_completion_review_scope_contract', lambda *a, **kw: scope)
     monkeypatch.setattr(agent, '_scheduler_action_contract_missing', lambda **kw: None)
     monkeypatch.setattr(agent, '_turn_has_artifact_delivery_contract', lambda state: False)
     assert agent._partial_source_report_delivery_ready({}, [result])
@@ -279,3 +279,67 @@ def test_partial_source_delivery_requires_facts_unknowns_and_completed_scope(mon
     assert not agent._partial_source_report_delivery_ready({}, [result]), 'Missing required attachment must still be repaired'
     result.output['observations'] = []
     assert not partial_source_report_disclosures([result]), 'Unknowns alone are not a usable result'
+
+
+@pytest.mark.parametrize('label,detail', [('予約日','2027-01-04 休業'),('Fecha','2027-01-04 Cerrado')])
+def test_blocked_report_retains_exact_disabled_control_evidence_without_inventory_success(label,detail):
+    from nullion.source_observation_contract import compact_source_observations,source_report_status
+    evidence=PageEvidence('operator',BrowserPolicy())
+    state=SimpleNamespace(url='https://example.com/calendar',title='Calendar',dom_state=None,screenshot=None)
+    async def capture():
+        return {'url':state.url,'text':detail,'controls':[{'label':detail,'text':detail,'value':'2027-01-04','disabled':True}]}
+    evidence.text_capture=capture
+    asyncio.run(evidence.capture(state))
+    claim={'label':label,'semantic_role':'interface_control','value':detail,'quote':detail,'source_id':0,'control_index':0}
+    assert evidence.retain(BrowserReport(goal_status='blocked',next_action='report',blocker=detail,observations=[claim]))==1
+    output=evidence.result(error=None,elapsed=1,steps=1,done=True)
+    assert output['report_status']=='blocked'
+    record=output['observations'][0]
+    assert record['evidence_kind']=='source_blocker' and record['control_state']['disabled'] is True
+    assert record['control_state']['value']=='2027-01-04'
+    compact=compact_source_observations(output)
+    assert compact['observations'][0]['evidence_kind']=='source_blocker'
+    assert compact['observations'][0]['quote']==detail and compact['report_status']=='blocked'
+    clipped=compact_source_observations({**output,'unknowns':['x'*1500]*5},max_chars=1800)
+    assert clipped['omitted_unknown_count']>0 and clipped['report_status']=='blocked'
+    result=__import__('nullion.tools',fromlist=['ToolResult']).ToolResult('read','browser_run_task','completed',compact)
+    assert source_report_status([result])=='blocked'
+    from nullion.source_observation_contract import source_answer_context
+    context=source_answer_context([result])
+    assert context['evidence'][0]['value']==detail
+    assert context['evidence'][0]['evidence_kind']=='source_blocker'
+    from nullion.agent_orchestrator import _completion_review_evidence_result_is_positive
+    assert _completion_review_evidence_result_is_positive(result), 'Captured closure is a fact, never an inventory result'
+    from nullion.agent_orchestrator import _project_tool_output_for_repair
+    assert _project_tool_output_for_repair('browser_run_task',compact)['observations'][0]['evidence_kind']=='source_blocker'
+    assert not _completion_review_evidence_result_is_positive(type(result)('unquoted','browser_run_task','completed',
+        {**compact,'observations':[]}))
+
+
+def test_blocked_report_still_rejects_invented_quote_and_keeps_prior_facts():
+    evidence=PageEvidence('operator',BrowserPolicy())
+    state=SimpleNamespace(url='https://example.com/',title='Page',dom_state=SimpleNamespace(llm_representation=lambda:'A $80'),screenshot=None)
+    asyncio.run(evidence.capture(state))
+    evidence.retain(BrowserReport(goal_status='partial',next_action='alternative_source',observations=[{'label':'A','value':'$80','quote':'A $80'}]))
+    assert evidence.retain(BrowserReport(goal_status='blocked',next_action='report',blocker='Unknown',observations=[{'label':'B','value':'$90','quote':'B $90'}]))==0
+    assert evidence.last_rejections[0]['reason']=='quote_not_captured'
+    output=evidence.result(error=None,elapsed=2,steps=2,done=True)
+    assert output['report_status']=='partial' and output['observations'][0]['value']=='$80'
+
+
+@pytest.mark.parametrize('mutation',['marker','quote','source','timestamp','index','url'])
+def test_blocker_proof_requires_native_capture_provenance(mutation):
+    from copy import deepcopy
+    from nullion.source_observation_contract import has_captured_blocker_evidence
+    output={'result_kind':'source_observations','report_status':'blocked','page_url':'https://example.com/',
+        'sources':[{'source_url':'https://example.com/','captured_at':10.0}],
+        'observations':[{'evidence_kind':'source_blocker','value':'休業','quote':'2027-01-04 休業','source_index':0}]}
+    assert has_captured_blocker_evidence(output)
+    changed=deepcopy(output)
+    if mutation=='marker':changed['observations'][0].pop('evidence_kind')
+    elif mutation=='quote':changed['observations'][0]['value']='Disponible'
+    elif mutation=='source':changed['sources']=[]
+    elif mutation=='timestamp':changed['sources'][0]['captured_at']=True
+    elif mutation=='index':changed['observations'][0]['source_index']=99
+    elif mutation=='url':changed['sources'][0]['source_url']='file:///private/source'
+    assert not has_captured_blocker_evidence(changed)

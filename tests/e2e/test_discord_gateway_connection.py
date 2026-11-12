@@ -2,6 +2,7 @@
 Only the external Discord endpoints and external model are simulated.
 """
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -54,6 +55,8 @@ async def test_discord_sdk_connection_and_authorized_chat(
             self.requests = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if "allowed_target_indexes" in json.dumps(kwargs.get("messages", [])):
                 self.relationship_calls += 1
                 return {

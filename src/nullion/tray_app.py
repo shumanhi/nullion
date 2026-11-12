@@ -15,12 +15,14 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.request
 import webbrowser
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
+from nullion.http_transport import SharedHttpClient, http_pool_limits
 
 
 _DEFAULT_PORT = 8742
@@ -94,11 +96,20 @@ def _open_path(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def _request_json(url: str, *, method: str = "GET", timeout: float = 2.5) -> dict[str, Any]:
-    request = urllib.request.Request(url, method=method)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = response.read().decode("utf-8")
-    data = json.loads(payload or "{}")
+def _request_json(
+    url: str, *, method: str = "GET", timeout: float = 2.5, client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    if client is None:
+        with httpx.Client(trust_env=False) as temporary:
+            return _request_json(url, method=method, timeout=timeout, client=temporary)
+    try:
+        response = client.request(method, url, timeout=timeout)
+        response.raise_for_status()
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        # Only connection establishment failures permit the CLI restart fallback.
+        # A read/write failure can occur after a POST has already taken effect.
+        raise urllib.error.URLError(exc) from exc
+    data = json.loads(response.text or "{}")
     return data if isinstance(data, dict) else {}
 
 
@@ -164,6 +175,10 @@ class NullionTray:
         self.status_label = "Checking..."
         self.online = False
         self._stop = threading.Event()
+        self._http = SharedHttpClient()
+        self._refresh_lock = threading.Lock()
+        self._failed_checks = 0
+        self._next_check = 0.0
         self.icon = None
         self._mac_handler = None
         self._webview_process: subprocess.Popen | None = None
@@ -216,21 +231,38 @@ class NullionTray:
             self.refresh_status()
             self._stop.wait(self.poll_interval)
 
-    def refresh_status(self) -> None:
+    def _request(self, path: str, **kwargs) -> dict[str, Any]:
+        client = self._http.get(lambda: httpx.Client(trust_env=False, limits=http_pool_limits(tray=True)))
+        return _request_json(f"{self.base_url}{path}", client=client, **kwargs)
+
+    def refresh_status(self, *, force: bool = False) -> None:
+        # Native timers, menu actions and delayed restart checks can overlap.
+        if self._stop.is_set() or not self._refresh_lock.acquire(blocking=False):
+            return
         try:
-            health = _request_json(f"{self.base_url}/api/health")
-            if health.get("status") != "ok":
-                raise RuntimeError("health check did not return ok")
+            if not force and time.monotonic() < self._next_check:
+                return
             try:
-                status = _request_json(f"{self.base_url}/api/status")
+                health = self._request("/api/health")
+                if health.get("status") != "ok":
+                    raise RuntimeError("health check did not return ok")
+                try:
+                    status = self._request("/api/status")
+                except Exception:
+                    status = health
+                self.online = True
+                self.status_label = _short_status(status)
+                self._failed_checks = 0
+                self._next_check = 0.0
             except Exception:
-                status = health
-            self.online = True
-            self.status_label = _short_status(status)
-        except Exception:
-            self.online = False
-            self.status_label = "Offline"
-        self._refresh_menu()
+                self.online = False
+                self.status_label = "Offline"
+                self._failed_checks += 1
+                delay = min(60.0, max(self.poll_interval, 2.0) * 2 ** min(self._failed_checks - 1, 5))
+                self._next_check = time.monotonic() + delay
+            self._refresh_menu()
+        finally:
+            self._refresh_lock.release()
 
     def notify(self, message: str) -> None:
         if not self.icon:
@@ -295,10 +327,12 @@ class NullionTray:
 
     def restart_nullion(self, *_args) -> None:
         try:
-            _request_json(f"{self.base_url}/api/restart", method="POST", timeout=4.0)
+            self._request("/api/restart", method="POST", timeout=4.0)
             self.notify("Restart requested.")
         except urllib.error.URLError:
             self._run_nullion_shortcut("--restart")
+        except (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError, httpx.WriteTimeout, httpx.RemoteProtocolError):
+            self.notify("Restart result unknown. Check status before retrying.")
         except Exception as exc:
             self.notify(f"Restart failed: {exc}")
         finally:
@@ -306,7 +340,7 @@ class NullionTray:
 
     def restart_chat_services(self, *_args) -> None:
         try:
-            data = _request_json(f"{self.base_url}/api/chat-services/restart", method="POST", timeout=8.0)
+            data = self._request("/api/chat-services/restart", method="POST", timeout=8.0)
             self.notify(str(data.get("message") or "Chat services restart requested."))
         except Exception as exc:
             self.notify(f"Chat service restart failed: {exc}")
@@ -321,11 +355,16 @@ class NullionTray:
             self.notify(f"Could not run nullion {flag}: {exc}")
 
     def _delayed_refresh(self) -> None:
-        time.sleep(4)
-        self.refresh_status()
+        if not self._stop.wait(4):
+            self.refresh_status(force=True)
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._refresh_lock:
+            self._http.close()
 
     def quit(self, *_args) -> None:
-        self._stop.set()
+        self.close()
         if self._mac_handler is not None:
             self._mac_handler.quit_(None)
             return
@@ -384,10 +423,13 @@ class NullionTray:
                 tray.restart_chat_services()
 
             def refresh_(self, sender):
+                tray.refresh_status(force=True)
+
+            def poll_(self, sender):
                 tray.refresh_status()
 
             def quit_(self, sender):
-                tray._stop.set()
+                tray.close()
                 AppKit.NSApp.terminate_(None)
 
             def update_status(self):
@@ -449,7 +491,7 @@ class NullionTray:
         Foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             max(self.poll_interval, 2.0),
             handler,
-            "refresh:",
+            "poll:",
             None,
             True,
         )
@@ -485,6 +527,8 @@ def _run_tray(args) -> None:
     except RuntimeError as exc:
         print(f"nullion-tray: {exc}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        tray.close()
 
 
 if __name__ == "__main__":

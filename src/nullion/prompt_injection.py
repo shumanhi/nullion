@@ -15,6 +15,7 @@ UNTRUSTED_TOOL_NAMES = frozenset(
         "terminal_exec",
         "web_fetch",
         "web_search",
+        "inspect_retained_evidence",
     }
 )
 

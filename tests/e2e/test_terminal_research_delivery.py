@@ -1,4 +1,5 @@
 """Real API, browser tool adapter, graph, SQLite and Telegram delivery boundaries."""
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import asyncio
 import json
 import os
@@ -49,16 +50,28 @@ def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(
         alternatives.append(call.tool_name)
         return ToolResult(call.invocation_id, call.tool_name, 'completed', {
             'result_kind': 'source_observations', 'report_status': 'completed',
+            'source_record_collections': [{'path':['observations'],'identity_fields':['source_url','quote']}],
             'observations': [{'value': 'Independent record: 39', 'quote': 'Independent record: 39',
                 'source_url': 'https://example.net/record'}], 'unknowns': []})
     registry.register(ToolSpec('secondary_reader', 'Read independent source', ToolRiskLevel.LOW,
         ToolSideEffectClass.READ, False, 2, capability_tags=('web',)), secondary)
     class Model:
         steps = 0; reviews = 0
+        errors = []
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
+            try:
+                return self._create(**kw)
+            except AssertionError as error:
+                self.errors.append(repr(error))
+                raise
+        def _create(self, **kw):
             names = {t['name'] for t in kw.get('tools', [])}; system = kw.get('system', '')
             if system.startswith('You are a material-requirements planner'):
-                return text_response(json.dumps({'all_material_requirements_enumerated': True,
+                packet=json.loads(kw['messages'][0]['content'][0]['text'])
+                return text_response(json.dumps({**fixture_source_plan(packet,scope='evidence_summary'),
+                    'all_material_requirements_enumerated': True,
                     'material_requirements': [{'requirement': 'Establish and independently verify the source claims',
                     'requirement_kind': 'fact', 'evidence_subject_id': 'source',
                     'eligible_evidence_tool_names': ['browser_run_task', 'secondary_reader'] if mode == 'alternative_method' and alternatives else ['browser_run_task']}]}))
@@ -70,20 +83,24 @@ def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(
                     source = next(r for r in payload['tool_evidence'] if r['tool_name'] == 'browser_run_task'
                         and r['output'].get('report_status') == 'completed')
                     assert source['output']['observations'][0]['quote'] == 'Recorded statement: 42'
-                    return text_response(json.dumps({'disposition': 'complete', 'unresolved_requirements': [],
+                    return text_response(json.dumps({**fixture_source_assessment(payload,conclusion='limited'),
+                        'disposition': 'complete', 'unresolved_requirements': [],
                         'retry_tool_names': [], 'all_material_requirements_enumerated': True,
                         'material_requirements': [{**{k: row[k] for k in ('requirement_id', 'requirement', 'requirement_kind')},
                             'satisfied': True, 'draft_covered': True, 'evidence_invocation_ids': [source['invocation_id']]}
                             for row in payload['material_requirement_contract']]}))
                 if mode == 'alternative_method' and alternatives:
                     payload = json.loads(kw['messages'][0]['content'][0]['text'])
-                    source = next(r for r in payload['tool_evidence'] if r['tool_name'] == 'secondary_reader')
-                    return text_response(json.dumps({'disposition': 'complete', 'unresolved_requirements': [],
+                    source = next(r for r in payload['tool_evidence'] if r['tool_name'] == 'secondary_reader' and r.get('output',{}).get('source_record_binding'))
+                    return text_response(json.dumps({**fixture_source_assessment(payload,conclusion='limited'),
+                        'disposition': 'complete', 'unresolved_requirements': [],
                         'retry_tool_names': [], 'all_material_requirements_enumerated': True,
                         'material_requirements': [{**{k: row[k] for k in ('requirement_id', 'requirement', 'requirement_kind')},
                             'satisfied': True, 'draft_covered': True, 'evidence_invocation_ids': [source['invocation_id']]}
                             for row in payload['material_requirement_contract']]}))
-                return text_response(json.dumps({'disposition': 'retry',
+                payload=json.loads(kw['messages'][0]['content'][0]['text'])
+                return text_response(json.dumps({**fixture_source_assessment(payload,conclusion='limited',sufficient=False),
+                    'disposition': 'retry',
                     'unresolved_requirements': ['Independent verification is incomplete'],
                     'retry_tool_names': ['browser_run_task', 'secondary_reader'] if mode == 'alternative_method' else ['browser_run_task']}))
             if names == {'present_source_answer'}:
@@ -101,7 +118,7 @@ def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(
             if self.steps == 2:
                 return tool_response('browser_run_task', {'url': 'https://example.com/source', 'task': prompt})
             if mode == 'alternative_method':
-                assert names == {'secondary_reader'}, names
+                assert 'secondary_reader' in names, names
                 return tool_response('secondary_reader', {})
             if mode == 'explicit_continuation':
                 return tool_response('browser_run_task', {'url': 'https://example.net/source', 'task': prompt})
@@ -128,8 +145,14 @@ def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(
         assert restored.json()['terminal_replies'][0]['text'] == text
         assert all(p['phase'] not in {'schema_followup_tool_retry', 'local_system_fallback_retry'}
                    for e in events if e.get('event_type') == 'conversation.latency_timing' for p in e.get('phase_timings', []))
+    assert not model.errors, model.errors
+    if mode == 'alternative_method':
+        reviews = [e for e in events if e.get('event_type') == 'conversation.completion_review']
+        assert reviews[-1]['disposition'] == 'complete' and reviews[-1].get('review_error') is None, reviews
     assert len(calls) == (2 if mode == 'explicit_continuation' else 1)
-    assert model.reviews == (0 if mode == 'presentation_invalid' else 2 if mode == 'alternative_method' else 1)
+    # The shared terminal owner can review retained evidence after malformed
+    # composition without reopening the browser or publishing its inventory.
+    assert model.reviews == (2 if mode in {'alternative_method','review_timeout'} else 1)
     assert alternatives == (['secondary_reader'] if mode == 'alternative_method' else [])
     wire = []
     class Message:

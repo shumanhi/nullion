@@ -130,13 +130,13 @@ def test_fallback_next_run_uses_cron_weekday_numbering(monkeypatch) -> None:
     assert next_run == "2026-05-17T09:00:00+00:00"
 
 
-def test_default_utc_preference_falls_back_to_detected_local_timezone(monkeypatch) -> None:
+def test_explicit_utc_preference_is_preserved_on_a_non_utc_host(monkeypatch) -> None:
     import nullion.preferences as preferences
 
     monkeypatch.setattr(preferences, "load_preferences", lambda: SimpleNamespace(timezone="UTC"))
     monkeypatch.setattr(preferences, "detect_system_timezone", lambda default="UTC": "America/New_York")
 
-    assert crons._cron_timezone() == ZoneInfo("America/New_York")
+    assert crons._cron_timezone() == timezone.utc
 
 
 def test_add_cron_persists_next_run_from_user_local_timezone(cron_db_path, monkeypatch) -> None:

@@ -1,4 +1,5 @@
 """Real API/graph/persistence/delivery; failures are injected at the external model boundary."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -33,6 +34,7 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
         return ToolResult(call.invocation_id, call.tool_name, 'completed', {
             'result_kind': 'source_observations', 'report_status': 'completed',
             'observations': [{'label': 'Powder A', 'value': '8.10 USD · 12 oz · Example City, NY',
+                              'quote': '8.10 USD · 12 oz · Example City, NY',
                               'source_url': 'https://example.com/powder'}], 'limitations': []})
     registry.register(ToolSpec('lookup_source', 'Read live offers', ToolRiskLevel.LOW,
         ToolSideEffectClass.READ, False, 2, capability_tags=('web',)), read)
@@ -40,6 +42,8 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
         steps = 0; failures = 0; normal_calls = 0
         failed_kwargs = None
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {t['name'] for t in kw.get('tools', [])}
             system = kw.get('system', '')
             if system.startswith('You are a material-requirements planner'):
@@ -49,7 +53,6 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
                     'eligible_evidence_tool_names': ['lookup_source']}]}))
             if system.startswith('You are a semantic completion reviewer'):
                 return text_response(json.dumps({'disposition': 'complete', 'unresolved_requirements': [], 'retry_tool_names': []}))
-            if names == {'present_source_answer'}: return source_presentation_response(kw)
             if not names: return text_response('Powder A: 8.10 USD, 12 oz, Example City, NY.')
             self.normal_calls += 1
             assert 'Example City, NY' in json.dumps(kw), kw
@@ -58,7 +61,7 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
                 raise RuntimeError('Synthetic external provider failure')
             if reads and failure_phase != 'before_tools':
                 assert '8.10 USD' in json.dumps(kw)
-                assert 'lookup_source' in names
+                assert 'lookup_source' in names or names == {'present_source_answer'}
                 if self.failures == 0 or failure_phase == 'persistent':
                     self.failures += 1
                     if self.failed_kwargs is None: self.failed_kwargs = kw
@@ -66,6 +69,7 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
                     if failure_phase == 'invalid_schema': return None
                     raise RuntimeError('Synthetic external provider failure')
                 assert kw == self.failed_kwargs
+            if names == {'present_source_answer'}: return source_presentation_response(kw)
             self.steps += 1
             if self.steps == 1:
                 return tool_response('request_tool_scope', {'capabilities': ['web'],
@@ -131,6 +135,8 @@ def test_plain_chat_does_not_enter_recovery_or_add_provider_calls(tmp_path, monk
     class Model:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             return text_response('こんにちは。')
     model = Model(); runtime.model_client = model

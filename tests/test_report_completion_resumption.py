@@ -1,3 +1,5 @@
+import pytest
+from tests.workflow_provider_protocol import workflow_provider_reply
 from datetime import UTC, datetime
 
 from nullion.agent_orchestrator import AgentOrchestrator, TurnResult, _tool_invocation_signature
@@ -6,7 +8,8 @@ from nullion.runtime import bootstrap_persistent_runtime
 from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
 
 
-def test_resumed_run_reuses_completed_action_but_requires_approval_for_new_arguments(tmp_path):
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_resumed_run_reuses_completed_action_but_requires_approval_for_new_arguments(tmp_path, scheduled):
     runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');registry=ToolRegistry();writes=[]
     # The existing action receipt is execution state. It grants no permission
     # for a different account action in the continuation.
@@ -25,6 +28,8 @@ def test_resumed_run_reuses_completed_action_but_requires_approval_for_new_argum
     class Model:
         calls=0
         def create(self,**kwargs):
+            reply = workflow_provider_reply(kwargs)
+            if reply is not None: return reply
             self.calls+=1
             return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(self.calls),
                 'name':'create_record','input':{'id':'A' if self.calls==1 else 'B'}}]}
@@ -32,7 +37,7 @@ def test_resumed_run_reuses_completed_action_but_requires_approval_for_new_argum
     result=AgentOrchestrator(model_client=model).resume_turn(conversation_id='web:resume',principal_id='web:resume',
         user_message='Finish both records',messages_snapshot=[{'role':'user','content':'Finish both records'}],
         previous_result=previous,tool_registry=registry,policy_store=runtime.store,approval_store=runtime.store,
-        tool_flow_context={'scheduled_task_run':True},max_iterations=4)
+        tool_flow_context={'scheduled_task_run':scheduled},max_iterations=4)
     assert writes==[] and model.calls==2
     assert result.suspended_for_approval and result.approval_id
     assert runtime.store.get_approval_request(result.approval_id).status.value=='pending'

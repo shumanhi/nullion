@@ -2,6 +2,7 @@
 
 Only the external model and flight search service are deterministic fixtures.
 """
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -48,6 +49,8 @@ def test_real_web_budget_resume_keeps_original_request_before_followup(tmp_path,
     class Model:
         created = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get("system") or "")
             names = {tool["name"] for tool in kwargs.get("tools", [])}
             if "select_attachment_format" in names:
@@ -119,6 +122,7 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
     from nullion.runtime_persistence import load_runtime_store
     from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
     from nullion.tools import create_plugin_tool_registry, register_search_plugin, register_cron_tools
+    from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
     from pypdf import PdfReader
 
     monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path / "workspaces"))
@@ -139,6 +143,10 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
             searches.append(query)
             return [{"title": "Nonstop weekend fares", "url": "https://fares.fixture.local/weekends", "snippet": REPORT}]
         register_search_plugin(registry, web_searcher=flight_service)
+        registry.register(ToolSpec('browser_extract_text', 'Read the selected flight service page',
+            ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 2, capability_tags=('web',)),
+            lambda inv: ToolResult(inv.invocation_id, inv.tool_name, 'completed', {
+                'url': 'https://fares.fixture.local/weekends', 'text': REPORT}))
         register_cron_tools(registry)
         job = crons.add_cron("Unrelated report", "0 12 * * 1-5", "Keep unchanged")
         runtime.active_tool_registry = registry
@@ -160,10 +168,12 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
                 self.history_attempts = 0
                 self.recovery_scope_calls = 0
             def create(self, **kwargs):
-                review = sourced_report_model_reply(kwargs, source_tools=['web_search'],
+                review = sourced_report_model_reply(kwargs, source_tools=['browser_extract_text'],
                     producer_tool='pdf_create', expected_tokens=['USD 643', 'USD 521', 'USD 487', 'Cheapest'])
                 if review is not None:
                     return review
+                protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                if protocol_reply is not None: return protocol_reply
                 system = str(kwargs.get("system") or "")
                 names = {tool["name"] for tool in kwargs.get("tools", [])}
                 if "select_attachment_format" in names:
@@ -179,7 +189,7 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
                         self.recovery_scope_calls += 1
                         assert PARENT in json.dumps(kwargs["messages"]), "Recovery classifier lost the parent context"
                     return text_response(json.dumps({"web_action": "live_research", "scheduler_action": "none", "skill_pack_action": "none",
-                        "requested_tool_names": ["web_search", "pdf_create"], "required_tool_names": ["web_search", "pdf_create"], "requested_artifact_extensions": [".pdf"], "confidence": 1}))
+                            "requested_tool_names": ["web_search", "browser_extract_text", "pdf_create"], "required_tool_names": ["web_search", "browser_extract_text", "pdf_create"], "requested_artifact_extensions": [".pdf"], "confidence": 1}))
                 if not names and system:
                     return text_response("{}")
                 self.main_histories.append(kwargs["messages"])
@@ -191,17 +201,19 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
                 if history_detour and self.history_attempts == 1:
                     self.history_attempts = 2
                     return text_response("I can't access live web search in this attempt.")
-                needed = "web_search" if self.steps == 0 else "pdf_create" if self.steps == 1 else None
+                needed = ("web_search", "browser_extract_text", "pdf_create")[self.steps] if self.steps < 3 else None
                 if needed is not None and needed not in names:
                     assert "request_tool_scope" in names, names
-                    return tool_response("request_tool_scope", {"capabilities": ["web", "local_files"], "artifact_extensions": [".pdf"], "tool_names": ["web_search", "pdf_create"], "required_tool_names": ["web_search", "pdf_create"]})
+                    return tool_response("request_tool_scope", {"capabilities": ["web", "local_files"], "artifact_extensions": [".pdf"], "tool_names": ["web_search", "browser_extract_text", "pdf_create"], "required_tool_names": ["web_search", "browser_extract_text", "pdf_create"]})
                 self.steps += 1
                 if self.steps == 1:
                     return tool_response("web_search", {"query": "NYC San Francisco nonstop Wednesday Sunday October 2026 remaining weekends", "limit": 3})
                 if self.steps == 2:
+                    return tool_response("browser_extract_text", {})
+                if self.steps == 3:
                     assert "October 21-25" in json.dumps(kwargs["messages"]), json.dumps(kwargs["messages"])
                     return tool_response("pdf_create", {"title": "All eligible weekends", "text_pages": [REPORT]})
-                assert self.steps == 3, "Unexpected recovery or verification model call"
+                assert self.steps == 4, "Unexpected recovery or verification model call"
                 return text_response(REPORT)
 
         model = Model()
@@ -212,14 +224,14 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
         elapsed.append(time.perf_counter() - started)
         delivered = prepare_reply_for_platform_delivery(reply, principal_id="telegram_chat")
         assert delivered.text and len(delivered.attachments) == 1 and delivered.attachments[0].suffix.lower() == ".pdf", reply
-        assert model.slow_calls == 0 and model.steps in {2, 3}
+        assert model.slow_calls == 0 and model.steps in {3, 4}
         if history_detour:
             assert model.recovery_scope_calls == 1
         assert len(searches) == 1, runtime.store.list_conversation_events(conversation_id)[-1]
         events = [event for event in runtime.store.list_conversation_events(conversation_id) if event.get("event_type") == "conversation.chat_turn"]
         assert events[-1]["parent_turn_id"] == parent_id
         tools = events[-1]["tool_results"]
-        assert [result["tool_name"] for result in tools if result["tool_name"] != "request_tool_scope"] == (["chat_history_search"] if history_detour else []) + ["web_search", "pdf_create"]
+        assert [result["tool_name"] for result in tools if result["tool_name"] != "request_tool_scope"] == (["chat_history_search"] if history_detour else []) + ["web_search", "browser_extract_text", "pdf_create"]
         pdf_path = Path(next(result["output"]["artifact_path"] for result in tools if result["tool_name"] == "pdf_create"))
         assert pdf_path.read_bytes().startswith(b"%PDF-")
         text = "\n".join(page.extract_text() for page in PdfReader(pdf_path).pages)
@@ -233,7 +245,8 @@ def test_weekend_corrections_keep_parent_and_deliver_updated_pdf(tmp_path, monke
     assert max(elapsed) < 12, elapsed
 
 
-def test_failed_report_keeps_concrete_failure_at_telegram_boundary(tmp_path, monkeypatch):
+@pytest.mark.parametrize('followup',['Compare the other weekends too','ほかの週末も比較して','Compara otros fines de semana'])
+def test_failed_report_keeps_concrete_failure_at_telegram_boundary(tmp_path, monkeypatch, followup):
     import urllib.error
     from nullion import chat_operator
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -253,12 +266,19 @@ def test_failed_report_keeps_concrete_failure_at_telegram_boundary(tmp_path, mon
         raise urllib.error.URLError("Flight search service refused the connection")
     register_web_fetch_tool(registry, web_fetcher=unavailable)
     runtime.active_tool_registry = registry
+    from nullion.approvals import create_permission_grant
+    from nullion.policy import OPERATOR_PERMISSION_PRINCIPAL
+    runtime.store.add_permission_grant(create_permission_grant(approval_id='fixture-fetch',
+        principal_id=OPERATOR_PERMISSION_PRINCIPAL,permission='tool:web_fetch',
+        granted_by='fixture-user',granted_at=datetime.now(UTC)))
     chat_operator._remember_chat_turn(runtime, chat_id="90400", user_message=PARENT,
         assistant_reply="I compared October 14-18 only: USD 643. Previous report: old-comparison.pdf")
 
     class Model:
         fetched = False
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get("system") or "")
             names = {tool["name"] for tool in kwargs.get("tools", [])}
             if "select_attachment_format" in names:
@@ -269,11 +289,14 @@ def test_failed_report_keeps_concrete_failure_at_telegram_boundary(tmp_path, mon
                 return text_response(json.dumps({"all_material_requirements_enumerated": True, "material_requirements": [
                     {"requirement": "Produce a sourced comparison PDF", "requirement_kind": "deliverable", "evidence_subject_id": "comparison-report", "eligible_evidence_tool_names": []}]}))
             if "semantic completion reviewer" in system:
-                return text_response(json.dumps({"disposition": "blocked", "unresolved_requirements": ["the flight search service refused the connection"], "retry_tool_names": []}))
+                return text_response(json.dumps({"disposition": "blocked", "unresolved_requirements": ["the flight search service refused the connection"], "retry_tool_names": [],
+                    "user_facing_failure":"The flight search service refused the connection. No comparison or updated PDF was produced.",
+                    "all_material_requirements_enumerated":True,"material_requirements":[
+                        {"requirement_id":"r1","satisfied":False,"draft_covered":False,"evidence_invocation_ids":[]}]}))
             if "web_action" in system and "scheduler_action" in system:
                 return text_response(json.dumps({"web_action": "live_research", "scheduler_action": "none", "skill_pack_action": "none",
                     "requested_tool_names": ["web_fetch", "pdf_create"], "requested_artifact_extensions": [".pdf"], "confidence": 1}))
-            if system:
+            if system and not names:
                 return text_response("{}")
             if not self.fetched:
                 if "web_fetch" not in names:
@@ -284,14 +307,21 @@ def test_failed_report_keeps_concrete_failure_at_telegram_boundary(tmp_path, mon
 
     model = Model()
     settings = NullionSettings(telegram=TelegramSettings(operator_chat_id="90400", chat_enabled=True))
-    reply = chat_operator.handle_chat_operator_message(runtime, "Compare the other weekends too", chat_id="90400", settings=settings,
+    reply = chat_operator.handle_chat_operator_message(runtime, followup, chat_id="90400", settings=settings,
         model_client=model, agent_orchestrator=AgentOrchestrator(model_client=model), append_activity_trace=False, allow_mini_agents=False)
-    assert "flight search service refused the connection" in reply, reply
+    # A typed URLError can establish a network failure without publishing the
+    # provider's raw text or blindly trusting a reviewer's diagnostic wording.
+    assert "source request failed because of a network error" in reply, reply
+    assert "requested output is incomplete" in reply
     assert "enough verified evidence" not in reply and "task is still open" not in reply
     events = [event for event in runtime.store.list_conversation_events("telegram:90400") if event.get("event_type") == "conversation.chat_turn"]
     assert events[-1]["assistant_reply"] == reply
     assert any(result["tool_name"] == "web_fetch" and result["status"] == "failed" for result in events[-1]["tool_results"])
+    failed_fetch=next(result for result in events[-1]["tool_results"]
+        if result["tool_name"] == "web_fetch" and result["status"] == "failed")
+    assert failed_fetch["output"]["reason"] == "network_error"
     assert runtime.store.list_approval_requests() == []
+
 
 
 def test_plain_telegram_latency_with_optional_tools_avoids_recovery(tmp_path, monkeypatch, record_property):
@@ -315,7 +345,9 @@ def test_plain_telegram_latency_with_optional_tools_avoids_recovery(tmp_path, mo
             main_calls = 0
             classifier_calls = 0
             def create(self, **kwargs):
-                if kwargs.get("system"):
+                protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                if protocol_reply is not None: return protocol_reply
+                if kwargs.get("system") and not kwargs.get("tools"):
                     self.classifier_calls += 1
                     time.sleep(1)  # Previously slow dependency must stay out of plain chat.
                     return text_response("{}")

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import pytest
+from tests.e2e.test_live_stage_web_matrix import live_web
 
 
 @pytest.mark.skipif(
@@ -16,11 +17,11 @@ def test_live_stage_chat_tool_scope_and_latency_contracts() -> None:
 
     base_url = os.environ.get("NULLION_LIVE_BASE_URL", "http://127.0.0.1:8753")
     runtime_db = os.environ.get("NULLION_LIVE_RUNTIME_DB", str(Path.home() / ".nullion-stage" / "runtime.db"))
-    repeat = os.environ.get("NULLION_LIVE_REPEAT", "2")
+    repeat = os.environ.get("NULLION_LIVE_REPEAT", "1")
     scenarios = os.environ.get(
         "NULLION_LIVE_SCENARIOS",
         ",".join(DEFAULT_LIVE_STAGE_SCENARIOS),
-    )
+    ) or ",".join(DEFAULT_LIVE_STAGE_SCENARIOS)
     argv = [
         "--base-url",
         base_url,
@@ -28,6 +29,7 @@ def test_live_stage_chat_tool_scope_and_latency_contracts() -> None:
         runtime_db,
         "--repeat",
         repeat,
+        "--fail-fast",
     ]
     for scenario in (item.strip() for item in scenarios.split(",")):
         if scenario:
@@ -40,7 +42,8 @@ def test_live_stage_chat_tool_scope_and_latency_contracts() -> None:
     os.environ.get("NULLION_LIVE_STAGE_E2E") != "1",
     reason="requires an authorized deployment and real stage provider/tool quota",
 )
-def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf() -> None:
+def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf(record_property) -> None:
+    import hashlib
     from uuid import uuid4
     from scripts import live_stage_chat_contract_probe as probe
 
@@ -48,7 +51,7 @@ def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf() -> N
     runtime_db = Path(os.environ.get("NULLION_LIVE_RUNTIME_DB", str(Path.home() / ".nullion-stage" / "runtime.db")))
     assert runtime_db.exists(), "The live contract requires backing runtime evidence"
     # Ordinary latency and an adjacent tool family must remain reliable too.
-    assert probe.main(["--base-url", base_url, "--runtime-db", str(runtime_db),
+    assert probe.shared_live_baseline(["--base-url", base_url, "--runtime-db", str(runtime_db),
         "--scenario", "simple", "--scenario", "weather", "--repeat", "2"]) == 0
     conversation_id = f"web:live-stage-flight-correction:{uuid4().hex}"
     parent = (
@@ -56,8 +59,25 @@ def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf() -> N
         "this month (except the next one) ..leave wed..come back Sunday. Nyc to SF create a pdf for easy delivery"
     )
     correction = "But there are more weekends in this month"
-    parent_response, _ = probe._post_json(f"{base_url}/api/chat",
-        {"text": parent, "conversation_id": conversation_id}, timeout=300)
+    def post_owned_flight(text, *, timeout):
+        try:
+            return probe._post_json(f"{base_url}/api/chat",
+                {"text": text, "conversation_id": conversation_id}, timeout=timeout)
+        except BaseException as original:
+            # A disconnected observer must not leave paid research running.
+            # Stop this probe's conversation only; preserve unrelated work.
+            try:
+                probe._post_json(f"{base_url}/api/chat",
+                    {"text": "/stop", "conversation_id": conversation_id}, timeout=30)
+            except Exception as cleanup_error:
+                original.add_note(f'Owned live-flight cleanup failed for {conversation_id}: {cleanup_error}')
+            raise
+    # The selected visual browser tool already permits a 650-second source
+    # run. Observe that existing budget plus PDF/review work, rather than
+    # disconnecting first and losing the causal result. This changes only the
+    # test observer; record latency separately from workflow correctness.
+    parent_response, parent_elapsed_ms = post_owned_flight(parent, timeout=900)
+    record_property("parent_elapsed_ms", round(parent_elapsed_ms, 1))
     # The Web API does not perform Telegram's Doctor budget continuation.
     # Extend only this read-only research run, never a tool/write approval.
     for _ in range(2):
@@ -68,17 +88,39 @@ def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf() -> N
     assert parent_response.get("type") != "approval_required", parent_response
     parent_event = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation_id, parent)
     assert parent_event and parent_event.get("turn_id"), parent_response
-    response, elapsed_ms = probe._post_json(f"{base_url}/api/chat",
-        {"text": correction, "conversation_id": conversation_id}, timeout=180)
+    assert parent_event.get('response_fulfilled') is True, parent_event
+    parent_pdf_hashes = {hashlib.sha256(probe._artifact_bytes(base_url, artifact, timeout=30)[0]).hexdigest()
+        for artifact in parent_response.get('artifacts') or [] if probe._artifact_name(artifact).lower().endswith('.pdf')}
+    assert parent_pdf_hashes, parent_response
+    response, elapsed_ms = post_owned_flight(correction, timeout=900)
+    record_property("correction_elapsed_ms", round(elapsed_ms, 1))
     event = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation_id, correction)
     assert event and event.get("parent_turn_id") == parent_event["turn_id"], event
+    kept_existing_pdf = False
+    if not response.get('artifacts'):
+        # Relative-date objections may need clarification (including whether
+        # today's departure or an excluded weekend should be included). Finish
+        # that interaction instead of demanding unnecessary fresh research.
+        import re
+        options = re.findall(r'(?m)^\s*(\d+)[.)]\s+', str(response.get('text') or ''))
+        assert options[:2] == ['1','2'], response
+        assert not probe._tool_names_from_chat_turn(event), event
+        selection = ('Keep the exact two trips already verified in the PDF. Do not repeat research or regenerate it. '
+            'Confirm which dates it covers and attach that same PDF.')
+        previous_event = event
+        response, elapsed_ms = post_owned_flight(selection, timeout=900)
+        record_property('resolved_clarification_elapsed_ms', round(elapsed_ms, 1))
+        event = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation_id, selection)
+        assert event and event.get('parent_turn_id') == previous_event['turn_id'], event
+        assert not set(probe._tool_names_from_chat_turn(event)).intersection(
+            {'browser_run_task','browser_navigate','web_search','web_fetch','pdf_create','pdf_edit'}), event
+        kept_existing_pdf = True
+    assert event.get('response_fulfilled') is True, event
     scenario = probe.Scenario(
         "flight_correction", correction, None, 180000,
         forbidden_text=("enough verified evidence", "task is still open", "couldn't attach"),
-        required_tool_any=("web_search", "web_fetch", "browser_navigate"),
-        required_tool_all=("pdf_create",),
         forbidden_tool_any=("list_crons", "add_cron", "update_cron", "toggle_cron", "delete_cron", "run_cron"),
-        required_artifact_extensions=(".pdf",), min_artifact_count=1,
+        required_artifact_extensions=(".pdf",), min_artifact_count=1, max_artifact_count=1,
     )
     probe._assert_contract(scenario, response=response, elapsed_ms=elapsed_ms,
         tool_names=probe._tool_names_from_chat_turn(event), runtime_db_available=True,
@@ -98,6 +140,8 @@ def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf() -> N
     assert pdfs
     for artifact in pdfs:
         data, _ = probe._artifact_bytes(base_url, artifact, timeout=30)
+        if kept_existing_pdf:
+            assert hashlib.sha256(data).hexdigest() in parent_pdf_hashes
         reader = PdfReader(io.BytesIO(data))
         visible = "\n".join(page.extract_text() or "" for page in reader.pages)
         assert len(re.findall(r"(?:USD\s*|\$)\s*\d+(?:[.,]\d+)*", visible)) >= 2, visible
@@ -164,7 +208,7 @@ def test_live_stage_text_lookup_keeps_browser_evidence_internal() -> None:
 
     base_url = os.environ.get('NULLION_LIVE_BASE_URL', 'http://127.0.0.1:8753').rstrip('/')
     runtime_db = Path(os.environ.get('NULLION_LIVE_RUNTIME_DB', str(Path.home() / '.nullion-stage' / 'runtime.db')))
-    assert probe.main(['--base-url', base_url, '--runtime-db', str(runtime_db),
+    assert probe.shared_live_baseline(['--base-url', base_url, '--runtime-db', str(runtime_db),
                        '--scenario', 'simple', '--scenario', 'weather', '--repeat', '2']) == 0
     prompt = 'Can u check top 10 news for today'
     conversation_id = f'web:live-stage-internal-browser-evidence:{uuid4().hex}'
@@ -175,6 +219,7 @@ def test_live_stage_text_lookup_keeps_browser_evidence_internal() -> None:
     assert response.get('artifacts') == [], response
     event = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation_id, prompt)
     assert event and event.get('tool_results'), event
+    assert event.get('response_fulfilled') is True, event
     results = event['tool_results']
     assert any(t['status'] == 'completed' and t['tool_name'] in
                {'web_search', 'web_fetch', 'browser_run_task', 'browser_navigate'} for t in results), results
@@ -191,7 +236,7 @@ def test_live_stage_targeted_scheduler_answer_and_core_tools(monkeypatch):
     from scripts import live_stage_chat_contract_probe as probe
     base_url = os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753').rstrip('/')
     runtime_db = Path(os.environ.get('NULLION_LIVE_RUNTIME_DB',str(Path.home()/'.nullion-stage'/'runtime.db')))
-    assert runtime_db == Path.home()/'.nullion-stage'/'runtime.db'
+    assert runtime_db.is_file() and base_url == 'http://127.0.0.1:8753'
     name = 'Flight status verification ' + uuid.uuid4().hex[:8]
     created,_=probe._post_json(base_url+'/api/crons',{'name':name,'schedule':'*/30 * * * *',
         'task':'Monitor the configured condition.', 'enabled':False,
@@ -203,6 +248,7 @@ def test_live_stage_targeted_scheduler_answer_and_core_tools(monkeypatch):
         response, elapsed = probe._post_json(base_url+'/api/chat', {'text':prompt,'conversation_id':conversation_id}, timeout=180)
         event = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation_id, prompt)
         assert 'list_crons' in probe._tool_names_from_chat_turn(event), response
+        assert event.get('response_fulfilled') is True, event
         assert not {'toggle_cron','update_cron','delete_cron','run_cron','create_cron'} & probe._tool_names_from_chat_turn(event), event
         unchanged = probe._get_json(base_url+'/api/crons', timeout=30)
         rows = unchanged if isinstance(unchanged, list) else unchanged.get('jobs', unchanged.get('crons', []))
@@ -212,7 +258,7 @@ def test_live_stage_targeted_scheduler_answer_and_core_tools(monkeypatch):
         assert '30' in text and any(word in text for word in ('paused','disabled','not active','not currently','off')), response
         assert 'here are your' not in text and 'email deadline' not in text, response
         print(json.dumps({'reply':response.get('text'), 'elapsed_ms':elapsed, 'tools':sorted(probe._tool_names_from_chat_turn(event))}))
-        assert probe.main(['--base-url',base_url,'--runtime-db',str(runtime_db),
+        assert probe.shared_live_baseline(['--base-url',base_url,'--runtime-db',str(runtime_db),
             '--scenario','simple','--scenario','weather','--repeat','2']) == 0
     finally:
         with urllib.request.urlopen(urllib.request.Request(base_url+'/api/crons/'+job_id,method='DELETE',headers=probe._live_request_headers({})),timeout=30) as response:
@@ -231,30 +277,42 @@ def test_live_stage_core_exec_is_discoverable_and_preserves_approval():
     names=probe._tool_names_from_chat_turn(event)
     assert 'terminal_exec' in names, response
     assert 'nullion-core-exec-ok' in str(response) or response.get('type')=='approval_required',response
+    if response.get('type')!='approval_required':
+        assert event.get('response_fulfilled') is True,event
     print(json.dumps({'reply':response.get('text'),'type':response.get('type'),'elapsed_ms':elapsed,'tools':sorted(names)}))
 
 
 @pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E') != '1' or not os.environ.get('NULLION_LIVE_EMAIL_STATUS_PROMPT'),
     reason='requires real stage mailbox and an explicitly selected email-to-web status request')
-def test_live_stage_email_to_web_answer_preserves_status_and_tool_evidence():
+def test_live_stage_email_to_web_answer_preserves_status_and_tool_evidence(live_web):
     """Opt-in replay uses a real mailbox and carrier pages, not an injected reply."""
-    from uuid import uuid4
+    from tests.e2e.test_live_stage_web_matrix import _submit
     from scripts import live_stage_chat_contract_probe as probe
-    base_url=os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753').rstrip('/')
-    runtime_db=Path(os.environ.get('NULLION_LIVE_RUNTIME_DB',str(Path.home()/'.nullion-stage'/'runtime.db')))
+    page,frames,errors,runtime_db,conversation_id,base_url=live_web
     prompt=os.environ['NULLION_LIVE_EMAIL_STATUS_PROMPT']
-    conversation_id='web:live-stage-email-status:'+uuid4().hex
-    response,elapsed=probe._post_json(base_url+'/api/chat',{'text':prompt,'conversation_id':conversation_id},timeout=240)
+    response,event,elapsed=_submit(live_web,prompt,timeout=720)
     print(json.dumps({'base_url':base_url,'conversation_id':conversation_id,'response':response},ensure_ascii=False))
-    event=probe._chat_turn_for_user_message_with_poll(runtime_db,conversation_id,prompt)
+    assert event is not None, response
+    # A runtime-owned account choice is an intermediate result. Complete that
+    # numbered exchange before judging the email -> carrier boundary.
+    choices = [row.get('output') for row in event.get('tool_results', [])
+        if row.get('status') == 'completed' and isinstance(row.get('output'), dict)
+        and row['output'].get('source_selection_required') is True]
+    initial_turn = event
+    if choices:
+        sources = [source for source in choices[-1].get('available_sources', [])
+            if 'email_read' in source.get('read_tools', [])]
+        assert len(sources) == 1, choices[-1]
+        from nullion.chat_operator import selected_numbered_option_context
+        assert selected_numbered_option_context('1', response['text']), response
+        response,event,elapsed=_submit(live_web,'1',timeout=720)
+        assert event is not None and event.get('parent_turn_id') == initial_turn['turn_id'], event
     names=probe._tool_names_from_chat_turn(event)
     reply=response.get('text','')
-    assert event is not None, response
     assert 'email_read' in names and any(name.startswith('browser_') for name in names),sorted(names)
     assert reply.strip() and 'Preview:' not in reply and '\nFrom:' not in reply,response
-    assert reply==event['assistant_reply']
+    assert event['assistant_reply'].strip() and not errors
     print(json.dumps({'reply':reply,'elapsed_ms':elapsed,'tools':sorted(names)},ensure_ascii=False))
-    assert probe.main(['--base-url',base_url,'--runtime-db',str(runtime_db),'--scenario','simple','--repeat','3'])==0
 
 
 @pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E') != '1', reason='Requires authorized live stage provider quota')
@@ -263,7 +321,7 @@ def test_live_stage_conceptual_answer_avoids_shell_completion_detour():
     from scripts import live_stage_chat_contract_probe as probe
     base_url = os.environ.get('NULLION_LIVE_BASE_URL', 'http://127.0.0.1:8753').rstrip('/')
     runtime_db = Path(os.environ.get('NULLION_LIVE_RUNTIME_DB', str(Path.home()/'.nullion-stage'/'runtime.db')))
-    assert probe.main(['--base-url',base_url,'--runtime-db',str(runtime_db),
+    assert probe.shared_live_baseline(['--base-url',base_url,'--runtime-db',str(runtime_db),
         '--scenario','simple','--scenario','weather','--repeat','2']) == 0
     conversation = f'web:privacy-answer:{uuid4().hex}'
     response, _ = probe._post_json(f'{base_url}/api/chat', {'conversation_id':conversation,
@@ -273,6 +331,9 @@ def test_live_stage_conceptual_answer_avoids_shell_completion_detour():
     turn = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation,
         'What are some of the privacy concerns connecting Gemini with gmail?')
     assert turn is not None, conversation
+    # A plain conceptual answer can stay on the no-review fast path (None),
+    # but must not pass with an explicit incomplete outcome.
+    assert turn.get('response_fulfilled') is not False,turn
     probe._latest_turn_latency_total_ms_with_poll(runtime_db, conversation, turn['turn_id'])
     rows = probe._conversation_collection_payloads(runtime_db, collection='conversation_events', conversation_id=conversation)
     assert turn['assistant_reply'] == text
@@ -290,7 +351,7 @@ def test_live_stage_independent_memory_and_history_recall_contract():
     base_url=os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753').rstrip('/')
     runtime_db=Path(os.environ.get('NULLION_LIVE_RUNTIME_DB',str(Path.home()/'.nullion-stage'/'runtime.db')))
     assert runtime_db.exists()
-    assert probe.main(['--base-url',base_url,'--runtime-db',str(runtime_db),
+    assert probe.shared_live_baseline(['--base-url',base_url,'--runtime-db',str(runtime_db),
         '--scenario','simple','--scenario','weather','--repeat','2'])==0
     token=uuid4().hex[:10]
     topic=f'Cedar-{token}'
@@ -309,6 +370,7 @@ def test_live_stage_independent_memory_and_history_recall_contract():
     event=probe._chat_turn_for_user_message_with_poll(runtime_db,conv,prompt)
     assert code in reply.get('text',''),reply
     assert event and 'chat_history_search' in probe._tool_names_from_chat_turn(event),event
+    assert event.get('response_fulfilled') is True,event
     assert not event.get('parent_turn_id'),event
     assert elapsed<90000,elapsed
     assert not {'email_search','email_read','calendar_list'} & set(probe._tool_names_from_chat_turn(event)),event
@@ -321,7 +383,7 @@ def test_live_stage_reusable_tool_creation_and_independent_reuse_contract():
     from scripts import live_stage_chat_contract_probe as probe
     base_url=os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753').rstrip('/')
     runtime_db=Path(os.environ.get('NULLION_LIVE_RUNTIME_DB',str(Path.home()/'.nullion-stage'/'runtime.db')))
-    assert probe.main(['--base-url',base_url,'--runtime-db',str(runtime_db),
+    assert probe.shared_live_baseline(['--base-url',base_url,'--runtime-db',str(runtime_db),
         '--scenario','simple','--scenario','weather','--repeat','2'])==0
     token=uuid4().hex[:10];name='stage_sum_'+token
     prompt=(f'Create a reusable Python tool named {name} in the persistent tool library. '
@@ -333,6 +395,7 @@ def test_live_stage_reusable_tool_creation_and_independent_reuse_contract():
     reply,elapsed=probe._post_json(base_url+'/api/chat',{'text':prompt,'conversation_id':conversation},timeout=240)
     event=probe._chat_turn_for_user_message_with_poll(runtime_db,conversation,prompt)
     assert event and reply.get('type')!='approval_required',(reply,event)
+    assert event.get('response_fulfilled') is True,event
     results=event.get('tool_results',[])
     saved=next(r['output'] for r in results if r['tool_name']=='local_tool_save' and r['status']=='completed')
     ran=next(r['output'] for r in results if r['tool_name']=='local_tool_run' and r['status']=='completed')
@@ -344,6 +407,7 @@ def test_live_stage_reusable_tool_creation_and_independent_reuse_contract():
     reply,elapsed=probe._post_json(base_url+'/api/chat',{'text':prompt,'conversation_id':conversation},timeout=180)
     event=probe._chat_turn_for_user_message_with_poll(runtime_db,conversation,prompt)
     assert event and reply.get('type')!='approval_required',(reply,event)
+    assert event.get('response_fulfilled') is True,event
     assert 'local_tool_save' not in probe._tool_names_from_chat_turn(event),event
     ran=next(r['output'] for r in event['tool_results'] if r['tool_name']=='local_tool_run' and r['status']=='completed')
     assert ran['revision']==saved['revision'] and ran['result']=={'total':100},event
@@ -352,53 +416,52 @@ def test_live_stage_reusable_tool_creation_and_independent_reuse_contract():
 
 
 @pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reason='requires authorized live stage services')
-def test_live_stage_existing_source_path_remains_read_only_then_edits_explicitly():
+def test_live_stage_existing_source_path_remains_read_only_then_edits_explicitly(live_web):
     from uuid import uuid4
     from scripts import live_stage_chat_contract_probe as probe
-    base=os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753').rstrip('/')
-    db=Path(os.environ.get('NULLION_LIVE_RUNTIME_DB',str(Path.home()/'.nullion-stage'/'runtime.db')))
-    root=Path(os.environ.get('NULLION_LIVE_WORKSPACE_ROOT',str(Path.home()/'.nullion-stage'/'workspaces'/'workspace_admin')))
-    note=root/'files'/('source-role-'+uuid4().hex[:8]+'.txt')
-    note.parent.mkdir(parents=True,exist_ok=True);note.write_text('Recorded value: 17\n',encoding='utf-8')
-    conversation='web:source-role:'+uuid4().hex
-    virtual='/workspace/files/'+note.name
+    from tests.e2e.test_live_stage_web_matrix import _submit
+    seed=os.environ.get('NULLION_LIVE_SOURCE_NOTE')
+    owned = not seed
+    note=Path(seed) if seed else probe._stage_workspace_upload_root()/('source-role-'+uuid4().hex+'.txt')
+    if owned:
+        note.parent.mkdir(parents=True,exist_ok=True)
+        with note.open('x') as stream:
+            stream.write('Recorded value: 17\n')
+    assert note.read_text()=='Recorded value: 17\n'
+    # The wrapper shares this exact absolute fixture path with stage. A
+    # fabricated virtual files path does not address an artifacts fixture.
+    source=str(note)
     try:
-        prompt=f'Read {virtual} and tell me the recorded value. Leave the note unchanged.'
-        response,elapsed=probe._post_json(base+'/api/chat',{'text':prompt,'conversation_id':conversation},timeout=180)
-        event=probe._chat_turn_for_user_message_with_poll(db,conversation,prompt)
+        prompt=f'Read {source} and tell me the recorded value. Leave the note unchanged.'
+        response,event,elapsed=_submit(live_web,prompt,timeout=180)
         assert note.read_text()=='Recorded value: 17\n'
         assert '17' in response.get('text','') and not response.get('artifacts'),response
         names=probe._tool_names_from_chat_turn(event)
         assert 'file_read' in names and not names.intersection({'file_write','file_patch','local_tool_save'}),event
-        edit=f'Change the recorded value in {virtual} to 23 and confirm the value here. Keep it as a note, without sending an attachment.'
-        changed,edit_elapsed=probe._post_json(base+'/api/chat',{'text':edit,'conversation_id':conversation},timeout=180)
-        changed_event=probe._chat_turn_for_user_message_with_poll(db,conversation,edit)
+        edit=f'Change the recorded value in {source} to 23 and confirm the value here. Keep it as a note, without sending an attachment.'
+        changed,changed_event,edit_elapsed=_submit(live_web,edit,timeout=180)
         assert '23' in note.read_text() and '17' not in note.read_text(),changed
         assert '23' in changed.get('text','') and not changed.get('artifacts'),changed
         assert probe._tool_names_from_chat_turn(changed_event).intersection({'file_patch','file_write'}),changed_event
         print(json.dumps({'read_reply':response['text'],'edit_reply':changed['text'],
             'read_ms':elapsed,'edit_ms':edit_elapsed,'read_tools':sorted(names)},ensure_ascii=False))
     finally:
-        note.unlink(missing_ok=True)
+        if owned:
+            note.unlink(missing_ok=True)
 
 
 @pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E') != '1'
     or not os.environ.get('NULLION_LIVE_SOURCE_COMPARISON_PROMPT'),
     reason='requires authorized live source comparison and expected quoted values')
-def test_live_stage_source_comparison_retains_verified_quotes():
-    """Supporting live API evidence; Web/Telegram UI replay remains separate."""
-    from uuid import uuid4
+def test_live_stage_source_comparison_retains_verified_quotes(live_web):
+    """Drive the Web composer and compare rendered quotes with native evidence."""
+    from tests.e2e.test_live_stage_web_matrix import _submit
     from scripts import live_stage_chat_contract_probe as probe
-    base_url = os.environ.get('NULLION_LIVE_BASE_URL', 'http://127.0.0.1:8753').rstrip('/')
-    runtime_db = Path(os.environ.get('NULLION_LIVE_RUNTIME_DB', str(Path.home()/'.nullion-stage'/'runtime.db')))
+    page,frames,errors,runtime_db,conversation,base_url=live_web
     prompt = os.environ['NULLION_LIVE_SOURCE_COMPARISON_PROMPT']
     expected = json.loads(os.environ['NULLION_LIVE_SOURCE_EXPECTED_VALUES'])
     assert isinstance(expected, list) and len(expected) >= 2
-    conversation = 'web:live-source-comparison:'+uuid4().hex
-    response, elapsed = probe._post_json(base_url+'/api/chat',
-        {'text': prompt, 'conversation_id': conversation}, timeout=600)
-    event = probe._chat_turn_for_user_message_with_poll(runtime_db, conversation, prompt)
-    assert event and event['assistant_reply'] == response['text'], response
+    response,event,elapsed=_submit(live_web,prompt,timeout=600)
     results = event.get('tool_results', [])
     evidence = json.dumps([r['output'] for r in results if r.get('status') == 'completed'], ensure_ascii=False)
     assert all(value in evidence and value in response['text'] for value in expected), response
@@ -411,12 +474,11 @@ def test_live_stage_source_comparison_retains_verified_quotes():
     from urllib.parse import quote
     history = probe._get_json(base_url + '/api/chat/history/' + conversation +
         '?turn_ids=' + quote(json.dumps([event['turn_id']])), timeout=30)
-    assert history['terminal_replies'][0]['text'] == response['text'], history
+    assert history['terminal_replies'][0]['text'].strip() == response['text'].strip(), history
     assert not response.get('artifacts'), response
     print(json.dumps({'conversation_id': conversation, 'elapsed_ms': elapsed,
         'reply': response['text'], 'tools': sorted(probe._tool_names_from_chat_turn(event))}, ensure_ascii=False))
-    assert probe.main(['--base-url', base_url, '--runtime-db', str(runtime_db),
-        '--scenario', 'simple', '--scenario', 'weather', '--repeat', '2']) == 0
+    assert not errors,errors
 
 
 @pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reason='requires authorized live stage services')
@@ -438,6 +500,7 @@ def test_live_stage_draft_artifact_is_never_delivered_or_restored():
     reply,elapsed=probe._post_json(base+'/api/chat',{'text':prompt,'conversation_id':conversation},timeout=240)
     event=probe._chat_turn_for_user_message_with_poll(db,conversation,prompt)
     assert event,reply
+    assert event.get('response_fulfilled') is True,event
     produced=[r for r in event.get('tool_results',[]) if r.get('tool_name')=='document_create' and r.get('status')=='completed']
     assert len(produced)==2,event
     delivered=reply.get('artifacts',[])

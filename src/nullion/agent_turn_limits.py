@@ -127,3 +127,39 @@ def chosen_multiplier_from_resume_token(resume_token: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value in AGENT_TURN_LIMIT_EXTENSION_MULTIPLIERS else None
+
+
+def store_budget_approval(runtime, *, conversation_id, message, messages_snapshot,
+        current_max_iterations, tool_result_count, chat_id=None, request_id=None,
+        message_id=None, requested_extensions=(), context=None, resume_state=None):
+    """One persistence/approval mechanism for chat and scheduled continuations.
+
+    Execution-specific state is opaque here. It grants budget only, never tool
+    or boundary permissions. Publish choices only after the checkpoint commits.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+    from nullion.approvals import create_approval_request, ApprovalStatus
+    from nullion.suspended_turns import SuspendedTurn
+    approval = create_approval_request(requested_by=conversation_id,
+        action=AGENT_TURN_LIMIT_EXTENSION_ACTION, resource=(context or {}).get('cron_id', conversation_id),
+        request_kind=AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+        context={**build_agent_turn_limit_extension_context(current_max_iterations=current_max_iterations,
+            tool_result_count=tool_result_count, conversation_id=conversation_id,
+            requested_extensions=requested_extensions), **(context or {})})
+    token = {**build_agent_turn_limit_resume_token(current_max_iterations=current_max_iterations), **(resume_state or {})}
+    suspended = SuspendedTurn(approval_id=approval.approval_id, conversation_id=conversation_id,
+        chat_id=chat_id, message=message, request_id=request_id, message_id=message_id,
+        created_at=datetime.now(UTC), messages_snapshot=messages_snapshot or [
+            {'role': 'user', 'content': [{'type': 'text', 'text': str(message).removeprefix('/chat ')}]}],
+        pending_tool_calls=[], resume_token=token)
+    runtime.store.add_approval_request(approval)
+    runtime.store.add_suspended_turn(suspended)
+    try:
+        runtime.checkpoint()
+    except Exception:
+        runtime.store.remove_suspended_turn(approval.approval_id)
+        runtime.store.add_approval_request(replace(approval, status=ApprovalStatus.DENIED,
+            decision_reason='budget_checkpoint_unavailable'))
+        raise
+    return approval.approval_id

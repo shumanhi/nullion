@@ -21,8 +21,18 @@ export_results() {
 trap export_results EXIT
 export NULLION_APP_REPO="$PWD"
 python -m pip install --disable-pip-version-check --no-build-isolation '.[test]'
-# pytest arguments are deliberately whitespace-separated, never evaluated as shell code.
+# Legacy environment selectors remain whitespace-separated. CLI selectors use
+# the JSON array decoded by pytest_target_order so option values stay intact.
 read -r -a pytest_args <<< "${NULLION_E2E_PYTEST_ARGS:-tests/e2e}"
+# Group explicit parent/child paths so pytest reuses the same fixture collectors.
+pytest_args_file="$(mktemp)"
+python scripts/pytest_target_order.py "${pytest_args[@]}" > "$pytest_args_file"
+mapfile -d '' -t pytest_args < "$pytest_args_file"
+rm -f "$pytest_args_file"
+if [[ ${#pytest_args[@]} -eq 0 ]]; then
+  echo "No test selectors remained after argument normalization." >&2
+  exit 2
+fi
 if [[ "${NULLION_TEST_COVERAGE:-0}" == 1 ]]; then
   python -m coverage run --source=src/nullion -m pytest -q "${pytest_args[@]}"
   python -m coverage report --fail-under=70

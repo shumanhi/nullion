@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+from types import SimpleNamespace
 import logging
 import os
 from pathlib import Path
@@ -40,12 +41,14 @@ from nullion.platform_activity import (
     deliver_platform_task_status_update,
     platform_activity_capabilities,
 )
-from nullion.run_activity import activity_trace_enabled
+from nullion.chat_operator import activity_trace_enabled_for_chat
 from nullion.session_stop import stop_session_async, stop_session_reply
-from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
+from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER, TurnPublicationRevoked
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.users import resolve_messaging_user
 
+
+from nullion.delivery_acknowledgement import UnconfirmedDelivery, deliver_attachment_batch
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +80,7 @@ def _handle_messaging_ingress_result_with_dispatch(
     turn_dispatch_decision=None,
     text_delta_callback=None,
     activity_callback=None,
+    cancellation_checker=None,
 ):
     try:
         parameters = inspect.signature(handle_messaging_ingress_result).parameters
@@ -96,6 +100,10 @@ def _handle_messaging_ingress_result_with_dispatch(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         ):
             kwargs["activity_callback"] = activity_callback
+        if "cancellation_checker" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            kwargs["cancellation_checker"] = cancellation_checker
         return handle_messaging_ingress_result(service, ingress, **kwargs)
     return handle_messaging_ingress_result(service, ingress)
 
@@ -131,11 +139,14 @@ def _normalize_slack_text(text: str) -> str:
 
 
 def _format_slack_reply(text: str) -> str:
-    """Adapt Nullion's Markdown-ish replies to Slack mrkdwn."""
+    """Translate shared Markdown into Slack syntax; leave code literal."""
+    from nullion.chat_text import transform_markdown_prose
     text = sanitize_external_inline_markup(text)
-    text = _RE_MARKDOWN_LINK.sub(lambda m: f"<{m.group(2)}|{m.group(1)}>", text)
-    text = _RE_MARKDOWN_BOLD.sub(lambda m: f"*{m.group(1)}*", text)
-    return text
+    def render_prose(prose):
+        prose = _RE_MARKDOWN_LINK.sub(lambda m: f"<{m.group(2)}|{m.group(1)}>", prose)
+        prose = _RE_MARKDOWN_BOLD.sub(lambda m: f"*{m.group(1)}*", prose)
+        return re.sub(r'(?m)^ {0,3}#{1,6} +(.+?) *#* *$', r'*\1*', prose)
+    return transform_markdown_prose(text, render_prose)
 
 
 def _slack_reply_chunks(text: str | None, *, limit: int = 39000) -> list[tuple[str, str]]:
@@ -218,15 +229,21 @@ async def _update_slack_message(client, *, channel: str, ts: str, text: str) -> 
         if asyncio.iscoroutine(result):
             result = await result
         return _slack_response_ok(result)
-    except Exception:
+    except UnconfirmedDelivery:
+        raise
+    except Exception as exc:
+        from nullion.delivery_acknowledgement import send_error_replay_safety
+        if send_error_replay_safety(exc) == 'unknown':
+            raise UnconfirmedDelivery() from exc
         logger.debug("Slack working message update failed", exc_info=True)
         return False
 
 
 class _SlackTextDeltaStreamer:
-    def __init__(self, *, loop, client, channel: str, ts: str | None) -> None:
+    def __init__(self, *, loop, client, channel: str, ts: str | None, publication_gate=None) -> None:
         self._loop = loop
         self._client = client
+        self._publication_gate = publication_gate
         self._channel = channel
         self._ts = ts
         self._parts: list[str] = []
@@ -241,6 +258,8 @@ class _SlackTextDeltaStreamer:
         if not delta or self._client is None or not self._channel or not self._ts:
             return
         self._parts.append(delta)
+        if self._publication_gate is not None and not self._publication_gate.can_publish():
+            return
         text = self.text
         now = time.monotonic()
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
@@ -253,10 +272,14 @@ class _SlackTextDeltaStreamer:
             ).result(timeout=2)
             if delivered:
                 self._last_text = text
+        except TurnPublicationRevoked:
+            return
         except Exception:
             logger.debug("Slack text streaming update failed", exc_info=True)
 
     async def finish(self, final_text: str | None) -> bool:
+        if self._publication_gate is not None and not await self._publication_gate.wait():
+            return False
         text = str(final_text or "")
         if not self._client or not self._channel or not self._ts or not text:
             return False
@@ -322,32 +345,21 @@ async def _upload_slack_reply_files(client, *, channel: str, paths: tuple[Path, 
         return False
     upload_v2 = getattr(client, "files_upload_v2", None)
     upload_legacy = getattr(client, "files_upload", None)
+    if upload_v2 is None and upload_legacy is None:
+        return False
+    async def send_one(index, path):
+        comment = initial_comment if index == 0 else None
+        if upload_v2 is not None:
+            return await retry_messaging_delivery_operation(lambda: upload_v2(channel=channel,
+                file=str(path), filename=path.name, title=path.name, initial_comment=comment), replay_safe=False)
+        return await retry_messaging_delivery_operation(lambda: upload_legacy(channels=channel,
+            file=str(path), filename=path.name, title=path.name, initial_comment=comment), replay_safe=False)
     try:
-        for index, path in enumerate(paths):
-            comment = initial_comment if index == 0 else None
-            if upload_v2 is not None:
-                await retry_messaging_delivery_operation(
-                    lambda path=path, comment=comment: upload_v2(
-                        channel=channel,
-                        file=str(path),
-                        filename=path.name,
-                        title=path.name,
-                        initial_comment=comment,
-                    )
-                )
-            elif upload_legacy is not None:
-                await retry_messaging_delivery_operation(
-                    lambda path=path, comment=comment: upload_legacy(
-                        channels=channel,
-                        file=str(path),
-                        filename=path.name,
-                        title=path.name,
-                        initial_comment=comment,
-                    )
-                )
-            else:
-                return False
+        await deliver_attachment_batch(paths, send_one)
         return True
+    except UnconfirmedDelivery as exc:
+        exc.confirmed_text = bool(exc.confirmed and initial_comment)
+        raise
     except Exception:
         logger.warning("Slack file upload failed", exc_info=True)
         return False
@@ -392,7 +404,11 @@ async def send_slack_platform_delivery(
                 initial_comment=_format_slack_reply(initial_comment or "") or None,
             ),
         )
+        if result.unconfirmed is not None:
+            raise result.unconfirmed
         return result.ok
+    except UnconfirmedDelivery:
+        raise
     except Exception:
         logger.warning("Slack platform delivery failed", exc_info=True)
         return False
@@ -573,23 +589,31 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
     def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
         del event
 
-    text_streamer = _SlackTextDeltaStreamer(
-        loop=asyncio.get_running_loop(),
-        client=client,
-        channel=working_channel,
-        ts=working_ts,
-    )
-
     turn_registration = await GLOBAL_TURN_DISPATCH_TRACKER.register(
         ingress.operator_chat_id,
         ingress.text,
-        turn_id=ingress.message_id or ingress.request_id,
+        turn_id=ingress.request_id or ingress.message_id,
+        runtime_store=getattr(getattr(service, "runtime", None), "store", None),
         model_client=getattr(service, "model_client", None),
         active_turn_followup_evidence=has_structured_turn_relationship_evidence(
             ingress.text,
             attachments=ingress.attachments,
         ),
     )
+    gate = turn_registration.publication_gate
+    async def withdraw_sent(response):
+        ts = _slack_response_field(response, "ts")
+        delete = getattr(client, "chat_delete", None)
+        if ts and callable(delete):
+            await delete(channel=working_channel, ts=ts)
+    delivery_client = SimpleNamespace(**{
+        name: gate.guard(method, withdraw=withdraw_sent if name == "chat_postMessage" else None)
+        if callable(method := getattr(client, name, None)) else None
+        for name in ("chat_postMessage", "chat_update", "files_upload_v2", "files_upload")
+    })
+    guarded_say = gate.guard(say, withdraw=withdraw_sent)
+    text_streamer = _SlackTextDeltaStreamer(loop=asyncio.get_running_loop(), client=delivery_client,
+        channel=working_channel, ts=working_ts, publication_gate=gate)
     _mark_timing("turn_registered")
     try:
         await turn_registration.wait_for_dependencies()
@@ -599,6 +623,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             service,
             ingress,
             turn_dispatch_decision=turn_registration.decision,
+            cancellation_checker=turn_registration.is_cancelled,
             text_delta_callback=text_streamer.emit,
             activity_callback=emit_working_ack_for_tool_activity,
         )
@@ -627,22 +652,24 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             ):
                 chunks = chunks[1:]
             for formatted_chunk, plain_chunk in chunks:
-                await _send_slack_callable_with_plain_fallback(say, formatted_text=formatted_chunk, plain_text=plain_chunk)
+                await _send_slack_callable_with_plain_fallback(guarded_say, formatted_text=formatted_chunk, plain_text=plain_chunk)
             return True
 
         result = await execute_platform_reply_delivery(
             turn_result.reply,
             channel="slack",
+            tool_results=getattr(turn_result, "tool_results", ()),
             target_id=working_channel,
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
             request_id=ingress.request_id,
             message_id=ingress.message_id,
             reply_already_sent=reply_already_sent,
+            publication_gate=turn_registration.publication_gate,
             send_text=_send_text,
             finalize_stream=text_streamer.finish,
             send_attachments=lambda initial_comment, paths: _upload_slack_reply_files(
-                client,
+                delivery_client,
                 channel=working_channel,
                 paths=paths,
                 initial_comment=_format_slack_reply(initial_comment or "") or None,
@@ -743,7 +770,7 @@ async def run_slack_app(
                 status_messages=_status_messages,
                 status_locks=_status_locks,
                 planner_feed_enabled=True,
-                include_activity=activity_trace_enabled(),
+                include_activity=activity_trace_enabled_for_chat(service.runtime, chat_id=conversation_id),
             )
         outbound_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
         return await send_slack_platform_delivery(bot_token=bot_token, channel=channel, text=outbound_text)

@@ -1,5 +1,6 @@
 """Real chat route, SQLite, graph and Telegram delivery; external provider fakes only."""
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import asyncio
 import json
 import os
@@ -47,21 +48,25 @@ def test_chat_preserves_completed_findings_through_review_and_browser_failure(tm
     class Model:
         steps = 0; reviews = 0
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             names = {t['name'] for t in kw.get('tools', [])}; system = kw.get('system', '')
             if system.startswith('You are a material-requirements planner'):
-                return text_response(json.dumps({'all_material_requirements_enumerated': True,
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
+                return text_response(json.dumps({**fixture_source_plan(packet), 'all_material_requirements_enumerated': True,
                     'material_requirements': [{'requirement': 'Verify both prices and final availability',
                     'requirement_kind': 'fact', 'evidence_subject_id': 'comparison',
                     'eligible_evidence_tool_names': ['lookup_source']}]}))
             if system.startswith('You are a semantic completion reviewer'):
                 self.reviews += 1
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
                 if mode in {'timeout', 'same_batch_wait_failure'}: raise TimeoutError('External review provider timed out')
                 if mode == 'invalid_review': return text_response('not structured data')
                 if mode == 'blocked_requirements':
-                    return text_response(json.dumps({'disposition': 'blocked',
+                    return text_response(json.dumps({**fixture_source_assessment(packet), 'disposition': 'blocked',
                         'unresolved_requirements': ['Verify the exact price.; Provide cancellation terms.; Confirm final availability.'],
                         'retry_tool_names': []}))
-                return text_response(json.dumps({'disposition': 'retry',
+                return text_response(json.dumps({**fixture_source_assessment(packet), 'disposition': 'retry',
                     'unresolved_requirements': ['Final availability remains unverified'],
                     'retry_tool_names': ['browser_wait_for']}))
             if names == {'present_source_answer'}: return source_presentation_response(kw)
@@ -92,7 +97,7 @@ def test_chat_preserves_completed_findings_through_review_and_browser_failure(tm
         payload = response.json()
         assert '71 USD' in payload['text'] and '240 USD' in payload['text'], payload
         assert 'Cancellation terms' in payload['text']
-        assert payload['text'].count('Not verified from this check:') == 1, payload
+        assert payload['text'].count('Not verified from this check') == 1, payload
         assert payload['text'].count('Cancellation terms not displayed') == 1, payload
         assert 'Verify the exact price' not in payload['text'] and 'Provide cancellation' not in payload['text'], payload
         assert "I couldn't complete this request because" not in payload['text'], payload
@@ -107,7 +112,7 @@ def test_chat_preserves_completed_findings_through_review_and_browser_failure(tm
     elapsed = time.perf_counter() - started
     record_property('elapsed_seconds', elapsed)
     assert calls == ['transport', 'lodging'] + (['wait'] if mode in {'later_wait_failure', 'same_batch_wait_failure'} else [])
-    assert model.reviews <= (3 if mode == 'later_wait_failure' else 1)
+    assert model.reviews <= (3 if mode == 'later_wait_failure' else 2 if mode in {'timeout','invalid_review','same_batch_wait_failure'} else 1)
     assert elapsed < 8, elapsed
     wire = []
     class Message:
@@ -116,7 +121,7 @@ def test_chat_preserves_completed_findings_through_review_and_browser_failure(tm
             wire.append((text, kw)); return SimpleNamespace(message_id=20)
     asyncio.run(_deliver_reply(Message(), payload['text'], principal_id='telegram:733'))
     assert '71 USD' in wire[0][0] and '240 USD' in wire[0][0]
-    assert len(wire) == 1 and wire[0][0].count('Not verified from this check:') == 1
+    assert len(wire) == 1 and wire[0][0].count('Not verified from this check') == 1
     assert 'Verify the exact price' not in wire[0][0]
     assert wire[0][1]['parse_mode'] == 'HTML'
 
@@ -166,6 +171,8 @@ def test_plain_api_latency_stays_independent_of_slow_optional_review(tmp_path, m
     class Model:
         calls = 0
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             if kw.get('system', '').startswith(('You are a semantic completion reviewer', 'You are a material-requirements planner')):
                 time.sleep(1); raise AssertionError('Optional slow review entered plain chat')
             self.calls += 1

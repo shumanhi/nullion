@@ -1,6 +1,7 @@
 """Real browser, agent graph, SQLite and platform artifacts after correctable failures."""
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import socket
@@ -64,6 +65,13 @@ def test_correctable_browser_calls_recover_within_normal_budget(tmp_path, monkey
                 calls = 0
                 session = None
                 def create(self, **kwargs):
+                    if 'material-requirements planner' in str(kwargs.get('system') or ''):
+                        return text_response(json.dumps({'all_material_requirements_enumerated': True,
+                            'requested_artifact_extensions': ['.png'], 'material_requirements': [{
+                                'requirement': 'Deliver the requested page capture.', 'requirement_kind': 'deliverable',
+                                'evidence_subject_id': 'page-capture', 'eligible_evidence_tool_names': ['browser_screenshot']}]}))
+                    protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                    if protocol_reply is not None: return protocol_reply
                     names = {tool["name"] for tool in kwargs.get("tools", [])}
                     self.calls += 1
                     assert "browser_screenshot" in names, "Correction must not remove capture access"
@@ -189,6 +197,8 @@ def test_repair_retries_are_bounded_and_plain_turns_stay_fast(tmp_path, monkeypa
     class WrongArguments:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             assert self.calls <= 2
             assert "browser_wait_for" in {tool["name"] for tool in kwargs["tools"]}
@@ -205,6 +215,8 @@ def test_repair_retries_are_bounded_and_plain_turns_stay_fast(tmp_path, monkeypa
     class Plain:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             if self.calls != 1:
                 time.sleep(2)
@@ -236,6 +248,8 @@ def test_web_approval_route_shows_actual_resume_budget(tmp_path):
         messages_snapshot=[{"role": "user", "content": [{"type": "text", "text": "次へ"}]}], current_max_iterations=24, tool_results=[])
     class Model:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             return text_response("完了しました。")
     app = create_app(runtime, orchestrator=AgentOrchestrator(model_client=Model()), registry=ToolRegistry())
     with TestClient(app) as client:

@@ -24,6 +24,10 @@ from nullion.plugins.browser_plugin.browser_session import BrowserBackend, Brows
 from nullion.tools import ToolInvocation, ToolResult, tool_execution_remaining_seconds
 from nullion.workspace_storage import workspace_storage_roots_for_principal
 
+BROWSER_ITEM_FIELDS = ("title", "url", "canonical_url", "compact_text", "link_text", "section_heading",
+                       "image_url", "image_alt", "image_width", "image_height", "price_text",
+                       "price_candidates", "numeric_snippets", "url_path_depth")
+
 
 def _ok(invocation: ToolInvocation, output: dict[str, Any]) -> ToolResult:
     return ToolResult(
@@ -42,6 +46,24 @@ def _fail(invocation: ToolInvocation, message: str, output: dict[str, Any] | Non
         output=output or {},
         error=message,
     )
+
+
+def _browser_failure_output(exc: BaseException) -> dict[str, str]:
+    # Preserve native transport facts for callers without parsing error prose.
+    cause = getattr(exc, "reason", exc)
+    timeout = isinstance(cause, TimeoutError)
+    if not timeout:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except ImportError:
+            pass  # Optional browser dependency; no provider prose is classified.
+        else:
+            timeout = isinstance(cause, PlaywrightTimeoutError)
+    reason = ("browser_connection_unavailable" if isinstance(cause, ConnectionError)
+              else "source_timeout" if timeout else "source_error")
+    # A native page-operation deadline does not establish that navigation or
+    # extraction is unavailable for every other source in the same request.
+    return {"failure_reason": reason, **({"failure_scope": "invocation"} if timeout else {})}
 
 
 def _compact_failure_message(message: object, *, max_chars: int = 360) -> str:
@@ -214,6 +236,11 @@ def _browser_snapshot_script(*, max_elements: int = 120) -> str:
       placeholder: el.getAttribute('placeholder') || '',
       name: el.getAttribute('name') || '',
       type: el.getAttribute('type') || '',
+      href: el.tagName.toLowerCase() === 'a' ? el.href : '',
+      form_action: el.form ? el.form.action : '',
+      form_method: el.form ? el.form.method : '',
+      native_type: 'type' in el ? el.type : '',
+      has_inline_click_handler: Boolean(el.getAttribute('onclick')),
       visible: isVisible,
       disabled: disabled(el),
       editable: isEditable,
@@ -230,16 +257,45 @@ def _browser_snapshot_script(*, max_elements: int = 120) -> str:
   const active = document.activeElement && document.activeElement.dataset
     ? document.activeElement.dataset.nullionEid || ''
     : '';
-  return {{url: location.href, title: document.title, active_element_id: active, element_count: elements.length, elements}};
+  // Read-only region locators let a source repair use observed DOM structure
+  // rather than invent a selector from visible text or control labels.
+  const locator = (el) => {{
+    const parts = [];
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {{
+      if (node.id && document.querySelectorAll('#' + CSS.escape(node.id)).length === 1) {{
+        parts.unshift('#' + CSS.escape(node.id));
+        break;
+      }}
+      const tag = node.tagName.toLowerCase();
+      const peers = node.parentElement ? Array.from(node.parentElement.children).filter(peer => peer.tagName === node.tagName) : [node];
+      parts.unshift(tag + (peers.length > 1 ? ':nth-of-type(' + (peers.indexOf(node) + 1) + ')' : ''));
+      if (tag === 'body') break;
+    }}
+    return parts.join(' > ');
+  }};
+  const regions = Array.from(document.querySelectorAll('main,section,article,[role="main"],[role="region"],[role="list"],table'))
+    .filter(visible).slice(0, 30).map(el => ({{
+      selector: locator(el), tag: el.tagName.toLowerCase(),
+      label: textOf(el.getAttribute('aria-label') || '').slice(0, 160),
+      headings: Array.from(el.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).filter(visible)
+        .slice(0, 8).map(heading => textOf(heading.innerText || heading.textContent).slice(0, 160)),
+      link_count: el.querySelectorAll('a[href]').length,
+    }}));
+  const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
+    .filter(visible).slice(0, 30).map(el => ({{selector: locator(el), tag: el.tagName.toLowerCase(),
+      text: textOf(el.innerText || el.textContent).slice(0, 200)}}));
+  return {{url: location.href, title: document.title, active_element_id: active, element_count: elements.length, elements, regions, headings}};
 }})()
 """
 
 
-def _browser_extract_items_script(*, max_items: int = 30, selector: str | None = None) -> str:
+def _browser_extract_items_script(*, max_items: int = 30, selector: str | None = None,
+                                  section_heading: str | None = None) -> str:
     return f"""
 (() => {{
   const maxItems = Math.max(1, Math.min(100, {int(max_items)}));
   const rootSelector = {json.dumps(selector or "")};
+  const wantedHeading = {json.dumps(section_heading or "")};
   const textOf = (value, limit = 360) => (value || '').replace(/\\s+/g, ' ').trim().slice(0, limit);
   const visible = (el) => {{
     if (!el) return false;
@@ -248,6 +304,7 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
   }};
   const absoluteUrl = (value) => {{
+    if (!String(value || '').trim()) return '';
     try {{
       const url = new URL(String(value || ''), location.href);
       if (!['http:', 'https:'].includes(url.protocol)) return '';
@@ -394,6 +451,30 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     }}
     return best;
   }};
+  // Retain the enclosing section's label; item-local text cannot establish
+  // membership in a labeled collection. This is DOM structure, not vendor text.
+  const sectionNodes = new Map();
+  const headingCache = new WeakMap();
+  const sectionFor = (anchor, itemRoot) => {{
+    for (let node = itemRoot.parentElement, depth = 0; node && depth < 10;
+         node = node.parentElement, depth += 1) {{
+      if (!headingCache.has(node)) headingCache.set(node,
+        Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).reverse());
+      const heading = headingCache.get(node).find((h) =>
+        visible(h) && !itemRoot.contains(h) &&
+        !h.closest('article,li,[role="listitem"],[role="article"]') &&
+        Boolean(h.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_FOLLOWING));
+      if (heading) {{
+        if (!sectionNodes.has(heading)) sectionNodes.set(heading, {{
+          id: 'section-' + sectionNodes.size,
+          heading: textOf(heading.innerText || heading.textContent, 160),
+        }});
+        return sectionNodes.get(heading);
+      }}
+      if (node === document.body) break;
+    }}
+    return null;
+  }};
   const titleFrom = (anchor, root, image) => {{
     const candidates = [
       anchor.getAttribute('aria-label'),
@@ -409,6 +490,36 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
       if (text.length >= 3) return text;
     }}
     return '';
+  }};
+  // Offer selectors witnessed in the rendered DOM, without guessing site
+  // regions or assigning editorial meaning from class names or prose. The
+  // agent still selects and tests the relevant scope before saving a probe.
+  const availableScopes = () => {{
+    const groups = new Map();
+    const add = (selector, anchor, label) => {{
+      const target = absoluteUrl(anchor.getAttribute('href'));
+      if (!selector || !label || !target) return;
+      if (!groups.has(selector)) groups.set(selector, {{selector, urls: new Set(), sample_text: []}});
+      const group = groups.get(selector);
+      group.urls.add(target);
+      if (group.sample_text.length < 2 && !group.sample_text.includes(label)) group.sample_text.push(label);
+    }};
+    for (const anchor of Array.from(document.querySelectorAll('a[href]')).slice(0, 800)) {{
+      if (!visible(anchor) || anchor.closest('nav,header,footer,[role="navigation"]')) continue;
+      const nodes = [anchor, ...Array.from(anchor.querySelectorAll('h1,h2,h3,h4,h5,h6,span,strong,[role="heading"]')).slice(0, 12)];
+      for (const node of nodes) {{
+        const directText = textOf(Array.from(node.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE)
+          .map((n) => n.textContent).join(' '), 100);
+        if (directText.length < 3 || !visible(node)) continue;
+        const classes = Array.from(node.classList).slice(0, 2);
+        const marker = node.tagName.toLowerCase() + classes.map((name) => '.' + CSS.escape(name)).join('');
+        if (!classes.length && !node.matches('h1,h2,h3,h4,h5,h6,[role="heading"]')) continue;
+        add(node === anchor ? marker : 'a:has(' + marker + ')', anchor, directText);
+      }}
+    }}
+    return Array.from(groups.values()).sort((a, b) => b.urls.size - a.urls.size)
+      .slice(0, 12).map((group) => ({{selector: group.selector,
+        visible_link_count: group.urls.size, sample_text: group.sample_text}}));
   }};
   const numericSnippets = (text) => {{
     const snippets = [];
@@ -438,8 +549,48 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
       if (visible(root)) roots.push(root);
     }}
   }}
-  const anchors = roots.length
-    ? roots.flatMap((root) => Array.from(root.querySelectorAll('a[href]')))
+  let namedAnchors = null;
+  let matchedHeadings = 0;
+  if (wantedHeading) {{
+    const normalizeHeading = (value) => textOf(value, 200).normalize('NFKC').toLocaleLowerCase();
+    const searchRoots = rootSelector ? roots.slice() : [document.body];
+    namedAnchors = [];
+    for (const searchRoot of searchRoots) {{
+      const headings = Array.from(searchRoot.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
+        .filter((heading) => visible(heading) && !heading.closest('article,li,[role="listitem"],[role="article"]'));
+      const level = (heading) => Number(heading.getAttribute('aria-level') || heading.tagName.slice(1)) || 6;
+      for (let index = 0; index < headings.length; index += 1) {{
+        const heading = headings[index];
+        if (normalizeHeading(heading.innerText || heading.textContent) !== normalizeHeading(wantedHeading)) continue;
+        matchedHeadings += 1;
+        if (!sectionNodes.has(heading)) sectionNodes.set(heading, {{
+          id: 'section-' + sectionNodes.size,
+          heading: textOf(heading.innerText || heading.textContent, 160),
+        }});
+        // A logical section ends at the next peer or higher heading. Choosing
+        // an outer <section> can accidentally read the entire page; empty
+        // regions must not borrow the following region's links either.
+        const boundary = headings.slice(index + 1).find((next) => level(next) <= level(heading));
+        for (const anchor of searchRoot.querySelectorAll('a[href]')) {{
+          if (!heading.contains(anchor) &&
+              Boolean(heading.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+              (!boundary || Boolean(anchor.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING))) {{
+            namedAnchors.push(anchor);
+          }}
+        }}
+      }}
+    }}
+  }}
+  if ((rootSelector && !roots.length) || (wantedHeading && !matchedHeadings)) return {{
+    url: location.href, title: document.title, items: [],
+    coverage: {{scope_found: false, selector: rootSelector || null,
+      section_heading: wantedHeading || null, truncated: false, sections: [], available_scopes: availableScopes()}},
+  }};
+  const anchors = namedAnchors !== null ? namedAnchors : roots.length
+    ? roots.flatMap((root) => [
+        ...(root.matches('a[href]') ? [root] : []),
+        ...Array.from(root.querySelectorAll('a[href]')),
+      ])
     : Array.from(document.querySelectorAll('a[href]'));
   const candidates = [];
   let sourceIndex = 0;
@@ -472,8 +623,15 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
       (compactText.length >= 30 ? 4 : 0) -
       (depth < 2 ? 12 : 0) -
       (image.url && titleImageOverlap < 0.15 && anchorTitleOverlap < 0.15 ? 14 : 0);
+    const section = sectionFor(anchor, root);
     candidates.push({{
       score,
+      title_quality: (anchor.matches('h1,h2,h3,h4,h5,h6,[role="heading"]') ||
+        anchor.closest('h1,h2,h3,h4,h5,h6,[role="heading"]') ||
+        anchor.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]')) ? 4 :
+        (!anchor.querySelector('img,source') && textOf(anchor.innerText || anchor.textContent).length >= 3 ? 3 : 1),
+      section_id: section ? section.id : null,
+      section_heading: section ? section.heading : '',
       source_index: sourceIndex,
       url: resolvedUrl || url,
       canonical_url: resolvedUrl || url,
@@ -492,30 +650,50 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
   }}
   candidates.sort((left, right) => right.score - left.score || left.source_index - right.source_index);
   const unique = [];
-  const seenUrls = new Set();
-  const seenImages = new Set();
-  const seenTitles = new Set();
+  const seenUrls = new Map();
   for (const item of candidates) {{
     const urlKey = item.canonical_url || item.url;
-    const imageKey = item.image_url || '';
-    const titleKey = stableTextKey(item.title || item.link_text || item.compact_text);
-    if (urlKey && seenUrls.has(urlKey)) continue;
-    if (imageKey && seenImages.has(imageKey)) continue;
-    if (titleKey && seenTitles.has(titleKey)) continue;
-    if (urlKey) seenUrls.add(urlKey);
-    if (imageKey) seenImages.add(imageKey);
-    if (titleKey) seenTitles.add(titleKey);
+    if (seenUrls.has(urlKey)) {{
+      const previous = seenUrls.get(urlKey);
+      // Image links and title links often point to the same record. Preserve
+      // the image-rich row, but take its title from the stronger text/heading
+      // companion instead of keeping a photo credit or decorative alt label.
+      if (item.title_quality > previous.title_quality && item.title) {{
+        previous.title = item.title;
+        previous.link_text = item.link_text;
+        previous.title_quality = item.title_quality;
+      }}
+      if (item.section_id && previous.section_id !== item.section_id &&
+          !(previous.additional_sections || []).some((section) => section.id === item.section_id)) {{
+        if (!previous.additional_sections) previous.additional_sections = [];
+        previous.additional_sections.push({{id: item.section_id, heading: item.section_heading}});
+      }}
+      continue;
+    }}
+    seenUrls.set(urlKey, item);
     unique.push(item);
-    if (unique.length >= maxItems) break;
   }}
-  const items = unique.map((item, index) => {{
-    const {{score, ...rest}} = item;
+  const selected = unique.slice(0, maxItems);
+  const sections = Array.from(sectionNodes.values()).map((section) => {{
+    const belongs = (item) => item.section_id === section.id ||
+      (item.additional_sections || []).some((extra) => extra.id === section.id);
+    const total = unique.filter(belongs).length;
+    const returned = selected.filter(belongs).length;
+    return {{...section, total_items: total, returned_items: returned, complete: total === returned}};
+  }});
+  const items = selected.map((item, index) => {{
+    const {{score, title_quality, ...rest}} = item;
     return {{...rest, source_index: index + 1}};
   }});
   return {{
 	    url: location.href,
 	    title: document.title,
 	    query_tokens: searchQueryTokens,
+        coverage: {{scope_found: true, selector: rootSelector || null,
+          section_heading: wantedHeading || null,
+          candidate_count: unique.length, returned_count: items.length,
+          truncated: unique.length > items.length, sections,
+          ...(unique.length > items.length ? {{available_scopes: availableScopes()}} : {{}})}},
 	    item_count: items.length,
 	    items,
   }};
@@ -4148,6 +4326,41 @@ def _serialized_browser_operation(method):
                 return _fail(invocation, "Browser operation timed out waiting for the session.",
                              {"reason": "handler_timeout", "session_id": session_id})
             result = method(self, invocation, *args, **kwargs)
+            if (result.status == "completed" and isinstance(result.output, dict)
+                    and method.__name__ in {"browser_run_js", "browser_extract_text", "browser_extract_items", "browser_extract_detail"}):
+                # Output values cannot attest their own document provenance.
+                # Keep this independent, bounded URL read under the same lock.
+                remaining = tool_execution_remaining_seconds()
+                if remaining is None or remaining > 0.25:
+                    try:
+                        document_url = _run(self._backend.run_js(session_id, "() => location.href"), timeout_seconds=1)
+                        if isinstance(document_url, str):
+                            preview_url = _workspace_html_preview_url(document_url, principal_id=invocation.principal_id)
+                            if preview_url is not None:
+                                result.output["page_url"] = preview_url
+                                result.output["source_document_path"] = url2pathname(urlparse(preview_url).path)
+                            elif urlparse(document_url).scheme in {"http", "https"}:
+                                result.output["page_url"] = document_url
+                                if method.__name__ == "browser_extract_text" and isinstance(result.output.get("text"), str):
+                                    result.output['observation_setup'] = [{'tool_name': 'browser_navigate',
+                                        'arguments': {'url': document_url}}]
+                                    for key in ('ready_selector', 'ready_text'):
+                                        if invocation.arguments.get(key):
+                                            result.output['observation_setup'].append({'tool_name': 'browser_wait_for',
+                                                'arguments': {'selector' if key == 'ready_selector' else 'text': invocation.arguments[key]}})
+                                    result.output['observation_readiness'] = {
+                                        'verified': bool(invocation.arguments.get('ready_selector') or invocation.arguments.get('ready_text')),
+                                        'supported_parameters': ['ready_selector', 'ready_text']}
+                                    # Bind native text to the independently observed
+                                    # document while the existing session lock is held.
+                                    # A prior navigation receipt alone cannot prove
+                                    # which document produced this extraction.
+                                    result.output["record"] = {"url": document_url,
+                                        "text": result.output["text"], "selector": result.output.get("selector")}
+                                    result.output["source_record_collections"] = [{"path": ["record"],
+                                        "identity_fields": ["url"], "cardinality": "one"}]
+                    except Exception:
+                        pass
             remaining = tool_execution_remaining_seconds()
             if result.status == "failed" and remaining is not None and remaining <= 0:
                 return _fail(invocation, "Browser operation timed out.",
@@ -4542,6 +4755,7 @@ class BrowserTools:
             "record_scope": record_scope,
             "page": dict(page),
             "record": dict(record),
+            "source_record_collections": [{"path": ["record"], "identity_fields": ["title", "url"], "cardinality": "one"}],
         }
 
     @staticmethod
@@ -4668,6 +4882,43 @@ class BrowserTools:
         with self._element_snapshot_lock:
             cached = self._element_snapshots.get(session_id, {}).get(element_id)
         return dict(cached) if isinstance(cached, dict) else None
+
+    def action_review_context(self, invocation: ToolInvocation, results) -> dict[str, object]:
+        """Project the exact observed control, never a sampled page prefix."""
+        args = invocation.arguments
+        if not any(args.get(key) for key in ('element_id', 'role', 'name', 'text')):
+            return {}
+        session_id = self._session_id(invocation)
+        mutations = {'browser_open', 'browser_navigate', 'browser_click', 'browser_click_element',
+            'browser_click_id', 'browser_type_field', 'browser_type_id', 'browser_select_combobox',
+            'browser_run_js', 'browser_close'}
+        for result in reversed(list(results)):
+            output = result.output if isinstance(result.output, dict) else {}
+            if output.get('session_id') != session_id or result.status != 'completed' or result.error:
+                continue
+            if result.tool_name == 'browser_snapshot':
+                snapshot = output.get('snapshot')
+                if not isinstance(snapshot, dict):
+                    return {'status': 'needs_current_snapshot', 'session_id': session_id}
+                rows = snapshot.get('elements') or []
+                def matches(row):
+                    if not isinstance(row, dict): return False
+                    if args.get('element_id'): return row.get('element_id') == args['element_id']
+                    tests = []
+                    for key in ('role', 'name', 'text'):
+                        if args.get(key):
+                            actual = (row.get('label') or row.get('text')) if key == 'name' else row.get(key)
+                            tests.append(actual == args[key])
+                    return bool(tests) and all(tests)
+                targets = [row for row in rows if matches(row)]
+                return {'status': 'observed' if len(targets) == 1 else 'target_not_unique',
+                    'source_invocation_id': result.invocation_id, 'session_id': session_id,
+                    'page_url': snapshot.get('url'), 'match_count': len(targets),
+                    'target': targets[0] if len(targets) == 1 else None}
+            if result.tool_name in mutations:
+                return {'status': 'needs_current_snapshot', 'session_id': session_id,
+                    'reason': 'Page interaction followed the retained snapshot'}
+        return {'status': 'needs_current_snapshot', 'session_id': session_id}
 
     def _visible_editable_field_candidates(self, session_id: str, *, limit: int = 8) -> list[dict[str, object]]:
         run_js = getattr(self._backend, "run_js", None)
@@ -4831,9 +5082,11 @@ class BrowserTools:
         )
         try:
             result = _run(self._backend.navigate(session_id, navigate_url))
-            return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
+            return _ok(invocation, {"result": result, "session_id": session_id,
+                "result_kind": "browser_navigation", "page_url": str(navigate_url),
+                **self._connection_notice_output()})
         except Exception as e:
-            return _fail(invocation, f"Navigation failed: {e}")
+            return _fail(invocation, f"Navigation failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_click(self, invocation: ToolInvocation) -> ToolResult:
@@ -4948,18 +5201,48 @@ class BrowserTools:
         selector = invocation.arguments.get("selector")
         if selector is not None and not isinstance(selector, str):
             return _fail(invocation, "selector must be a string")
+        section_heading = invocation.arguments.get("section_heading")
+        if section_heading is not None and (not isinstance(section_heading, str) or not section_heading.strip()):
+            return _fail(invocation, "section_heading must be a nonempty visible heading")
+        fields = invocation.arguments.get("fields")
+        if fields is not None and (not isinstance(fields, list) or not fields
+                or not all(isinstance(field, str) and field in BROWSER_ITEM_FIELDS for field in fields)):
+            return _fail(invocation, "Choose registered item fields to return.", {
+                "reason": "invalid_tool_arguments", "recovery": {"kind": "correct_arguments",
+                    "retry_tool_name": invocation.tool_name,
+                    "argument_constraints": {"fields": {"type": "array", "minItems": 1,
+                        "items": {"type": "string", "enum": list(BROWSER_ITEM_FIELDS)}}}}})
         try:
             result = _run(
                 self._backend.run_js(
                     session_id,
-                    _browser_extract_items_script(max_items=max_items, selector=selector.strip() if selector else None),
+                    _browser_extract_items_script(max_items=max_items, selector=selector.strip() if selector else None,
+                                                  section_heading=section_heading),
                 )
             )
             if not isinstance(result, dict):
                 return _fail(invocation, "Item extraction returned an invalid result.")
+            coverage = result.get("coverage")
+            if isinstance(coverage, dict) and coverage.get("scope_found") is False:
+                return _fail(invocation, "The selected item region was not found or visible; inspect the page and repair the selector.",
+                             {"reason": "tool_precondition_unmet", "failure_reason": "source_scope_missing", "session_id": session_id,
+                              "page_url": result.get("url"),
+                              "observation_setup_required": result.get("url") == "about:blank",
+                              "recovery": {"kind": "repair_precondition", "retry_tool_name": invocation.tool_name,
+                                           "required_tool_names": ["browser_snapshot", "browser_extract_text"],
+                                           "precondition": {"kind": "visible_source_region", "session_id": session_id,
+                                               "available_scopes": coverage.get("available_scopes", [])},
+                                           "next_action": "inspect_page_and_correct_source_scope"}})
             items = result.get("items")
             if not isinstance(items, list):
                 return _fail(invocation, "Item extraction returned no item list.")
+            if fields is not None:
+                selected = {*fields, "source_index", "section_id", "additional_sections"}
+                items = [{key: value for key, value in item.items() if key in selected}
+                         for item in items if isinstance(item, dict)]
+            identity_fields = [field for field in ("title", "url", "canonical_url") if fields is None or field in fields]
+            change_fields = [next((field for field in ("canonical_url", "url") if field in identity_fields), "")]
+            change_fields = [field for field in change_fields if field]
             page = {
                 "url": result.get("url"),
                 "title": result.get("title"),
@@ -4968,13 +5251,24 @@ class BrowserTools:
                 "page": page,
                 "items": items,
                 "item_count": len(items),
+                # The adapter records the actual rendered URL, never a model
+                # guess. The background runner validates this declared READ
+                # prerequisite and uses its own persistent tab/profile.
+                **({"observation_setup": [{"tool_name": "browser_navigate",
+                    "arguments": {"url": page["url"]}}]}
+                   if isinstance(page["url"], str) and page["url"].startswith(("https://", "http://")) else {}),
+                "source_record_collections": [{"path": ["items"],
+                    "identity_fields": identity_fields,
+                    "change_identity_fields": change_fields, "cardinality": "many"}],
                 "session_id": session_id,
+                **({"result_kind": "browser_item_collection", "coverage": coverage}
+                   if isinstance(coverage, dict) else {}),
             }
             if assertion := self._current_page_assertion(invocation, session_id):
                 output["page_state_assertion"] = assertion
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Item extraction failed: {e}")
+            return _fail(invocation, f"Item extraction failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_extract_detail(self, invocation: ToolInvocation) -> ToolResult:
@@ -5231,6 +5525,12 @@ class BrowserTools:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
+            # An observed, model-selected readiness criterion is replayed by
+            # background reads too. No site names, text inference or fixed sleep.
+            if invocation.arguments.get('ready_selector'):
+                _run(self._backend.wait_for(session_id, str(invocation.arguments['ready_selector']), None, None, 5))
+            if invocation.arguments.get('ready_text'):
+                _run(self._backend.wait_for(session_id, None, None, str(invocation.arguments['ready_text']), 5))
             text = _run(self._backend.extract_text(session_id, selector))
             output: dict[str, object] = {
                 "text": text,
@@ -5243,7 +5543,16 @@ class BrowserTools:
                 output["page_state_assertion"] = assertion
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Extract text failed: {e}")
+            failure = _browser_failure_output(e)
+            if failure.get('failure_reason') == 'source_timeout' and (
+                    invocation.arguments.get('ready_selector') or invocation.arguments.get('ready_text')):
+                return _fail(invocation, 'The selected results-readiness landmark was not visible within the bounded wait.',
+                    {'reason': 'source_not_ready', 'failure_reason': 'source_not_ready', 'session_id': session_id,
+                        'recovery': {'kind': 'correct_arguments', 'retry_tool_name': 'browser_extract_text',
+                            'required_tool_names': ['browser_snapshot'],
+                            'argument_constraints': {'inspect_current_results_first': True,
+                                'supported_parameters': ['ready_selector', 'ready_text'], 'wait_seconds': 5}}})
+            return _fail(invocation, f'Extract text failed: {e}', failure)
 
     @_serialized_browser_operation
     def browser_screenshot(self, invocation: ToolInvocation) -> ToolResult:
@@ -5522,7 +5831,13 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         try:
             elements = _run(self._backend.find(session_id, str(selector)))
-            return _ok(invocation, {"elements": elements, "count": len(elements), "session_id": session_id})
+            matches_truncated = any(row.get('matches_truncated') is True for row in elements)
+            complete = (False if matches_truncated or any(row.get('text_truncated') is True for row in elements)
+                else True if all(row.get('text_truncated') is False for row in elements) else None)
+            return _ok(invocation, {"elements": elements, "count": len(elements), "session_id": session_id,
+                "total_matches": elements[0].get('total_matches') if elements else 0,
+                "observation_coverage": {"complete": complete, "kind": "element_label_preview",
+                    "reason": 'element_matches_truncated' if matches_truncated else "text_preview_truncated" if complete is False else None}})
         except Exception as e:
             return _fail(invocation, f"Find failed: {e}")
 

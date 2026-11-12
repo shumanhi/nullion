@@ -32,6 +32,7 @@ from nullion.codebase_summary import build_codebase_summary, format_codebase_sum
 from nullion.config import NullionSettings, load_settings, web_session_allow_duration_label, web_session_allow_expires_at
 from nullion.builder_capabilities import accept_dependency_builder_proposal
 from nullion.doctor_playbooks import execute_doctor_playbook_command
+from nullion.health_action_notices import health_action_notice
 from nullion.runtime import (
     PersistentRuntime,
     archive_stored_builder_proposal,
@@ -523,16 +524,20 @@ def _doctor_action_cmd(runtime: PersistentRuntime, action: str, token: str | Non
     if resolved is None:
         return f"Doctor action not found: {normalized_token}"
     action_id = str(resolved.get("action_id") or "")
+    if action in {"start", "complete", "dismiss", "cancel"} and resolved.get("status") in {
+        "completed", "resolved", "cancelled", "dismissed", "failed",
+    }:
+        return health_action_notice("doctor", action, str(resolved["status"]), already_handled=True).message
     try:
         if action == "start":
             updated = runtime.start_doctor_action(action_id)
-            return f"Started Doctor action {action_id}.\nStatus: {updated['status']}"
+            return health_action_notice("doctor", action, str(updated["status"])).message
         if action == "complete":
             updated = runtime.complete_doctor_action(action_id)
-            return f"Completed Doctor action {action_id}.\nStatus: {updated['status']}"
+            return health_action_notice("doctor", action, str(updated["status"])).message
         if action in {"dismiss", "cancel"}:
-            runtime.cancel_doctor_action(action_id, reason="Dismissed from operator command")
-            return f"Dismissed Doctor action {action_id}."
+            updated = runtime.cancel_doctor_action(action_id, reason="Dismissed from operator command")
+            return health_action_notice("doctor", action, str(updated["status"])).message
     except ValueError as exc:
         return str(exc)
     return "Usage: /doctor <start|complete|dismiss> <n|action_id>"
@@ -618,7 +623,8 @@ def _operator_timestamp_label(raw: object) -> str:
         parsed = datetime.fromisoformat(normalized)
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(_operator_timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+        from nullion.preferences import format_user_datetime
+        return format_user_datetime(parsed, date_style='configured', include_seconds=True)
     except Exception:
         return text
 
@@ -632,7 +638,8 @@ def _render_uptime(runtime: PersistentRuntime, *, now: datetime | None = None) -
     current_time = now if now is not None else datetime.now(UTC)
     elapsed = current_time - runtime.started_at
     total_seconds = max(int(elapsed.total_seconds()), 0)
-    started = runtime.started_at.astimezone(_operator_timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+    from nullion.preferences import format_user_datetime
+    started = format_user_datetime(runtime.started_at, date_style='configured', include_seconds=True)
     return "\n".join(
         [
             "⏱️ Nullion uptime",
@@ -696,7 +703,8 @@ def _render_delivery_receipts(parts: list[str]) -> str:
 
 def _render_version(runtime: PersistentRuntime) -> str:
     del runtime
-    started = datetime.now(UTC).strftime("%-d %b %Y")  # e.g. "23 Apr 2026"
+    started_at = datetime.now(UTC).astimezone(_operator_timezone())
+    started = f'{started_at.day} {started_at:%b %Y}'
     return f"Nullion {__version__} — running since {started}. You're up to date."
 
 
@@ -707,7 +715,8 @@ def _backup_human_label(backup: dict) -> str:
     modified_at = backup.get("modified_at")
     if isinstance(modified_at, (int, float)):
         dt = datetime.fromtimestamp(modified_at, tz=UTC).astimezone(_operator_timezone())
-        return dt.strftime("%-d %b %Y, %-I:%M %p %Z")
+        from nullion.preferences import format_user_datetime
+        return format_user_datetime(dt)
 
     # Try to extract mtime from the backup path on disk.
     try:
@@ -716,7 +725,8 @@ def _backup_human_label(backup: dict) -> str:
         if backup_path.exists():
             mtime = backup_path.stat().st_mtime
             dt = datetime.fromtimestamp(mtime, tz=UTC).astimezone(_operator_timezone())
-            return dt.strftime("%-d %b %Y, %-I:%M %p %Z")
+            from nullion.preferences import format_user_datetime
+            return format_user_datetime(dt)
     except Exception:
         pass
     # Fallback: just clean up the filename
@@ -1861,7 +1871,8 @@ def _format_memory_entry(entry: UserMemoryEntry, index: int) -> str:
     if len(value) > 140:
         value = f"{value[:137]}..."
     updated = _memory_timestamp(entry)
-    suffix = f" • {updated.strftime('%Y-%m-%d %H:%M UTC')}" if updated else ""
+    from nullion.preferences import format_user_datetime
+    suffix = f" • {format_user_datetime(updated, date_style='configured')}" if updated else ""
     return _display_ref(f"{entry.key} — {value} [{entry.kind.value}]{suffix}", index)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -31,7 +32,7 @@ def test_telegram_completed_context_and_overlapping_semantic_followup(tmp_path, 
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
     registry = ToolRegistry()
     registry.register(
-        ToolSpec(name="web_fetch", description="Read product listing", risk_level=ToolRiskLevel.LOW,
+        ToolSpec(name="listing_read", description="Read product listing", risk_level=ToolRiskLevel.LOW,
                  side_effect_class=ToolSideEffectClass.READ, requires_approval=False, timeout_seconds=5,
                  capability_tags=("web", "research"), input_schema={"type": "object", "properties": {"url": {"type": "string"}}}),
         lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed",
@@ -46,6 +47,8 @@ def test_telegram_completed_context_and_overlapping_semantic_followup(tmp_path, 
             self.relationship_calls = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if "allowed_target_indexes" in json.dumps(kwargs.get("messages", [])):
                 self.relationship_calls.append(kwargs)
                 time.sleep(0.5)  # Previously slow relationship dependency.
@@ -55,6 +58,9 @@ def test_telegram_completed_context_and_overlapping_semantic_followup(tmp_path, 
                     return {"completion": {"status": "incomplete", "reason": "max_output_tokens"},
                             "content": [{"type": "text", "text": '{"relationship":"follow_up",'}]}
                 return {"content": [{"type": "text", "text": json.dumps({"relationship": relationship, "effect": "continue", "confidence": 0.98, "target_index": 0 if relationship == "follow_up" else None, "target_is_explicit": relationship == "follow_up"})}]}
+            if not kwargs.get("tools") and 'web_action' in str(kwargs.get('system') or ''):
+                return {"content": [{"type": "text", "text": json.dumps({'web_action':'live_research','scheduler_action':'none',
+                    'skill_pack_action':'none','requested_tool_names':['listing_read'],'required_tool_names':['listing_read'],'confidence':1})}]}
             if not kwargs.get("tools") and "timeout" not in kwargs:
                 # Off-path skill learning shares the provider; it must not
                 # consume a scripted foreground response.
@@ -62,9 +68,9 @@ def test_telegram_completed_context_and_overlapping_semantic_followup(tmp_path, 
             self.requests.append(kwargs)
             count = len(self.requests)
             if count == 2:
-                return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "scope", "name": "request_tool_scope", "input": {"tool_names": ["web_fetch"]}}]}
+                return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "scope", "name": "request_tool_scope", "input": {"capabilities": ["web"], "tool_names": ["listing_read"]}}]}
             if count == 3:
-                return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "lookup", "name": "web_fetch", "input": {"url": "https://example.test/product"}}]}
+                return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "lookup", "name": "listing_read", "input": {"url": "https://example.test/product"}}]}
             if count == 4:
                 second_ready.set()
                 assert release_second.wait(15), "test must release in-flight lookup"
@@ -187,7 +193,9 @@ def test_web_numeric_followup_does_not_revive_old_scheduler_scope(tmp_path, monk
             self.foreground = []
 
         def create(self, **kwargs):
-            if kwargs.get("system") or (not kwargs.get("tools") and "timeout" not in kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
+            if not kwargs.get("tools") and 'web_action' in str(kwargs.get('system') or ''):
                 return {"content": [{"type": "text", "text": json.dumps({"web_action": "none", "scheduler_action": "none", "skill_pack_action": "none", "requested_tool_names": [], "required_tool_names": [], "confidence": 0.99})}]}
             self.foreground.append(kwargs)
             if len(self.foreground) == 2:

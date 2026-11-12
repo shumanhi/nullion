@@ -60,10 +60,10 @@ def test_browser_monitor_requires_semantic_review_even_when_all_tools_complete()
                                'scheduled_task_request':'指定日の条件を確認。'},'user_message':'Runtime wrapper'}
     assert _completion_review_required(state,tool_results=results)
     assert _completion_review_original_request(state)=='指定日の条件を確認。'
-    assert not _completion_review_required({'user_message':'同じ質問。'},tool_results=results)
+    assert _completion_review_required({'user_message':'同じ質問。'},tool_results=results)
     assert not _completion_review_required(state,tool_results=[])
     state['tool_flow_context']['scheduled_alert_delivery_mode']='report_each_run'
-    assert not _completion_review_required(state,tool_results=results)
+    assert _completion_review_required(state,tool_results=results)
 
 
 def test_presentation_repair_cannot_override_unverified_source_scope():
@@ -74,7 +74,7 @@ def test_presentation_repair_cannot_override_unverified_source_scope():
     assert result['response_fulfilled'] is False
 
 
-def test_material_contract_reuses_typed_catalog_and_invalidates_on_new_source():
+def test_material_contract_reuses_typed_catalog_across_new_sources_until_request_changes():
     from nullion.agent_orchestrator import _extract_completion_requirement_contract
     from nullion.tools import ToolRegistry
     class Model:
@@ -101,10 +101,10 @@ def test_material_contract_reuses_typed_catalog_and_invalidates_on_new_source():
     assert model.calls == 1
     results.append(ToolResult('detail', 'browser_extract_detail', 'completed', {'text': 'seat state'}))
     assert _extract_completion_requirement_contract(state, tool_results=results)
-    assert model.calls == 2
+    assert model.calls == 1
     state['user_message'] = '別の日付を確認。'
     assert _extract_completion_requirement_contract(state, tool_results=results)
-    assert model.calls == 3
+    assert model.calls == 2
 
 
 @pytest.mark.parametrize('task', ['指定日の条件を確認。', 'Verifica la condición de la fecha.'])
@@ -151,3 +151,13 @@ def test_manual_matches_only_failure_withholds_legacy_partial_findings():
     assert 'did not produce a complete report' in sent[0]
     assert 'generic retry footer' not in sent[0]
     assert outcome['execution_outcome']['execution_succeeded'] is False
+
+
+def test_alert_protocol_failure_notice_is_not_an_earlier_recovered_browser_failure():
+    from nullion.cron_delivery import _cron_report_failure_notice
+    result = {'cron_alert_delivery_policy_failed': True,
+        'cron_alert_delivery_policy_failure': 'invalid_structured_decision',
+        'tool_results': [ToolResult('old', 'browser_navigate', 'failed', {}, error='Navigation failed')]}
+    notice = _cron_report_failure_notice(result)
+    assert 'alert-delivery decision' in notice and 'No matching alert was published' in notice
+    assert 'browser operation failed' not in notice

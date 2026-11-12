@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 
 from nullion.chat_backend import fetch_url_snapshot, search_web
+from nullion.http_transport import close_http_error_response
 from nullion.messaging_adapters import messaging_media_scratch_root
 
 
@@ -653,10 +654,7 @@ def _local_image_generate(prompt: str, output_path: str, size: str | None, sourc
         raise RuntimeError("image_generate provider is not configured")
     template = os.environ.get("NULLION_IMAGE_GENERATE_COMMAND", "").strip()
     if template:
-        try:
-            return _command_image_generate(template, prompt, output_path, size, source_path=source_path)
-        except Exception as exc:
-            return _fallback_svg_image_generate(prompt, output_path, size, fallback_error=str(exc))
+        return _command_image_generate(template, prompt, output_path, size, source_path=source_path)
     model_selection = _media_model_selection(
         "NULLION_IMAGE_GENERATE_PROVIDER",
         "NULLION_IMAGE_GENERATE_MODEL",
@@ -664,10 +662,7 @@ def _local_image_generate(prompt: str, output_path: str, size: str | None, sourc
     )
     if model_selection is not None:
         provider, model = model_selection
-        try:
-            return _model_image_generate(provider, model, prompt, output_path, size, source_path=source_path)
-        except Exception as exc:
-            return _fallback_svg_image_generate(prompt, output_path, size, fallback_error=str(exc))
+        return _model_image_generate(provider, model, prompt, output_path, size, source_path=source_path)
     return _fallback_svg_image_generate(prompt, output_path, size)
 
 
@@ -933,6 +928,8 @@ def _openrouter_image_generate(
                     detail = str(error["message"])
         except Exception:
             pass
+        finally:
+            close_http_error_response(exc)
         raise RuntimeError(f"OpenRouter image generation failed ({exc.code}): {detail}") from exc
 
     choices = response_payload.get("choices") if isinstance(response_payload, dict) else None
@@ -982,6 +979,8 @@ def _request_gemini_json(url: str, *, api_key: str, payload: dict[str, object]) 
                     detail = str(error["message"])
         except Exception:
             pass
+        finally:
+            close_http_error_response(exc)
         raise RuntimeError(f"Gemini image generation failed ({exc.code}): {detail}") from exc
     if not isinstance(decoded, dict):
         raise RuntimeError("Gemini image generation returned a non-object response")

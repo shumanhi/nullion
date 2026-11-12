@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import inspect
+from types import SimpleNamespace
 import logging
 import os
 from pathlib import Path
@@ -40,12 +41,14 @@ from nullion.platform_activity import (
     deliver_platform_task_status_update,
     platform_activity_capabilities,
 )
-from nullion.run_activity import activity_trace_enabled
+from nullion.chat_operator import activity_trace_enabled_for_chat
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.users import load_user_registry, resolve_messaging_user
 
+
+from nullion.delivery_acknowledgement import UnconfirmedDelivery, deliver_attachment_batch
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +80,7 @@ def _handle_messaging_ingress_result_with_dispatch(
     turn_dispatch_decision=None,
     text_delta_callback=None,
     activity_callback=None,
+    cancellation_checker=None,
 ):
     try:
         parameters = inspect.signature(handle_messaging_ingress_result).parameters
@@ -96,6 +100,10 @@ def _handle_messaging_ingress_result_with_dispatch(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         ):
             kwargs["activity_callback"] = activity_callback
+        if "cancellation_checker" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            kwargs["cancellation_checker"] = cancellation_checker
         return handle_messaging_ingress_result(service, ingress, **kwargs)
     return handle_messaging_ingress_result(service, ingress)
 
@@ -201,9 +209,10 @@ async def _edit_discord_message(message, text: str) -> bool:
 
 
 class _DiscordTextDeltaStreamer:
-    def __init__(self, *, loop, channel) -> None:
+    def __init__(self, *, loop, channel, publication_gate=None) -> None:
         self._loop = loop
         self._channel = channel
+        self._publication_gate = publication_gate
         self._message = None
         self._parts: list[str] = []
         self._last_update_at = 0.0
@@ -214,6 +223,27 @@ class _DiscordTextDeltaStreamer:
         return "".join(self._parts)
 
     async def _send_or_edit(self, text: str) -> bool:
+        if self._publication_gate is not None and not await self._publication_gate.wait():
+            await self.discard()
+            return False
+        delivered = await self._publish(text)
+        if self._publication_gate is not None and not await self._publication_gate.wait():
+            await self.discard()
+            return False
+        return delivered
+
+    async def discard(self):
+        message, self._message = self._message, None
+        delete = getattr(message, "delete", None)
+        if callable(delete):
+            try:
+                await delete()
+            except Exception:
+                logger.warning("Could not withdraw a superseded Discord draft", exc_info=True)
+
+    async def _publish(self, text: str) -> bool:
+        if self._message is not None and self._last_text == text:
+            return True
         rendered = sanitize_external_inline_markup(text or "")
         if self._message is None:
             send = getattr(self._channel, "send", None)
@@ -231,6 +261,8 @@ class _DiscordTextDeltaStreamer:
         if not delta or self._channel is None:
             return
         self._parts.append(delta)
+        if self._publication_gate is not None and not self._publication_gate.can_publish():
+            return
         text = self.text
         now = time.monotonic()
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
@@ -245,8 +277,6 @@ class _DiscordTextDeltaStreamer:
         text = str(final_text or "")
         if not text or self._message is None:
             return False
-        if self._last_text == text:
-            return True
         return await self._send_or_edit(text)
 
 
@@ -303,11 +333,14 @@ async def _send_discord_chunks_with_plain_fallback(channel, text: str | None, *,
 async def _send_discord_reply_files(channel, *, text: str | None, paths: tuple[Path, ...]) -> bool:
     if not paths:
         return False
+    async def send_one(index, path):
+        return await _send_discord_reply_file(channel, path=path, content=text if index == 0 else None)
     try:
-        for index, path in enumerate(paths):
-            content = text if index == 0 else None
-            await _send_discord_reply_file(channel, path=path, content=content)
+        await deliver_attachment_batch(paths, send_one)
         return True
+    except UnconfirmedDelivery as exc:
+        exc.confirmed_text = bool(exc.confirmed and text)
+        raise
     except Exception:
         logger.warning("Discord file send failed", exc_info=True)
         return False
@@ -320,7 +353,7 @@ async def _send_discord_reply_file(channel, *, path: Path, content: str | None) 
             kwargs = {"file": file_obj}
             if content:
                 kwargs["content"] = content
-            await channel.send(**kwargs)
+            return await channel.send(**kwargs)
         finally:
             close = getattr(file_obj, "close", None)
             if close is not None:
@@ -329,7 +362,7 @@ async def _send_discord_reply_file(channel, *, path: Path, content: str | None) 
                 except Exception:
                     pass
 
-    await retry_messaging_delivery_operation(operation)
+    return await retry_messaging_delivery_operation(operation, replay_safe=False)
 
 
 async def send_discord_platform_delivery(
@@ -372,7 +405,7 @@ async def send_discord_platform_delivery(
                 return True
 
             async def _send_attachments(initial_text: str | None, paths: tuple[Path, ...]) -> bool:
-                for index, attachment_path in enumerate(paths):
+                async def send_one(index, attachment_path):
                     content = initial_text if index == 0 else None
 
                     async def operation(attachment_path=attachment_path, content=content):
@@ -385,7 +418,12 @@ async def send_discord_platform_delivery(
                             )
                         response.raise_for_status()
 
-                    await retry_messaging_delivery_operation(operation)
+                    return await retry_messaging_delivery_operation(operation, replay_safe=False)
+                try:
+                    await deliver_attachment_batch(paths, send_one)
+                except UnconfirmedDelivery as exc:
+                    exc.confirmed_text = bool(exc.confirmed and initial_text)
+                    raise
                 return True
 
             result = await execute_platform_reply_delivery(
@@ -397,7 +435,11 @@ async def send_discord_platform_delivery(
                 send_text=_send_text,
                 send_attachments=_send_attachments,
             )
+            if result.unconfirmed is not None:
+                raise result.unconfirmed
             return result.ok
+    except UnconfirmedDelivery:
+        raise
     except Exception:
         logger.warning("Discord platform delivery failed", exc_info=True)
         return False
@@ -562,6 +604,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         ingress.operator_chat_id,
         ingress.text,
         turn_id=ingress.message_id or ingress.request_id,
+        runtime_store=getattr(getattr(service, "runtime", None), "store", None),
         model_client=getattr(service, "model_client", None),
         active_turn_followup_evidence=has_structured_turn_relationship_evidence(
             ingress.text,
@@ -569,7 +612,14 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         ),
     )
     _mark_timing("turn_registered")
-    text_streamer = _DiscordTextDeltaStreamer(loop=asyncio.get_running_loop(), channel=message.channel)
+    text_streamer = _DiscordTextDeltaStreamer(loop=asyncio.get_running_loop(), channel=message.channel,
+        publication_gate=turn_registration.publication_gate)
+    async def withdraw_sent(sent):
+        delete = getattr(sent, "delete", None)
+        if callable(delete):
+            await delete()
+    delivery_channel = SimpleNamespace(send=turn_registration.publication_gate.guard(
+        message.channel.send, withdraw=withdraw_sent))
 
     def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
         del event
@@ -583,12 +633,14 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                 service,
                 ingress,
                 turn_dispatch_decision=turn_registration.decision,
+                cancellation_checker=turn_registration.is_cancelled,
                 text_delta_callback=text_streamer.emit,
                 activity_callback=emit_working_ack_for_tool_activity,
             )
             reply = turn_result.reply
         _mark_timing("handler_completed")
         if await turn_registration.is_superseded():
+            await text_streamer.discard()
             turn_outcome = "superseded"
             _log_turn_timing(turn_outcome)
             return
@@ -596,22 +648,24 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         reply_already_sent = bool(getattr(turn_result, "reply_already_sent", False))
 
         async def _send_text(reply_text: str) -> bool:
-            await _send_discord_chunks_with_plain_fallback(message.channel, reply_text, limit=1900)
+            await _send_discord_chunks_with_plain_fallback(delivery_channel, reply_text, limit=1900)
             return True
 
         await execute_platform_reply_delivery(
             reply,
             channel="discord",
+            tool_results=getattr(turn_result, "tool_results", ()),
             target_id=_optional_message_text(getattr(message.channel, "id", None)),
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
             request_id=ingress.request_id,
             message_id=ingress.message_id,
             reply_already_sent=reply_already_sent,
+            publication_gate=turn_registration.publication_gate,
             send_text=_send_text,
             finalize_stream=text_streamer.finish,
             send_attachments=lambda initial_text, paths: _send_discord_reply_files(
-                message.channel,
+                delivery_channel,
                 text=initial_text,
                 paths=paths,
             ),
@@ -726,7 +780,7 @@ async def run_discord_app(
                 status_messages=_status_messages,
                 status_locks=_status_locks,
                 planner_feed_enabled=True,
-                include_activity=activity_trace_enabled(),
+                include_activity=activity_trace_enabled_for_chat(service.runtime, chat_id=conversation_id),
             )
         if kwargs.get("is_artifact"):
             path = Path(str(text or "")).expanduser()

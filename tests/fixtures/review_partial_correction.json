@@ -1,0 +1,236 @@
+{
+  "disposition": "retry",
+  "unresolved_requirements": [
+    "Confirm that CedarBond is a bottle or syringe adhesive rather than caulk.",
+    "Confirm that StoneEpoxy is supplied in a bottle or syringe rather than caulk.",
+    "Provide the final concise recommendation after confirming that all three products meet the no-caulk format restriction."
+  ],
+  "retry_tool_names": [
+    "opaque_capture"
+  ],
+  "source_presentation_valid": false,
+  "reply_target": "corrected_findings",
+  "user_facing_failure": "The captured records establish prices, quantities, and surface suitability, but do not verify the required bottle-or-syringe format for CedarBond or StoneEpoxy. The draft is also overly long and does not state a clear overall recommendation.",
+  "supported_findings": [
+    {
+      "kind": "finding",
+      "presentation": "paragraph",
+      "section": "Comparison",
+      "requirement_ids": [
+        "r1",
+        "r2",
+        "r3",
+        "r4"
+      ],
+      "text": {
+        "format": "nullion.report.v1",
+        "message": {
+          "title": "Adhesive value comparison",
+          "summary": "Based on the recorded pricing, CedarBond has by far the lowest unit cost and is suitable for wood and mixed hard surfaces. A final no-caulk recommendation requires confirmation that CedarBond and StoneEpoxy are bottle or syringe products.",
+          "detail_level": "compact",
+          "sections": [
+            {
+              "heading": "Recorded options",
+              "priority": "primary",
+              "layout": "list",
+              "items": [
+                {
+                  "title": "CedarBond",
+                  "summary": "Best recorded unit value for larger repairs.",
+                  "required_details": [
+                    "$9.98 for 8 fl oz ($1.25/fl oz)",
+                    "For wood and mixed hard surfaces; waterproof",
+                    "Expands while curing"
+                  ],
+                  "extra_details": [],
+                  "source_ids": [
+                    "s1"
+                  ],
+                  "shared_detail_ids": [
+                    "d1"
+                  ]
+                },
+                {
+                  "title": "StoneEpoxy",
+                  "summary": "Highest unit cost; positioned for strong small repairs.",
+                  "required_details": [
+                    "$9.88 for 0.85 fl oz ($11.62/fl oz)",
+                    "For wood and mixed hard surfaces; waterproof",
+                    "Two-part adhesive"
+                  ],
+                  "extra_details": [],
+                  "source_ids": [
+                    "s2"
+                  ],
+                  "shared_detail_ids": [
+                    "d1"
+                  ]
+                },
+                {
+                  "title": "QuickEpoxy",
+                  "summary": "Lowest upfront price, but more expensive per ounce than CedarBond.",
+                  "required_details": [
+                    "$5.97 for 0.85 fl oz ($7.02/fl oz)",
+                    "For wood and mixed hard surfaces; water-resistant",
+                    "Small syringe"
+                  ],
+                  "extra_details": [],
+                  "source_ids": [
+                    "s3"
+                  ],
+                  "shared_detail_ids": [
+                    "d1"
+                  ]
+                }
+              ]
+            }
+          ],
+          "sources": [
+            {
+              "id": "s1",
+              "label": "CedarBond record — https://catalog.example/0"
+            },
+            {
+              "id": "s2",
+              "label": "StoneEpoxy record — https://catalog.example/1"
+            },
+            {
+              "id": "s3",
+              "label": "QuickEpoxy record — https://catalog.example/2"
+            }
+          ],
+          "shared_details": [
+            {
+              "id": "d1",
+              "text": "Exact full-cure and seller details were unavailable in the records."
+            }
+          ]
+        }
+      },
+      "evidence_invocation_ids": [
+        "e0001",
+        "e0002",
+        "e0003"
+      ]
+    },
+    {
+      "kind": "limitation",
+      "presentation": "paragraph",
+      "section": "Remaining verification",
+      "requirement_ids": [
+        "r1",
+        "r2",
+        "r4"
+      ],
+      "text": "The records do not identify CedarBond’s package format or StoneEpoxy’s bottle/syringe format, so they do not yet fully establish compliance with the no-caulk restriction.",
+      "evidence_invocation_ids": [
+        "e0001",
+        "e0002"
+      ]
+    }
+  ],
+  "clarification": null,
+  "all_material_requirements_enumerated": true,
+  "scheduled_alert_delivery": null,
+  "material_requirements": [
+    {
+      "requirement_id": "r1",
+      "satisfied": false,
+      "draft_covered": false,
+      "evidence_invocation_ids": [
+        "e0001"
+      ],
+      "blocking_failure_invocation_ids": []
+    },
+    {
+      "requirement_id": "r2",
+      "satisfied": false,
+      "draft_covered": false,
+      "evidence_invocation_ids": [
+        "e0002"
+      ],
+      "blocking_failure_invocation_ids": []
+    },
+    {
+      "requirement_id": "r3",
+      "satisfied": true,
+      "draft_covered": true,
+      "evidence_invocation_ids": [
+        "e0003"
+      ],
+      "blocking_failure_invocation_ids": []
+    },
+    {
+      "requirement_id": "r4",
+      "satisfied": false,
+      "draft_covered": false,
+      "evidence_invocation_ids": [],
+      "blocking_failure_invocation_ids": []
+    }
+  ],
+  "search_coverage": {
+    "outcome_kind": "results",
+    "conclusion": "limited",
+    "coverage_sufficient": false,
+    "scope_matches_request": true,
+    "discovery_evidence_invocation_ids": [],
+    "match_evidence_invocation_ids": [
+      "e0001",
+      "e0002",
+      "e0003"
+    ],
+    "candidates": [
+      {
+        "candidate_id": "s-be905cd8c262e81b",
+        "disposition": "pending",
+        "reason": "Price and surface suitability were checked, but bottle/syringe format and non-caulk status remain unverified.",
+        "evidence_invocation_ids": [
+          "e0001"
+        ]
+      },
+      {
+        "candidate_id": "s-b8cc13518da75aa1",
+        "disposition": "pending",
+        "reason": "Price, adhesive identity, and surface suitability were checked, but bottle/syringe format remains unverified.",
+        "evidence_invocation_ids": [
+          "e0002"
+        ]
+      },
+      {
+        "candidate_id": "s-21dc848dcd811143",
+        "disposition": "checked",
+        "reason": "The record verifies a small syringe adhesive, price, quantity, and suitability for wood and mixed hard surfaces.",
+        "evidence_invocation_ids": [
+          "e0003"
+        ]
+      }
+    ],
+    "constraints": [
+      {
+        "constraint_id": "c-9f33a88448e33976",
+        "verified": true,
+        "evidence_invocation_ids": [
+          "e0001",
+          "e0002",
+          "e0003"
+        ]
+      },
+      {
+        "constraint_id": "c-4cf9100fcc4f72c6",
+        "verified": false,
+        "evidence_invocation_ids": [
+          "e0003"
+        ]
+      },
+      {
+        "constraint_id": "c-c5927d8e268206fc",
+        "verified": true,
+        "evidence_invocation_ids": [
+          "e0001",
+          "e0002",
+          "e0003"
+        ]
+      }
+    ]
+  }
+}

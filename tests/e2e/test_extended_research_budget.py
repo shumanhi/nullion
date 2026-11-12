@@ -1,4 +1,5 @@
 """Default multi-round work completes through the real chat/persistence boundary."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -40,6 +41,8 @@ def test_default_budget_completes_more_than_twenty_four_model_rounds(tmp_path, m
     class Model:
         rounds = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {t['name'] for t in kwargs.get('tools', [])}
             if 'select_attachment_format' in names:
                 return {'content':[{'type':'tool_use','id':'format','name':'select_attachment_format',

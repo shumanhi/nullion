@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 import argparse
 import asyncio
 from dataclasses import dataclass
@@ -54,6 +56,8 @@ from nullion.web_research_policy import (
     should_register_search_plugin,
 )
 
+
+from nullion.telegram_transport import telegram_send_error_replay_safety
 
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -176,7 +180,7 @@ def _checkpoint_is_valid_sqlite(checkpoint: Path) -> bool:
     if checkpoint.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
         return False
     try:
-        with sqlite3.connect(str(checkpoint), timeout=10) as conn:
+        with sqlite_connection(str(checkpoint), timeout=10) as conn:
             row = conn.execute("PRAGMA quick_check").fetchone()
     except sqlite3.Error:
         return False
@@ -487,7 +491,9 @@ def _build_runtime_service_from_settings(
     try:
         from nullion.cron_delivery import record_interrupted_cron_delivery_runs
 
-        interrupted = record_interrupted_cron_delivery_runs(runtime.store, actor="telegram_startup")
+        interrupted = record_interrupted_cron_delivery_runs(
+            runtime.store, actor="telegram_startup", checkpoint_path=checkpoint,
+        )
         if interrupted:
             runtime.checkpoint()
             logger.info("Marked %d interrupted cron delivery run(s) after Telegram startup.", interrupted)
@@ -575,6 +581,8 @@ def _build_runtime_service_from_settings(
         runtime,
         default_chat_id=_operator_chat_id,
     )
+    from nullion.live_tracking_tools import register_live_tracker_tools
+    register_live_tracker_tools(active_tool_registry, model_client_getter=lambda: getattr(service, "model_client", None))
     runtime.active_tool_registry = active_tool_registry
     service = service_factory(runtime, settings=settings)
 
@@ -592,9 +600,13 @@ def _build_runtime_service_from_settings(
                 "conversation_id": conv_id,
             }
             payload.update(extra)
-            runtime.store.add_event(make_event(event_type, "cron_scheduler", payload))
-            runtime.store.add_audit_record(make_audit_record(event_type, "cron_scheduler", payload))
-            runtime.checkpoint()
+            from nullion.cron_delivery import checkpoint_cron_delivery_records
+            store = runtime.store
+            event = make_event(event_type, "cron_scheduler", payload)
+            audit = make_audit_record(event_type, "cron_scheduler", payload)
+            store.add_event(event)
+            store.add_audit_record(audit)
+            checkpoint_cron_delivery_records(runtime, store=store, events=(event,), audit_records=(audit,))
         except Exception:
             logger.debug("Could not record Telegram cron delivery event", exc_info=True)
 
@@ -608,15 +620,18 @@ def _build_runtime_service_from_settings(
         try:
             from nullion.cron_delivery import record_cron_delivery_chat_turn
 
-            record_cron_delivery_chat_turn(
-                runtime.store,
+            store = runtime.store
+            event = record_cron_delivery_chat_turn(
+                store,
                 job,
                 conversation_id=conversation_id,
                 delivery_channel=delivery_channel,
                 delivery_target=delivery_target,
                 delivered_text=delivered_text,
             )
-            runtime.checkpoint()
+            from nullion.cron_delivery import checkpoint_cron_delivery_records
+            if event is not None:
+                checkpoint_cron_delivery_records(runtime, store=store, conversation_events=(event,))
         except Exception:
             logger.debug("Could not record Telegram cron delivery chat turn", exc_info=True)
 
@@ -665,6 +680,8 @@ def _build_runtime_service_from_settings(
         *,
         label: str,
         cancellation_checker=None,
+        budget_resume=None,
+        delivery_conversation_id=None,
     ) -> dict:
         from nullion.cron_delivery import run_single_agent_cron_turn
 
@@ -680,6 +697,8 @@ def _build_runtime_service_from_settings(
             model_client=getattr(service, "model_client", None),
             record_event=_record_cron_delivery_event,
             cancellation_checker=cancellation_checker,
+            budget_resume=budget_resume,
+            delivery_conversation_id=delivery_conversation_id,
         )
 
     def _send_cron_platform_delivery(
@@ -839,6 +858,50 @@ def _build_runtime_service_from_settings(
                 logger.debug("Could not resolve manual Telegram cron target from invocation", exc_info=True)
         return _operator_chat_id or ""
 
+    def _cron_callbacks_for_run(*, label, effective_channel, delivery_target, budget_resume=None):
+        from nullion.cron_delivery import CronRunDeliveryCallbacks, cron_delivery_block_reason, manual_cron_silent_delivery_text
+        from nullion.tracker_status import health_store_path
+        return CronRunDeliveryCallbacks(
+                effective_channel=effective_channel,
+                delivery_target=delivery_target,
+                run_agent_turn=lambda cron_job, conv_id, cancellation_checker=None, delivery_conversation_id=None: _run_cron_agent_turn(
+                    cron_job,
+                    conv_id,
+                    label=label,
+                    cancellation_checker=cancellation_checker,
+                    budget_resume=budget_resume,
+                    delivery_conversation_id=delivery_conversation_id,
+                ),
+                record_event=_record_cron_delivery_event,
+                block_reason=cron_delivery_block_reason,
+                save_web_delivery=_save_cron_web_delivery,
+                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
+                    cron_job,
+                    channel,
+                    target,
+                    text,
+                    run_label=label,
+                ),
+                start_background_delivery=None,
+                clear_background_delivery=None,
+                silent_delivery_text=manual_cron_silent_delivery_text,
+                notify_approval_required=_notify_cron_approval_required,
+                record_chat_turn=_record_cron_delivery_chat_turn,
+                health_store_path=health_store_path(runtime),
+            )
+
+    def _resume_scheduled_budget(job, continuation, execution_callback=None, cancellation_checker=None):
+        channel, _, target = continuation.checkpoint['conversation_id'].partition(':')
+        callbacks = _cron_callbacks_for_run(
+            label='Scheduled task', effective_channel=lambda job: channel,
+            delivery_target=lambda job, channel: continuation.checkpoint['conversation_id'] if channel == 'web' else target,
+            budget_resume=continuation)
+        from nullion.scheduled_budget import run_scheduled_continuation
+        return run_scheduled_continuation(job, continuation, callbacks=callbacks,
+            execution_callback=execution_callback, cancellation_checker=cancellation_checker)
+
+    runtime.scheduled_budget_runner = _resume_scheduled_budget
+
     def _cron_tool_runner(job, invocation=None):
         from nullion.tracker_status import health_store_path
         from nullion.cron_delivery import (
@@ -915,32 +978,8 @@ def _build_runtime_service_from_settings(
         return start_manual_cron_background_delivery(
             job,
             label="Manual scheduled task run",
-            callbacks=CronRunDeliveryCallbacks(
-                effective_channel=_manual_effective_channel,
-                delivery_target=_manual_delivery_target,
-                run_agent_turn=lambda cron_job, conv_id, cancellation_checker=None: _run_cron_agent_turn(
-                    cron_job,
-                    conv_id,
-                    label="Manual scheduled task run",
-                    cancellation_checker=cancellation_checker,
-                ),
-                record_event=_record_cron_delivery_event,
-                block_reason=cron_delivery_block_reason,
-                save_web_delivery=_save_cron_web_delivery,
-                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
-                    cron_job,
-                    channel,
-                    target,
-                    text,
-                    run_label="Manual scheduled task run",
-                ),
-                start_background_delivery=None,
-                clear_background_delivery=None,
-                silent_delivery_text=manual_cron_silent_delivery_text,
-                notify_approval_required=_notify_cron_approval_required,
-                record_chat_turn=_record_cron_delivery_chat_turn,
-                health_store_path=health_store_path(runtime),
-            ),
+            callbacks=_cron_callbacks_for_run(label="Manual scheduled task run",
+                effective_channel=_manual_effective_channel, delivery_target=_manual_delivery_target),
             origin_conversation_id=origin_conversation_id,
             thread_name_prefix="nullion-telegram-manual-cron",
             before_run=_start_manual_cron_monitor,
@@ -1018,7 +1057,7 @@ async def _send_operator_telegram_message(bot_token: str, chat_id: str, text: st
     """Fire-and-forget: send a single Telegram message to the operator chat."""
     try:
         from telegram import Bot  # type: ignore[import]
-        from nullion.telegram_formatting import format_telegram_text
+        from nullion.telegram_formatting import format_telegram_text, format_telegram_chunks
 
         formatted_text, message_kwargs = format_telegram_text(text)
         async with build_telegram_bot(Bot, bot_token) as bot:
@@ -1042,7 +1081,12 @@ async def _send_operator_telegram_delivery(
     message_only: bool = False,
 ) -> bool:
     """Send a Telegram delivery, uploading any MEDIA artifact directives."""
+    from nullion.delivery_acknowledgement import UnconfirmedDelivery, deliver_attachment_batch
+    from nullion.messaging_adapters import record_unconfirmed_delivery
+    from nullion.telegram_transport import telegram_document_timeout_kwargs
     delivery = None
+    transport_acknowledged = False
+    confirmed_text = False
     try:
         from telegram import Bot  # type: ignore[import]
 
@@ -1053,7 +1097,7 @@ async def _send_operator_telegram_delivery(
             record_platform_delivery_receipt,
             telegram_attachment_upload_limit_bytes,
         )
-        from nullion.telegram_formatting import format_telegram_text
+        from nullion.telegram_formatting import format_telegram_text, format_telegram_chunks
 
         delivery = prepare_reply_for_platform_delivery(
             text,
@@ -1063,31 +1107,29 @@ async def _send_operator_telegram_delivery(
         )
         async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:
-                caption = delivery.text
+                from nullion.telegram_app import _telegram_attachment_caption_kwargs
+                caption_text, caption_kwargs, caption_too_long = _telegram_attachment_caption_kwargs(delivery.text)
                 sent_message_id = None
-                for index, attachment_path in enumerate(delivery.attachments):
-                    caption_text = caption[:1024] if caption and index == 0 else None
-                    caption_kwargs = {}
-                    if caption_text:
-                        caption_text, caption_kwargs = format_telegram_text(caption_text)
+                if caption_too_long:
+                    for chunk, chunk_kwargs in format_telegram_chunks(delivery.text or ""):
+                        sent = await retry_messaging_delivery_operation(
+                            lambda: bot.send_message(chat_id, chunk, **chunk_kwargs), replay_safe=False, retry_policy=telegram_send_error_replay_safety
+                        )
+                        if sent_message_id is None:
+                            sent_message_id = getattr(sent, "message_id", None)
+                    confirmed_text = True
+                async def send_one(index, attachment_path):
+                    document_kwargs = dict(caption_kwargs) if index == 0 else {}
                     if index == 0 and reply_markup is not None:
-                        caption_kwargs = {**caption_kwargs, "reply_markup": reply_markup}
-                    async def send_document(
-                        attachment_path=attachment_path,
-                        caption_text=caption_text,
-                        caption_kwargs=caption_kwargs,
-                    ):
+                        document_kwargs["reply_markup"] = reply_markup
+                    async def operation():
                         with attachment_path.open("rb") as document:
-                            return await bot.send_document(
-                                chat_id,
-                                document,
-                                caption=caption_text,
-                                **caption_kwargs,
-                            )
-
-                    sent_message = await retry_messaging_delivery_operation(send_document)
-                    if sent_message_id is None:
-                        sent_message_id = getattr(sent_message, "message_id", None)
+                            return await bot.send_document(chat_id, document,
+                                caption=caption_text if index == 0 else None,
+                                **document_kwargs, **telegram_document_timeout_kwargs())
+                    return await retry_messaging_delivery_operation(operation, replay_safe=False, retry_policy=telegram_send_error_replay_safety)
+                identities = await deliver_attachment_batch(delivery.attachments, send_one)
+                sent_message_id = identities[0] if identities else sent_message_id
                 receipt = build_platform_delivery_receipt(
                     channel="telegram",
                     target_id=str(chat_id),
@@ -1097,6 +1139,7 @@ async def _send_operator_telegram_delivery(
                     message_id=None if sent_message_id is None else str(sent_message_id),
                 )
                 record_platform_delivery_receipt(receipt)
+                transport_acknowledged = True
                 return delivery_receipt_transport_succeeded(receipt)
             message_kwargs = {}
             if reply_markup is not None:
@@ -1107,18 +1150,7 @@ async def _send_operator_telegram_delivery(
                 message_kwargs["parse_mode"] = parse_mode
                 chunks = [text]
             else:
-                from nullion.telegram_app import _split_telegram_message_chunks
-
-                plain_chunks = _split_telegram_message_chunks(delivery.text or "", limit=3000)
-                chunks = []
-                for plain_chunk in plain_chunks:
-                    formatted_chunk, formatting_kwargs = format_telegram_text(plain_chunk)
-                    if len(formatted_chunk) > 4096 and len(plain_chunk) > 1:
-                        for smaller_chunk in _split_telegram_message_chunks(plain_chunk, limit=1500):
-                            smaller_formatted, smaller_kwargs = format_telegram_text(smaller_chunk)
-                            chunks.append((smaller_formatted, smaller_kwargs))
-                    else:
-                        chunks.append((formatted_chunk, formatting_kwargs))
+                chunks = format_telegram_chunks(delivery.text or "")
             sent_message_id = None
             for index, chunk in enumerate(chunks):
                 if parse_mode:
@@ -1134,7 +1166,7 @@ async def _send_operator_telegram_delivery(
                         chat_id,
                         message_text,
                         **chunk_kwargs,
-                    )
+                    ), replay_safe=False, retry_policy=telegram_send_error_replay_safety
                 )
                 if sent_message_id is None:
                     sent_message_id = getattr(sent_message, "message_id", None)
@@ -1147,8 +1179,16 @@ async def _send_operator_telegram_delivery(
                 message_id=None if sent_message_id is None else str(sent_message_id),
             )
             record_platform_delivery_receipt(receipt)
+            transport_acknowledged = True
             return delivery_receipt_transport_succeeded(receipt)
+    except UnconfirmedDelivery as exc:
+        if delivery is not None:
+            exc.confirmed_text = confirmed_text or bool(exc.confirmed and delivery.text)
+            record_unconfirmed_delivery(delivery, exc, channel='telegram', target_id=str(chat_id), request_id=request_id)
+        raise
     except Exception:
+        if transport_acknowledged:
+            return True
         logger.warning("Failed to deliver operator notification message", exc_info=True)
         if delivery is not None:
             try:

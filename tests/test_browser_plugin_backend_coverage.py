@@ -709,8 +709,8 @@ def test_browser_extract_items_script_preserves_url_identity_after_nested_unwrap
     assert "looksLikeNestedUrl" in script
     assert "if (!looksLikeNestedUrl(decoded)) continue;" in script
     assert "decodedRaw.matchAll(/https?:\\/\\//ig)" in script
-    assert "stableTextKey" in script
-    assert "seenTitles" in script
+    assert "seenUrls" in script
+    assert "additional_sections" in script
     assert "const resolvedItemUrl = (value) => nestedHttpUrl(value) || absoluteUrl(value);" in script
     assert "url: resolvedUrl || url" in script
     assert "canonical_url: resolvedUrl || url" in script
@@ -850,7 +850,8 @@ def test_browser_tools_cover_success_failure_and_cleanup(monkeypatch, tmp_path) 
     assert return_tools.browser_run_js(
         inv("browser_run_js", {"script": "return document.location.href", "session_id": "s1"})
     ).output["result"] == {"wrapped": True}
-    assert return_backend.calls[-1][2].startswith("async () =>")
+    assert return_backend.calls[-2][2].startswith("async () =>")
+    assert return_backend.calls[-1][2] == "() => location.href"
     assert tools.browser_close(inv("browser_close", {"session_id": "s1"})).output["closed"] == "s1"
     assert "s1" in backend.closed
 
@@ -2736,7 +2737,8 @@ async def test_playwright_backend_page_methods_and_shutdown() -> None:
     await backend.wait_for("s", "#ready", None, None, 1)
     await backend.wait_for("s", None, "https://example.com/*", None, 1)
     await backend.wait_for("s", None, None, None, 1)
-    assert await backend.find("s", "a") == [{"tag": "a", "text": "link", "href": "https://example.com"}]
+    assert await backend.find("s", "a") == [{"tag": "a", "text": "link", "href": "https://example.com",
+        "text_length": 4, "text_truncated": False, "total_matches": 1, "matches_truncated": False}]
     assert await backend.run_js("s", "1+1") == {"script": "1+1"}
     await playwright_backend.PlaywrightBackend.close_session(backend, "s")
     await playwright_backend.PlaywrightBackend.shutdown(backend)
@@ -7095,7 +7097,8 @@ async def test_cdp_backend_page_methods_screenshot_and_shutdown() -> None:
     await backend.wait_for("s", "#ready", None, None, 1)
     await backend.wait_for("s", None, "https://example.com/*", None, 1)
     await backend.wait_for("s", None, None, None, 1)
-    assert await backend.find("s", "a") == [{"tag": "a", "text": "link", "href": ""}]
+    assert await backend.find("s", "a") == [{"tag": "a", "text": "link", "href": "",
+        "text_length": 4, "text_truncated": False, "total_matches": 1, "matches_truncated": False}]
     assert await backend.run_js("s", "1+1") == {"script": "1+1"}
     await cdp_backend.CDPBackend.close_session(backend, "s")
     await cdp_backend.CDPBackend.shutdown(backend)

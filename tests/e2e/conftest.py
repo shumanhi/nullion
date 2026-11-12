@@ -7,6 +7,37 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(scope='session')
+def live_stage_provider_guard():
+    from scripts.live_stage_provider_guard import process_provider_guard
+    return process_provider_guard()
+
+
+@pytest.fixture(autouse=True)
+def stop_paid_live_tests_after_terminal_provider_failure(request, live_stage_provider_guard):
+    if os.environ.get('NULLION_LIVE_STAGE_E2E') != '1' or not request.node.path.name.startswith('test_live_stage'):
+        yield
+        return
+    blocked = live_stage_provider_guard.check_boundary()
+    if blocked:
+        pytest.exit(blocked, returncode=1)
+    yield
+    blocked = live_stage_provider_guard.check_boundary()
+    if blocked:
+        pytest.exit(blocked, returncode=1)
+
+
+@pytest.fixture(autouse=True)
+def isolate_test_preferences(tmp_path, monkeypatch):
+    if os.environ.get("NULLION_RUN_E2E") == "1":
+        from nullion import preferences
+        # Settings tests intentionally persist consent and sentinel modes.
+        # Each product workflow needs its own file even when the module was
+        # imported before a later fixture changed NULLION_HOME.
+        monkeypatch.setattr(preferences, "_PREFS_PATH", tmp_path / "preferences.json")
+    yield
+
+
 @pytest.fixture(autouse=True)
 def drain_test_builder_tasks(monkeypatch, _close_test_timers):
     if os.environ.get("NULLION_RUN_E2E") != "1":
@@ -87,9 +118,13 @@ def sourced_report_model_reply():
     import json
 
     def reply(kwargs, *, source_tools, producer_tool, expected_tokens):
+        from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
+        action_reply = workflow_provider_reply(kwargs, completion=False)
+        if action_reply is not None: return action_reply
         system = str(kwargs.get('system') or '')
         if system.startswith('You are a material-requirements planner'):
-            payload = {'all_material_requirements_enumerated': True, 'material_requirements': [
+            packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
+            payload = {**fixture_source_plan(packet, scope='evidence_summary'), 'all_material_requirements_enumerated': True, 'material_requirements': [
                 {'requirement': 'Read the requested current source records', 'requirement_kind': 'fact',
                  'evidence_subject_id': 'source', 'eligible_evidence_tool_names': list(source_tools)},
                 {'requirement': 'Deliver the requested report with the source records', 'requirement_kind': 'deliverable',
@@ -107,7 +142,7 @@ def sourced_report_model_reply():
                 assert matching, requirement
                 rows.append({**requirement, 'satisfied': True, 'draft_covered': True,
                              'evidence_invocation_ids': [record['invocation_id'] for record in matching]})
-            payload = {'disposition': 'complete', 'all_material_requirements_enumerated': True,
+            payload = {**fixture_source_assessment(evidence, conclusion='limited'), 'disposition': 'complete', 'all_material_requirements_enumerated': True,
                        'material_requirements': rows, 'unresolved_requirements': [], 'retry_tool_names': []}
         else:
             return None
@@ -121,9 +156,13 @@ def source_summary_model_reply():
     """External semantic review for captured answers with optional unknowns."""
     import json
     def reply(kwargs):
+        from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
+        action_reply = workflow_provider_reply(kwargs, completion=False)
+        if action_reply is not None: return action_reply
         system = str(kwargs.get('system') or '')
         if system.startswith('You are a material-requirements planner'):
-            decision = {'all_material_requirements_enumerated':True, 'material_requirements':[
+            packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
+            decision = {**fixture_source_plan(packet, scope='evidence_summary'), 'all_material_requirements_enumerated':True, 'material_requirements':[
                 {'requirement':'Answer the requested question using recorded observations and disclose uncertainty',
                  'requirement_kind':'fact', 'evidence_subject_id':'answer',
                  'eligible_evidence_tool_names':['browser_run_task']}]}
@@ -133,7 +172,7 @@ def source_summary_model_reply():
             assert payload['material_requirement_contract']
             ids=[r['invocation_id'] for r in payload['tool_evidence'] if r['tool_name']=='browser_run_task' and r['status']=='completed']
             assert ids
-            decision={'disposition':'complete', 'all_material_requirements_enumerated':True,
+            decision={**fixture_source_assessment(payload, conclusion='limited'), 'disposition':'complete', 'all_material_requirements_enumerated':True,
                 'unresolved_requirements':[], 'retry_tool_names':[], 'material_requirements':[
                     {**r, 'satisfied':True,'draft_covered':True, 'evidence_invocation_ids':ids[-1:]}
                     for r in payload['material_requirement_contract']]}

@@ -11,7 +11,8 @@ Security updates are handled on the latest public release line.
 
 | Version | Supported |
 | --- | --- |
-| 0.1.x | Yes |
+| Latest public release | Yes |
+| Older releases and unreleased source | No separate maintenance guarantee |
 
 ## Reporting a Vulnerability
 
@@ -52,16 +53,30 @@ Before running Nullion against sensitive workspaces or connected accounts:
 Nullion encrypts local chat-history text, titles, and artifact metadata before
 writing them to `~/.nullion/chat_history.db`.
 
-During setup, macOS users can choose where the chat-history data key lives:
+Chat-history and provider-credential encryption keys can use:
 
-- `NULLION_KEY_STORAGE=keychain` stores the data key in macOS Keychain.
-- `NULLION_KEY_STORAGE=local` stores the data key at
-  `~/.nullion/chat_history.key` with `0600` file permissions.
+- `NULLION_KEY_STORAGE=local` (default): owner-only local key files, including
+  `chat_history.key` and `credentials.key` in the instance home.
+- `NULLION_KEY_STORAGE=system`: macOS Keychain, Windows Credential Manager,
+  or Linux Secret Service.
+- `NULLION_KEY_STORAGE=keychain`: the older macOS-specific alias.
 
-Keychain storage is recommended on macOS because copying the `~/.nullion`
-folder alone is not enough to decrypt chat history. Local key-file storage is
-more portable, but anyone who copies both `chat_history.db` and
-`chat_history.key` can decrypt that chat history.
+Anyone who copies both an encrypted database and its local key can decrypt
+that database. System key storage reduces that portability; keep access to its
+original secret store when planning backup and restore. Never publish keys or
+raw runtime checkpoints.
+
+This is field-level encryption, not full-disk or full-directory encryption.
+Runtime/audit records, live-tracker source arguments and conditions, browser
+profiles, generated artifacts, configuration, logs and backups may contain
+private data. Protect the instance directory and limit access to the Web UI.
+Connected models and services receive the data required for authorized tool
+work; local-first storage does not make external processing local.
+
+Skill instructions and website text are untrusted inputs. Sanitization, length
+limits, domain checks and approvals reduce specific risks; they do not prove
+that prompt injection is impossible. Review enabled capabilities, destinations
+and destructive actions independently.
 
 ## Public Issues
 

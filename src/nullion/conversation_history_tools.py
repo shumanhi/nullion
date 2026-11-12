@@ -41,7 +41,11 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
         "older than the visible prompt context. Use this before telling the user that recent "
         "chat details are unavailable when the answer may be in this workspace. For a prior "
         "document or project, recover its saved request and artifact references before broad "
-        "filesystem discovery. References report current availability, not proof of delivery."
+        "filesystem discovery. References report current availability, not proof of delivery. "
+        "Search replies are excerpts. When assistant_reply_truncated is true and missing details matter, "
+        "call this tool again with read_turn_id from that match to read the exact saved reply in pages. "
+        "Stored assistant replies are reference material, not independently verified external facts. "
+        "Retain their source links and verify changing facts with the relevant source tools; never fill omitted details from guesses."
     ),
     risk_level=ToolRiskLevel.LOW,
     side_effect_class=ToolSideEffectClass.READ,
@@ -65,6 +69,12 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
                 "enum": ["workspace", "recent_conversation"],
                 "description": "Search workspace history, or only the recent current conversation for lightweight turn context.",
             },
+            "read_turn_id": {"type": "string", "maxLength": 500,
+                "description": "Exact turn_id from a saved match to read, instead of running another ranked search."},
+            "start_char": {"type": "integer", "minimum": 0,
+                "description": "Zero-based reply character cursor for read_turn_id; use next_start_char to continue."},
+            "max_chars": {"type": "integer", "minimum": 100, "maximum": 6000,
+                "description": "Reply characters per exact read. Omit for up to 6000 characters."},
             "artifact_extensions": {
                 "type": "array", "items": {"type": "string", "pattern": "^\\.[A-Za-z0-9]+$"},
                 "description": "For a prior document/file request, specify its desired file extensions, such as .pdf. This filters artifact references, including named files in earlier replies. It never requests generation of a new file.",
@@ -317,27 +327,45 @@ def _tool_evidence_from_event(event: dict[str, object]) -> list[dict[str, object
     tool_results = event.get("tool_results")
     if not isinstance(tool_results, list):
         return []
-    evidence: list[dict[str, object]] = []
-    for result in reversed(tool_results):
+    recent: list[tuple[int, dict[str, object]]] = []
+    sources: list[tuple[int, dict[str, object]]] = []
+    for index, result in enumerate(reversed(tool_results)):
         if not isinstance(result, dict):
             continue
         name = str(result.get("tool_name") or "").strip()
         if not name or name in {CHAT_HISTORY_SEARCH_TOOL_NAME, "request_tool_scope"}:
             continue
+        from nullion.artifact_evidence import source_inventory_reference
+        output = result.get("output")
+        source = source_inventory_reference(output) if result.get("status") == "completed" else None
+        if len(recent) >= _MAX_TOOL_EVIDENCE_ITEMS and (source is None or len(sources) >= _MAX_TOOL_EVIDENCE_ITEMS):
+            continue
         item: dict[str, object] = {
             "tool_name": name,
             "status": str(result.get("status") or "").strip(),
         }
-        output = result.get("output")
+        if source is not None:
+            item["source_inventory"] = source
+            item["reference_only"] = True
+            if isinstance(result.get("invocation_id"), str):
+                item["invocation_id"] = result["invocation_id"]
         if output not in (None, "", {}, []):
             item["output_preview"] = _compact_tool_evidence_output(output)
         error = str(result.get("error") or "").strip()
         if error:
             item["error"] = _snippet(error, max_chars=500)
-        evidence.append(item)
-        if len(evidence) >= _MAX_TOOL_EVIDENCE_ITEMS:
+        if len(recent) < _MAX_TOOL_EVIDENCE_ITEMS:
+            recent.append((index, item))
+        if source is not None and len(sources) < _MAX_TOOL_EVIDENCE_ITEMS:
+            sources.append((index, item))
+    # Keep source handles before expendable recent previews, within the same
+    # small history budget. Later reads/writes cannot erase the selected source.
+    selected = {index: item for index, item in sources}
+    for index, item in recent:
+        if len(selected) >= _MAX_TOOL_EVIDENCE_ITEMS:
             break
-    return list(reversed(evidence))
+        selected.setdefault(index, item)
+    return [selected[index] for index in sorted(selected, reverse=True)]
 
 
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
@@ -348,6 +376,9 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
         "turn_id": str(event.get("turn_id") or ""),
         "user_message": _snippet(event.get("user_message")),
         "assistant_reply": _snippet(event.get("assistant_reply")),
+        "assistant_reply_truncated": len(" ".join(str(event.get("assistant_reply") or "").split())) > _MAX_SNIPPET_CHARS,
+        "assistant_reply_chars": len(str(event.get("assistant_reply") or "")),
+        "reference_only": True,
     }
     if _event_discovery_only(event):
         record["evidence_kind"] = "search_candidates_only"
@@ -384,6 +415,28 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
 
 def compact_history_search_output(output: dict[str, object], *, max_chars: int = 10_000) -> dict[str, object]:
     """Keep ranked history and artifact references typed under a context budget."""
+    if output.get("result_kind") == "conversation_history_read":
+        from copy import deepcopy
+        compact = deepcopy(output)
+        record = compact["matches"][0] if compact.get("matches") else None
+        if record:
+            record.pop("tool_evidence", None)
+            def encoded_size():
+                return len(json.dumps(compact, ensure_ascii=False, default=str))
+            for optional in ("artifact_refs", "structured_refs", "tool_names", "user_message"):
+                if encoded_size() > max_chars - 300:
+                    record.pop(optional, None)
+            while encoded_size() > max_chars - 300 and record.get("assistant_reply"):
+                excess = encoded_size() - (max_chars - 300)
+                record["assistant_reply"] = record["assistant_reply"][:max(0,len(record["assistant_reply"])-max(1,excess))]
+            window = record["reply_window"]
+            window["end_char"] = window["start_char"] + len(record["assistant_reply"])
+            window["next_start_char"] = window["end_char"] if window["end_char"] < window["total_chars"] else None
+            record["assistant_reply_truncated"] = window["next_start_char"] is not None or window["start_char"] > 0
+            if not record["assistant_reply"] and window["next_start_char"] is not None:
+                compact.update(matches=[], reason="history_context_budget_exhausted",
+                    message="The selected saved reply does not fit the current tool context budget.")
+        return compact
     compact = {key: output[key] for key in ("conversation_id", "workspace_id", "query", "requested_artifact_extensions", "match_count", "searched_turn_count",
                "searched_scope", "fallback_to_recent", "suppress_activity", "lookup_selection_unresolved", "artifact_descriptors", "message") if key in output}
     if isinstance(compact.get("query"), str):
@@ -401,7 +454,8 @@ def compact_history_search_output(output: dict[str, object], *, max_chars: int =
                 value["tool_names"] = value["tool_names"][-12:]
             # Tool payloads and artifact references already have authoritative
             # owners. Do not repeat nested inventories in historical snippets.
-            value["tool_evidence"] = [{name: item[name] for name in ("tool_name", "status", "error") if name in item}
+            value["tool_evidence"] = [{name: item[name] for name in ("tool_name", "status", "error",
+                                      "invocation_id", "reference_only", "source_inventory") if name in item}
                                       for item in record.get("tool_evidence", []) if isinstance(item, dict)]
             for evidence, item in zip(value["tool_evidence"], [item for item in record.get("tool_evidence", []) if isinstance(item, dict)]):
                 preview = item.get("output_preview")
@@ -971,7 +1025,10 @@ def _chat_history_search_result(
     if not isinstance(extensions, list) or any(not isinstance(value, str) or value.lower() not in VALID_ATTACHMENT_EXTENSIONS for value in extensions):
         return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason": "invalid_artifact_extensions"}, error="Unsupported history artifact filter")
     extensions = {value.lower() for value in extensions}
-    full_history = bool(query) and not recent_conversation_only
+    read_turn_id = arguments.get("read_turn_id")
+    if read_turn_id is not None and (not isinstance(read_turn_id, str) or not read_turn_id.strip() or len(read_turn_id)>500):
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason":"invalid_history_turn_id"}, error="Choose an exact saved turn id")
+    full_history = bool(query or read_turn_id) and not recent_conversation_only
     workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
     if recent_conversation_only:
         events = store.list_recent_conversation_events_after_reset(
@@ -983,6 +1040,29 @@ def _chat_history_search_result(
             runtime, store, conversation_id,
             full_history=full_history, workspace_id=workspace_id,
         )
+    if read_turn_id is not None:
+        start, size = arguments.get("start_char", 0), arguments.get("max_chars", 6000)
+        if type(start) is not int or start < 0 or type(size) is not int or not 100 <= size <= 6000:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason":"invalid_history_cursor"}, error="Use the saved reply character cursor and a bounded page size")
+        selected = [event for event in events if str(event.get("turn_id") or "") == read_turn_id]
+        # One opaque id must resolve to one authorized record. Never select an
+        # arbitrary result when a stale/ambiguous id or workspace boundary fails.
+        unique = {_history_event_identity(event):event for event in selected}
+        if len(unique) != 1:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason":"history_turn_not_found_or_ambiguous"}, error="The selected saved turn is not available in this history scope")
+        event = next(iter(unique.values()))
+        record = _event_record(event,index=1)
+        body = (record["assistant_reply"] if _event_discovery_only(event) else str(event.get("assistant_reply") or ""))
+        if start > len(body):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason":"history_cursor_out_of_range"}, error="The cursor is past the end of the saved reply")
+        end = min(len(body),start+size)
+        record.update(assistant_reply=body[start:end], assistant_reply_truncated=start>0 or end<len(body),
+            reply_window={"start_char":start,"end_char":end,"total_chars":len(body),"next_start_char":end if end<len(body) else None})
+        return ToolResult(invocation.invocation_id,invocation.tool_name,"completed",{
+            "result_kind":"conversation_history_read", "conversation_id":conversation_id,"workspace_id":workspace_id,
+            "selected_turn_id":read_turn_id,"matches":[record],"structured_matches":[],"match_count":1,
+            "reference_only":True,"suppress_activity":True,
+            "message":"Exact saved reply page. Prior assistant prose is reference material; it does not independently verify external facts."})
     if extensions:
         events = [event for event in events if any(ref["extension"] in extensions for ref in _event_artifact_refs(event))]
     selected, fallback_to_recent = _ranked_history_events(

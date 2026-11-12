@@ -1020,7 +1020,7 @@ def test_prepare_reply_for_platform_delivery_attaches_explicit_media_temp_file(t
         principal_id="telegram:contract-chat",
     )
 
-    assert delivery.text == "⏰ **SCHEDULED TASK: Cron contract file-only**"
+    assert delivery.text == "**SCHEDULED TASK: Cron contract file-only**"
     assert delivery.attachments == (report,)
     assert delivery.media_directive_count == 1
     assert delivery.unavailable_attachment_count == 0
@@ -1029,7 +1029,7 @@ def test_prepare_reply_for_platform_delivery_attaches_explicit_media_temp_file(t
         f"⏰ **SCHEDULED TASK: Cron contract text-and-file**\n\nStatus ready\nMEDIA:{report}",
         principal_id="telegram:contract-chat",
     )
-    assert text_and_file.text == "⏰ **SCHEDULED TASK: Cron contract text-and-file**\n\nStatus ready"
+    assert text_and_file.text == "**SCHEDULED TASK: Cron contract text-and-file**\n\nStatus ready"
     assert text_and_file.attachments == (report,)
 
 
@@ -1869,7 +1869,7 @@ async def test_slack_delivery_retries_plain_text_after_formatted_send_failure() 
         async def chat_postMessage(self, **kwargs):
             self.messages.append(kwargs)
             if len(self.messages) == 1:
-                raise RuntimeError("formatted send failed")
+                raise _FormattingRejected("formatted send rejected")
 
     client = FormattingFailureSlackClient()
 
@@ -1898,7 +1898,7 @@ async def test_discord_delivery_retries_plain_text_after_send_failure() -> None:
                 kwargs["content"] = args[0]
             self.messages.append(kwargs)
             if len(self.messages) == 1:
-                raise RuntimeError("formatted send failed")
+                raise _FormattingRejected("formatted send rejected")
 
     channel = FormattingFailureChannel()
 
@@ -1906,3 +1906,7 @@ async def test_discord_delivery_retries_plain_text_after_send_failure() -> None:
 
     assert channel.messages[0]["content"] == "Hello **Ada**"
     assert "```text\nHello **Ada**\n```" in channel.messages[1]["content"]
+
+
+class _FormattingRejected(RuntimeError):
+    status_code = 400

@@ -15,6 +15,85 @@ from scripts.live_stage_chat_contract_probe import Scenario, _event_tool_names
 from scripts.live_stage_telegram_desktop_probe import _delivered_artifacts, _receipt_artifacts, _turn_artifacts
 
 
+def test_default_live_scenarios_do_not_repeat_paid_work():
+    scenarios = live_stage_chat_contract_probe.DEFAULT_LIVE_STAGE_SCENARIOS
+    assert len(scenarios) == len(set(scenarios))
+    assert {'simple', 'weather', 'calendar', 'image', 'scheduler_manual_run'}.issubset(scenarios)
+
+
+def test_followup_success_cannot_mask_a_failed_original_request():
+    scenario=Scenario('source','',None,None,required_tool_all_each_turn=('opaque_read',))
+    with pytest.raises(AssertionError):
+        live_stage_chat_contract_probe._assert_turn_tools(scenario,{'tool_results':[{'tool_name':'opaque_read','status':'failed'}]})
+    live_stage_chat_contract_probe._assert_turn_tools(scenario,{'tool_results':[{'tool_name':'opaque_read','status':'completed'}]})
+
+
+@pytest.mark.parametrize('prompt', ['同じ質問', 'La misma pregunta', 'Repeated request'])
+@pytest.mark.parametrize('terminal_id', [None, 'current'])
+def test_repeated_live_prompt_requires_its_own_turn_evidence(prompt, terminal_id):
+    old = {'turn_id': 'old', 'user_message': prompt, 'tool_results': ['old evidence']}
+    new = {'turn_id': 'current', 'user_message': prompt, 'tool_results': ['current evidence']}
+    select = live_stage_chat_contract_probe._select_new_chat_turn
+    assert select([old], prompt, turn_id=terminal_id, prior_turn_ids={'old'}) is None
+    assert select([old, new], prompt, turn_id=terminal_id, prior_turn_ids={'old'}) is new
+    assert select([old, new], prompt, turn_id='different', prior_turn_ids={'old'}) is None
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_probe_deduplicates_selected_scenarios_and_stops_paid_work_after_failure(tmp_path, monkeypatch, fail):
+    probe = live_stage_chat_contract_probe
+    calls = []
+    monkeypatch.setattr(probe, '_get_json', lambda *args, **kwargs: {})
+    monkeypatch.setattr(probe, 'SCENARIOS', {name: Scenario(name, name, None, None) for name in ['a', 'b']})
+    def post(url, payload, timeout):
+        calls.append(payload)
+        if fail:
+            raise ConnectionError('External provider unavailable')
+        return {'type': 'message', 'text': 'Ready.', 'artifacts': []}, 1
+    monkeypatch.setattr(probe, '_post_json', post)
+    outcome = probe.main(['--runtime-db', str(tmp_path/'absent.db'), '--repeat', '1', '--fail-fast',
+        '--scenario', 'a', '--scenario', 'a', '--scenario', 'b'])
+    assert outcome == (1 if fail else 0)
+    assert len(calls) == (1 if fail else 2)
+
+
+@pytest.mark.parametrize('name',['scheduler_bulk_enable_recovery','scheduler_fresh_followup_after_bulk_enable'])
+@pytest.mark.parametrize('wrong_scope',[False,True])
+def test_live_scheduler_probes_own_their_jobs_and_never_restore_unchanged_jobs(monkeypatch,name,wrong_scope):
+    probe=live_stage_chat_contract_probe
+    rows={'unrelated':{'id':'unrelated','enabled':False}};created=[];patched=[];deleted=[];prompts=[]
+    monkeypatch.setattr(probe,'_get_json',lambda *args,**kwargs:list(rows.values()))
+    def post(url,payload,timeout):
+        if url.endswith('/api/crons'):
+            identifier='owned-'+str(len(created));created.append(identifier)
+            rows[identifier]={**payload,'id':identifier}
+            return {'ok':True,'job':rows[identifier]},1
+        prompts.append(payload['text'])
+        for identifier in created:rows[identifier]['enabled']=True
+        if wrong_scope:rows['unrelated']['enabled']=True
+        return {'type':'message','text':'Selected tasks enabled. Current scheduler status confirmed.','artifacts':[]},1
+    monkeypatch.setattr(probe,'_post_json',post)
+    def patch(url,payload,timeout):
+        identifier=url.rsplit('/',1)[-1];patched.append(identifier);rows[identifier].update(payload)
+    monkeypatch.setattr(probe,'_patch_json',patch)
+    def delete(url,timeout):
+        identifier=url.rsplit('/',1)[-1];deleted.append(identifier);rows.pop(identifier)
+    monkeypatch.setattr(probe,'_delete_json',delete)
+    monkeypatch.setattr(probe,'_event_tool_names_with_poll',lambda *args,**kwargs:{'list_crons','toggle_cron'})
+    monkeypatch.setattr(probe,'_tool_names_for_user_message_with_poll',lambda *args,**kwargs:{'list_crons'})
+    runner=getattr(probe,'_run_'+name)
+    args=dict(base_url='http://127.0.0.1:8753',runtime_db=None,scenario=probe.SCENARIOS[name],
+        timeout=1,index=0,runtime_db_available=False)
+    if wrong_scope:
+        with pytest.raises(AssertionError,match='unrelated task states'):runner(**args)
+    else:runner(**args)
+    assert set(created)==set(deleted) and set(rows)=={'unrelated'}
+    assert patched==(['unrelated'] if wrong_scope else [])
+    assert not rows['unrelated']['enabled']
+    assert all(identifier in prompts[0] for identifier in created)
+    assert 'unrelated' not in prompts[0]
+
+
 @pytest.mark.parametrize("persist_capture", [True, False])
 @pytest.mark.parametrize("tool_name", ["browser_screenshot", "weather_forecast"])
 def test_capture_probe_waits_for_full_sqlite_receipt_not_timing(tmp_path, persist_capture, tool_name):
@@ -641,8 +720,15 @@ def test_browser_live_record_scenarios_reject_search_lead_dumps() -> None:
     stock_scenario = live_stage_chat_contract_probe.SCENARIOS["market_quote_live_records"]
     stock_forbidden = " ".join(stock_scenario.forbidden_text).lower()
     assert "advertisement" in stock_forbidden
-    assert "robinhood" in stock_forbidden
     assert stock_scenario.required_tool_any == ("market_quote",)
+    complete = "CRML $6.38; MSFT $532.60; OKLO $25.94; TMC $2.39. Source basis: Yahoo Finance."
+    live_stage_chat_contract_probe._assert_contract(stock_scenario,
+        response={"text":complete}, elapsed_ms=100, tool_names={"market_quote"},
+        runtime_db_available=True)
+    with pytest.raises(AssertionError):
+        live_stage_chat_contract_probe._assert_contract(stock_scenario,
+            response={"text":complete.replace("TMC", "missing")}, elapsed_ms=100,
+            tool_names={"market_quote"}, runtime_db_available=True)
 
 
 def test_email_simple_live_access_rejects_attachment_browser_and_file_fallbacks() -> None:
@@ -757,7 +843,9 @@ def test_random_website_and_formatted_pack_scenarios_reject_sidecars_and_partial
     random_bundle = live_stage_chat_contract_probe.SCENARIOS["random_website_artifact_bundle"]
     formatted_pack = live_stage_chat_contract_probe.SCENARIOS["formatted_pdf_flyer_pack"]
 
-    assert random_bundle.min_artifact_count >= 4
+    assert random_bundle.min_artifact_count == random_bundle.max_artifact_count == 4
+    kids = live_stage_chat_contract_probe.SCENARIOS["kids_playbook_artifact_pack"]
+    assert kids.min_artifact_count == kids.max_artifact_count == 4
     assert ".json" in random_bundle.forbidden_artifact_extensions
     assert ".txt" in random_bundle.forbidden_artifact_extensions
     assert "only attached" in random_bundle.forbidden_text
@@ -975,3 +1063,35 @@ def test_live_stage_capture_ignores_timing_event_without_receipt():
         json.dumps({"tool_name": "browser_screenshot", "status": "completed", "event_type": "conversation.tool_timing", "duration_ms": 123})]
     live_stage_chat_contract_probe._assert_contract(scenario, response={}, elapsed_ms=1,
         tool_names={"browser_navigate", "browser_screenshot"}, runtime_db_available=True, tool_output_texts=outputs)
+
+
+def test_shared_baseline_reuses_only_success_in_same_process(monkeypatch):
+    probe = live_stage_chat_contract_probe
+    probe._successful_live_baselines.clear()
+    calls = []
+    outcomes = iter([1, 0, 0])
+    monkeypatch.setattr(probe, 'main', lambda argv: calls.append(tuple(argv)) or next(outcomes))
+    args = ['--base-url', 'http://stage', '--scenario', 'simple', '--repeat', '2']
+    assert probe.shared_live_baseline(args) == 1
+    assert probe.shared_live_baseline(args) == 0
+    assert probe.shared_live_baseline(args) == 0
+    assert len(calls) == 2
+    assert probe.shared_live_baseline([*args[:-1], '3']) == 0
+    assert len(calls) == 3
+    with pytest.raises(ValueError):
+        probe.shared_live_baseline(['--scenario', 'file_create'])
+    probe._successful_live_baselines.clear()
+
+
+def test_shared_baseline_expiry_remeasures(monkeypatch):
+    probe = live_stage_chat_contract_probe
+    probe._successful_live_baselines.clear()
+    now = [0.0]; calls = []
+    monkeypatch.setattr(probe.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(probe, 'main', lambda argv: calls.append(argv) or 0)
+    args = ['--scenario', 'weather']
+    assert probe.shared_live_baseline(args) == 0
+    now[0] = 1801
+    assert probe.shared_live_baseline(args) == 0
+    assert len(calls) == 2
+    probe._successful_live_baselines.clear()

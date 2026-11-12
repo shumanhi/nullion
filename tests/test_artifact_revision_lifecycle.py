@@ -193,7 +193,12 @@ def test_final_evidence_filters_custom_writers_but_keeps_downloaded_sources(tmp_
     rows=[ToolResult('a','custom_export','completed',{'artifact_paths':[draft]}),
           ToolResult('b','custom_export','completed',{'artifact_paths':[final]}),
           ToolResult('c','web_fetch','completed',{'artifact_paths':[source]})]
-    assert _selected_artifact_tool_results(rows,[final],registry=registry)==rows[1:]
+    selected=_selected_artifact_tool_results(rows,[final],registry=registry)
+    assert selected[1:]==rows[1:]
+    assert selected[0].invocation_id=='a' and selected[0].status=='completed'
+    assert selected[0].output['result_kind']=='superseded_producer_execution'
+    assert selected[0].output['execution_succeeded'] is True
+    assert 'artifact_paths' not in selected[0].output and draft not in str(selected[0].output)
 
 
 def test_cross_format_replacements_require_selection_and_final_manifests_remain_authoritative(tmp_path):

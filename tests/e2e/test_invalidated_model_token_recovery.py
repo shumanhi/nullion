@@ -54,7 +54,7 @@ def test_invalidated_token_reuses_same_account_credential_at_real_chat_boundary(
         def __init__(self,**kwargs):pass
         def __enter__(self):return self
         def __exit__(self,*args):return False
-        def stream(self,method,url,*,json,headers):
+        def stream(self,method,url,*,json,headers,timeout):
             requests.append({'body':json,'headers':headers,'thread':threading.current_thread().name,'thread_id':threading.get_ident()})
             if headers['Authorization']=='Bearer '+old:time.sleep(.15)
             return Response(headers)

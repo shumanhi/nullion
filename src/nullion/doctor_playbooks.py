@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from nullion.health_action_notices import health_action_notice
 
 
 _TERMINAL_ACTION_STATUSES = {"completed", "cancelled", "failed", "dismissed", "resolved"}
@@ -22,6 +23,8 @@ class DoctorPlaybookResult:
     acknowledgement: str
     message: str
     action: dict[str, str | None]
+    effect: str = "guidance"
+    repair_verified: bool = False
 
 
 def _runtime_store(runtime: Any) -> Any:
@@ -230,6 +233,10 @@ def execute_doctor_playbook_command(
     signal_current_process_restart: Callable[[], None] | None = None,
 ) -> DoctorPlaybookResult:
     """Execute a structured Doctor playbook command for any chat/web surface."""
+    current = _get_doctor_action(runtime, action_id)
+    if str(current.get("status") or "") in _TERMINAL_ACTION_STATUSES and command != "doctor:inspect_run":
+        notice = health_action_notice("doctor", "complete", str(current["status"]), already_handled=True)
+        return DoctorPlaybookResult(notice.acknowledgement, notice.message, current, effect="none")
     final_state = _compiled_doctor_playbook_graph().invoke(
         {
             "runtime": runtime,
@@ -341,18 +348,19 @@ def _doctor_telegram_node(state: _DoctorPlaybookState) -> dict[str, object]:
     command = state["command"]
     source = state["source"]
     if state.get("restart_chat_services") is not None:
-        message = state["restart_chat_services"]()
+        state["restart_chat_services"]()
         updated = _cancel_if_open(runtime, action_id, reason=f"{command} triggered from {source}")
         acknowledgement = "Restarting" if command == "doctor:restart_bot" else "Reconnecting"
-        return {"result": DoctorPlaybookResult(acknowledgement, message, updated)}
+        message = "Chat-service restart requested.\n\nRecovery has not been verified yet. Send a test message after the services reconnect."
+        return {"result": DoctorPlaybookResult(acknowledgement, message, updated, effect="operation_requested")}
     if state.get("signal_current_process_restart") is not None:
         state["signal_current_process_restart"]()
         updated = _cancel_if_open(runtime, action_id, reason=f"{command} triggered from {source}")
-        message = "Restarting the bot now. It will be back online shortly."
+        message = "Telegram restart requested. Recovery has not been verified yet; send a test message after it reconnects."
         if command == "doctor:reconnect_telegram":
-            message = "Reconnecting to Telegram now."
+            message = "Telegram reconnect requested. Recovery has not been verified yet; send a test message after it reconnects."
         acknowledgement = "Restarting" if command == "doctor:restart_bot" else "Reconnecting"
-        return {"result": DoctorPlaybookResult(acknowledgement, message, updated)}
+        return {"result": DoctorPlaybookResult(acknowledgement, message, updated, effect="operation_requested")}
     updated = _start_if_open(runtime, action_id)
     return {
         "result": DoctorPlaybookResult(
@@ -373,7 +381,7 @@ def _doctor_retry_model_api_node(state: _DoctorPlaybookState) -> dict[str, objec
         if source.lower() == "operator command"
         else "Will retry the model API on the next request."
     )
-    return {"result": DoctorPlaybookResult("Retrying", message, updated)}
+    return {"result": DoctorPlaybookResult("Retry next request", message, updated)}
 
 
 def _doctor_static_node(acknowledgement: str, message: str, *, cancel_reason: str | None = None):
@@ -396,21 +404,25 @@ def _doctor_run_diagnosis_node(state: _DoctorPlaybookState) -> dict[str, object]
 
 
 def _doctor_plugin_node(state: _DoctorPlaybookState) -> dict[str, object]:
-    updated = _cancel_if_open(
-        state["runtime"],
-        state["action_id"],
-        reason=f"{state['command']} triggered from {state['source']}",
-    )
-    return {"result": DoctorPlaybookResult("Acknowledged", "Action noted.", updated)}
+    current = _get_doctor_action(state["runtime"], state["action_id"])
+    operation = {"doctor:restart_plugin": "restart", "doctor:disable_plugin": "disable"}[state["command"]]
+    message = f"Plugin {operation} was not run.\n\nOpen Settings → Plugins to {operation} the affected plugin, then recheck its status. The Doctor alert remains open."
+    return {"result": DoctorPlaybookResult("Plugin action needed", message, current)}
 
 
 def _doctor_unknown_node(state: _DoctorPlaybookState) -> dict[str, object]:
-    updated = _cancel_if_open(
-        state["runtime"],
-        state["action_id"],
-        reason=f"Unknown command from {state['source']}: {state['command']}",
-    )
-    return {"result": DoctorPlaybookResult("Dismissed", "Action dismissed.", updated)}
+    current = _get_doctor_action(state["runtime"], state["action_id"])
+    return {"result": DoctorPlaybookResult(
+        "Unsupported action", "This Doctor action is not supported. No action was run and the alert was left unchanged.",
+        current, effect="unsupported",
+    )}
+
+
+def _doctor_pause_chat_node(state: _DoctorPlaybookState) -> dict[str, object]:
+    current = _get_doctor_action(state["runtime"], state["action_id"])
+    return {"result": DoctorPlaybookResult(
+        "Stop request guidance", "Use /stop in the chat to cancel an active request. No chat pause was applied; the Doctor alert is unchanged.", current,
+    )}
 
 
 @lru_cache(maxsize=1)
@@ -421,14 +433,7 @@ def _compiled_doctor_playbook_graph():
     graph.add_node("retry_workflow", _doctor_retry_workflow_node)
     graph.add_node("telegram", _doctor_telegram_node)
     graph.add_node("retry_model_api", _doctor_retry_model_api_node)
-    graph.add_node(
-        "pause_chat",
-        _doctor_static_node(
-            "Paused",
-            "Chat paused. Send any message to resume.",
-            cancel_reason="Chat paused from {source}",
-        ),
-    )
+    graph.add_node("pause_chat", _doctor_pause_chat_node)
     graph.add_node(
         "switch_model",
         _doctor_static_node(

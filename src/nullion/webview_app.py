@@ -17,6 +17,7 @@ from urllib.request import urlopen
 import webbrowser
 
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
+from nullion.http_transport import close_http_error_response
 from nullion.tray_app import _DEFAULT_HOST, _DEFAULT_PORT, _load_env as _load_tray_env, _web_base_url, _build_icon_image
 from nullion.version import version_tag
 
@@ -289,6 +290,7 @@ def _check_loading_screen_health(base_url: str) -> dict[str, object]:
                 "message": "Local app is healthy.",
             }
     except HTTPError as exc:
+        close_http_error_response(exc)
         return {
             "ok": False,
             "status": int(exc.code),

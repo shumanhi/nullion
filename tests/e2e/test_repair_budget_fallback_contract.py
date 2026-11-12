@@ -1,4 +1,5 @@
 """Tool-owned repair budgets must yield to safe alternatives without restarting the request."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 
@@ -37,7 +38,7 @@ def test_chat_uses_alternate_read_after_repair_budget_without_losing_receipts(tm
         if call.tool_name == 'browser_extract_detail':
             return ToolResult(call.invocation_id, call.tool_name, 'completed', {
                 'result_kind': 'source_observations', 'report_status': 'completed', 'limitations': [],
-                'observations': [{'label': 'Offer A', 'value': '8.10 USD · 12 oz', 'source_url': 'https://example.com/offer'}]})
+                'observations': [{'label': 'Offer A', 'value': '8.10 USD · 12 oz', 'quote': '8.10 USD · 12 oz', 'source_url': 'https://example.com/offer'}]})
         return ToolResult(call.invocation_id, call.tool_name, 'completed', {'session_id': 'shared-session', 'page_revision': 1, 'observed_price': '8.10 USD'})
     registry = ToolRegistry()
     for name in ['browser_navigate', 'browser_wait_for', 'browser_snapshot', 'browser_extract_detail']:
@@ -46,6 +47,8 @@ def test_chat_uses_alternate_read_after_repair_budget_without_losing_receipts(tm
     class Model:
         steps = 0
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             system = kw.get('system', ''); names = {t['name'] for t in kw.get('tools', [])}
             if system.startswith('You are a material-requirements planner'):
                 return text_response(json.dumps({'all_material_requirements_enumerated': True, 'material_requirements': [

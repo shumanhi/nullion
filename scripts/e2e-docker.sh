@@ -4,6 +4,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 if [[ $# -gt 0 ]]; then
   export NULLION_E2E_PYTEST_ARGS="$*"
+  export NULLION_E2E_PYTEST_ARGS_JSON="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@")"
 fi
 export NULLION_E2E_PYTEST_ARGS="${NULLION_E2E_PYTEST_ARGS:-tests/e2e}"
 export NULLION_RUN_E2E="${NULLION_RUN_E2E:-1}"

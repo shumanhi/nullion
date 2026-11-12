@@ -190,3 +190,17 @@ Author checklist:
 - avoid instructions that bypass approvals or hide side effects
 - include examples of successful and blocked flows
 - prefer small focused skills over one giant catch-all skill
+
+## Loading and tool scope
+
+Nullion uses a compact cached capability/skill index for awareness. Exact skill
+documents and connector context are loaded after structured scope selection
+when needed; enabling a pack should not load its full instructions or probe
+every account on every ordinary chat turn. A missing tool can trigger an
+explicit scope request without restarting the user's task.
+
+Skill descriptions and examples are guidance for the model, not keyword-based
+product routing. A skill cannot turn a read-only status question into a write
+action, bypass account consent, or make a generic delegated browser job safe
+for repeated live polling. Use the dedicated contracts in
+[Live tracking](live-tracking.md) and [Architecture](architecture.md).

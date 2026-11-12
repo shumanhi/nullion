@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 
 import asyncio
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ class ScriptedClient:
         self.calls: list[dict] = []
 
     def create(self, **kwargs):
+        reply = workflow_provider_reply(kwargs)
+        if reply is not None: return reply
         self.calls.append(kwargs)
         if not self.responses:
             return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}
@@ -206,9 +209,9 @@ async def test_golden_failure_recovery_workflow_can_use_fallback_tool() -> None:
     client = ScriptedClient([
         use_tool(tool_use("primary-1", "primary_lookup", {"query": "x"})),
         use_tool(tool_use("fallback-1", "fallback_lookup", {"query": "x"})),
-        final("Recovered with fallback data."),
+        final("Selected resource has value 42."),
     ])
-    registry = GoldenRegistry({"primary_lookup": RuntimeError("primary failed"), "fallback_lookup": {"answer": "ok"}})
+    registry = GoldenRegistry({"primary_lookup": RuntimeError("primary failed"), "fallback_lookup": {"value": 42}})
 
     result, _updates = await run_task(
         client,
@@ -217,7 +220,7 @@ async def test_golden_failure_recovery_workflow_can_use_fallback_tool() -> None:
     )
 
     assert result.status == "success"
-    assert result.output == "Recovered with fallback data."
+    assert result.output == "Selected resource has value 42."
     assert [call.tool_name for call in registry.calls] == ["primary_lookup", "fallback_lookup"]
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Mapping
 
 
@@ -89,16 +90,58 @@ def compact_list_crons_output_for_context(
     row_limit = max(1, int(max_rows or 1))
     visible_rows = prioritized_rows[:row_limit]
     compact: dict[str, object] = {
-        "cron_count": len(crons),
+        "cron_count": output.get("cron_count", len(crons)),
         "crons": visible_rows,
     }
+    # Context sampling may omit descriptive prose, never the tool's typed
+    # failure/recovery contract. Otherwise a stale cursor becomes a permanent
+    # unavailable capability and later scope selection retires its reader.
+    for key in ("reason", "error_code", "retryable", "recovery", "required_source_tool",
+                "executed", "terminal_user_action_required", "connection_state", "failure_scope", "source_urls"):
+        if key in output:
+            compact[key] = output[key]
+    for key in ("offset", "limit", "matched_count", "inventory_version", "has_more", "next_offset", "inventory_scope"):
+        if key in output:
+            compact[key] = output[key]
     if isinstance(output.get("query"), str):
         compact["query"] = output["query"]
     if isinstance(output.get("total_count"), int):
         compact["total_cron_count"] = output["total_count"]
     omitted_count = max(0, len(prioritized_rows) - len(visible_rows))
     if omitted_count:
+        # Follow-up/repair passes need the identities and display timing of
+        # every observed row even when verbose health/task details are sampled.
+        # Keep source pagination separate from this detail sample: the index
+        # observes this page only and never certifies unseen inventory pages.
+        index = []
+        index_chars = 0
+        for row in compact_rows:
+            entry = {key: row[key] for key in ("selection_index", "id", "name", "enabled",
+                "schedule_description", "next_run_description", "has_task") if key in row}
+            size = len(json.dumps(entry, ensure_ascii=False))
+            if index_chars + size > 24000:
+                break
+            index.append(entry)
+            index_chars += size
+        compact["inventory_index"] = index
+        compact["inventory_index_complete"] = len(index) == len(compact_rows)
+        compact["source_page_has_more"] = output.get("has_more")
+        compact["inventory_index_guidance"] = (
+            "The inventory_index preserves exact task identities, status and display timing from this source page. "
+            "When naming an entry, copy its full name verbatim, including distinguishing suffixes; do not shorten it. "
+            "Use it for an inventory answer or wording correction; crons is only the detailed sample. "
+            "A complete index does not include unseen source pages or full stored task instructions. "
+            "Inspect retained detail only when those omitted fields are needed."
+        )
         compact["omitted_cron_count"] = omitted_count
+        # This history view may prioritize a referenced row out of order. Its
+        # sample cannot advance the source cursor past unseen records. Re-read
+        # that exact page to enumerate it; retain the original boundary too.
+        if "offset" in output:
+            compact["source_page_next_offset"] = output.get("next_offset")
+            compact["has_more"] = True
+            compact["next_offset"] = output["offset"]
+            compact["context_sample_only"] = True
     if matched_rows:
         compact["matched_crons"] = matched_rows[:3]
         compact["matched_cron_count"] = len(matched_rows)

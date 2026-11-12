@@ -1,6 +1,8 @@
 """Workspace task records with durable, reversible updates and tool receipts."""
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from datetime import UTC, date, datetime
 import hashlib
 import json
@@ -91,7 +93,7 @@ class PersonalTaskToolRegistry:
             try:
                 initialized = False
                 if path.is_file() and path.suffix in {'.db', '.sqlite', '.sqlite3'}:
-                    with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as connection:
+                    with sqlite_connection(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as connection:
                         initialized = connection.execute(
                             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_events'"
                         ).fetchone() is not None
@@ -113,7 +115,7 @@ class PersonalTaskToolRegistry:
                     return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
                         {'workspace_id': self._workspace_id, 'items': [], 'item_count': 0,
                          'persisted': True, 'storage_initialized': False})
-                with sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5) as connection:
+                with sqlite_connection(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as connection:
                     initialized = connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_events'"
                     ).fetchone() is not None
@@ -131,7 +133,7 @@ class PersonalTaskToolRegistry:
     def _save(self, invocation, path, args):
         now = datetime.now(UTC).isoformat()
         source_turn_id = args.get('source_turn_id')
-        with sqlite3.connect(str(path), timeout=5) as connection:
+        with sqlite_connection(str(path), timeout=5) as connection:
             connection.execute('BEGIN IMMEDIATE')
             records = _records(connection, self._conversation_id)
             task_id = args.get('task_id')

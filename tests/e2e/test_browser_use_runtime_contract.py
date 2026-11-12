@@ -1,6 +1,7 @@
 """Real Browser Use -> browser -> API -> SQLite and PNG delivery in Docker."""
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import threading
@@ -19,20 +20,14 @@ def response(value):
     return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': value}]}
 
 
-def source_presentation_response(kwargs):
-    from nullion.prompt_injection import UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START, UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END
-    message=kwargs['messages'][0]['content'][0]['text']
-    raw=message.split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n',1)[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,1)[0]
-    context=json.loads(raw)
-    draft={'intro':'', 'points':[{'evidence_ids':[row['id']],
-        'detail':'\n'.join(row['value'].splitlines()[1:]),'relevance':'Answers the requested comparison'} for row in context['evidence'][:7]],
-        'limitation_ids':[row['id'] for row in context['limitations'][:3]]}
-    return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'present','name':'present_source_answer','input':draft}]}
+from tests.source_answer_fixture import source_presentation_response
 
 
-@pytest.mark.parametrize("isolated", [False, True])
-@pytest.mark.parametrize("retry_summary", [False, True])
-def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path, monkeypatch, record_property, isolated, retry_summary, source_summary_model_reply):
+@pytest.mark.parametrize("retry_summary,isolated,direct_evidence,carry_prior,query_deep_page",
+    [(retry,isolated,direct,False,False) for retry in (False,True) for isolated in (False,True) for direct in (False,True)]
+    +[(retry,isolated,True,True,False) for retry in (False,True) for isolated in (False,True)]
+    +[(False,isolated,True,False,True) for isolated in (False,True)])
+def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path, monkeypatch, record_property, isolated, retry_summary, source_summary_model_reply, direct_evidence, carry_prior, query_deep_page):
     if not isolated:
         pytest.importorskip('browser_use')
     if isolated and os.environ.get('NULLION_BROWSER_USE_TEST_PYTHON'):
@@ -57,10 +52,13 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
 
     class Page(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith('/blocked'):
+                self.send_response(403);self.end_headers();self.wfile.write(b'Access blocked for this source');return
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(b'<html><body style="background:#102b42;color:white;font-size:24px;min-height:2400px"><h1>Rental results</h1><article><h2>Sedan A</h2><p>$80 Total</p></article><article><h2>Sedan B</h2><p>$88 Total</p></article></body></html>')
+            filler="".join("<div>Unrelated row "+str(i)+"</div>" for i in range(1000)) if query_deep_page else ""
+            self.wfile.write(('<html><body style="background:#102b42;color:white;font-size:24px;min-height:2400px"><h1>Rental results</h1>'+filler+'<article><h2>Sedan A</h2><p>$80 Total</p></article><article><h2>Sedan B</h2><p>$88 Total</p></article></body></html>').encode())
         def log_message(self, *_): pass
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Page)
@@ -87,13 +85,34 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                 outer_calls = 0
                 browser_calls = 0
                 def create(self, **kwargs):
+                    protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                    if protocol_reply is not None: return protocol_reply
                     schema_messages = [m for m in kwargs['messages'] if isinstance(m.get('content'), str) and m['content'].startswith('Return valid JSON matching this schema: ')]
                     if schema_messages:
                         self.browser_calls += 1
                         assert kwargs['max_tokens'] >= 8192
                         assert any(isinstance(m.get('content'), list) and any(p.get('type') == 'image' for p in m['content']) for m in kwargs['messages'])
                         schema = json.loads(schema_messages[-1]['content'].split(': ', 1)[1])
-                        actions = ({'record_observations': report} if self.browser_calls == 1 else {'scroll': {'down': True, 'pages': 0.8}} if self.browser_calls == 2 else {'done': {'data': report, 'success': True}})
+                        current_capture=next((m['content'] for m in kwargs['messages'] if isinstance(m.get('content'),str) and m['content'].startswith('Current captured page evidence')), '')
+                        blocked_step=carry_prior and '/blocked' in current_capture
+                        if carry_prior and not blocked_step:
+                            handed_off=json.dumps(kwargs['messages'],ensure_ascii=False)
+                            assert 'Prior source step context' in handed_off and 'HTTP 403' in handed_off
+                        if direct_evidence and not blocked_step and not query_deep_page:
+                            captured_messages = [m['content'] for m in kwargs['messages'] if isinstance(m.get('content'), str) and m['content'].startswith('Current captured page evidence')]
+                            assert captured_messages and '$80 Total' in captured_messages[-1]
+                            assert 'untrusted source data' in captured_messages[-1]
+                        actions = ({'done': {'data': report, 'success': True}} if direct_evidence else {'record_observations': report} if self.browser_calls == 1 else {'scroll': {'down': True, 'pages': 0.8}} if self.browser_calls == 2 else {'done': {'data': report, 'success': True}})
+                        if query_deep_page:
+                            if self.browser_calls==1:
+                                assert '$80 Total' not in current_capture
+                                actions={'read_page_state':{'query':'Sedan A'}}
+                            else:
+                                assert self.browser_calls==2
+                                captured_search=json.dumps(kwargs['messages'])
+                                assert 'matched_line_indices' in captured_search and '$80 Total' in captured_search and '$88 Total' in captured_search
+                                actions={'done':{'data':report,'success':True}}
+                        if blocked_step:actions={'done':{'data':{'goal_status':'blocked','next_action':'alternative_source','observations':[], 'unknowns':['First source could not be read'],'blocker':'HTTP 403 from first source'},'success':False}}
                         value = {'evaluation_previous_goal': 'Page captured', 'memory': 'Observed both prices', 'next_goal': 'Return partial findings', 'action': [actions]}
                         if 'thinking' in schema.get('properties', {}): value['thinking'] = 'Use captured evidence'
                         # Fill optional planning fields only when present in the versioned schema.
@@ -104,7 +123,7 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                     reviewed=source_summary_model_reply(kwargs)
                     if reviewed is not None: return reviewed
                     if not tools:
-                        return response(json.dumps({'web_action': 'browser_interaction', 'requested_tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task'], 'requested_artifact_extensions': ['.png'], 'confidence': 1}))
+                        return response(json.dumps({'web_action': 'browser_interaction', 'requested_tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task'], 'requested_artifact_extensions': [] if carry_prior else ['.png'], 'confidence': 1}))
                     if 'select_attachment_format' in tools:
                         return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'format', 'name': 'select_attachment_format', 'input': {'extension': '.png', 'confidence': 1}}]}
                     self.outer_calls += 1
@@ -113,13 +132,15 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                             return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'retry','name':'browser_run_task','input':{'task':prompt,'url':url}}]}
                         return source_presentation_response(kwargs)
                     if self.outer_calls == 1:
-                        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'scope', 'name': 'request_tool_scope', 'input': {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task'], 'artifact_extensions': ['.png']}}]}
+                        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'scope', 'name': 'request_tool_scope', 'input': {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task'], 'artifact_extensions': [] if carry_prior else ['.png']}}]}
                     if self.outer_calls == 2:
                         assert 'browser_run_task' in tools
                         visual = next(tool for tool in kwargs['tools'] if tool['name'] == 'browser_run_task')
                         assert 'PNG screenshots' in visual['description']
                         assert 'isolated browser session' in visual['description']
-                        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'browse', 'name': 'browser_run_task', 'input': {'task': prompt, 'url': url, 'max_steps': 4}}]}
+                        return {'stop_reason': 'tool_use', 'content': [
+                            *([{'type':'tool_use','id':'first-source','name':'browser_run_task','input':{'task':'Read the first source and report any access blocker.','url':f'http://localhost:{server.server_port}/blocked','max_steps':2}}] if carry_prior else []),
+                            {'type': 'tool_use', 'id': 'browse', 'name': 'browser_run_task', 'input': {'task': prompt, 'url': url, 'max_steps': 4}}]}
                     assert self.outer_calls == 3, 'No redundant verification/model retry after evidence delivery'
                     payload = json.dumps(kwargs['messages'])
                     assert 'partial' in payload, payload
@@ -138,28 +159,32 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
             app = web_app.create_app(runtime, orchestrator=AgentOrchestrator(model_client=model), registry=registry)
             start = time.monotonic()
             with TestClient(app) as client:
-                result = client.post('/api/chat', json={'text': f'{prompt} {url} .png', 'conversation_id': conversation})
+                result = client.post('/api/chat', json={'text': f'{prompt} {url}'+('' if carry_prior else ' .png'), 'conversation_id': conversation})
             samples.append(time.monotonic() - start)
             assert result.status_code == 200, result.text
-            assert len(result.json()['artifacts']) >= 2, result.json()
-            assert '$80' in result.json()['text'] and '$88' in result.json()['text'], json.dumps({'response_text': result.json()['text'], 'outer_calls': model.outer_calls, 'turns': [{k: e.get(k) for k in ('event_type', 'assistant_reply', 'reply')} for e in runtime.store.list_conversation_events(conversation)]})
+            assert (not result.json()['artifacts']) if carry_prior else len(result.json()['artifacts']) >= (1 if direct_evidence else 2), result.json()
+            assert '$80' in result.json()['text'] and '$88' in result.json()['text'], json.dumps({'response_text': result.json()['text'], 'outer_calls': model.outer_calls, 'turns': [{k: e.get(k) for k in ('event_type', 'assistant_reply', 'reply', 'error', 'tool_results')} for e in runtime.store.list_conversation_events(conversation)]})
             assert 'Unshown or unresolved' not in result.json()['text']
             assert 'After-hours return' in result.json()['text']
             assert 'task is still open' not in result.json()['text']
             assert 'not every requested part could be verified' not in result.json()['text']
             turns = [event for event in runtime.store.list_conversation_events(conversation) if event.get('event_type') == 'conversation.chat_turn']
             outputs = [tool['output'] for tool in turns[-1]['tool_results'] if tool['tool_name'] == 'browser_run_task']
-            assert len(outputs) == 1 and outputs[0]['report_status'] == 'partial', turns[-1]
+            assert len(outputs) == (2 if carry_prior else 1), turns[-1]
+            if carry_prior:assert outputs[0]['report_status']=='blocked'
+            outputs=outputs[-1:]
+            assert outputs[0]['report_status']=='partial',outputs
             assert len(outputs[0]['observations']) == len({row['quote'] for row in report['observations']}), 'Relabeling an identical quote must not create more findings'
             assert len(json.dumps(outputs[0], ensure_ascii=False)) < 12_000
             assert outputs[0]['sources'] and 'preview' not in outputs[0]
             paths = outputs[0]['artifact_paths']
-            assert len(paths) >= 2 and all(Image.open(path).format == 'PNG' for path in paths)
+            assert len(paths) >= (1 if direct_evidence else 2) and all(Image.open(path).format == 'PNG' for path in paths)
             # Verify real platform preparation sees the captured image bytes.
             delivered = prepare_reply_for_platform_delivery(turns[-1]['assistant_reply'], principal_id='web_user')
-            assert delivered.attachments, result.json()
+            assert (not delivered.attachments) if carry_prior else delivered.attachments, result.json()
             assert all(Path(attachment).read_bytes().startswith(b'\x89PNG') for attachment in delivered.attachments)
-            assert model.browser_calls == 3 and model.outer_calls == (4 if retry_summary else 3)
+            if query_deep_page:assert 'read_page_state' in outputs[0]['execution_audit']['action_names']
+            assert model.browser_calls == (2 if carry_prior or query_deep_page else 1 if direct_evidence else 3) and model.outer_calls == (4 if retry_summary else 3)
         record_property('browser_use_average_seconds', sum(samples) / len(samples))
         assert sum(samples) / len(samples) < 20
         assert max(samples) < 30
@@ -186,6 +211,8 @@ def test_plain_chat_never_enters_slow_optional_browser_agent(tmp_path, monkeypat
     class Model:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             return response('Hello.')
     model = Model()
@@ -219,7 +246,8 @@ def test_remote_browser_resource_lease_excludes_overlapping_workers(tmp_path, mo
     assert free.returncode == 0 and free.stdout.strip() == 'acquired', free.stderr
 
 
-def test_isolated_browser_can_follow_an_alternative_public_origin(tmp_path, monkeypatch):
+@pytest.mark.parametrize("crowded", [False, True, 'stalled'])
+def test_isolated_browser_can_follow_an_alternative_public_origin(tmp_path, monkeypatch, crowded):
     """Exercise the real Browser Use navigation policy, faking only its model."""
     worker_python = os.environ.get('NULLION_BROWSER_USE_TEST_PYTHON')
     if not worker_python:
@@ -230,6 +258,10 @@ def test_isolated_browser_can_follow_an_alternative_public_origin(tmp_path, monk
 
     class Page(BaseHTTPRequestHandler):
         def do_GET(self):
+            if crowded=='stalled' and self.path in {'/json/version','/json/list'}:
+                value=[] if self.path=='/json/list' else {'webSocketDebuggerUrl':cdp_socket_url}
+                self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers()
+                self.wfile.write(json.dumps(value).encode());return
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
@@ -257,6 +289,8 @@ def test_isolated_browser_can_follow_an_alternative_public_origin(tmp_path, monk
         calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls += 1
             schema_message = next(m for m in kwargs['messages'] if isinstance(m.get('content'), str)
                                   and m['content'].startswith('Return valid JSON matching this schema: '))
@@ -271,12 +305,47 @@ def test_isolated_browser_can_follow_an_alternative_public_origin(tmp_path, monk
                     value[key] = None
             return response(json.dumps(value))
 
+    from contextlib import ExitStack
+    owned_resources = ExitStack()
+    pages = []
+    if crowded is True:
+        import socket
+        from playwright.sync_api import sync_playwright
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            cdp_port = listener.getsockname()[1]
+        playwright = owned_resources.enter_context(sync_playwright())
+        browser = playwright.chromium.launch(headless=True, args=[f'--remote-debugging-port={cdp_port}'])
+        owned_resources.callback(browser.close)
+        context = browser.new_context()
+        pages = [context.new_page() for _ in range(55)]
+        monkeypatch.setenv('NULLION_BROWSER_USE_CDP_URL', f'http://127.0.0.1:{cdp_port}')
+    elif crowded=='stalled':
+        from websockets.sync.server import serve
+        def unresponsive(connection):
+            try:
+                for _ in connection:pass
+            except Exception:pass
+        cdp_server=owned_resources.enter_context(serve(unresponsive,'127.0.0.1',0))
+        threading.Thread(target=cdp_server.serve_forever,daemon=True).start()
+        cdp_socket_url=f'ws://127.0.0.1:{cdp_server.socket.getsockname()[1]}/devtools/browser/stalled'
+        monkeypatch.setenv('NULLION_BROWSER_USE_CDP_URL',f'http://127.0.0.1:{server.server_port}')
     try:
         result = run_isolated_browser_task(BrowserTask(task='別の情報源を調べて', url=initial, max_steps=3),
             client=Model(), principal_id='other-user', policy=BrowserPolicy(), timeout=60, python=worker_python)
+        if result.get('page_url')!=alternative:print(json.dumps(result,ensure_ascii=False))
         assert result['page_url'] == alternative, result
         assert result['observations'] and result['observations'][0]['value'] == '19:30', result
         assert all(d['role'] == 'source' for d in result['artifact_descriptors']), result
+        if crowded is True:
+            assert result['browser_session_recovery'] == {'kind':'isolated_capacity_fallback',
+                'shared_browser_modified':False, 'shared_session_reused':False}
+            assert len(context.pages) == 55
+            assert all(not page.is_closed() and page.url == 'about:blank' for page in pages)
+        elif crowded=='stalled':
+            assert result['browser_session_recovery'] == {'kind':'isolated_startup_fallback',
+                'configured_endpoint_changed':False, 'shared_session_reused':False}
     finally:
+        owned_resources.close()
         server.shutdown()
         server.server_close()

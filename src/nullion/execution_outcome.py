@@ -66,6 +66,38 @@ class ExecutionOutcomeEvaluation:
     outcome: ExecutionOutcome = field(default_factory=lambda: ExecutionOutcome(status=ExecutionStatus.FAILED))
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedAnswer:
+    """The composer's immutable result; review and transport do not reauthor it."""
+    outcome: ExecutionOutcome
+    binding: str
+
+
+def prepare_answer(request, text, tool_results, artifacts=(), *, complete=False, remaining_work=()):
+    from nullion.workflow_reasoning import outcome_binding
+    return PreparedAnswer(ExecutionOutcome(
+        status=ExecutionStatus.SUCCEEDED if complete else ExecutionStatus.PARTIALLY_SUCCEEDED,
+        requested_outcome=request, user_visible_message=text,
+        missing_requirements=tuple(remaining_work)),
+        outcome_binding(request, {}, text, tool_results, artifacts))
+
+
+def prepared_answer_matches(answer, request, tool_results, artifacts=()):
+    from nullion.workflow_reasoning import outcome_binding
+    return isinstance(answer, PreparedAnswer) and answer.binding == outcome_binding(
+        request, {}, answer.outcome.user_visible_message, tool_results, artifacts)
+
+
+def owned_prepared_answer(result, request):
+    """The exact composed answer may cross transports, not execution authority."""
+    from nullion.workflow_recovery import result_value
+    answer = result_value(result, 'prepared_answer')
+    text = result_value(result, 'final_text', result_value(result, 'text'))
+    return answer if (prepared_answer_matches(answer, request,
+        result_value(result, 'tool_results', ()) or (), result_value(result, 'artifacts', ()) or ())
+        and answer.outcome.user_visible_message == text) else None
+
+
 def build_execution_outcome(
     *,
     requested_outcome: str = "",
@@ -74,11 +106,13 @@ def build_execution_outcome(
     artifacts_created: Iterable[str] | None = None,
     artifacts_delivered: Iterable[str] | None = None,
     delivery_status: str | None = None,
-    fulfillment_satisfied: bool = True,
+    fulfillment_satisfied: bool | None = True,
+    partial_fulfillment: bool = False,
     missing_requirements: Iterable[str] | None = None,
     cancelled: bool = False,
     suspended_for_approval: bool = False,
     reason: str | None = None,
+    reviewed_execution=None,
 ) -> ExecutionOutcome:
     """Build a normalized terminal outcome from structured execution facts."""
     tools_used: list[str] = []
@@ -88,15 +122,27 @@ def build_execution_outcome(
     first_failure_reason = str(reason or "").strip()
     completed_tools = 0
     failed_or_denied_tools = 0
-    for result in tool_results or ():
+    from nullion.workflow_recovery import recovered_failure_ids, result_id
+    results = list(tool_results or ())
+    from nullion.execution_review_evidence import ExecutionReviewEvidence
+    review = reviewed_execution if isinstance(reviewed_execution, ExecutionReviewEvidence) else None
+    missing = tuple(str(item).strip() for item in (missing_requirements or ()) if str(item).strip())
+    verified_complete = bool(review and review.complete and fulfillment_satisfied
+        and not review.blocking_failure_ids and not missing and not partial_fulfillment)
+    recovered = recovered_failure_ids(results)
+    for result in results:
         tool_name = _tool_name(result)
         if tool_name:
             tools_used.append(tool_name)
         status = _tool_status(result)
+        if result_id(result) in recovered:
+            evidence.append(f"tool_recovered:{tool_name}")
+            continue
         output = _tool_output(result)
+        causal = review is None or _tool_identity(result) in review.blocking_failure_ids
         if isinstance(output, dict):
             user_action_reason = _user_action_reason_from_output(output)
-            if user_action_reason:
+            if user_action_reason and not verified_complete and causal:
                 needs_user_action_reason = needs_user_action_reason or user_action_reason
                 first_failure_reason = first_failure_reason or user_action_reason
         if status == "completed":
@@ -104,10 +150,12 @@ def build_execution_outcome(
             if tool_name:
                 evidence.append(f"tool_completed:{tool_name}")
         elif status in {"failed", "denied"}:
-            failed_or_denied_tools += 1
+            failed_or_denied_tools += int(not verified_complete and causal)
             if tool_name:
                 failed_tools.append(tool_name)
                 evidence.append(f"tool_{status}:{tool_name}")
+            if not causal or verified_complete:
+                continue
             if isinstance(output, dict) and output.get("connection_state") == "pending_or_failed":
                 app_id = str(output.get("connector_app_id") or "connector").strip()
                 needs_user_action_reason = f"{app_id} connection is pending or failed"
@@ -125,7 +173,6 @@ def build_execution_outcome(
         evidence.append(f"artifacts_delivered:{len(delivered)}")
 
     normalized_delivery = str(delivery_status or "").strip().lower()
-    missing = tuple(str(item).strip() for item in (missing_requirements or ()) if str(item).strip())
     has_visible_output = bool(str(user_visible_message or "").strip()) or bool(delivered)
 
     if cancelled:
@@ -176,6 +223,14 @@ def build_execution_outcome(
             delivery_status=normalized_delivery,
         )
 
+    if normalized_delivery in {"unknown", "partial"}:
+        return _outcome(ExecutionStatus.PARTIALLY_SUCCEEDED, requested_outcome=requested_outcome,
+            user_visible_message=user_visible_message, tools_used=tools_used, failed_tools=failed_tools,
+            artifacts_created=created, artifacts_delivered=delivered, evidence=evidence,
+            missing_requirements=missing, failure_reason="delivery acknowledgement unresolved",
+            next_action="Check the destination before requesting a resend; automatic replay is stopped.",
+            delivery_status=normalized_delivery)
+
     if normalized_delivery == "partial_success":
         return _outcome(
             ExecutionStatus.PARTIALLY_SUCCEEDED,
@@ -207,6 +262,29 @@ def build_execution_outcome(
             next_action="Wait for the background run to deliver its terminal result.",
             delivery_status=normalized_delivery,
         )
+
+    if partial_fulfillment and normalized_delivery != "failed" and has_visible_output:
+        return _outcome(
+            ExecutionStatus.PARTIALLY_SUCCEEDED,
+            requested_outcome=requested_outcome, user_visible_message=user_visible_message,
+            tools_used=tools_used, failed_tools=failed_tools, artifacts_created=created,
+            artifacts_delivered=delivered, evidence=evidence, missing_requirements=missing,
+            failure_reason=first_failure_reason or _missing_reason(missing) or "required work remains incomplete",
+            next_action="Review the partial report and complete its remaining checks.",
+            delivery_status=normalized_delivery,
+        )
+
+    if (fulfillment_satisfied is None and normalized_delivery in {'sent','saved'}
+            and has_visible_output and (completed_tools or created)
+            and not failed_or_denied_tools and not first_failure_reason and not missing):
+        # Delivered work with unknown semantic completion is neither a proved
+        # full success nor a failed source check. Keep that distinction without
+        # inventing a missing-work warning or a failure for Doctor to repeat.
+        return _outcome(ExecutionStatus.PARTIALLY_SUCCEEDED,
+            requested_outcome=requested_outcome, user_visible_message=user_visible_message,
+            tools_used=tools_used, failed_tools=failed_tools, artifacts_created=created,
+            artifacts_delivered=delivered, evidence=evidence, missing_requirements=(),
+            failure_reason=None, next_action=None, delivery_status=normalized_delivery)
 
     if normalized_delivery == "failed" or not fulfillment_satisfied:
         return _outcome(
@@ -272,6 +350,10 @@ def build_execution_outcome(
     )
 
 
+def _tool_identity(result):
+    return result.get('invocation_id') if isinstance(result, dict) else getattr(result, 'invocation_id', None)
+
+
 def _outcome(
     status: ExecutionStatus,
     *,
@@ -287,7 +369,8 @@ def _outcome(
     next_action: str | None,
     delivery_status: str,
 ) -> ExecutionOutcome:
-    delivery_succeeded = delivery_status in {"sent", "saved", "silent", "partial_success"} or bool(artifacts_delivered)
+    delivery_succeeded = delivery_status not in {"unknown", "partial"} and (
+        delivery_status in {"sent", "saved", "silent", "partial_success"} or bool(artifacts_delivered))
     execution_succeeded = status in {ExecutionStatus.SUCCEEDED, ExecutionStatus.PARTIALLY_SUCCEEDED}
     return ExecutionOutcome(
         status=status,

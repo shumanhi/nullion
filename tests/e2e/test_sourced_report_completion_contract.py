@@ -1,6 +1,7 @@
 """Sourced reports retain browser work, complete comparisons, and deliver readable PDFs."""
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import html
 import json
 import os
@@ -92,15 +93,33 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
         step = 0
         review_calls = 0
         planner_calls = 0
+        def __init__(self):
+            self.errors = []
         def create(self, **kwargs):
+            try: return self._create(**kwargs)
+            except Exception as exc:
+                self.errors.append(repr(exc))
+                raise
+        def _create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system = str(kwargs.get('system', ''))
             if system.startswith('You are a material-requirements planner'):
                 self.planner_calls += 1
+                packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
                 requirements = [{'requirement': f'Compare direct AAA-BBB {window} with carrier, schedule and cost', 'requirement_kind': 'comparison_side',
                     'evidence_subject_id': f'window-{i}', 'eligible_evidence_tool_names': ['browser_extract_text']} for i, window in enumerate(windows)]
                 requirements.append({'requirement': 'Deliver a readable PDF with all comparisons and the cheapest option', 'requirement_kind': 'deliverable',
                     'evidence_subject_id': 'report', 'eligible_evidence_tool_names': ['pdf_create']})
-                return response(json.dumps({'all_material_requirements_enumerated': True, 'material_requirements': requirements}))
+                plan=fixture_source_plan(packet, scope='comparison')
+                # This fixture compares three filters on the explicitly supplied
+                # source, rather than claiming a search across other providers.
+                if plan:
+                    plan['search_coverage']['restricted_source_ids']=[
+                        row['candidate_id'] for row in packet['discovered_sources']['candidates']]
+                return response(json.dumps({**plan,
+                    'all_material_requirements_enumerated': True,
+                    'requested_artifact_extensions':['.pdf'], 'material_requirements': requirements}))
             if system.startswith('You are a semantic completion reviewer'):
                 self.review_calls += 1
                 payload = json.loads(kwargs['messages'][0]['content'][0]['text'])
@@ -108,14 +127,16 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
                 matching = [r for r in evidence if r.get('tool_name') == 'browser_extract_text' and 'WINDOW ' in json.dumps(r.get('output'))]
                 if len(matching) < 3:
                     assert 'unavailable' in json.dumps(payload['artifact_evidence']).lower()
-                    return response(json.dumps({'disposition': 'retry', 'unresolved_requirements': ['Matching records for every comparison are missing'],
+                    return response(json.dumps({**fixture_source_assessment(payload, conclusion='limited', sufficient=False),
+                        'disposition': 'retry', 'unresolved_requirements': ['Matching records for every comparison are missing'],
                         'retry_tool_names': ['browser_snapshot']}))
-                completed_pdf = [r for r in evidence if r.get('tool_name') == 'pdf_create' and r.get('status') == 'completed'][-1]
+                completed_pdf = [r for r in evidence if r.get('tool_name') == 'pdf_create' and r.get('status') == 'completed' and r.get('output',{}).get('artifact_record_binding')][-1]
                 material = []
                 for i, row in enumerate(payload['material_requirement_contract']):
                     record = matching[i] if i < 3 else completed_pdf
                     material.append({**row, 'satisfied': True, 'draft_covered': True, 'evidence_invocation_ids': [record['invocation_id']]})
-                return response(json.dumps({'disposition': 'complete', 'all_material_requirements_enumerated': True,
+                return response(json.dumps({**fixture_source_assessment(payload, conclusion='comparison'),
+                    'disposition': 'complete', 'all_material_requirements_enumerated': True,
                     'material_requirements': material, 'unresolved_requirements': [], 'retry_tool_names': []}))
             names = {t['name'] for t in kwargs.get('tools', [])}
             self.step += 1
@@ -161,7 +182,10 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
             user_message=prompt + ' ' + url, conversation_history=[], tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store,
             max_iterations=18, tool_flow_context={'requires_artifact_delivery': True, 'required_artifact_extensions': ['.pdf']})
         assert not result.reached_iteration_limit and not result.suspended_for_approval, result.final_text
-        assert result.response_fulfilled is True, result.final_text
+        assert not model.errors, json.dumps({'errors':model.errors,'reviews':[
+            e for e in runtime.store.list_conversation_events('telegram:report-user')
+            if e.get('event_type')=='conversation.completion_review']},ensure_ascii=False)
+        assert result.response_fulfilled is True, json.dumps([{k:e.get(k) for k in ['disposition','review_error','response_diagnostics','unresolved_requirements']} for e in runtime.store.list_conversation_events('telegram:report-user') if e.get('event_type')=='conversation.completion_review'])
         assert model.review_calls == 2 and model.step == 10
         assert queries == [('AAA-BBB', window, 'direct') for window in windows]
         reader = PdfReader(pdf)
@@ -203,6 +227,8 @@ def test_optional_research_and_pdf_tools_keep_plain_turns_on_fast_path(tmp_path,
         class Model:
             calls = 0
             def create(self, **kwargs):
+                protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                if protocol_reply is not None: return protocol_reply
                 self.calls += 1
                 if self.calls > 1 or not kwargs.get('tools'):
                     time.sleep(2)  # Previously slow review must stay outside ordinary chat.

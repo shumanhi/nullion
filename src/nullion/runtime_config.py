@@ -11,6 +11,40 @@ from nullion import runtime_cache
 from nullion.settings import Settings
 
 
+
+def media_configuration_signature(settings: object) -> str:
+    """Fingerprint only media configuration; ordinary chat never rebuilds tools."""
+    import hashlib
+    import json
+
+    values = {key: value for key, value in os.environ.items()
+        if key.startswith(("NULLION_MEDIA_", "NULLION_IMAGE_", "NULLION_AUDIO_", "NULLION_VIDEO_"))}
+    values["plugin_enabled"] = "media_plugin" in getattr(settings, "enabled_plugins", ())
+    values["provider_bindings"] = [binding.provider for binding in getattr(settings, "provider_bindings", ())
+        if binding.capability == "media_plugin"]
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def refresh_media_tool_registry(registry: object, settings: object) -> bool:
+    """Rebind configured media adapters after a settings change across surfaces."""
+    if registry is None or not callable(getattr(registry, "unregister", None)):
+        return False
+    from nullion.providers import resolve_plugin_provider_kwargs
+    from nullion.tools import register_media_plugin
+
+    bindings = {binding.capability: binding.provider for binding in getattr(settings, "provider_bindings", ())}
+    kwargs = resolve_plugin_provider_kwargs(plugin_name="media_plugin",
+        provider_name=bindings.get("media_plugin", "local_media_provider"))
+    # Resolve the new binding before removing the working registration.
+    for name in ("audio_transcribe", "image_extract_text", "image_generate"):
+        registry.unregister(name)
+    unmark = getattr(registry, "unmark_plugin_installed", None)
+    if callable(unmark):
+        unmark("media_plugin")
+    register_media_plugin(registry, **kwargs)
+    return True
+
+
 def _default_credentials_path() -> Path:
     configured_home = os.environ.get("NULLION_HOME")
     if configured_home and configured_home.strip():

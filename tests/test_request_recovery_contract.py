@@ -10,6 +10,28 @@ from nullion.turn_context_policy import (ScopedTurnToolRegistry, TurnToolEvidenc
     _planner_materialized_registry)
 
 
+@pytest.mark.parametrize('name,tags', [('browser_navigate',()), ('browser_extract_text',()),
+    ('email_read',()), ('weather_forecast',()), ('opaque_source',('connector',))])
+def test_retained_observation_policy_survives_a_fresh_recovery_registry(name,tags):
+    base=ToolRegistry();calls=[]
+    for tool_name,effect,capabilities in [(name,ToolSideEffectClass.READ,tags),
+            ('file_read',ToolSideEffectClass.READ,()), ('file_write',ToolSideEffectClass.WRITE,())]:
+        base.register(ToolSpec(tool_name,tool_name,ToolRiskLevel.LOW,effect,False,2,
+            capability_tags=capabilities),lambda inv:calls.append(inv.tool_name))
+    original=ScopedTurnToolRegistry(base,evidence=TurnToolEvidence(context_linked=True),
+        tool_scope_decision=TurnToolScopeDecision(valid=True,evidence_policy='retained',
+            requested_tool_names=('file_read','file_write')))
+    recovered=RequestRecoveryContract.from_registry(original).bind(ScopedTurnToolRegistry(base,
+        evidence=TurnToolEvidence(has_url_target=True),tool_scope_decision=TurnToolScopeDecision(
+            valid=True,requested_tool_names=(name,'file_read','file_write'),required_tool_names=(name,))))
+    assert recovered.turn_tool_scope_decision.evidence_policy=='retained'
+    assert recovered.can_invoke_tool('file_read') and recovered.can_invoke_tool('file_write')
+    assert not recovered.can_invoke_tool(name)
+    assert name not in recovered.turn_tool_scope_decision.required_tool_names
+    assert recovered.invoke(ToolInvocation('retry',name,'web:current',{})).status=='denied'
+    assert not calls
+
+
 def fixture_registry(effect=ToolSideEffectClass.WRITE):
     registry = ToolRegistry()
     writes = []
@@ -86,13 +108,17 @@ def test_completed_scope_reconstruction_does_not_invent_account_consent():
     assert decision.source_artifact_request_evidence=='2' and decision.excluded_artifact_extensions==('.pdf',)
 
 
-def test_exec_remains_available_but_executor_denials_are_not_bypassed(tmp_path,monkeypatch):
+@pytest.mark.parametrize('focused',[False,True])
+def test_exec_remains_available_but_executor_denials_are_not_bypassed(tmp_path,monkeypatch,focused):
     from nullion.tools import ToolExecutor
     from test_browser_cleanup_and_delete_review import terminal_setup
     runtime,base,backend=terminal_setup(tmp_path,monkeypatch)
     original=ScopedTurnToolRegistry(base,evidence=TurnToolEvidence(),tool_scope_decision=TurnToolScopeDecision(
         requested_tool_names=('file_read',),valid=True))
     recovered=RequestRecoveryContract.from_registry(original).bind(base)
+    if focused:
+        from nullion.agent_orchestrator import _FocusedRecoveryToolRegistry
+        recovered=_FocusedRecoveryToolRegistry(recovered,{'request_tool_scope','archive_create','file_read','file_write','file_patch','terminal_exec'})
     assert recovered.can_invoke_tool('terminal_exec')
     invocation=ToolInvocation('exec','terminal_exec','web:review',{'command':'pwd'})
     denied=ToolExecutor(store=runtime.store,registry=recovered,denied_tool_names=['terminal_exec']).invoke(invocation)
@@ -240,7 +266,8 @@ def test_existing_file_write_preserves_target_and_delivery_is_explicit(tmp_path,
     assert delivered.status=='completed' and delivered.output['path']==str(target), delivered
     from pathlib import Path
     copy=Path(delivered.output['artifact_path'])
-    assert copy!=target and copy.parent==roots.artifacts and copy.read_bytes()==target.read_bytes()==b'29'
+    assert copy!=target and copy.is_relative_to(roots.artifacts) and copy.name==target.name
+    assert copy.read_bytes()==target.read_bytes()==b'29'
     assert artifact_paths_from_tool_results([delivered])==[str(copy)]
 
 
@@ -257,3 +284,37 @@ def test_tool_turns_checkpoint_bounded_history_without_full_store_scan(tmp_path,
     restored=bootstrap_persistent_runtime(runtime.checkpoint_path)
     saved=restored.store.list_conversation_events('web:durable')
     assert len(saved)==128 and saved[-1]['assistant_reply']=='139'
+
+
+@pytest.mark.parametrize('prompt', ['状態は？', '¿Qué novedades hay?', 'Any update?'])
+def test_runtime_packaging_grant_is_local_and_bound_to_selected_files(tmp_path,prompt):
+    from PIL import Image
+    base,writes=fixture_registry()
+    calls=[]
+    base.register(ToolSpec('archive_create','Archive',ToolRiskLevel.LOW,ToolSideEffectClass.WRITE,False,2),
+        lambda inv: (calls.append(inv.arguments) or ToolResult(inv.invocation_id,inv.tool_name,'completed',{})))
+    image=tmp_path/'image.png';Image.new('RGB',(3,3),'blue').save(image)
+    page=tmp_path/'page.html';page.write_text('<html><img src="image.png"></html>')
+    extra=tmp_path/'private.txt';extra.write_text('unrelated')
+    original=ScopedTurnToolRegistry(base,evidence=TurnToolEvidence(current_user_message=prompt,requested_extensions=('.html',)),
+        tool_scope_decision=TurnToolScopeDecision(valid=True,requested_tool_names=('catalog',),requested_artifact_extensions=('.html',)))
+    contract=RequestRecoveryContract.from_registry(original)
+    recovered=contract.bind(base)
+    # A model argument cannot impersonate the runtime-owned selector signal.
+    arguments={'capabilities':['local_files'],'tool_names':['archive_create'],
+        'artifact_packaging_request':{'linked_paths':[str(page)],'retained_paths':[]}}
+    outer=ScopedTurnToolRegistry(recovered,evidence=TurnToolEvidence(),tool_scope_decision=contract.decision)
+    _,denied=outer.apply_scope_request(ToolInvocation('model','request_tool_scope','web:review',arguments))
+    assert not denied.can_invoke_tool('archive_create')
+    context={'artifact_packaging_request':{'linked_paths':[str(page)],'retained_paths':[]}}
+    _,ready=outer.apply_scope_request(ToolInvocation('runtime','request_tool_scope','web:review',
+        {'capabilities':['local_files'],'tool_names':['archive_create']},flow_context=context))
+    assert ready.can_invoke_tool('archive_create')
+    assert not ready.can_invoke_tool('change')
+    bad=ready.invoke(ToolInvocation('bad-package','archive_create','web:review',
+        {'source_paths':[str(page),str(image),str(extra)],'output_path':str(tmp_path/'page.zip')}))
+    assert bad.status=='denied' and bad.output['reason']=='artifact_packaging_sources_not_selected'
+    ok=ready.invoke(ToolInvocation('package','archive_create','web:review',
+        {'source_paths':[str(page),str(image)],'output_path':str(tmp_path/'page.zip')}))
+    assert ok.status=='completed' and len(calls)==1 and not writes
+    assert ready.turn_tool_scope_decision.requested_artifact_extensions==('.html','.zip')

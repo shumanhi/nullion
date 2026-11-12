@@ -162,8 +162,9 @@ def test_repair_keeps_hydrated_sources_and_dedupe_after_many_search_previews(sou
     assert source_text in evidence
     assert 'Other current source' in evidence
     assert 'already-reported' in evidence
-    hydrated = [row['tool_name'] for row in rows if row.get('source_excerpt')]
-    assert hydrated[:3] == ['browser_extract_text', 'browser_extract_text', 'file_read']
+    hydrated = [row for row in rows if row.get('source_excerpt') or 'source_data' in row]
+    assert sorted(row['tool_name'] for row in hydrated[:3]) == ['browser_extract_text', 'browser_extract_text', 'file_read']
+    assert next(row['source_data'] for row in hydrated if row['tool_name']=='file_read')['reported_events'][0]['id']=='already-reported'
     assert len(evidence) < 9300
 
 
@@ -418,3 +419,30 @@ def test_missing_typed_required_check_cannot_be_repaired_into_success():
     assert state.get('cron_completion_required') and state['response_fulfilled'] is False
     assert '19:30' in state['cron_unfinished_findings'] and model.calls==2
     assert '19:30' not in state['text']
+
+
+@pytest.mark.parametrize('name', ['Mesa observations', '観測データ', 'Datos actuales'])
+def test_late_json_source_documents_survive_long_research_history(name):
+    records=[result('browser_extract_text',{'text':f'Research result {i}: '+('finding '*220)}) for i in range(24)]
+    current={'name':name,'visits':29,'unique_visitors':7,'samples':[{'date':f'2026-01-{i:02d}','count':i,'uniques':i//2} for i in range(1,15)]}
+    records.append(result('file_read',{'path':'/workspace/current.json','content':json.dumps(current),'truncated':False}))
+    records.append(result('terminal_exec',{'stdout':json.dumps({'state':'authenticated','count':17}),'exit_code':0}))
+    evidence=json.loads(_cron_final_repair_tool_evidence(records))
+    sources=[r['source_data'] for r in evidence if 'source_data' in r]
+    assert current in sources and {'state':'authenticated','count':17} in sources
+    assert len(json.dumps(evidence))<32500
+    assert next(r for r in sources if 'samples' in r)['samples'][-1]['count']==14
+
+
+def test_truncated_or_failed_json_reads_never_become_complete_source_data():
+    rows=[result('file_read',{'content':'{"visits":29}','truncated':True}),
+          result('terminal_exec',{'stdout':'{"visits":29}'},status='failed')]
+    assert all('source_data' not in r for r in json.loads(_cron_final_repair_tool_evidence(rows)))
+
+
+def test_structured_cli_recovery_retains_counts_without_secrets_or_failed_commands():
+    record=result('terminal_exec',{'exit_code':0,'stdout':json.dumps({'count':13,'note':'ghp_'+'x'*25})})
+    evidence=_cron_final_repair_tool_evidence([record])
+    assert '"count": 13' in evidence and 'ghp_' not in evidence
+    failed=result('terminal_exec',{'exit_code':7,'stdout':'{"count":13}'})
+    assert 'source_data' not in json.loads(_cron_final_repair_tool_evidence([failed]))[0]

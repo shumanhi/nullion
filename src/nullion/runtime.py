@@ -142,6 +142,7 @@ from nullion.runtime_store import RuntimeStore
 from nullion.runtime_persistence import (
     build_runtime_store_payload,
     checkpoint_runtime_conversation_events,
+    checkpoint_runtime_events,
     list_runtime_store_backups as _list_runtime_store_backups,
     load_runtime_store,
     render_runtime_store_payload_json,
@@ -276,6 +277,7 @@ class PersistentRuntime:
     last_checkpoint_file_signature: tuple[int, int] | None = None
     live_tool_registry: ToolRegistry | None = None
     model_client: Any | None = None
+    scheduled_budget_runner: Any | None = None
 
     @property
     def active_tool_registry(self) -> ToolRegistry | None:
@@ -310,8 +312,10 @@ class PersistentRuntime:
             not force
             and fingerprint == self.last_checkpoint_fingerprint
             and self.checkpoint_path.exists()
-            and current_file_signature == self.last_checkpoint_file_signature
         ):
+            # Another writer changing the file is not a local mutation. Leave
+            # our last-seen signature intact so a later real change still
+            # merges that writer's records rather than overwriting them.
             if measure_sqlite:
                 logger.debug(
                     "runtime checkpoint skipped path=%s fingerprint_ms=%.1f",
@@ -345,8 +349,16 @@ class PersistentRuntime:
             )
         return saved_path
 
-    def checkpoint_conversation_events(self, *, limit: int = 128) -> Path:
-        return checkpoint_runtime_conversation_events(self.store, self.checkpoint_path, limit=limit)
+    def checkpoint_conversation_events(self, *, limit: int = 128, timeout_seconds: float = 10,
+                                       conversation_id: str | None = None) -> Path:
+        return checkpoint_runtime_conversation_events(
+            self.store, self.checkpoint_path, limit=limit, timeout_seconds=timeout_seconds,
+            conversation_id=conversation_id,
+        )
+
+    def checkpoint_runtime_events(self, events, *, audit_records=(), timeout_seconds: float = 0.1) -> Path:
+        return checkpoint_runtime_events(self.store, self.checkpoint_path, events,
+                                         audit_records=audit_records, timeout_seconds=timeout_seconds)
 
     def list_backups(self) -> list[dict[str, object]]:
         return list_runtime_store_backups(self.checkpoint_path)
@@ -4586,7 +4598,7 @@ def bootstrap_persistent_runtime(path: str | Path) -> PersistentRuntime:
         logger.debug("Startup maintenance skipped for runtime checkpoint %s", checkpoint_path, exc_info=True)
     store = bootstrap_runtime_store(checkpoint_path)
     store._memory_checkpoint_path = checkpoint_path
-    fingerprint = render_runtime_store_payload_json(store) if checkpoint_path.exists() else None
+    fingerprint = runtime_store_payload_fingerprint(build_runtime_store_payload(store)) if checkpoint_path.exists() else None
     return PersistentRuntime(
         store=store,
         checkpoint_path=checkpoint_path,

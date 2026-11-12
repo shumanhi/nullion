@@ -22,6 +22,20 @@ def owned_check(db,j,run_id,started):
     with scheduled_token(token):start_check(db,j,run_id,now=started)
 
 
+@pytest.mark.parametrize('kind', ['approval', 'match', 'incomplete', 'cancelled'])
+def test_real_terminal_result_corrects_provisional_lease_interruption(tmp_path, kind):
+    db = tmp_path / 'runtime.db'
+    j = job(next_run=(NOW + timedelta(days=7)).isoformat())
+    owned_check(db, j, 'delayed', NOW)
+    later = NOW + timedelta(days=3)
+    assert tracker_statuses(db, [j], now=later)[j.id]['last_outcome'] == 'interrupted'
+    finish_check(db, j, 'delayed', result(kind), now=later + timedelta(seconds=1))
+    status = tracker_statuses(db, [j], now=later + timedelta(seconds=2))[j.id]
+    expected = 'waiting_for_approval' if kind == 'approval' else kind
+    assert status['last_outcome'] == expected
+    assert status['consecutive_failures'] == (1 if kind == 'incomplete' else 0)
+
+
 def job(**changes):
     return replace(CronJob(id='neutral', name='通知条件', task='条件を確認する', schedule='*/15 * * * *',
         delivery_channel='web', delivery_target='web:user-a', schedule_timezone='America/New_York',
@@ -78,6 +92,26 @@ def test_unverified_or_delivery_failed_never_count_as_success(tmp_path):
         finish_check(db,j,run,{**result('no_match'),**extra},now=NOW+timedelta(seconds=index))
     status=tracker_statuses(db,[j],now=NOW+timedelta(seconds=10))[j.id]
     assert status['successful_checks_24h']==0 and status['incomplete_checks_24h']==len(variants)
+    assert status['last_success_at'] is None
+
+
+@pytest.mark.parametrize('extra,issue', [
+    ({'response_presentation':{'outcome_review_status':'unavailable','outcome_review_timeout':True}}, 'review_timeout'),
+    ({'response_presentation':{'outcome_review_status':'unavailable','outcome_review_timeout':False}}, 'review_unavailable'),
+    ({'reason':'cron_run_model_timeout'}, 'model_timeout'),
+    ({'model_timed_out':True}, 'model_timeout'),
+    ({}, 'source_unverified'),
+    ({'cron_delivery_failed':True, 'response_presentation':{'outcome_review_status':'unavailable'}}, 'delivery_failed'),
+])
+def test_failure_cause_preserves_review_outage_and_actual_delivery_receipt(tmp_path,extra,issue):
+    db=tmp_path/'r.db';j=job();start_check(db,j,'one',now=NOW)
+    finish_check(db,j,'one',{'response_fulfilled':False, 'cron_source_verification_required':True,
+        'cron_source_verification_satisfied':False,
+        'execution_outcome':{'execution_succeeded':False,'delivery_succeeded':issue!='delivery_failed'}, **extra},
+        now=NOW+timedelta(seconds=1))
+    status=tracker_statuses(db,[j],now=NOW+timedelta(seconds=2))[j.id]
+    assert status['last_issue']==issue and status['consecutive_failures']==1
+    assert status['last_delivery_succeeded'] is (issue!='delivery_failed')
     assert status['last_success_at'] is None
 
 
@@ -238,3 +272,16 @@ def test_upgrade_clears_legacy_delay_warning_without_recovery_alert(tmp_path):
         assert state['warning_sent_at']  # Legacy notices are inert; no recovery is sent.
     assert dispatch(db,[j],NOW+timedelta(minutes=12),sent)==0
     assert not sent
+
+
+@pytest.mark.parametrize('helper_status',['unavailable','advice'])
+def test_helper_diagnostics_do_not_hide_an_actual_execution_failure(tmp_path,helper_status):
+    current=job(artifact_delivery_options={})
+    path=tmp_path/'actual-source-failure.db'
+    start_check(path,current,'failed',now=NOW)
+    finish_check(path,current,'failed',{'response_fulfilled':None,
+        'response_presentation':{'outcome_review_role':'helper','outcome_review_status':helper_status},
+        'execution_outcome':{'execution_succeeded':False,'delivery_succeeded':True}},
+        now=NOW+timedelta(seconds=1))
+    state=tracker_statuses(path,[current],now=NOW+timedelta(seconds=2),reconcile=False)[current.id]
+    assert state['consecutive_failures']==1 and state['last_success_at'] is None

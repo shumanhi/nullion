@@ -43,6 +43,7 @@ from nullion.events import make_event
 from nullion.latency_phases import record_surface_latency_timing
 from nullion.config import NullionSettings, web_session_allow_duration_label, web_session_allow_expires_at
 from nullion.doctor_playbooks import execute_doctor_playbook_command
+from nullion.health_action_notices import health_action_notice
 from nullion.messaging_adapters import (
     DeliveryContract,
     WORKING_ACK_TEXT,
@@ -67,7 +68,7 @@ from nullion.messaging_delivery_contract import (
     task_status_has_active_work,
 )
 from nullion.telegram_turn_graph import plan_telegram_post_run_delivery
-from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker, TurnDispatchDecision
+from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker, TurnDispatchDecision, TurnPublicationGate
 from nullion.conversation_runtime import ConversationTurnDisposition
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.policy import permission_scope_principal
@@ -112,7 +113,7 @@ from nullion.agent_orchestrator import AgentOrchestrator
 from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.runtime import PersistentRuntime, format_doctor_diagnosis_for_operator
 from nullion.runtime_persistence import load_runtime_store
-from nullion.telegram_formatting import format_telegram_text
+from nullion.telegram_formatting import format_telegram_text, format_telegram_chunks, telegram_plain_text, telegram_text_units
 from nullion.telegram_transport import (
     build_telegram_bot,
     configure_telegram_application_builder,
@@ -363,39 +364,16 @@ _TELEGRAM_ATTACHMENT_CAPTION_LIMIT = 1024
 
 
 def _telegram_document_timeout_kwargs() -> dict[str, float | int]:
-    timeouts = telegram_request_timeout_kwargs()
-    kwargs: dict[str, float | int] = {}
-    for key in ("connect_timeout", "pool_timeout"):
-        value = timeouts.get(key)
-        if value is not None:
-            kwargs[key] = value
-    media_read_timeout = telegram_media_read_timeout_seconds() or timeouts.get("read_timeout")
-    if media_read_timeout is not None:
-        kwargs["read_timeout"] = media_read_timeout
-    media_write_timeout = timeouts.get("media_write_timeout") or timeouts.get("write_timeout")
-    if media_write_timeout is not None:
-        kwargs["write_timeout"] = media_write_timeout
-    return kwargs
+    from nullion.telegram_transport import telegram_document_timeout_kwargs
+    return telegram_document_timeout_kwargs()
 
 
 async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -> object | None:
     delivery_kwargs = {**_telegram_document_timeout_kwargs(), **kwargs}
-
-    async def operation() -> object:
+    async def operation():
         with attachment_path.open("rb") as document:
             return await message.reply_document(document, **delivery_kwargs)
-
-    last_exc: Exception | None = None
-    for attempt in range(3):
-        try:
-            return await retry_messaging_delivery_operation(operation, attempts=1)
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= 2 or not is_retryable_messaging_delivery_error(exc):
-                break
-            await asyncio.sleep(0.5 * (attempt + 1))
-    assert last_exc is not None
-    raise last_exc
+    return await retry_messaging_delivery_operation(operation, replay_safe=False, retry_policy=telegram_send_error_replay_safety)
 
 
 def _is_pre_upload_telegram_attachment_connect_failure(exc: BaseException) -> bool:
@@ -414,7 +392,7 @@ def _telegram_attachment_caption_kwargs(caption: str | None) -> tuple[str | None
     if caption is None:
         return None, {}, False
     formatted_caption, caption_kwargs = format_telegram_text(caption)
-    if len(formatted_caption) <= _TELEGRAM_ATTACHMENT_CAPTION_LIMIT:
+    if telegram_text_units(formatted_caption) <= _TELEGRAM_ATTACHMENT_CAPTION_LIMIT:
         return formatted_caption, caption_kwargs, False
     return None, {}, True
 
@@ -457,6 +435,11 @@ async def _answer_callback_query_safely(callback_query, *args, **kwargs) -> bool
         return False
 
 
+
+from nullion.delivery_acknowledgement import UnconfirmedDelivery, deliver_attachment_batch
+from nullion.messaging_adapters import record_unconfirmed_delivery
+
+from nullion.telegram_transport import telegram_send_error_replay_safety
 
 logger = logging.getLogger(__name__)
 _TYPING_KEEPALIVE_INTERVAL_SECONDS = 2.0
@@ -502,11 +485,13 @@ def _cache_runtime_checkpoint_signature(runtime: PersistentRuntime) -> None:
     signature = _checkpoint_file_signature(path)
     if signature is None:
         return
+    # Caching a stat is not proof this runtime loaded or wrote that snapshot.
+    # A no-op checkpoint may deliberately leave another writer's changes
+    # unseen; the next ingress must still refresh, and a later save must merge.
+    last_seen = getattr(runtime, "last_checkpoint_file_signature", signature)
+    if last_seen != signature:
+        return
     _CHECKPOINT_FILE_SIGNATURES[str(path)] = signature
-    try:
-        runtime.last_checkpoint_file_signature = signature
-    except Exception:
-        pass
 
 
 def render_runtime_store_payload_json(store) -> str:
@@ -566,7 +551,9 @@ async def _reply_text_in_chunks(message, text: str, *, do_quote: bool, **kwargs)
     chunks = _split_telegram_message_chunks(text)
     if len(chunks) == 1:
         return await retry_messaging_delivery_operation(
-            lambda: reply_text(text, do_quote=do_quote, **kwargs)
+            lambda: reply_text(text, do_quote=do_quote, **kwargs),
+            replay_safe=False,
+            retry_policy=telegram_send_error_replay_safety,
         )
     first_message = None
     # Long resumed tool output often contains raw command results. Send chunks as
@@ -578,7 +565,9 @@ async def _reply_text_in_chunks(message, text: str, *, do_quote: bool, **kwargs)
                 chunk,
                 do_quote=do_quote if index == 0 else False,
                 **safe_kwargs,
-            )
+            ),
+            replay_safe=False,
+            retry_policy=telegram_send_error_replay_safety,
         )
         if first_message is None:
             first_message = sent_message
@@ -611,13 +600,7 @@ def _is_telegram_no_text_to_edit_error(exc: BaseException) -> bool:
 
 
 def _telegram_plain_format_fallback_text(plain_text: str) -> tuple[str, dict[str, str]]:
-    fallback = (
-        "Telegram could not render the formatted reply, so here is the same text as plain output:\n\n"
-        "```text\n"
-        f"{plain_text}"
-        "\n```"
-    )
-    return sanitize_external_inline_markup(fallback), {}
+    return telegram_plain_text(plain_text), {}
 
 
 async def _reply_text_in_chunks_with_plain_fallback(
@@ -628,54 +611,37 @@ async def _reply_text_in_chunks_with_plain_fallback(
     do_quote: bool,
     **kwargs,
 ) -> object | None:
-    if "parse_mode" in kwargs and len(formatted_text) > _TELEGRAM_MESSAGE_CHUNK_SIZE:
+    if telegram_text_units(formatted_text) > _TELEGRAM_MESSAGE_CHUNK_SIZE:
         reply_text = getattr(message, "reply_text", None)
         if reply_text is None:
             raise AttributeError("Telegram message object has no reply_text method")
-        plain_chunks = _split_telegram_message_chunks(plain_text, limit=3000)
-        index = 0
-        while index < len(plain_chunks):
-            plain_chunk = plain_chunks[index]
-            chunk_text, chunk_kwargs = format_telegram_text(plain_chunk)
-            if len(chunk_text) > _TELEGRAM_MESSAGE_CHUNK_SIZE and len(plain_chunk) > 1:
-                plain_chunks[index:index + 1] = _split_telegram_message_chunks(
-                    plain_chunk,
-                    limit=max(1, len(plain_chunk) // 2),
-                )
-                continue
-            chunk_kwargs = {
-                **_without_parse_mode(kwargs),
-                **chunk_kwargs,
-            }
+        first_message = None
+        for index, (chunk_text, formatting) in enumerate(format_telegram_chunks(plain_text)):
+            chunk_kwargs = {**_without_parse_mode(kwargs), **formatting}
+            if index:
+                chunk_kwargs.pop("reply_markup", None)
             try:
                 sent_message = await retry_messaging_delivery_operation(
-                    lambda chunk_text=chunk_text, index=index, chunk_kwargs=chunk_kwargs: (
-                        reply_text(
-                            chunk_text,
-                            do_quote=do_quote if index == 0 else False,
-                            **chunk_kwargs,
-                        )
-                    )
+                    lambda: reply_text(chunk_text, do_quote=do_quote if index == 0 else False, **chunk_kwargs),
+                    replay_safe=False,
+                    retry_policy=telegram_send_error_replay_safety,
                 )
-                if index == 0:
-                    first_message = sent_message
             except Exception as exc:
                 if "parse_mode" not in chunk_kwargs or not _is_telegram_parse_error(exc):
                     raise
+                from nullion.telegram_formatting import telegram_html_to_plain
                 logger.warning("Telegram rejected formatted chunk; retrying as plain text.", exc_info=True)
                 sent_message = await retry_messaging_delivery_operation(
-                    lambda plain_chunk=plain_chunk, index=index, chunk_kwargs=chunk_kwargs: (
-                        reply_text(
-                            sanitize_external_inline_markup(plain_chunk),
-                            do_quote=do_quote if index == 0 else False,
-                            **_without_parse_mode(chunk_kwargs),
-                        )
-                    )
+                    lambda: reply_text(telegram_html_to_plain(chunk_text, include_link_targets=True),
+                                       do_quote=do_quote if index == 0 else False,
+                                       **_without_parse_mode(chunk_kwargs)),
+                    replay_safe=False,
+                    retry_policy=telegram_send_error_replay_safety,
                 )
-                if index == 0:
-                    first_message = sent_message
-            index += 1
-        return first_message if "first_message" in locals() else None
+            if index == 0:
+                first_message = sent_message
+        return first_message
+
     try:
         return await _reply_text_in_chunks(message, formatted_text, do_quote=do_quote, **kwargs)
     except Exception as exc:
@@ -710,7 +676,9 @@ async def _edit_text_with_plain_fallback(
 ) -> None:
     try:
         await retry_messaging_delivery_operation(
-            lambda: edit_text(formatted_text, **kwargs)
+            lambda: edit_text(formatted_text, **kwargs),
+            replay_safe=False,
+            retry_policy=telegram_send_error_replay_safety,
         )
     except Exception as exc:
         if "parse_mode" not in kwargs or not _is_telegram_parse_error(exc):
@@ -723,7 +691,9 @@ async def _edit_text_with_plain_fallback(
                 lambda: edit_text(
                     fallback_text,
                     **fallback_delivery_kwargs,
-                )
+                ),
+                replay_safe=False,
+                retry_policy=telegram_send_error_replay_safety,
             )
         except Exception as fallback_exc:
             if "parse_mode" not in fallback_delivery_kwargs or not _is_telegram_parse_error(fallback_exc):
@@ -732,7 +702,9 @@ async def _edit_text_with_plain_fallback(
                 lambda: edit_text(
                     sanitize_external_inline_markup(plain_text),
                     **_without_parse_mode(fallback_delivery_kwargs),
-                )
+                ),
+                replay_safe=False,
+                retry_policy=telegram_send_error_replay_safety,
             )
 
 
@@ -817,13 +789,17 @@ async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool
         return False
     safe_kwargs = {key: value for key, value in kwargs.items() if key not in {"parse_mode"}}
     sent = await retry_messaging_delivery_operation(
-        lambda: reply_text(chunks[0], do_quote=do_quote, **safe_kwargs)
+        lambda: reply_text(chunks[0], do_quote=do_quote, **safe_kwargs),
+        replay_safe=False,
+        retry_policy=telegram_send_error_replay_safety,
     )
     edit_text = getattr(sent, "edit_text", None)
     if edit_text is None:
         for chunk in chunks[1:]:
             sent = await retry_messaging_delivery_operation(
-                lambda chunk=chunk: reply_text(chunk, do_quote=False, **safe_kwargs)
+                lambda chunk=chunk: reply_text(chunk, do_quote=False, **safe_kwargs),
+                replay_safe=False,
+                retry_policy=telegram_send_error_replay_safety,
             )
         return sent
     rendered = chunks[0]
@@ -836,14 +812,72 @@ async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool
     return sent
 
 
+class _SupersededTelegramDelivery(BaseException):
+    """Control flow for revoked publication, never a retryable network failure."""
+
+
+async def _withdraw_telegram_draft(message) -> None:
+    delete = getattr(message, "delete", None)
+    if callable(delete):
+        try:
+            await retry_messaging_delivery_operation(delete)
+            return
+        except Exception:
+            logger.debug("Could not withdraw a superseded Telegram draft", exc_info=True)
+    edit = getattr(message, "edit_text", None)
+    if callable(edit):
+        try:
+            await retry_messaging_delivery_operation(lambda: edit("Updating this request…"))
+        except Exception:
+            logger.warning("Could not replace a superseded Telegram draft", exc_info=True)
+
+
+class _PublicationGuardedTelegramMessage:
+    def __init__(self, message, gate: TurnPublicationGate, *, sent=None) -> None:
+        self._message, self._gate = message, gate
+        self._sent: list[object] = [] if sent is None else sent
+
+    def __getattr__(self, name):
+        value = getattr(self._message, name)
+        if name not in {"reply_text", "reply_document", "reply_photo", "edit_text"} or not callable(value):
+            return value
+
+        async def publish(*args, **kwargs):
+            if not await self._gate.wait():
+                raise _SupersededTelegramDelivery()
+            sent = await value(*args, **kwargs)
+            if sent is not None and name != "edit_text":
+                self._sent.append(sent)
+            if not await self._gate.wait():
+                raise _SupersededTelegramDelivery()
+            if sent is not None and hasattr(sent, "edit_text"):
+                return _PublicationGuardedTelegramMessage(sent, self._gate, sent=self._sent)
+            return sent
+        return publish
+
+    async def discard(self) -> None:
+        for message in self._sent:
+            await _withdraw_telegram_draft(message)
+        self._sent.clear()
+
+
 class _TelegramTextDeltaStreamer:
-    def __init__(self, *, loop, message) -> None:
+    def __init__(self, *, loop, message, publication_gate: TurnPublicationGate | None = None) -> None:
         self._loop = loop
-        self._message = message
+        self._guarded_message = (
+            _PublicationGuardedTelegramMessage(message, publication_gate)
+            if publication_gate is not None else None
+        )
+        self._message = self._guarded_message or message
+        self._send_lock = asyncio.Lock()
         self._sent_message = None
         self._parts: list[str] = []
         self._last_update_at = 0.0
         self._last_text = ""
+        self._publication_gate = publication_gate
+        self._pending_sends: list[object] = []
+        self._pending_lock = threading.Lock()
+        self._unconfirmed_delivery = None
 
     @property
     def text(self) -> str:
@@ -854,10 +888,37 @@ class _TelegramTextDeltaStreamer:
         return self._sent_message is not None
 
     @property
+    def has_unconfirmed_delivery(self) -> bool:
+        return self._unconfirmed_delivery is not None
+
+    @property
+    def has_emitted_delta(self) -> bool:
+        return bool(self._parts)
+
+    @property
     def sent_message(self):
         return self._sent_message
 
     async def _send_or_edit(self, text: str, *, final: bool = False) -> bool:
+        async with self._send_lock:
+            if self._unconfirmed_delivery is not None:
+                raise self._unconfirmed_delivery
+            try:
+                return await self._publish(text, final=final)
+            except UnconfirmedDelivery as exc:
+                self._unconfirmed_delivery = exc
+                if self._publication_gate is not None and not self._publication_gate.can_publish():
+                    await self.discard()
+                    return False
+                raise
+            except _SupersededTelegramDelivery:
+                await self.discard()
+                return False
+
+    async def _publish(self, text: str, *, final: bool = False) -> bool:
+        if self._publication_gate is not None and not await self._publication_gate.wait():
+            await self.discard()
+            return False
         plain_text = sanitize_external_inline_markup(text or "")
         rendered, formatting_kwargs = format_telegram_text(text) if final else (plain_text, {})
         if self._sent_message is None:
@@ -869,8 +930,13 @@ class _TelegramTextDeltaStreamer:
                     rendered,
                     do_quote=_should_quote_reply(_message_text_or_caption(self._message)),
                     **formatting_kwargs,
-                )
+                ),
+                replay_safe=False,
+                retry_policy=telegram_send_error_replay_safety,
             )
+            if self._publication_gate is not None and not await self._publication_gate.wait():
+                await self.discard()
+                return False
             return True
         edit_text = getattr(self._sent_message, "edit_text", None)
         if edit_text is None:
@@ -888,28 +954,63 @@ class _TelegramTextDeltaStreamer:
         except Exception as exc:
             if not _is_telegram_message_not_modified_error(exc):
                 raise
+        if self._publication_gate is not None and not await self._publication_gate.wait():
+            await self.discard()
+            return False
         return True
 
     def emit(self, delta: str) -> None:
         if not delta or self._message is None:
             return
         self._parts.append(delta)
+        if self._publication_gate is not None and not self._publication_gate.can_publish():
+            return
         text = self.text
         now = time.monotonic()
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
             return
         self._last_text = text
         self._last_update_at = now
+        pending = asyncio.run_coroutine_threadsafe(self._send_or_edit(text), self._loop)
+        with self._pending_lock:
+            self._pending_sends.append(pending)
         try:
-            asyncio.run_coroutine_threadsafe(self._send_or_edit(text), self._loop).result(timeout=2)
+            pending.result(timeout=2)
         except Exception:
             logger.debug("Telegram text streaming update failed", exc_info=True)
 
+    async def drain(self) -> None:
+        # Timing out in emit does not cancel Telegram's pending send. Resolve
+        # that ownership before choosing between editing it and a new reply.
+        while True:
+            with self._pending_lock:
+                pending, self._pending_sends = self._pending_sends, []
+            if not pending:
+                return
+            results = await asyncio.gather(
+                *(asyncio.wrap_future(item) for item in pending), return_exceptions=True,
+            )
+            if any(isinstance(result, BaseException) for result in results):
+                logger.warning("Telegram draft update failed before finalization")
+
     async def finish(self, final_text: str | None) -> bool:
+        await self.drain()
+        if self._publication_gate is not None and not self._publication_gate.can_publish():
+            await self.discard()
+            return False
+        if self._unconfirmed_delivery is not None:
+            raise self._unconfirmed_delivery
         text = str(final_text or "")
         if not text or self._sent_message is None:
             return False
         return await self._send_or_edit(text, final=True)
+
+    async def discard(self) -> None:
+        message, self._sent_message = self._sent_message, None
+        if self._guarded_message is not None:
+            await self._guarded_message.discard()
+        elif message is not None:
+            await _withdraw_telegram_draft(message)
 
 
 def _is_valid_telegram_bot_token(value: str) -> bool:
@@ -1536,7 +1637,8 @@ def _doctor_title_text(action: dict[str, object]) -> str:
     detail_l = detail.lower()
     code = str(action.get("recommendation_code") or "").lower()
     reason = str(action.get("reason") or action.get("source_reason") or "").lower()
-    if "insufficient_quota" in detail_l or "exceeded your current quota" in detail_l:
+    from nullion.health_probes import recorded_model_error_details
+    if recorded_model_error_details(action).get("category") == "quota" or "insufficient_quota" in detail_l or "exceeded your current quota" in detail_l:
         return "Model quota exhausted"
     if "chat backend" in detail_l or "agent orchestrator error" in detail_l:
         return "Chat backend unavailable"
@@ -1561,7 +1663,8 @@ def _doctor_diagnosis_text(action: dict[str, object]) -> str:
     detail_l = detail.lower()
     code = str(action.get("recommendation_code") or "").lower()
     reason = str(action.get("reason") or action.get("source_reason") or "").lower()
-    if "insufficient_quota" in detail_l or "exceeded your current quota" in detail_l:
+    from nullion.health_probes import recorded_model_error_details
+    if recorded_model_error_details(action).get("category") == "quota" or "insufficient_quota" in detail_l or "exceeded your current quota" in detail_l:
         return "The configured model provider rejected the request because the account has no available quota."
     if "chat backend" in detail_l or "agent orchestrator error" in detail_l:
         return "Nullion could not get a model response from the chat backend."
@@ -1582,8 +1685,9 @@ def _doctor_suggestion_text(action: dict[str, object]) -> str:
     detail_l = _doctor_detail_text(action).lower()
     code = str(action.get("recommendation_code") or "").lower()
     reason = str(action.get("reason") or action.get("source_reason") or "").lower()
-    if "insufficient_quota" in detail_l or "exceeded your current quota" in detail_l:
-        return "Check provider billing/quota or switch Nullion to a configured model provider with available quota, then retry the request."
+    from nullion.health_probes import recorded_model_error_details
+    if recorded_model_error_details(action).get("category") == "quota" or "insufficient_quota" in detail_l or "exceeded your current quota" in detail_l:
+        return "Wait for the provider allowance to reset or switch Nullion to a configured model provider with available quota, then retry the request."
     if "chat backend" in detail_l or "agent orchestrator error" in detail_l:
         return "Review the backend error, confirm the configured model works, then retry the chat request."
     if code == "monitor_manual_cron":
@@ -1823,6 +1927,16 @@ def _record_telegram_delivery_receipt(
     )
 
 
+async def _notify_telegram_unconfirmed_delivery(message, delivery, exc, *, request_id=None):
+    target = getattr(getattr(message, 'chat', None), 'id', None)
+    record_unconfirmed_delivery(delivery, exc, channel='telegram', target_id=target, request_id=request_id)
+    try:
+        await message.reply_text(exc.notice(), do_quote=False)
+        exc.notice_sent = True
+    except Exception:
+        logger.debug('Could not confirm the delivery-status notice', exc_info=True)
+
+
 async def _deliver_reply(
     message,
     reply: str,
@@ -1834,10 +1948,12 @@ async def _deliver_reply(
     allow_attachments: bool | None = None,
     delivery_contract: DeliveryContract | None = None,
     artifact_paths: tuple[str, ...] | list[str] | None = None,
+    tool_results: tuple[object, ...] | list[object] | None = None,
     request_id: str | None = None,
     turn_id: str | None = None,
     phase: str = "primary",
     quote_reply: bool | None = None,
+    publication_gate: TurnPublicationGate | None = None,
 ) -> None:
     """Send a reply to a Telegram message.
 
@@ -1846,6 +1962,19 @@ async def _deliver_reply(
     kept but the inline keyboard is appended (used for safe-alternative suggestion
     buttons on refusal replies).
     """
+    if publication_gate is not None:
+        guarded = _PublicationGuardedTelegramMessage(message, publication_gate)
+        try:
+            if await publication_gate.wait():
+                await _deliver_reply(guarded, reply, decision_card=decision_card,
+                    additional_markup=additional_markup, streaming_mode=streaming_mode,
+                    principal_id=principal_id, allow_attachments=allow_attachments,
+                    delivery_contract=delivery_contract, artifact_paths=artifact_paths,
+                    tool_results=tool_results,
+                    request_id=request_id, turn_id=turn_id, phase=phase, quote_reply=quote_reply)
+        except _SupersededTelegramDelivery:
+            await guarded.discard()
+        return
     started_at = time.perf_counter()
     timing_marks: list[str] = []
     timing_last_at = started_at
@@ -1890,6 +2019,8 @@ async def _deliver_reply(
         delivery_kwargs["delivery_contract"] = delivery_contract
     if artifact_paths:
         delivery_kwargs["artifact_paths"] = tuple(str(path) for path in artifact_paths if str(path or "").strip())
+    if tool_results:
+        delivery_kwargs["tool_results"] = tool_results
     delivery = prepare_reply_for_platform_delivery(
         visible_reply or "",
         **delivery_kwargs,
@@ -1913,19 +2044,19 @@ async def _deliver_reply(
             do_quote = False
         try:
             _mark_timing("upload_attachments")
-            for index, attachment_path in enumerate(attachment_paths):
+            first_sent_message = None
+            async def send_one(index, attachment_path):
+                nonlocal first_sent_message
                 attachment_kwargs = caption_kwargs if index == 0 else {}
                 if index == 0 and decision_card is not None and decision_card.reply_markup is not None:
                     attachment_kwargs = {**attachment_kwargs, "reply_markup": decision_card.reply_markup}
-                sent_message = await _reply_document_attachment(
-                    message,
-                    attachment_path,
+                sent = await _reply_document_attachment(message, attachment_path,
                     caption=formatted_caption if index == 0 else None,
-                    do_quote=do_quote if index == 0 else False,
-                    **attachment_kwargs,
-                )
+                    do_quote=do_quote if index == 0 else False, **attachment_kwargs)
                 if index == 0:
-                    first_sent_message = sent_message
+                    first_sent_message = sent
+                return sent
+            identities = await deliver_attachment_batch(attachment_paths, send_one)
             _record_telegram_delivery_receipt(
                 message,
                 delivery,
@@ -1933,6 +2064,9 @@ async def _deliver_reply(
                 request_id=request_id,
                 delivered_message=first_sent_message if "first_sent_message" in locals() else None,
             )
+        except UnconfirmedDelivery as exc:
+            exc.confirmed_text = caption_too_long or bool(exc.confirmed and caption)
+            await _notify_telegram_unconfirmed_delivery(message, delivery, exc, request_id=request_id)
         except Exception:
             logger.warning("Could not upload Telegram reply attachment", exc_info=True)
             outcome = "attachment_failed"
@@ -1996,6 +2130,9 @@ async def _deliver_reply(
                     total_ms = (time.perf_counter() - started_at) * 1000
                     _log_slow_delivery(total_ms)
                     return
+            except UnconfirmedDelivery as exc:
+                await _notify_telegram_unconfirmed_delivery(message, delivery, exc, request_id=request_id)
+                return
             except Exception:
                 logger.warning("Telegram streaming reply failed; retrying final text delivery.", exc_info=True)
         try:
@@ -2007,6 +2144,9 @@ async def _deliver_reply(
                 do_quote=do_quote,
                 **reply_kwargs,
             )
+        except UnconfirmedDelivery as exc:
+            await _notify_telegram_unconfirmed_delivery(message, delivery, exc, request_id=request_id)
+            return
         except Exception:
             _record_telegram_delivery_receipt(
                 message,
@@ -2603,6 +2743,8 @@ def _run_confirmed_telegram_delivery(delivery_factory, *, timeout_seconds: float
     except RuntimeError:
         try:
             return asyncio.run(delivery_factory()) is not False
+        except UnconfirmedDelivery:
+            raise
         except Exception:
             logger.debug("Telegram delivery failed outside polling loop", exc_info=True)
             return False
@@ -2622,7 +2764,9 @@ def _run_confirmed_telegram_delivery(delivery_factory, *, timeout_seconds: float
     thread.join(timeout=max(0.1, float(timeout_seconds or 20.0)))
     if thread.is_alive():
         logger.debug("Telegram delivery confirmation timed out")
-        return False
+        raise UnconfirmedDelivery()
+    if isinstance(delivery_error, UnconfirmedDelivery):
+        raise delivery_error
     if delivery_error is not None:
         logger.debug(
             "Telegram delivery confirmation failed",
@@ -2646,6 +2790,8 @@ async def _send_operator_telegram_message(
     if not bot_token or not chat_id or not text:
         return False
     delivery = None
+    transport_acknowledged = False
+    confirmed_text = False
     try:
         from telegram import Bot  # type: ignore[import]
 
@@ -2658,45 +2804,53 @@ async def _send_operator_telegram_message(
         async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:
                 caption = delivery.text
-                for index, attachment_path in enumerate(delivery.attachments):
-                    async def send_document(
-                        attachment_path=attachment_path,
-                        caption=caption,
-                        index=index,
-                    ):
+                formatted_caption, caption_kwargs, caption_too_long = _telegram_attachment_caption_kwargs(caption)
+                if caption_too_long:
+                    for chunk, chunk_kwargs in format_telegram_chunks(caption or ""):
+                        await retry_messaging_delivery_operation(
+                            lambda: bot.send_message(chat_id=chat_id, text=chunk, **chunk_kwargs), replay_safe=False, retry_policy=telegram_send_error_replay_safety
+                        )
+                    confirmed_text = True
+                async def send_one(index, attachment_path):
+                    async def operation():
                         with attachment_path.open("rb") as document:
-                            return await bot.send_document(
-                                chat_id=chat_id,
-                                document=document,
-                                caption=caption[:1024] if caption and index == 0 else None,
-                            )
-
-                    sent_message = await retry_messaging_delivery_operation(
-                        send_document
-                    )
-                    if sent_message_id is None:
-                        sent_message_id = getattr(sent_message, "message_id", None)
+                            return await bot.send_document(chat_id=chat_id, document=document,
+                                caption=formatted_caption if index == 0 else None,
+                                **(caption_kwargs if index == 0 else {}), **_telegram_document_timeout_kwargs())
+                    return await retry_messaging_delivery_operation(operation, replay_safe=False, retry_policy=telegram_send_error_replay_safety)
+                identities = await deliver_attachment_batch(delivery.attachments, send_one)
+                sent_message_id = identities[0] if identities else sent_message_id
                 _record_operator_telegram_delivery_receipt(
                     chat_id,
                     delivery,
                     transport_ok=True,
                     message_id=sent_message_id,
                 )
+                transport_acknowledged = True
                 return True
             if delivery.text:
-                formatted, kwargs = format_telegram_text(delivery.text)
-                sent_message = await retry_messaging_delivery_operation(
-                    lambda: bot.send_message(chat_id=chat_id, text=formatted, **kwargs)
-                )
-                sent_message_id = getattr(sent_message, "message_id", None)
+                for formatted, kwargs in format_telegram_chunks(delivery.text):
+                    sent_message = await retry_messaging_delivery_operation(
+                        lambda: bot.send_message(chat_id=chat_id, text=formatted, **kwargs), replay_safe=False, retry_policy=telegram_send_error_replay_safety
+                    )
+                    if sent_message_id is None:
+                        sent_message_id = getattr(sent_message, "message_id", None)
             _record_operator_telegram_delivery_receipt(
                 chat_id,
                 delivery,
                 transport_ok=True,
                 message_id=sent_message_id,
             )
+            transport_acknowledged = True
             return True
+    except UnconfirmedDelivery as exc:
+        if delivery is not None:
+            exc.confirmed_text = confirmed_text or bool(exc.confirmed and delivery.text)
+            record_unconfirmed_delivery(delivery, exc, channel='telegram', target_id=str(chat_id))
+        raise
     except Exception as exc:
+        if transport_acknowledged:
+            return True
         logger.warning("Failed to deliver Telegram operator message", exc_info=True)
         if delivery is not None:
             _record_operator_telegram_delivery_receipt(
@@ -3108,14 +3262,14 @@ async def _send_callback_follow_up(
                 if edit_text is not None:
                     await _edit_text_with_plain_fallback(edit_text, formatted_text, caption, **text_kwargs)
         try:
-            for index, attachment_path in enumerate(attachment_paths):
-                await _reply_document_attachment(
-                    message,
-                    attachment_path,
-                    caption=formatted_caption if index == 0 else None,
-                    do_quote=False,
-                    **(caption_kwargs if index == 0 else {}),
-                )
+            async def send_one(index, attachment_path):
+                return await _reply_document_attachment(message, attachment_path,
+                    caption=formatted_caption if index == 0 else None, do_quote=False,
+                    **(caption_kwargs if index == 0 else {}))
+            await deliver_attachment_batch(attachment_paths, send_one)
+        except UnconfirmedDelivery as exc:
+            exc.confirmed_text = caption_too_long or bool(exc.confirmed and caption)
+            await _notify_telegram_unconfirmed_delivery(message, delivery, exc)
         except Exception:
             logger.warning("Could not upload Telegram callback attachment", exc_info=True)
             await _send_telegram_delivery_failure_safely(
@@ -3137,6 +3291,8 @@ async def _send_callback_follow_up(
                 do_quote=False,
                 **reply_kwargs,
             )
+        except UnconfirmedDelivery as exc:
+            await _notify_telegram_unconfirmed_delivery(message, delivery, exc)
         except Exception:
             logger.warning("Could not deliver Telegram callback follow-up after retries", exc_info=True)
         return
@@ -3887,20 +4043,23 @@ def _execute_decision_action(
         if current is None:
             return "Expired", "That Doctor action is no longer active."
         if _doctor_action_is_closed(current):
-            status = str(current.get("status") or "closed").replace("_", " ")
-            return "Already closed", f"{_doctor_card_text(current)}\n\nThis card is already {status}."
+            notice = health_action_notice("doctor", "complete", str(current.get("status") or "closed"), already_handled=True)
+            return notice.acknowledgement, notice.message
         if action == "start":
             updated = service.runtime.start_doctor_action(record_id)
             logger.info("Started Doctor action %s, status=%s", record_id, updated.get("status"))
-            return "Started", _doctor_card_text(updated)
+            notice = health_action_notice("doctor", action, str(updated.get("status") or ""))
+            return notice.acknowledgement, notice.message
         if action == "complete":
             updated = service.runtime.complete_doctor_action(record_id)
             logger.info("Completed Doctor action %s, status=%s", record_id, updated.get("status"))
-            return "Completed", "Action completed."
+            notice = health_action_notice("doctor", action, str(updated.get("status") or ""))
+            return notice.acknowledgement, notice.message
         if action == "cancel":
-            service.runtime.cancel_doctor_action(record_id, reason="Dismissed from Telegram")
+            updated = service.runtime.cancel_doctor_action(record_id, reason="Dismissed from Telegram")
             logger.info("Dismissed Doctor action %s", record_id)
-            return "Dismissed", "Action dismissed."
+            notice = health_action_notice("doctor", action, str(updated.get("status") or ""))
+            return notice.acknowledgement, notice.message
         # Playbook-specific commands like "doctor:restart_bot", "doctor:retry_model_api"
         if action.startswith("doctor:"):
             return _execute_doctor_command(service, command=action, action_id=record_id)
@@ -3985,7 +4144,7 @@ def _execute_doctor_command(service: "ChatOperatorService", *, command: str, act
         return result.acknowledgement, result.message
     except Exception as exc:
         logger.warning("Doctor command %s failed for action %s: %s", command, action_id, exc)
-        return "Error", "Action failed. See logs for details."
+        return "Doctor action failed", "Doctor could not run that action. The repair is unverified. Use /doctor to inspect the alert's current status before retrying."
 
 
 def _natural_overlap_ack(prompt: str, *, dispatch_decision: TurnDispatchDecision | None = None) -> str:
@@ -4083,6 +4242,7 @@ class ChatOperatorService:
     _working_ack_delivery_inflight_chats: set[str] = field(default_factory=set)
     _first_run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _live_config_signature_cache: tuple[object, ...] | None = None
+    _live_media_signature_cache: str | None = None
     _status_messages: dict[tuple[str, str], int] = field(default_factory=dict)
     _status_texts: dict[tuple[str, str], str] = field(default_factory=dict)
     _status_locks: dict[tuple[str, str], threading.Lock] = field(default_factory=dict)
@@ -4097,6 +4257,8 @@ class ChatOperatorService:
     def __post_init__(self) -> None:
         self.settings = copy.deepcopy(self.settings)
         self._live_config_signature_cache = self._live_config_signature()
+        from nullion.runtime_config import media_configuration_signature
+        self._live_media_signature_cache = media_configuration_signature(self.settings)
 
     async def _collect_media_group_messages(
         self,
@@ -4226,6 +4388,11 @@ class ChatOperatorService:
 
         next_settings = load_settings(env_path=env_path)
         self._apply_live_settings(next_settings)
+        from nullion.runtime_config import media_configuration_signature, refresh_media_tool_registry
+        media_signature = media_configuration_signature(next_settings)
+        if media_signature != self._live_media_signature_cache:
+            refresh_media_tool_registry(getattr(self.runtime, "active_tool_registry", None), next_settings)
+            self._live_media_signature_cache = media_signature
 
         chat_enabled = any(messaging_chat_enabled(channel, self.settings) for channel in self.chat_channels)
         surface = "/".join(self.chat_channels)
@@ -4961,6 +5128,8 @@ class ChatOperatorService:
             model_client=self.model_client,
             reply_context=reply_context,
             active_turn_followup_evidence=active_turn_followup_evidence,
+            finish_after_processing=False,
+            runtime_store=self.runtime.store,
         )
         turn_registration_local = turn_registration
         _mark_timing("turn_registered")
@@ -5064,11 +5233,14 @@ class ChatOperatorService:
 
         reply = None
         reply_artifact_paths: tuple[str, ...] = ()
+        reply_tool_results: tuple[object, ...] = ()
+        reply_already_sent = False
         decision_card = None
         _new_reminder_card = None
         _suggestion_markup = None
         reply_activity_phase = RunActivityPhase.ACTIVE
         keep_typing_until_delivery = False
+        text_streamer = None
         suppress_primary_reply_delivery = False
         ingress_checkpoint_deferred = False
         planner_activity_notice_text: str | None = None
@@ -5163,6 +5335,7 @@ class ChatOperatorService:
                     text_streamer = _TelegramTextDeltaStreamer(
                         loop=asyncio.get_running_loop(),
                         message=update_message,
+                        publication_gate=turn_registration.publication_gate,
                     )
                     if activity_streamer is not None:
                         if planner_status_requested:
@@ -5197,6 +5370,8 @@ class ChatOperatorService:
                     )
                     _mark_timing("handler_completed")
                     if isinstance(reply, PlatformChatResponse):
+                        reply_already_sent = reply.reply_already_sent
+                        reply_tool_results = tuple(reply.tool_results)
                         reply_artifact_paths = tuple(
                             str(path)
                             for path in reply.artifact_paths
@@ -5294,6 +5469,7 @@ class ChatOperatorService:
             if not keep_typing_until_delivery:
                 await _stop_typing_keepalive(typing_keepalive_task)
                 await self._activity_streams.unregister(conversation_id, activity_streamer)
+                await turn_registration.finish()
             if should_decrement:
                 self._inflight_chat_by_id[inflight_key] -= 1
                 if self._inflight_chat_by_id[inflight_key] <= 0:
@@ -5301,6 +5477,15 @@ class ChatOperatorService:
 
         try:
             if reply is None:
+                _log_turn_timing(turn_outcome)
+                return
+            if await turn_registration.is_superseded():
+                if text_streamer is not None:
+                    await text_streamer.discard()
+                if ingress_checkpoint_deferred:
+                    await asyncio.to_thread(self.runtime.checkpoint)
+                    _cache_runtime_checkpoint_signature(self.runtime)
+                turn_outcome = "superseded_by_revision"
                 _log_turn_timing(turn_outcome)
                 return
 
@@ -5384,10 +5569,13 @@ class ChatOperatorService:
                         )
                         if delivered_cron_card:
                             suppress_primary_reply_delivery = True
+            await text_streamer.drain()
             if _should_skip_telegram_primary_reply_delivery(
                 suppress_primary_reply_delivery=suppress_primary_reply_delivery,
                 decision_card=decision_card,
             ):
+                if text_streamer.has_sent_message:
+                    await text_streamer.discard()
                 if planner_activity_notice_text and message is not None:
                     await retry_messaging_delivery_operation(
                         lambda: message.reply_text(planner_activity_notice_text, do_quote=False)
@@ -5405,29 +5593,52 @@ class ChatOperatorService:
             streamed_plain_reply = bool(
                 handler_error is None
                 and isinstance(reply, str)
-                and text_streamer.has_sent_message
+                and (text_streamer.has_sent_message or text_streamer.has_unconfirmed_delivery)
                 and decision_card is None
                 and _suggestion_markup is None
                 and not reply_artifact_paths
             )
-            if getattr(reply, "reply_already_sent", False) or streamed_plain_reply:
+            # A producer's streamed marker can mean it invoked our callback,
+            # rather than that Telegram acknowledged the final message. When
+            # this streamer owns the attempt, only its receipt decides success.
+            reply_already_sent = (
+                reply_already_sent or bool(getattr(reply, "reply_already_sent", False))
+            ) and not text_streamer.has_emitted_delta
+            if reply_already_sent or streamed_plain_reply:
                 await _stop_typing_keepalive(typing_keepalive_task)
                 typing_keepalive_task = None
                 stream_delivery_ok = False
                 if streamed_plain_reply:
                     try:
                         stream_delivery_ok = await text_streamer.finish(str(reply))
+                    except UnconfirmedDelivery as exc:
+                        unknown_delivery = prepare_reply_for_platform_delivery(str(reply),
+                            allow_attachments=False, delivery_contract=DeliveryContract.message_only())
+                        await _notify_telegram_unconfirmed_delivery(message, unknown_delivery, exc,
+                            request_id=request_id)
+                        await turn_registration.finish()
+                        if activity_finish_task is not None:
+                            await activity_finish_task
+                        if ingress_checkpoint_deferred:
+                            await asyncio.to_thread(self.runtime.checkpoint)
+                            _cache_runtime_checkpoint_signature(self.runtime)
+                        turn_outcome = "delivery_unknown"
+                        _mark_timing("delivery_complete")
+                        _log_turn_timing(turn_outcome)
+                        return
                     except Exception:
                         logger.warning(
                             "Telegram streamed final edit failed; falling back to primary delivery",
                             exc_info=True,
                         )
                         stream_delivery_ok = False
+                        await text_streamer.discard()
                     if stream_delivery_ok:
                         streamed_delivery = prepare_reply_for_platform_delivery(
                             str(reply),
                             allow_attachments=False,
                             delivery_contract=DeliveryContract.message_only(),
+                            tool_results=reply_tool_results,
                         )
                         _record_telegram_delivery_receipt(
                             message,
@@ -5436,9 +5647,10 @@ class ChatOperatorService:
                             request_id=request_id,
                             delivered_message=text_streamer.sent_message,
                         )
-                if not streamed_plain_reply:
+                if not streamed_plain_reply and text_streamer is not None:
                     await text_streamer.finish(str(reply))
-                if getattr(reply, "reply_already_sent", False) or stream_delivery_ok:
+                if reply_already_sent or stream_delivery_ok:
+                    await turn_registration.finish()
                     if activity_finish_task is not None:
                         await activity_finish_task
                     if ingress_checkpoint_deferred:
@@ -5449,6 +5661,8 @@ class ChatOperatorService:
                     _log_turn_timing(turn_outcome)
                     return
 
+            if text_streamer.has_sent_message:
+                await text_streamer.discard()
             message = getattr(update, "message", None)
             if message is None:
                 message = getattr(update, "effective_message", None)
@@ -5517,8 +5731,10 @@ class ChatOperatorService:
                     delivery_contract=delivery_plan.delivery_contract,
                     artifact_paths=reply_artifact_paths,
                     request_id=request_id,
+                    tool_results=reply_tool_results,
                     turn_id=turn_registration.turn_id,
                     phase="telegram_primary",
+                    publication_gate=turn_registration.publication_gate,
                 )
                 await _stop_typing_keepalive(typing_keepalive_task)
                 typing_keepalive_task = None
@@ -5532,6 +5748,7 @@ class ChatOperatorService:
                             request_id=request_id,
                             turn_id=turn_registration.turn_id,
                             phase="telegram_supplemental",
+                            publication_gate=turn_registration.publication_gate,
                         )
                     )
                     supplemental_task.add_done_callback(_log_background_delivery_error)
@@ -5584,12 +5801,14 @@ class ChatOperatorService:
                         request_id=request_id,
                         turn_id=turn_registration.turn_id,
                         phase="telegram_reminder_card",
+                        publication_gate=turn_registration.publication_gate,
                     )
                 except Exception:
                     logger.warning("Failed to send reminder confirmation card", exc_info=True)
-            turn_outcome = "completed"
+            turn_outcome = "superseded_by_revision" if turn_registration.publication_gate.revoked else "completed"
             _log_turn_timing(turn_outcome)
         finally:
+            await turn_registration.finish()
             if "activity_finish_task" in locals() and activity_finish_task is not None and not activity_finish_task.done():
                 def _consume_activity_finish_error(task) -> None:  # noqa: ANN001
                     if task.cancelled():
@@ -6037,7 +6256,9 @@ class ChatOperatorService:
                 if ":" in str(chat_id):
                     return False
                 await retry_messaging_delivery_operation(
-                    lambda: app.bot.send_message(chat_id, text, disable_web_page_preview=True)
+                    lambda: app.bot.send_message(chat_id, text, disable_web_page_preview=True),
+                    replay_safe=False,
+                    retry_policy=telegram_send_error_replay_safety,
                 )
                 return True
 

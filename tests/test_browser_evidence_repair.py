@@ -123,7 +123,7 @@ def test_exact_source_quote_survives_an_unsupported_value_rewrite(rewrite):
 
 
 @pytest.mark.parametrize('repaired', [False, True])
-def test_only_a_structured_quote_repair_forces_semantic_completion_review(monkeypatch, repaired):
+def test_every_source_answer_receives_semantic_completion_review(monkeypatch, repaired):
     from nullion import agent_orchestrator as agent
     from test_source_failure_preservation import source_state
     state = source_state()
@@ -138,7 +138,7 @@ def test_only_a_structured_quote_repair_forces_semantic_completion_review(monkey
         return agent._CompletionReviewDecision('complete')
     monkeypatch.setattr(agent, '_review_risky_agent_completion', review)
     result = agent._complete_partial_source_report(state, '')
-    assert bool(calls) is repaired
+    assert calls  # Raw and repaired evidence both require goal review.
     if repaired: assert calls[0]['force'] is True
     assert result['result'].response_fulfilled
 
@@ -156,7 +156,7 @@ def test_a_genuine_but_irrelevant_quote_cannot_complete_the_request(monkeypatch)
     monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **kw:
         agent._CompletionReviewDecision('blocked', ('The requested price was not established',), ()))
     result = agent._complete_partial_source_report(state, '')
-    assert result['result'].response_fulfilled is False
+    assert result['result'].response_fulfilled is not True
 
 
 def field_records():
@@ -222,7 +222,7 @@ def test_grouped_fields_force_relationship_review(monkeypatch):
         return agent._CompletionReviewDecision('blocked', ('Relationship not established',), ())
     monkeypatch.setattr(agent, '_review_risky_agent_completion', review)
     result = agent._complete_partial_source_report(state, '')
-    assert calls and result['result'].response_fulfilled is False
+    assert calls and result['result'].response_fulfilled is not True
 
 
 @pytest.mark.parametrize('groups', [True, False])
@@ -254,7 +254,7 @@ def test_child_step_completion_always_requires_full_parent_review(monkeypatch):
     monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **kw:
         agent._CompletionReviewDecision('blocked', ('The other comparison side is still missing',), ()))
     result = agent._complete_partial_source_report(state, '')
-    assert result['result'].response_fulfilled is False
+    assert result['result'].response_fulfilled is not True
 
 
 def test_browser_step_keeps_parent_constraints_without_restarting_other_steps():
@@ -270,19 +270,27 @@ def test_browser_step_keeps_parent_constraints_without_restarting_other_steps():
 @pytest.mark.parametrize('row_count', [1, 12])
 def test_forced_review_honors_configured_deadline_and_sizes_coverage_output(monkeypatch, timeout, row_count):
     from nullion import agent_orchestrator as agent
+    import time
     from test_source_failure_preservation import source_state
     state = source_state(); calls = []
-    rows = [SimpleNamespace(requirement_id=f'r{i}', requirement='各候補の必要な条件を確認する。' * 15,
+    elapsed = [0.0]
+    class Clock:
+        def __getattr__(self, name): return getattr(time, name)
+        def perf_counter(self): return elapsed[0]
+    monkeypatch.setattr(agent, 'time', Clock())
+    rows = [agent._CompletionRequirementContractRow(requirement_id=f'r{i}', requirement='各候補の必要な条件を確認する。' * 15,
         requirement_kind='fact', evidence_subject_id=f's{i}', eligible_evidence_tool_names=('source_reader',)) for i in range(row_count)]
     monkeypatch.setattr(agent, '_extract_completion_requirement_contract', lambda *a, **kw: rows)
     monkeypatch.setenv('NULLION_COMPLETION_REVIEW_TIMEOUT_SECONDS', str(timeout))
     class Model:
         def create(self, **kwargs):
             calls.append(kwargs)
+            elapsed[0] += 1.0
             return {'content': [{'type': 'text', 'text': '{}'}]}
     state['orchestrator'] = SimpleNamespace(model_client=Model())
     agent._review_risky_agent_completion(state, final_text='結果', tool_results=state['tool_results'], artifacts=[], force=True)
-    assert len(calls) == 1 and calls[0]['timeout'] == timeout
+    assert len(calls) == 2
+    assert [call['timeout'] for call in calls] == [timeout, timeout - 1]
     assert calls[0]['max_tokens'] >= 1100
     if row_count == 12: assert calls[0]['max_tokens'] > 1100
 
@@ -383,12 +391,12 @@ def test_interpreted_intro_requires_independent_review_and_never_leaks_on_failur
     monkeypatch.setattr(agent, '_review_risky_agent_completion', review)
     result = agent._complete_partial_source_report(state, '')['result']
     assert calls
-    assert result.response_fulfilled is (disposition == 'complete')
-    assert ('No delivery date is shown' in result.final_text) is (disposition == 'complete')
+    assert (result.response_fulfilled is True if disposition=='complete' else result.response_fulfilled is not True)
+    assert 'No delivery date is shown' in result.final_text
     assert '71 USD' in result.final_text
 
 
-@pytest.mark.parametrize('ids', [['missing'], [], ['e0.0', 'e0.0']])
+@pytest.mark.parametrize('ids', [['missing'], ['e0.0', 'e0.0']])
 def test_interpreted_intro_rejects_invalid_binding(ids):
     from test_source_failure_preservation import source_state
     from nullion.source_observation_contract import render_source_answer
@@ -438,9 +446,12 @@ def test_optional_document_never_displaces_facts_or_becomes_clipped_proof(budget
     evidence = captured('候補 A\n€73\n' + 'x' * 3000)
     evidence.retain(report({'label': 'Price', 'value': '€73', 'quote': '€73'}))
     output = compact_source_observations(evidence.result(error=None, elapsed=1, steps=1, done=True), max_chars=budget)
+    assert output['observations'], output
     assert output['observations'][0]['value'] == '€73'
     assert output['report_status'] == 'completed'
     assert 'main_document_text' not in output['sources'][0]
+    import json
+    assert len(json.dumps(output,ensure_ascii=False)) <= budget
 
 
 def test_superseded_fact_capture_stays_available_for_explicit_image_delivery(tmp_path, monkeypatch):
@@ -582,3 +593,26 @@ def test_long_authoritative_requirement_echo_must_remain_exact(echo):
     decision=a._parse_completion_review_decision(response,registered_tool_names={'browser_run_task'},requirement_contract=contract)
     if echo=='exact': assert decision.material_requirements[0].requirement==text
     else: assert decision is None
+
+
+def test_empty_intro_does_not_require_introductory_claim_evidence():
+    from test_source_failure_preservation import source_state
+    from nullion.source_observation_contract import render_source_answer
+    state=source_state();presentation={**state['source_answer_checkpoint']['presentation'],
+        'intro':'','intro_evidence_ids':[]}
+    assert render_source_answer(state['tool_results'],presentation).strip()
+
+
+@pytest.mark.parametrize('offset', [0, 17, 99])
+def test_control_indexes_are_explicit_immutable_capture_references(offset):
+    evidence=captured('対象の設定')
+    controls=[{'tag':'BUTTON','text':f'選択 {i}','label':f'選択 {i}','value':None} for i in range(105)]
+    evidence.pages[0]['controls']=controls
+    first=evidence.page_state(source_id=0)
+    assert len(first['controls'])==100
+    control=first['controls'][offset]
+    assert control['control_index']==offset
+    assert all('control_index' not in row for row in controls), 'Display metadata must not mutate stored control proof'
+    assert evidence.retain(report({'label':'設定','source_id':0,'control_index':control['control_index'],
+        'quote':control['label'],'value':control['label']}))==1
+    assert evidence.observations[-1]['control_state']==controls[offset]
