@@ -31,7 +31,7 @@ from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
 from nullion.builder import format_builder_proposal_notification
-from nullion.chat_attachments import guess_media_type
+from nullion.chat_attachments import guess_media_type, image_media_type_from_bytes
 from nullion.chat_text import UserMessage, make_markdown_tables_chat_readable, render_user_message
 from nullion.config import NullionSettings
 from nullion.remediation import remediation_buttons_for_recommendation_code
@@ -1898,8 +1898,10 @@ def prepare_reply_for_platform_delivery(
         return _sanitize_platform_visible_text(text, tool_results=tool_results, **kwargs)
 
     def unavailable_attachment_reply():
+        from nullion.artifact_lifecycle import artifact_terminal_failure_reply
         from nullion.response_fulfillment_contract import artifact_delivery_failure_reply
-        return sanitize_visible(artifact_delivery_failure_reply(tool_results, default=_ATTACHMENT_UNAVAILABLE_REPLY))
+        return sanitize_visible(artifact_terminal_failure_reply(tool_results)
+            or artifact_delivery_failure_reply(tool_results, default=_ATTACHMENT_UNAVAILABLE_REPLY))
 
     if reply is None:
         return PlatformDelivery(text=None, attachments=())
@@ -2533,7 +2535,7 @@ def save_messaging_attachment(
     return {
         "name": dest.name,
         "path": str(dest),
-        "media_type": media_type or guess_media_type(dest.name),
+        "media_type": image_media_type_from_bytes(data) or media_type or guess_media_type(dest.name),
     }
 
 

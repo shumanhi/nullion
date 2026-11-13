@@ -50,20 +50,22 @@ class Provider:
         self.calls+=1
         if self.calls<=2:
             return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':f'probe-{self.calls}',
-                'name':'observation_read','input':{'target':str(self.calls)}}]}
-        return text('確認済みの値: 7。')
+                'name':'observation_read','input':{'target':'1' if self.complete else str(self.calls)}}]}
+        return text('確認済みの値: 7。' + (' Reconnect the account, then retry the task.' if self.bound else ''))
 
 
 def setup(tmp_path,monkeypatch,*,pending=False,**provider_kwargs):
     from nullion.tools import ToolRegistry,ToolSpec,ToolSideEffectClass,ToolRiskLevel,ToolResult
     from nullion.agent_orchestrator import AgentOrchestrator
-    runtime,home=isolated(tmp_path,monkeypatch);registry=ToolRegistry();attempts=[]
+    runtime,home=isolated(tmp_path,monkeypatch);registry=ToolRegistry();attempts=[]; results=[]
     def probe(inv):
         attempts.append(inv.arguments)
-        if inv.arguments['target']=='1':
-            return ToolResult(inv.invocation_id,inv.tool_name,'completed' if pending else 'failed',{'connection_state':'pending_or_failed',
+        if len(attempts)==1:
+            result=ToolResult(inv.invocation_id,inv.tool_name,'completed' if pending else 'failed',{'connection_state':'pending_or_failed',
                 'connector_app_id':'selected-source','reason':'source_connection_required','retryable':False,
                 **({'terminal_user_action_required':True} if pending else {})},None if pending else 'PRIVATE')
+            results.append(result)
+            return result
         return ToolResult(inv.invocation_id,inv.tool_name,'completed',{'value':7,'text':'確認済みの値: 7。'})
     registry.register(ToolSpec('observation_read','Read the selected observation source',ToolRiskLevel.LOW,
         ToolSideEffectClass.READ,False,2, capability_tags=('web',), input_schema={'type':'object', 'properties':{'target':{'type':'string'}},'required':['target'],'additionalProperties':False}),probe)
@@ -85,12 +87,13 @@ def test_web_reply_keeps_findings_and_distinguishes_current_connector_blockers(t
             for e in runtime.store.list_conversation_events('web:outcomes')
             if e.get('event_type') in {'conversation.completion_review','conversation.chat_turn'}])
         assert 'Private editing instruction' not in answer and 'PRIVATE' not in answer
-        assert ('Reconnect' in answer) is bound
+        assert ('Reconnect' in answer) is (not complete)
+        assert answer.count('Reconnect the account, then retry the task.') == int(not complete)
     turns=[e for e in runtime.store.list_conversation_events('web:outcomes') if e.get('event_type')=='conversation.chat_turn']
     assert turns and answer==turns[-1]['assistant_reply']
     results=turns[-1]['tool_results'];assert len([r for r in results if r['tool_name']=='observation_read'])==2
     assert len(attempts)==2
-    assert any(r.get('response_requirements',{}).get('execution_review') for r in results)
+    assert all(not (r.get('response_requirements') or {}).get('execution_review') for r in results)
 
 
 def test_web_ui_reload_keeps_successful_reply_after_old_connector_failure(tmp_path,monkeypatch):
@@ -102,8 +105,14 @@ def test_web_ui_reload_keeps_successful_reply_after_old_connector_failure(tmp_pa
         browser=pw.chromium.launch(headless=True)
         page=browser.new_page();page.goto(server.base_url)
         page.locator('#user-input').fill('選択した情報を確認して。')
-        page.locator('#user-input').press('Enter')
-        expect(page.locator('#messages')).to_contain_text('確認済みの値: 7。',timeout=20000)
+        # Streamed text is visible before terminal persistence. Reload only
+        # after the actual terminal save has committed, not after a chunk.
+        with page.expect_response(lambda response: response.request.method=='POST'
+                and response.url.endswith('/message')
+                and (response.request.post_data_json or {}).get('role')=='bot'
+                and ((response.request.post_data_json or {}).get('metadata') or {}).get('history_message_kind')=='terminal_reply',timeout=20000):
+            page.locator('#user-input').press('Enter')
+            expect(page.locator('#messages')).to_contain_text('確認済みの値: 7。',timeout=20000)
         page.reload();expect(page.locator('#messages')).to_contain_text('確認済みの値: 7。',timeout=20000)
         assert 'Reconnect' not in page.locator('#messages').inner_text()
         browser.close()

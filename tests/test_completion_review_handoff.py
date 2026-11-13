@@ -33,58 +33,8 @@ def test_saved_delivery_history_is_explicit_in_every_review_context():
         'scheduled_task_run': False, 'scheduled_execution_context': execution}})
 
 
-def test_handed_off_contract_reuses_proof_catalog_but_invalidates_changed_request_context():
-    class Model:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
-            return {'content': [{'type': 'text', 'text': json.dumps({
-                'all_material_requirements_enumerated': True,
-                'material_requirements': [{'requirement': packet['original_request'],
-                    'requirement_kind': 'fact', 'evidence_subject_id': 'reading',
-                    'eligible_evidence_tool_names': [row['name'] for row in packet['completed_current_turn_tools']]}]})}]}
-    model = Model()
-    evidence = [ToolResult('one', 'source_read', 'completed', {'value': 37})]
-    state = {'orchestrator': SimpleNamespace(model_client=model), 'tool_registry': ToolRegistry(),
-        'user_message': '現在の値を確認。', 'tool_results': evidence,
-        'tool_flow_context': {'known_user_context': 'Default collection A'}}
-    first = _extract_completion_requirement_contract(state, tool_results=evidence)
-    assert first and model.calls == 1
-    handoff = _completion_review_handoff_for_state(state)
-    resumed = {**state, 'completion_requirement_contract_cache': dict(handoff.requirement_contract_cache)}
-    evidence.append(ToolResult('two', 'other_read', 'completed', {'value': 41}))
-    assert _extract_completion_requirement_contract(resumed, tool_results=evidence) == first
-    assert model.calls == 1
-    resumed['tool_flow_context'] = {'known_user_context': 'Default collection B'}
-    assert _extract_completion_requirement_contract(resumed, tool_results=evidence)
-    assert model.calls == 2
-    resumed['user_message'] = '別の観測値を確認。'
-    assert _extract_completion_requirement_contract(resumed, tool_results=evidence)
-    assert model.calls == 3
 
 
-def test_every_saved_execution_assigns_final_transport_to_scheduler_only():
-    seen = []
-    class Model:
-        def create(self, **kwargs):
-            packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
-            seen.append(packet)
-            assert packet['scheduled_delivery_owner'] == 'cron_delivery'
-            return {'content': [{'type': 'text', 'text': json.dumps({
-                'all_material_requirements_enumerated': True, 'material_requirements': [
-                    {'requirement': '現在の値を確認。', 'requirement_kind': 'fact',
-                     'evidence_subject_id': 'record', 'eligible_evidence_tool_names': ['source_read']},
-                    {'requirement': '後で結果を届ける。', 'requirement_kind': 'action',
-                     'completion_owner': 'cron_delivery', 'evidence_subject_id': 'transport',
-                     'eligible_evidence_tool_names': []}]})}]}
-    state = {'orchestrator': SimpleNamespace(model_client=Model()), 'tool_registry': ToolRegistry(),
-        'user_message': '現在の値を確認。結果を届ける。', 'tool_flow_context': {'scheduled_task_run': True,
-            'scheduled_execution_context': {'phase': 'execute_saved_task', 'saved_task_id': 'job-1'}}}
-    rows = _extract_completion_requirement_contract(state,
-        tool_results=[ToolResult('read', 'source_read', 'completed', {'text': 'Current value 37'})])
-    assert len(rows) == 1 and rows[0].requirement_kind == 'fact'
-    assert len(seen) == 1
 
 
 def test_only_typed_saved_execution_requires_review_without_tool_calls():
@@ -92,7 +42,7 @@ def test_only_typed_saved_execution_requires_review_without_tool_calls():
     flow = {'scheduled_task_run':True, 'scheduled_execution_context':{
         'phase':'execute_saved_task','saved_task_id':'selected-job'}}
     state = {'tool_flow_context':flow, 'completion_requirement_contract_cache':{'rows':()}}
-    assert _completion_review_required(state, tool_results=[])
+    assert not _completion_review_required(state, tool_results=[])
     assert _completion_review_handoff_for_state(state) is not None
     assert not _completion_review_required({'tool_flow_context':{'scheduled_task_run':True}}, tool_results=[])
     assert not _completion_review_required({'tool_flow_context':{}}, tool_results=[])

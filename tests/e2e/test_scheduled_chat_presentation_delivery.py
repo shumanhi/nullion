@@ -92,5 +92,4 @@ def test_compact_report_preserves_metadata_through_scheduled_telegram_delivery(t
     assert len(deliveries) == 1 and report in deliveries[0]['text']
     assert '\n\n\n' not in deliveries[0]['text']
     reviews = runtime.store.list_recent_conversation_events('telegram:123', event_type='conversation.completion_review')
-    assert reviews and reviews[-1]['disposition'] == 'complete'
-    assert reviews[-1]['review_error'] is None
+    assert reviews == []

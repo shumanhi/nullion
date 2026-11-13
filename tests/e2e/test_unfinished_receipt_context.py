@@ -102,7 +102,7 @@ def test_failed_notification_keeps_receipt_and_resolution_without_reasking(tmp_p
             sent.append(value);return SimpleNamespace(message_id=881+len(sent))
     Message.text=followup;Message.chat.send_action=lambda **kw:asyncio.sleep(0)
     asyncio.run(service.on_message(SimpleNamespace(update_id=880,message=Message()),SimpleNamespace(bot=None)))
-    assert len(prepared)==1 and reviews and relations,sent
+    assert len(prepared)==1 and not reviews and relations,sent
     assert any('all eleven sauces' in value and '1. Approve' in value for value in sent),sent
     turns=[e for e in runtime.store.list_conversation_events(cid) if e.get('event_type')=='conversation.chat_turn']
     assert turns[-1]['parent_turn_id']==parent

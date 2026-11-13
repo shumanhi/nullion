@@ -41,27 +41,6 @@ def source_result():
     }})
 
 
-@pytest.mark.parametrize('edits', [
-    [{'old': 'missing', 'new': 'fixed'}],
-    [{'old': 'AAA', 'new': '<script>alert(1)</script>'}],
-    [{'old': 'AAA', 'new': '<img src="https://example.org/pixel.png">'}],
-    [{'old': 'AAA', 'new': None}],
-    ['malformed'],
-])
-def test_html_targeted_edits_reject_invalid_or_executable_bytes(edits):
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'quotes': [
-        {'symbol': 'AAA', 'price': 20, 'regular_market_time': '2028-04-02T12:00:00Z'}]})]}
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            return response(json.dumps({'requirements_satisfied': False, 'html': '', 'edits': edits}))
-    client = Client()
-    assert _instruction_aware_cron_html(Job(task='AAA の時刻'), result, model_client=client,
-        existing_html='<!doctype html><html><body>AAA</body></html>') is None
-    assert client.calls == 1
-    assert result['cron_artifact_review_attempts'][0]['status'] == 'invalid_edits'
 
 
 @pytest.mark.parametrize('configured_timeout, expected_timeout', [('120', 120), ('180', 180), ('30', 90)])
@@ -82,34 +61,6 @@ def test_html_review_uses_configured_artifact_budget(monkeypatch, configured_tim
     assert [item['phase'] for item in result['cron_artifact_review_attempts']] == ['generate']
 
 
-@pytest.mark.parametrize('phase', ['generate', 'review'])
-@pytest.mark.parametrize('recovers', [True, False])
-def test_html_timeout_retries_same_evidence_once_with_bounded_budget(monkeypatch, phase, recovers):
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    from nullion.model_clients import ModelClientTimeoutError
-    monkeypatch.setenv('NULLION_ARTIFACT_MODEL_TIMEOUT_SECONDS', '120')
-    report = '<!doctype html><html><body>AAA 20</body></html>'
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'quotes': [
-        {'symbol': 'AAA', 'price': 20}]})]}
-    calls = []
-    class Client:
-        def create(self, **kwargs):
-            payload = json.loads(kwargs['messages'][0]['content'][0]['text'])
-            current_phase = 'generate' if payload['existing_html'] is None else 'review'
-            calls.append((current_phase, kwargs['timeout'], payload))
-            attempts = sum(name == phase for name, _, _ in calls)
-            if current_phase == phase and (attempts == 1 or not recovers):
-                raise ModelClientTimeoutError('Transient artifact-phase timeout')
-            return response(json.dumps({'requirements_satisfied': True, 'html': report}))
-    outcome = _instruction_aware_cron_html(Job(task='AAA の価格'), result, model_client=Client(),
-        existing_html=report if phase == 'review' else None)
-    assert outcome == (report if recovers else None)
-    retried = [call for call in calls if call[0] == phase]
-    assert [call[1] for call in retried] == [180 if phase == 'review' else 120, 180]
-    assert retried[0][2] == retried[1][2]
-    traces = [item for item in result['cron_artifact_review_attempts'] if item['phase'] == phase]
-    assert [item['attempt'] for item in traces] == [1, 2]
-    assert [item['status'] for item in traces] == ['error', 'accepted' if recovers else 'error']
 
 
 @pytest.mark.parametrize('raw_html', [
@@ -146,146 +97,18 @@ def test_html_invalid_model_response_is_not_retried():
     assert len(calls) == 1
 
 
-def test_html_targeted_edits_are_bounded_and_require_independent_acceptance():
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'quotes': [
-        {'symbol': 'AAA', 'price': 20, 'regular_market_time': '2028-04-02T12:00:00Z'}]})]}
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            payload = json.loads(kwargs['messages'][0]['content'][0]['text'])
-            assert payload['allow_targeted_edits'] is (self.calls < 3)
-            return response(json.dumps({'requirements_satisfied': False, 'html': '',
-                'issues': ['source label missing'], 'edits': [{'old': 'AAA', 'new': 'AAA delayed'}]}))
-    client = Client()
-    assert _instruction_aware_cron_html(Job(task='وقت AAA'), result, model_client=client,
-        existing_html='<!doctype html><html><body>AAA</body></html>') is None
-    assert client.calls == 3
-    assert [x['status'] for x in result['cron_artifact_review_attempts']] == ['edits_proposed', 'edits_proposed', 'rejected']
 
 
-def test_html_review_compacts_images_without_changing_delivered_bytes():
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    encoded = 'A' * 300_000
-    report = '<!doctype html><html><body>AAA 20<img alt="図" src="data:image/png;base64,' + encoded + '"></body></html>'
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'symbol': 'AAA', 'price': 20})]}
-    class Client:
-        def create(self, **kwargs):
-            request = kwargs['messages'][0]['content'][0]['text']
-            # Includes the request-bound conditional-delivery schema, never image bytes.
-            assert len(request) < 2400
-            payload = json.loads(request)
-            assert 'AAA 20' in payload['existing_html'] and 'alt="図"' in payload['existing_html']
-            assert 'chars=300000' in payload['existing_html']
-            assert encoded not in request
-            assert len(payload['other_documents']) == 2
-            return response(json.dumps({'requirements_satisfied': True, 'html': ''}))
-    assert _instruction_aware_cron_html(Job(task='図と AAA の価格'), result, model_client=Client(),
-        existing_html=report, existing_documents=(report, report)) == report
 
 
-def test_html_review_rejects_edits_that_make_no_progress():
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'symbol': 'AAA', 'price': 20})]}
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            return response(json.dumps({'requirements_satisfied': False, 'edits': [{'old': 'AAA', 'new': 'AAA'}]}))
-    client = Client()
-    assert _instruction_aware_cron_html(Job(), result, model_client=client,
-        existing_html='<!doctype html><html><body>AAA</body></html>') is None
-    assert client.calls == 1
 
 
-@pytest.mark.parametrize('complete_before_timeout', [False, True])
-@pytest.mark.parametrize('signal', ['timeout', 'incomplete'])
-def test_streamed_review_decision_survives_timeout_without_restarting(complete_before_timeout, signal):
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    from nullion.model_clients import ModelClientTimeoutError
-    report = '<!doctype html><html><body>AAA 20</body></html>'
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'symbol': 'AAA', 'price': 20})]}
-    decision = json.dumps({'requirements_satisfied': True, 'html': '', 'issues': [], 'edits': []})
-    prefix = decision if complete_before_timeout else decision[:-2]
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                if signal == 'incomplete':
-                    return response(prefix, completion={'status': 'incomplete', 'incomplete_reason': 'max_output_tokens'})
-                kwargs['text_delta_callback'](prefix)
-                raise ModelClientTimeoutError('Response streamed before timeout')
-            assert kwargs['messages'][0]['content'][-1]['text'] == prefix
-            assert kwargs['timeout'] == 180
-            return response(decision[len(prefix):])
-    client = Client()
-    assert _instruction_aware_cron_html(Job(task='AAA の価格'), result, model_client=client, existing_html=report) == report
-    assert client.calls == (1 if complete_before_timeout else 2)
 
 
-def test_streamed_review_continuation_stops_when_no_progress_is_made():
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    from nullion.model_clients import ModelClientTimeoutError
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'symbol': 'AAA', 'price': 20})]}
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                kwargs['text_delta_callback']('{"requirements_satisfied":')
-            raise ModelClientTimeoutError('No further response bytes')
-    client = Client()
-    assert _instruction_aware_cron_html(Job(), result, model_client=client,
-        existing_html='<!doctype html><html><body>AAA</body></html>') is None
-    assert client.calls == 2
 
 
-@pytest.mark.parametrize('continuation', ['restarted', 'malformed', 'persistent_malformed'])
-def test_review_restart_keeps_original_document_and_remains_bounded(continuation):
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    from nullion.model_clients import ModelClientTimeoutError
-    report = '<!doctype html><html><body>AAA 20</body></html>'
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'symbol': 'AAA', 'price': 20})]}
-    decision = json.dumps({'requirements_satisfied': True, 'html': '', 'issues': [], 'edits': []})
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            assert json.loads(kwargs['messages'][0]['content'][0]['text'])['existing_html'] == report
-            if self.calls in (1, 3) and (self.calls == 1 or continuation == 'persistent_malformed'):
-                kwargs['text_delta_callback']('{"requirements_satisfied":')
-                raise ModelClientTimeoutError('Decision interrupted')
-            if self.calls == 2 or continuation == 'persistent_malformed':
-                return response(decision if continuation == 'restarted' else 'broken-json')
-            assert len(kwargs['messages'][0]['content']) == 1
-            return response(decision)
-    client = Client()
-    actual = _instruction_aware_cron_html(Job(task='AAA の価格'), result, model_client=client, existing_html=report)
-    assert actual == (None if continuation == 'persistent_malformed' else report)
-    assert client.calls == {'restarted': 2, 'malformed': 3, 'persistent_malformed': 4}[continuation]
 
 
-def test_review_continuation_preserves_whitespace_inside_exact_edit():
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    from nullion.model_clients import ModelClientTimeoutError
-    report = '<!doctype html><html><body>AAA 20</body></html>'
-    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'symbol': 'AAA', 'price': 20})]}
-    decision = json.dumps({'requirements_satisfied': False, 'html': '', 'issues': [],
-                           'edits': [{'old': 'AAA 20', 'new': 'AAA 20 更新'}]}, ensure_ascii=False)
-    split = decision.index('AAA 20') + 3
-    class Client:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                kwargs['text_delta_callback'](decision[:split])
-                raise ModelClientTimeoutError('Interrupted inside an exact substring')
-            if self.calls == 2:
-                return response(decision[split:])
-            return response(json.dumps({'requirements_satisfied': True, 'html': ''}))
-    assert _instruction_aware_cron_html(Job(task='AAA の価格'), result, model_client=Client(), existing_html=report) == report.replace('AAA 20', 'AAA 20 更新')
 
 
 @pytest.mark.parametrize('first', [response(), response('partial', completion={'status': 'incomplete', 'reason': 'max_output_tokens'})])
@@ -550,3 +373,33 @@ def test_all_hydrated_email_obligations_survive_many_earlier_searches():
     records = json.loads(evidence)
     assert [record['tool_name'] for record in records[:28]] == ['email_read'] * 28
     assert sum(record.get('tool_name') == 'calendar_list' for record in records) == 2
+
+
+@pytest.mark.parametrize('phase', ['generate'])
+@pytest.mark.parametrize('recovers', [True, False])
+def test_html_timeout_retries_same_evidence_once_with_bounded_budget(monkeypatch, phase, recovers):
+    from nullion.cron_delivery import _instruction_aware_cron_html
+    from nullion.model_clients import ModelClientTimeoutError
+    monkeypatch.setenv('NULLION_ARTIFACT_MODEL_TIMEOUT_SECONDS', '120')
+    report = '<!doctype html><html><body>AAA 20</body></html>'
+    result = {'tool_results': [ToolResult('q', 'market_quote', 'completed', {'quotes': [
+        {'symbol': 'AAA', 'price': 20}]})]}
+    calls = []
+    class Client:
+        def create(self, **kwargs):
+            payload = json.loads(kwargs['messages'][0]['content'][0]['text'])
+            current_phase = 'generate' if payload['existing_html'] is None else 'review'
+            calls.append((current_phase, kwargs['timeout'], payload))
+            attempts = sum(name == phase for name, _, _ in calls)
+            if current_phase == phase and (attempts == 1 or not recovers):
+                raise ModelClientTimeoutError('Transient artifact-phase timeout')
+            return response(json.dumps({'requirements_satisfied': True, 'html': report}))
+    outcome = _instruction_aware_cron_html(Job(task='AAA の価格'), result, model_client=Client(),
+        existing_html=report if phase == 'review' else None)
+    assert outcome == (report if recovers else None)
+    retried = [call for call in calls if call[0] == phase]
+    assert [call[1] for call in retried] == [180 if phase == 'review' else 120, 180]
+    assert retried[0][2] == retried[1][2]
+    traces = [item for item in result['cron_artifact_review_attempts'] if item['phase'] == phase]
+    assert [item['attempt'] for item in traces] == [1, 2]
+    assert [item['status'] for item in traces] == ['error', 'accepted' if recovers else 'error']

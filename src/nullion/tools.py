@@ -1569,6 +1569,8 @@ class ToolSpec:
     # Replay validates their contracts but lets the handler own their errors
     # and bounded repair instead of running a stale duplicate first.
     observation_inline_setup_tools: tuple[str, ...] = ()
+    # Adapter-owned output formats; source captures must never declare these.
+    produced_artifact_extensions: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -14265,6 +14267,7 @@ def _build_kernel_tool_registry(
         registry.register(
             ToolSpec(
                 name="file_write",
+                produced_artifact_extensions=('.csv', '.htm', '.html', '.json', '.md', '.svg', '.tsv', '.txt', '.yaml', '.yml'),
                 description="Write a local file inside the workspace.",
                 risk_level=ToolRiskLevel.MEDIUM,
                 side_effect_class=ToolSideEffectClass.WRITE,
@@ -14339,6 +14342,7 @@ def _build_kernel_tool_registry(
         registry.register(
             ToolSpec(
                 name="document_create",
+                produced_artifact_extensions=('.docx', '.pdf', '.html', '.htm'),
                 description=(
                     "Create a real .docx document artifact from structured paragraphs, sections, and existing image files. "
                     "The built-in generator applies a report-quality layout profile; provide structured content instead of raw dumps. "
@@ -14360,6 +14364,7 @@ def _build_kernel_tool_registry(
         registry.register(
             ToolSpec(
                 name="spreadsheet_create",
+                produced_artifact_extensions=('.xlsx',),
                 description=(
                     "Create a real .xlsx spreadsheet artifact from structured rows, links, and existing image files. "
                     "Use the structured sheets argument when the requested workbook needs multiple worksheets, "
@@ -14387,6 +14392,7 @@ def _build_kernel_tool_registry(
         registry.register(
             ToolSpec(
                 name="presentation_create",
+                produced_artifact_extensions=('.pptx',),
                 description=(
                     "Create a real .pptx slide deck artifact from structured slides and existing image files. "
                     "The built-in generator applies a report-quality layout profile and preserves media aspect ratios. "
@@ -14408,6 +14414,7 @@ def _build_kernel_tool_registry(
         registry.register(
             ToolSpec(
                 name="pdf_create",
+                produced_artifact_extensions=('.pdf',),
                 description=(
                     "Create a real PDF artifact locally from existing image files and/or report text pages. "
                     "Use text_pages for readable report content; image-only PDFs are only appropriate when the requested deliverable is image pages. "
@@ -14428,6 +14435,7 @@ def _build_kernel_tool_registry(
         registry.register(
             ToolSpec(
                 name="pdf_edit",
+                produced_artifact_extensions=('.pdf',),
                 description=(
                     "Edit a PDF locally into a new PDF artifact: keep/reorder pages, rotate pages, "
                     "append other PDFs, append image pages, or append text pages. "
@@ -17903,6 +17911,7 @@ def register_media_plugin(
             registry.register(
                 ToolSpec(
                     name="image_generate",
+                produced_artifact_extensions=('.png', '.jpg', '.jpeg', '.webp', '.svg'),
                     description=(
                         "Generate an image file using the configured image model when available, "
                         "or a safe local SVG fallback when no image model is configured."

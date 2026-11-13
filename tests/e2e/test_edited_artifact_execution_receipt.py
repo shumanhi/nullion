@@ -75,4 +75,4 @@ def test_create_then_edit_retains_execution_without_reviving_old_contents(tmp_pa
         assert len(data['artifacts'])==1,data
         document=PdfReader(io.BytesIO(client.get(data['artifacts'][0]['url']).content))
         assert len(document.pages)==2 and '37' in document.pages[0].extract_text() and '53' in document.pages[1].extract_text()
-        assert len(created)==2 and all(r.status=='completed' for r in created) and len(edited)==1 and model.reviews==1
+        assert len(created) == 2 and all((r.status == 'completed' for r in created)) and (len(edited) == 1) and (model.reviews == 0)

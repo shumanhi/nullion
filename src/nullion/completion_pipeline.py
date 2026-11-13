@@ -27,6 +27,9 @@ class CompletionDraft:
 
 class CompletionFileConflictError(ValueError):
     """An external change invalidated a content-only correction's file proof."""
+    def __init__(self, message, *, paths=()):
+        super().__init__(message)
+        self.paths = tuple(paths)
 
 
 def prepare_completion(state, text, *, review=None):
@@ -45,6 +48,8 @@ def prepare_completion(state, text, *, review=None):
     proof = outcome_binding('', {}, None, previous, ())
     previous_paths = list(state.get('artifacts') or ())
     files_before = outcome_binding('', {}, None, (), previous_paths)
+    from nullion.workflow_reasoning import selected_file_versions
+    versions_before = {row[0]: row[1:] for row in selected_file_versions(previous_paths)}
     prepared = preparer(state={**state, 'tool_results': deepcopy(list(previous)),
         'artifacts': list(state.get('artifacts') or ()),
         'response_presentation': deepcopy(dict(state.get('response_presentation') or {}))},
@@ -63,6 +68,7 @@ def prepare_completion(state, text, *, review=None):
         raise ValueError('Completion preparation cannot discard or change execution receipts')
     old_ids = {result_value(row, 'invocation_id') for row in previous}
     from nullion.artifact_validation import validate_artifact_paths
+    produced_paths = set()
     for row in prepared.tool_results:
         if result_value(row, 'invocation_id') in old_ids:
             continue
@@ -72,8 +78,15 @@ def prepare_completion(state, text, *, review=None):
                 or not isinstance(output, Mapping) or output.get('structured_artifact_verified') is not True
                 or not paths or not validate_artifact_paths(paths).ok):
             raise ValueError('Completion preparation may append only verified artifact receipts')
-    if review is not None and files_before != outcome_binding('', {}, None, (), previous_paths):
-        raise CompletionFileConflictError('Selected files changed during a content-only correction')
+        from pathlib import Path
+        produced_paths.update(str(Path(path).resolve()) for path in paths)
+    if files_before != outcome_binding('', {}, None, (), previous_paths):
+        from pathlib import Path
+        changed_paths = {str(Path(row[0]).resolve()) for row in selected_file_versions(previous_paths)
+            if versions_before.get(row[0]) != row[1:]}
+        if not changed_paths.issubset(produced_paths):
+            raise CompletionFileConflictError('Selected files changed without a new native production receipt',
+                paths=sorted(changed_paths - produced_paths))
     failure = ({'code': prepared.failure_code,
         'binding': outcome_binding('', {}, None, prepared.tool_results, prepared.artifacts)}
         if prepared.failure_code else None)
@@ -330,7 +343,7 @@ def recovery_closed(result, request=None, *, pending_tool_names=()):
         request = checkpoint.request if request is None else request
         if published_completion(result, request) is None:
             return False
-        if checkpoint.reason in {'answer_finalized', 'assisted_answer_finalized'}:
+        if checkpoint.reason in {'answer_finalized', 'assisted_answer_finalized', 'producer_finalized'}:
             completed = {result_value(row, 'tool_name') for row in
                 (result_value(result, 'tool_results', ()) or ())
                 if result_value(row, 'status') == 'completed'}

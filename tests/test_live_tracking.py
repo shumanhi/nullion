@@ -75,50 +75,6 @@ def matcher(op="greater_than", value=20):
     }
 
 
-@pytest.mark.parametrize('invalid', [None, 'unprepared', 'pointer', 'interval', 'missing_evidence'])
-def test_creation_review_projects_native_facts_without_creating_job(fixture, invalid):
-    from nullion.live_tracking_tools import register_live_tracker_tools
-    from nullion.workflow_reasoning import assess_action
-    registry = fixture.registry
-    registry.live_tracker_store_path = fixture.store.path
-    register_live_tracker_tools(registry)
-    probe = [{'tool_name': 'sensor_read', 'arguments': {'session_id': 'créateur-乙'}}]
-    observed = {'reading': 23, 'session_id': 'physical-output-42'}
-    prepared = {json.dumps(probe[0], ensure_ascii=False, sort_keys=True): observed}
-    args = {'name': '観測', 'duration_seconds': 90, 'interval_seconds': 5,
-            'probe': probe, 'matcher': matcher()}
-    if invalid == 'unprepared':
-        args['probe'] = [{'tool_name': 'sensor_read', 'arguments': {'session_id': 'physical-output-42'}}]
-    if invalid == 'pointer':
-        args['matcher']['conditions'][0]['pointer'] = '/absent'
-    if invalid == 'interval':
-        args['interval_seconds'] = 0
-    context = {'conversation_id': 'web:native-binding'}
-    if invalid != 'missing_evidence':
-        context['prepared_observations'] = prepared
-    invocation = ToolInvocation('native-facts', 'create_live_tracker', 'web:native-binding', args, flow_context=context)
-    spec = registry.get_spec('create_live_tracker')
-    facts = spec.action_review_context(invocation, [])['native_contract_validation']
-    assert facts['validated'] is (invalid is None)
-    assert not fixture.store.list('workspace_admin') and not fixture.readings
-    if invalid is None:
-        binding = facts['prepared_bindings'][0]
-        assert binding['argument_session_alias'] == 'créateur-乙'
-        assert binding['observed_physical_session'] == 'physical-output-42'
-        assert facts['declared_defaults']['notify_on_expiry'] is True and not facts['grants_consent']
-        class Provider:
-            def create(self, **kw):
-                return {'content': [{'type': 'text', 'text': json.dumps({'decision': 'revise',
-                    'issues': ['Use the physical handle instead.'], 'concern_scopes': ['native_contract']})}]}
-        reviewed = assess_action(model_client=Provider(), request='راقب هذه القراءات لدقيقة ونصف.', context={},
-            invocation=invocation, spec=spec, evidence=[], now=utcnow().isoformat())
-        assert reviewed.decision == 'proceed' and reviewed.advisory
-        created = registry.invoke(invocation)
-        assert created.status == 'completed', created
-        saved = fixture.store.get(created.output['id'])
-        assert saved['probe'] == probe and saved['notify_on_expiry'] is True
-    else:
-        assert not facts['advisory_concern_scopes']
 
 
 def create(f, *, now=None, **overrides):

@@ -87,6 +87,19 @@ class RequestRecoveryContract:
             return registry
         return RequestRecoveryRegistry(registry, self)
 
+    def for_artifact_production(self, extensions, producer_names):
+        """Apply the owner's validated output plan to the same recovery contract.
+
+        Called by completion orchestration, never by discovery payloads. A new
+        output stage may expose registered producers, but cannot authorize a
+        different account action or turn an existing-file lookup into creation.
+        """
+        if self.decision.source_artifact_retrieval_only:
+            return self
+        decision = replace(self.decision, requested_artifact_extensions=tuple(extensions))
+        return replace(self, decision=decision,
+            action_tools=self.action_tools.union(producer_names))
+
 
 class RequestRecoveryRegistry:
     """Keep delegate permissions while bounding new recovery actions."""
@@ -208,6 +221,11 @@ class RequestRecoveryRegistry:
             return self
         contract = self.contract.for_artifact_packaging(request)
         return contract.bind(self._delegate) if contract is not self.contract else self
+
+    def prepare_artifact_production(self, extensions):
+        discover = getattr(self._delegate, "artifact_production_tools", None)
+        names = discover(extensions) if callable(discover) else ()
+        return self.contract.for_artifact_production(extensions, names).bind(self._delegate)
 
     def apply_scope_request(self, invocation):
         prepared = self.prepare_artifact_packaging((invocation.flow_context or {}).get("artifact_packaging_request"))

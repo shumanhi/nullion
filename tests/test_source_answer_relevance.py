@@ -100,6 +100,6 @@ def test_source_summary_keeps_existing_system_memory_and_delivery_context():
                     {'role':'system','content':'Keep internal paths out of chat.'}],
         'tool_recovery_scopes_attempted':[]}
     _agent_turn_model_node(state)
-    assert 'Saved preference: concise replies with emojis.' in captured[0]['system']
-    assert 'Keep internal paths out of chat.' in captured[0]['system']
-    assert {tool['name'] for tool in captured[0]['tools']}=={'present_source_answer'}
+    assert 'Saved preference: concise replies with emojis.' in str(captured[0]['messages'])
+    assert 'Keep internal paths out of chat.' in str(captured[0]['messages'])
+    assert {tool['name'] for tool in captured[0]['tools']}==set()

@@ -990,7 +990,11 @@ def _instruction_aware_cron_html(
     document_prefix: str = "", continuation_attempt: int = 0, review_prefix: str = "",
     review_restart_attempted: bool = False,
 ) -> str | None:
-    """Recover only HTML that satisfies the saved job instructions and evidence."""
+    """Write missing HTML from retained evidence; never regrade an existing file."""
+    if existing_html is not None:
+        # Compatibility for older continuations: keep safe producer content.
+        # Native selection, byte receipts and upload checks still run later.
+        return existing_html if _safe_cron_html_document(existing_html) else None
     if not callable(getattr(model_client, "create", None)):
         return None
     evidence = _cron_structured_html_evidence_records(result.get("tool_results") or ())
@@ -1696,6 +1700,18 @@ def _cron_review_only_uncertainty(job: object, result: dict[str, object]) -> boo
         request, receipt, result.get('artifacts') or ()))
 
 
+def _prepared_cron_artifact_delivery_satisfied(job, result, *, content_receipt) -> bool:
+    """Reconcile owned partial bytes with delivery, not research completion."""
+    from nullion.report_completion import partial_report_receipt
+    from nullion.artifact_validation import validate_artifact_paths
+    from nullion.artifacts import artifact_format_extension, normalize_artifact_extensions
+    required, extensions = _cron_artifact_delivery_contract(job)
+    paths = list(result.get('artifacts') or ())
+    return bool(required and paths and partial_report_receipt(str(getattr(job, 'task', '') or ''),
+        content_receipt, paths) and all(any(artifact_format_extension(path) == extension for path in paths)
+            for extension in normalize_artifact_extensions(extensions)) and validate_artifact_paths(paths).ok)
+
+
 def _partial_cron_report_available(job: object, result: dict[str, object], *, selected_paths=None) -> bool:
     """A partial report receipt cannot authorize an alert, action or changed file."""
     if _cron_review_only_uncertainty(job, result):
@@ -2059,7 +2075,7 @@ class _ScheduledCompletionPreparer:
         self.payload = {}
         self.retained_text = None
         self._attempted = set()
-        self.requires_material_contract = not _cron_artifact_delivery_contract(job)[0]
+        self.requires_material_contract = False
 
     def __call__(self, *, state, text, review=None):
         from nullion.completion_pipeline import CompletionDraft
@@ -2640,6 +2656,8 @@ def _run_single_agent_cron_turn(
         return failure_result
 
     def prepare_result(result):
+        from nullion.producer_completion import clear_review_result
+        clear_review_result(result)
         requires_files = requires_artifact_delivery or bool(getattr(result, 'artifact_delivery_required', False))
         selected_files = list(getattr(result, 'artifacts', ()) or ())
         from nullion.artifact_validation import validate_artifact_paths
@@ -2671,10 +2689,6 @@ def _run_single_agent_cron_turn(
             "cron_task": str(getattr(job, "task", "") or ""),
             "cron_delivery_mode": (getattr(job, "artifact_delivery_options", None) or {}).get("alert_delivery_mode", ""),
         }
-        presentation = result_payload["response_presentation"]
-        if presentation.get("scheduled_source_verification_required") is True:
-            result_payload["cron_source_verification_required"] = True
-            result_payload["cron_source_verification_satisfied"] = presentation.get("scheduled_source_verification_satisfied") is True
         from nullion.agent_orchestrator import _completion_review_scope_contract
         source_action_contract = _completion_review_scope_contract(
             execution_registry, result_payload["tool_results"],
@@ -2686,44 +2700,6 @@ def _run_single_agent_cron_turn(
                 "required_tool_attempt_statuses",
             )
         }
-        from nullion.agent_orchestrator import _CompletionReviewHandoff, _outcome_review_binding_context
-        from nullion.workflow_reasoning import OutcomeReviewReceipt, outcome_binding
-        handoff = getattr(result, "completion_review_handoff", None)
-        receipt = getattr(result, "outcome_review_receipt", None)
-        if isinstance(handoff, _CompletionReviewHandoff) and handoff.latest_review is not None:
-            result_payload["cron_source_verification_feedback"] = _cron_outcome_review_feedback(handoff.latest_review)
-            advice = handoff.latest_review
-            if advice.review_error is None and advice.disposition == 'retry':
-                if advice.retry_tool_names:
-                    result_payload['cron_completion_required'] = True
-                    result_payload['cron_remaining_work'] = list(advice.unresolved_requirements)
-                else:
-                    result_payload['cron_presentation_assistance_pending'] = True
-        if (isinstance(handoff, _CompletionReviewHandoff) and handoff.latest_review is not None
-                and handoff.latest_review.review_error is None and result_payload["response_fulfilled"] is False
-                and (result_payload.get("response_presentation") or {}).get("outcome_review_role") != "helper"
-                and (handoff.latest_review.disposition in {"needs_user_input", "needs_approval", "blocked"}
-                     or handoff.latest_review.disposition == "retry")):
-            from nullion.agent_orchestrator import _completion_review_open_task_reply
-            result_payload["cron_outcome_review_disposition"] = handoff.latest_review.disposition
-            result_payload["cron_outcome_review_notice"] = _completion_review_open_task_reply(handoff.latest_review)
-        if (isinstance(handoff, _CompletionReviewHandoff) and isinstance(receipt, OutcomeReviewReceipt)
-                and receipt.disposition == "complete" and receipt.binding == outcome_binding(
-                    str(getattr(job, "task", "") or ""), _outcome_review_binding_context({
-                        "tool_flow_context": flow_context, "principal_id": conversation_id,
-                        "conversation_id": conversation_id}), result_payload["text"],
-                    result_payload["tool_results"], result_payload["artifacts"])):
-            _retain_verified_cron_alert_decision(job, result_payload, handoff.latest_review)
-            if (result_payload["response_fulfilled"] is True
-                    and handoff.latest_review.disposition == "complete" and not handoff.latest_review.review_error):
-                result_payload.update(cron_source_verification_required=True, cron_source_verification_satisfied=True)
-            if (result_payload["response_fulfilled"] is True and result_payload["artifacts"]
-                    and handoff.latest_review is not None and handoff.latest_review.disposition == "complete"
-                    and handoff.latest_review.review_error is None):
-                from nullion.report_completion import bind_report_outcome
-                request = str(getattr(job, "task", "") or "")
-                result_payload.update(cron_report_request=request, cron_report_content_receipt=bind_report_outcome(
-                    request, {"status": "complete", "remaining_work": []}, result_payload["artifacts"]))
         return result_payload
 
     result_payload = prepare_result(result)
@@ -2745,26 +2721,36 @@ def _run_single_agent_cron_turn(
         for key, value in producer_metadata.items():
             if key.startswith('cron_') or key == '_cron_text_report_candidate':
                 result_payload[key] = value
+        # Completion can remain false after an unfinished source step or an
+        # unavailable review. Delivery still owns the unchanged prepared files:
+        # an overall fulfillment flag is not a missing-file receipt. Reconcile
+        # only the content owner's byte-bound report with the saved delivery
+        # contract, retaining all ordinary cancellation/approval/delivery gates.
+        if _prepared_cron_artifact_delivery_satisfied(job, result_payload,
+                content_receipt=producer_metadata.get('cron_report_content_receipt')):
+            result_payload['artifact_delivery_satisfied'] = True
         from nullion.agent_orchestrator import _CompletionReviewHandoff
         handoff = getattr(result, 'completion_review_handoff', None)
         review = handoff.latest_review if isinstance(handoff, _CompletionReviewHandoff) else None
         result_payload['cron_source_verification_feedback'] = _cron_outcome_review_feedback(review)
         result_payload['cron_shared_completion_owner'] = True
         from nullion.completion_pipeline import published_completion
-        verified = (result_payload.get('response_fulfilled') is True and review is not None
-            and not review.review_error and review.disposition == 'complete'
+        verified = (result_payload.get('response_fulfilled') is True
             and published_completion(result, str(getattr(job, 'task', '') or ''),
                 conversation_id=conversation_id, principal_id=conversation_id) is not None)
         if review is not None:
             result_payload.update(cron_source_verification_required=True, cron_source_verification_satisfied=verified)
         validated_report_review = review if verified else None
         if verified:
-            result_payload.update(cron_source_verification_required=True, cron_source_verification_satisfied=True)
+            result_payload['cron_execution_contract_satisfied'] = True
+            result_payload.pop('cron_source_verification_required', None)
+            result_payload.pop('cron_source_verification_satisfied', None)
             for key in ('cron_completion_required', 'cron_remaining_work', 'cron_unfinished_findings',
                     'cron_report_partial', 'cron_verification_failed', 'cron_report_failed',
                     'cron_outcome_review_disposition', 'cron_outcome_review_notice'):
                 result_payload.pop(key, None)
-            _retain_verified_cron_alert_decision(job, result_payload, review)
+            if review is not None:
+                _retain_verified_cron_alert_decision(job, result_payload, review)
         helper_only = _cron_review_only_uncertainty(job, result_payload)
         paths = list(result_payload.get('artifacts') or ())
         if paths:
@@ -2822,7 +2808,9 @@ def _run_single_agent_cron_turn(
                     'raw_tool_payload_blocked', 'cron_report_delivery_gate'))
                 and feedback.get('disposition') not in {'blocked', 'needs_approval', 'needs_user_input'}
                 and _cron_result_has_completed_tool_evidence(result_payload)
-                and (_cron_remaining_execution_tools(result_payload) or result_payload.get('cron_remaining_work'))):
+                and (_cron_remaining_execution_tools(result_payload) or result_payload.get('cron_remaining_work')
+                    or result_payload.get('artifact_delivery_required') is True
+                        and result_payload.get('artifact_delivery_satisfied') is not True)):
             from nullion.scheduled_budget import store_scheduled_budget_approval
             progress_text = (str(result_payload.get('text') or '') if not result_payload.get('artifacts')
                 and _partial_cron_report_available(job, result_payload)

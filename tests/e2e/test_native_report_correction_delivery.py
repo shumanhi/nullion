@@ -52,11 +52,11 @@ def test_native_review_correction_reaches_scheduled_delivery_without_inapplicabl
                     return text_response(json.dumps(reply))
                 return protocol
             if not reads:return tool_response('record_read',{})
-            return text_response(verbose)
+            return text_response(json.dumps({'format':REPORT_MESSAGE_FORMAT,'message':message}))
     model=Provider();job=CronJob(id='native-report',name='記録の要点',task=task,schedule='0 * * * *',
         delivery_channel='telegram',delivery_target='123')
     result=run_scheduled(job,model,runtime,registry,send)
-    assert result['response_fulfilled'] is True and len(reads)==model.reviews==1
+    assert result['response_fulfilled'] is True and len(reads)==1 and model.reviews==0
     assert len(deliveries)==1 and deliveries[0]['text'].count(job.name)==1
     from nullion.telegram_formatting import telegram_html_to_plain
     body=telegram_html_to_plain(deliveries[0]['text'])
@@ -69,8 +69,7 @@ def test_native_review_correction_reaches_scheduled_delivery_without_inapplicabl
     assert body.count(message['shared_details'][0]['text'])==1
     if not triage:assert ('Historical detail' in body)==(detail=='detailed')
     if detail=='compact':assert len(body)<len(verbose)*.65
-    review=runtime.store.list_recent_conversation_events('telegram:123',event_type='conversation.completion_review')[-1]
-    assert review['review_error'] is None and review['presentation_repaired'] and review['disposition']=='complete'
+    assert not runtime.store.list_recent_conversation_events('telegram:123',event_type='conversation.completion_review')
 
 
 @pytest.mark.parametrize('detail',['compact','detailed'])

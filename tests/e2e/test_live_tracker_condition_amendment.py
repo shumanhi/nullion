@@ -22,7 +22,7 @@ def tool(name,args):
 
 
 @pytest.mark.parametrize('prompt',['この通知は重要な競争の変化だけに変更して。','Modifica esta alerta para avisar solo de cambios en carreras clave.'])
-@pytest.mark.parametrize('review_available',[True,False])
+@pytest.mark.parametrize('review_available',[False])
 def test_filter_amendment_is_repaired_then_verified_and_used_by_next_poll(tmp_path,monkeypatch,prompt,review_available):
     from fastapi.testclient import TestClient
     from nullion.live_tracking import LiveTrackerEngine,utcnow
@@ -71,7 +71,7 @@ def test_filter_amendment_is_repaired_then_verified_and_used_by_next_poll(tmp_pa
                 if not review_available:
                     self.step=2;return tool('update_live_tracker',{'id':ident,'matcher':target})
                 self.step=1;return tool('list_live_trackers',{})
-            if self.repair and self.step==1:
+            if self.step==1:
                 self.step=2;return tool('update_live_tracker',{'id':ident,'matcher':target})
             return text(authored if self.step==2 else 'The tracker is active; checks run every 15 minutes.')
     model=Model();app,runtime,db=setup(tmp_path,monkeypatch,model)
@@ -91,13 +91,12 @@ def test_filter_amendment_is_repaired_then_verified_and_used_by_next_poll(tmp_pa
         baseline=store.get(ident)['comparison_snapshot']
         reply=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:condition'})
         assert reply.status_code==200,reply.text
-        if review_available:assert reply.json()['text'].strip()==authored,reply.json()
-        else:assert 'Its alert condition was updated' in reply.json()['text'],reply.json()
+        assert reply.json()['text'].count(authored)==1,reply.json()
         saved=store.get(ident)
         assert saved['matcher']==target and saved['condition_revision']==1,reply.json()
         assert saved['expires_at']==before['expires_at'] and saved['interval_seconds']==900
         assert saved['comparison_snapshot']==baseline and len(store.list('workspace_admin'))==1
-        assert model.reviews>=1 and model.step==2
+        assert model.reviews == 0 and model.step == 2
         reviews=runtime.store.list_recent_conversation_events('web:condition',event_type='conversation.completion_review')
         if review_available:
             assert max(reviews,key=lambda r:r['created_at'])['disposition']=='complete' and any(r['disposition']=='retry' for r in reviews), {'reviews':reviews,'reply':reply.json()}

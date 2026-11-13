@@ -29,6 +29,7 @@ def test_optional_failed_artwork_does_not_block_plain_native_repair(tmp_path,mon
     runtime=setup_runtime(tmp_path,monkeypatch)
     monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off')
     with sync_playwright() as pw:monkeypatch.setenv('NULLION_CHROMIUM_EXECUTABLE',pw.chromium.executable_path)
+    extension = '.html' if extension == '.htm' else extension
     cid='web:optional-media';root=artifact_root_for_principal(cid);root.mkdir(parents=True,exist_ok=True)
     output=root/('result'+extension);native=builder(tmp_path,allowed_roots=[tmp_path]);executed=[]
     def create(inv):

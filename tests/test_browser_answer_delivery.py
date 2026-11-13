@@ -15,7 +15,7 @@ from nullion.tools import ToolResult
 def test_browser_answer_does_not_require_assertion_bound_records(reply, output):
     results = [ToolResult('read', 'browser_extract_text', 'completed', output)]
     assert sanitize_user_visible_reply(user_message='ข้อมูลล่าสุด', reply=reply, tool_results=results) == reply
-    assert _completion_review_required({}, tool_results=results)
+    assert not _completion_review_required({}, tool_results=results)
 
 
 def test_failed_optional_assertion_does_not_discard_other_results():
@@ -23,14 +23,14 @@ def test_failed_optional_assertion_does_not_discard_other_results():
                ToolResult('check', 'browser_assert_page_state', 'completed', {'verified': False, 'result': {'ok': False}})]
     reply = 'Service opens at 10:00. I could not confirm availability.'
     assert sanitize_user_visible_reply(user_message=None, reply=reply, tool_results=results) == reply
-    assert _completion_review_required({}, tool_results=results)
+    assert not _completion_review_required({}, tool_results=results)
 
 
 def test_actual_browser_failure_remains_visible_without_verification_retry():
     results = [ToolResult('nav', 'browser_navigate', 'failed', {}, error='Connection refused')]
     reply = 'The page could not be opened: connection refused.'
     assert sanitize_user_visible_reply(user_message=None, reply=reply, tool_results=results) == reply
-    assert _completion_review_required({}, tool_results=results)
+    assert not _completion_review_required({}, tool_results=results)
 
 
 def test_successful_navigation_does_not_replace_a_mixed_source_summary():

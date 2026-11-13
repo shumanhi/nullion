@@ -89,8 +89,6 @@ def test_profile_and_selected_clarification_survive_until_actual_result(tmp_path
             self.agent_calls += 1
             if mode in answers:
                 return text(answers[mode])
-            if mode != 'profile' and self.agent_calls == 1:
-                return text('I will look up the current options now.')
             if 'browser_run_task' not in names:
                 return call('request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_run_task']})
             if not reads:
@@ -122,4 +120,4 @@ def test_profile_and_selected_clarification_survive_until_actual_result(tmp_path
     if mode != 'profile':
         assert stored['parent_turn_id'] == 'pending-parent'
     if mode not in answers:
-        assert packets
+        assert packets == []

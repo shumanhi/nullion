@@ -52,6 +52,19 @@ def guess_media_type(path_or_name: str, fallback: str = "application/octet-strea
     return media_type or fallback
 
 
+def image_media_type_from_bytes(data: bytes) -> str | None:
+    """Use image signatures rather than a transport's filename or MIME hint."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def is_supported_image_attachment(attachment: ChatAttachment) -> bool:
     media_type = attachment.media_type.lower()
     suffix = Path(attachment.name or attachment.path).suffix.lower()
@@ -225,7 +238,9 @@ def chat_attachment_content_blocks(
                 if path.stat().st_size > MAX_INLINE_IMAGE_BYTES:
                     blocks.append({"type": "text", "text": descriptor + "\nImage is too large to inline for vision."})
                     continue
-                data = base64.b64encode(path.read_bytes()).decode("ascii")
+                image_bytes = path.read_bytes()
+                image_media_type = image_media_type_from_bytes(image_bytes) or attachment.media_type
+                data = base64.b64encode(image_bytes).decode("ascii")
             except OSError:
                 blocks.append({"type": "text", "text": descriptor + "\nImage could not be read."})
                 continue
@@ -235,7 +250,7 @@ def chat_attachment_content_blocks(
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": attachment.media_type,
+                        "media_type": image_media_type,
                         "data": data,
                     },
                 }

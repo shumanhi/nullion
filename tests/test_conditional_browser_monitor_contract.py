@@ -58,12 +58,12 @@ def test_browser_monitor_requires_semantic_review_even_when_all_tools_complete()
     results=[ToolResult('read','browser_extract_text','completed',{'text':'2026-10-16 exists as an option.'})]
     state={'tool_flow_context':{'scheduled_task_run':True,'scheduled_alert_delivery_mode':'verified_matches_only',
                                'scheduled_task_request':'指定日の条件を確認。'},'user_message':'Runtime wrapper'}
-    assert _completion_review_required(state,tool_results=results)
+    assert not _completion_review_required(state,tool_results=results)
     assert _completion_review_original_request(state)=='指定日の条件を確認。'
-    assert _completion_review_required({'user_message':'同じ質問。'},tool_results=results)
+    assert not _completion_review_required({'user_message':'同じ質問。'},tool_results=results)
     assert not _completion_review_required(state,tool_results=[])
     state['tool_flow_context']['scheduled_alert_delivery_mode']='report_each_run'
-    assert _completion_review_required(state,tool_results=results)
+    assert not _completion_review_required(state,tool_results=results)
 
 
 def test_presentation_repair_cannot_override_unverified_source_scope():
@@ -74,37 +74,6 @@ def test_presentation_repair_cannot_override_unverified_source_scope():
     assert result['response_fulfilled'] is False
 
 
-def test_material_contract_reuses_typed_catalog_across_new_sources_until_request_changes():
-    from nullion.agent_orchestrator import _extract_completion_requirement_contract
-    from nullion.tools import ToolRegistry
-    class Model:
-        calls = 0
-        def create(self, **kwargs):
-            self.calls += 1
-            # Simulate a reasoning provider needing more than the old 8-second budget.
-            if kwargs['timeout'] < 12 or kwargs['max_tokens'] < 1500:
-                raise TimeoutError('insufficient completion budget')
-            payload = json.loads(kwargs['messages'][0]['content'][0]['text'])
-            names = [row['name'] for row in payload['completed_current_turn_tools']]
-            return {'content': [{'type': 'text', 'text': json.dumps({
-                'all_material_requirements_enumerated': True,
-                'material_requirements': [{'requirement': '指定日の条件を確認。', 'requirement_kind': 'fact',
-                    'evidence_subject_id': 'condition', 'eligible_evidence_tool_names': names}]})}]}
-    model = Model()
-    state = {'orchestrator': SimpleNamespace(model_client=model), 'tool_registry': ToolRegistry(),
-             'user_message': '指定日の条件を確認。', 'tool_flow_context': {
-                 'scheduled_task_run': True, 'scheduled_alert_delivery_mode': 'verified_matches_only'}}
-    results = [ToolResult('read', 'browser_extract_text', 'completed', {'text': 'selected date'})]
-    first = _extract_completion_requirement_contract(state, tool_results=results)
-    assert first
-    assert _extract_completion_requirement_contract(state, tool_results=iter(results)) == first
-    assert model.calls == 1
-    results.append(ToolResult('detail', 'browser_extract_detail', 'completed', {'text': 'seat state'}))
-    assert _extract_completion_requirement_contract(state, tool_results=results)
-    assert model.calls == 1
-    state['user_message'] = '別の日付を確認。'
-    assert _extract_completion_requirement_contract(state, tool_results=results)
-    assert model.calls == 2
 
 
 @pytest.mark.parametrize('task', ['指定日の条件を確認。', 'Verifica la condición de la fecha.'])

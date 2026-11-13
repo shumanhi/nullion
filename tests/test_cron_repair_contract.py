@@ -172,22 +172,3 @@ def test_completed_html_bundle_keeps_files_and_caption_without_review(tmp_path):
     assert result['artifacts'] == [str(path) for path in paths]
     assert result['text'] == 'Saved caption'
     assert client.calls == []
-
-
-def test_html_review_preserves_generic_nested_metrics_and_required_work_policy():
-    from nullion.cron_delivery import _instruction_aware_cron_html
-    seen=[]
-    class Model:
-        def create(self,**kw):
-            payload=json.loads(kw['messages'][0]['content'][0]['text']);seen.append(payload)
-            data=json.dumps(payload['verified_tool_evidence'])
-            assert '37.5' in data and '2030-11-04T19:30:00Z' in data and 'sensor' in data
-            assert 'Missing required facts' in kw['system']
-            assert 'unless the saved instructions explicitly forbid partial' not in kw['system']
-            return {'content':[{'type':'text','text':json.dumps({'requirements_satisfied':True,'html':'','issues':[]})}]}
-    job=SimpleNamespace(name='検証',task='Report the reading, unit and time.',artifact_delivery_options={})
-    result={'tool_results':[{'tool_name':'lookup_sensor','status':'completed','output':{
-        'sensor':{'reading':37.5,'unit':'C','observed_at':'2030-11-04T19:30:00Z'}}}]}
-    document='<!doctype html><html><body>37.5 C, 2030-11-04T19:30:00Z</body></html>'
-    assert _instruction_aware_cron_html(job,result,model_client=Model(),existing_html=document)==document
-    assert len(seen)==1

@@ -10,7 +10,9 @@ approvals, settings, and local data under your control.
 Under the hood, Nullion uses LangGraph workflows to route tasks, approvals, file
 delivery, and follow-ups through predictable steps. Its security model keeps
 tool access, workspace boundaries, provider accounts, and human approvals
-separate, so powerful actions stay scoped and reviewable.
+separate, so powerful actions stay scoped and reviewable. The primary agent owns
+its answer without a separate AI reviewer; permissions, approvals, file integrity
+and delivery acknowledgements remain enforced by the runtime.
 
 Online docs: https://www.nullion.ai/docs/
 

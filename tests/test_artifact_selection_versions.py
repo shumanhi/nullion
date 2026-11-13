@@ -61,21 +61,41 @@ def test_unrequested_or_unproduced_format_cannot_supply_native_pack_selection():
 
 
 @pytest.mark.parametrize('case',['ready','new_target','missing_format','already_reviewed','executed_failure','missing_file'])
-def test_rejected_retained_overwrite_enters_review_only_with_a_current_native_package(tmp_path,case):
+@pytest.mark.parametrize('editor', ['file_write', 'file_patch', 'opaque_editor'])
+def test_rejected_retained_overwrite_enters_review_only_with_a_current_native_package(tmp_path,case,editor):
     from nullion.agent_orchestrator import _retained_artifact_reproposal_paths
     from nullion.tool_repair_contract import plan_revision_recovery
-    from nullion.tools import ToolInvocation
+    from nullion.tools import ToolInvocation, ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass
     paths=[str(tmp_path/'a.csv'),str(tmp_path/'b.html')]
     for path in paths:
         from pathlib import Path
         Path(path).write_text('Current requested content')
     rows=[ToolResult(str(i),'file_write','completed',{'artifact_path':path}) for i,path in enumerate(paths)]
-    state={'tool_flow_context':{'required_artifact_extensions':['.csv','.html']},'tool_results':rows}
+    registry = ToolRegistry()
+    registry.register(ToolSpec(editor, 'Edit an artifact', ToolRiskLevel.LOW, ToolSideEffectClass.WRITE, False, 2),
+        lambda inv: pytest.fail('Rejected edit must not run'))
+    state={'tool_registry':registry,'tool_flow_context':{'required_artifact_extensions':['.csv','.html']},'tool_results':rows}
     if case=='missing_format':rows.pop()
     if case=='already_reviewed':state['artifact_selection_nudged']=True
     if case=='missing_file':Path(paths[1]).unlink()
-    result=ToolResult('rejected','file_write','failed',{'reason':'request_plan_conflict','executed':False,
-        'review_decision':'revise','retryable':True,'recovery':plan_revision_recovery('file_write')})
+    result=ToolResult('rejected',editor,'failed',{'reason':'request_plan_conflict','executed':False,
+        'review_decision':'revise','retryable':True,'recovery':plan_revision_recovery(editor)})
     if case=='executed_failure':result.output['executed']=True
-    invocation=ToolInvocation('rejected','file_write','p',{'path':str(tmp_path/'new.csv') if case=='new_target' else paths[0]})
+    invocation=ToolInvocation('rejected',editor,'p',{'path':str(tmp_path/'new.csv') if case=='new_target' else paths[0]})
     assert _retained_artifact_reproposal_paths(state,invocation,result,rows)==(paths if case=='ready' else [])
+
+
+@pytest.mark.parametrize('effect', ['read', 'account_write', 'dangerous_exec'])
+def test_nonlocal_write_tools_cannot_enter_artifact_edit_recovery(tmp_path, effect):
+    from nullion.agent_orchestrator import _retained_artifact_reproposal_paths
+    from nullion.tool_repair_contract import plan_revision_recovery
+    from nullion.tools import ToolInvocation, ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass
+    path = tmp_path/'report.html'; path.write_text('<html>Existing report</html>')
+    registry = ToolRegistry()
+    registry.register(ToolSpec('opaque', 'Adapter', ToolRiskLevel.LOW, ToolSideEffectClass(effect), False, 2),
+        lambda inv: pytest.fail('Discovery must not execute'))
+    rows = [ToolResult('producer', 'file_write', 'completed', {'artifact_path':str(path)})]
+    result = ToolResult('rejected', 'opaque', 'failed', {'reason':'request_plan_conflict','executed':False,
+        'review_decision':'revise','retryable':True,'recovery':plan_revision_recovery('opaque')})
+    state = {'tool_registry':registry,'tool_results':rows,'tool_flow_context':{'required_artifact_extensions':['.html']}}
+    assert not _retained_artifact_reproposal_paths(state, ToolInvocation('rejected','opaque','p',{'path':str(path)}), result, rows)

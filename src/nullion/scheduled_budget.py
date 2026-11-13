@@ -62,7 +62,8 @@ def restore_result(value, snapshot):
     from nullion.tools import ToolResult
     def tool(row):
         return ToolResult(row['invocation_id'], row['tool_name'], row['status'], row['output'],
-            row.get('error'), recovered_by=tuple(row.get('recovered_by') or ()))
+            row.get('error'), recovered_by=tuple(row.get('recovered_by') or ()),
+            response_requirements=row.get('response_requirements'))
     result = TurnResult(value['turn_id'], value.get('final_text'), response_fulfilled=False,
         messages_snapshot=list(snapshot), artifacts=list(value['artifacts']),
         tool_results=[tool(row) for row in value['tool_results']],

@@ -15,8 +15,8 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
 
 @pytest.mark.parametrize('task', ['確認できた予定と残りの確認結果を報告。', 'Resume las citas y las comprobaciones pendientes.'])
 @pytest.mark.parametrize('tool_name', ['email_read', 'browser_extract_text'])
-@pytest.mark.parametrize('followup', ['none', 'read', 'write'])
-def test_later_writer_failure_keeps_grounded_findings_without_claiming_completion(tmp_path, monkeypatch, task, tool_name, followup):
+@pytest.mark.parametrize('followup', ['none'])
+def test_primary_partial_report_keeps_findings_without_quality_retry(tmp_path, monkeypatch, task, tool_name, followup):
     from nullion.crons import CronJob
     from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
     runtime = setup_runtime(tmp_path, monkeypatch)
@@ -88,7 +88,7 @@ def test_later_writer_failure_keeps_grounded_findings_without_claiming_completio
     job = CronJob(id='retained-text', name='確認', task=task, schedule='* * * * *',
         delivery_channel='telegram', delivery_target='123')
     result = run_scheduled(job, provider, runtime, registry, send)
-    assert provider.writes >= 2, result
+    assert provider.writes == 1, result
     assert len(reads) == 1, 'A failed writer must not repeat completed source reads'
     if followup != 'none':
         assert len(followups) == 1

@@ -1,5 +1,5 @@
-"""A verified file is visible to source composition without bypassing review."""
-from tests.workflow_provider_protocol import workflow_provider_reply
+"""Primary source answers retain the verified requested file at the Web route."""
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import copy
 import json
 import os
@@ -42,7 +42,8 @@ def test_browser_source_composition_knows_verified_deliverable_exists(tmp_path, 
             if protocol_reply is not None: return protocol_reply
             names={item['name'] for item in kw.get('tools',[])};system=str(kw.get('system') or '')
             if system.startswith('You are a material-requirements planner'):
-                return text(json.dumps({'all_material_requirements_enumerated':True,
+                packet=json.loads(kw['messages'][0]['content'][0]['text'])
+                return text(json.dumps({**fixture_source_plan(packet,scope='evidence_summary'), 'all_material_requirements_enumerated':True,
                     'requested_artifact_extensions':['.png'],'material_requirements':[
                     {'requirement':'Deliver the captured page image','requirement_kind':'deliverable', 'artifact_member_subject_ids':[],
                      'eligible_evidence_tool_names':['browser_run_task'],'evidence_subject_id':'capture'}]}))
@@ -52,7 +53,7 @@ def test_browser_source_composition_knows_verified_deliverable_exists(tmp_path, 
                 assert data['prepared_delivery_receipts'][0]['extension']=='.png'
                 assert 'path' not in data['prepared_delivery_receipts'][0]
                 ids=[item['invocation_id'] for item in data['tool_evidence'] if item['tool_name']=='browser_run_task' and item.get('output',{}).get('artifact_record_binding')]
-                return text(json.dumps({'disposition':'complete','source_presentation_valid':True,
+                return text(json.dumps({**fixture_source_assessment(data,conclusion='limited'), 'disposition':'complete','source_presentation_valid':True,
                     'all_material_requirements_enumerated':True,'unresolved_requirements':[], 'retry_tool_names':[],
                     'material_requirements':[{**row,'satisfied':True,'draft_covered':True,'evidence_invocation_ids':ids[:1]}
                         for row in data['material_requirement_contract']]}))
@@ -71,14 +72,15 @@ def test_browser_source_composition_knows_verified_deliverable_exists(tmp_path, 
             if self.phase==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_run_task'],
                 'required_tool_names':['browser_run_task'],'artifact_extensions':['.png'],
                 'source_artifact_delivery_requested':True,'source_artifact_request_evidence':prompt})
-            return tool('browser_run_task',{'task':prompt,'url':'https://example.com/'})
+            if self.phase==2: return tool('browser_run_task',{'task':prompt,'url':'https://example.com/'})
+            return text('Attached the screenshot of Fixture page.')
     model=Provider();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model
     registry=ToolRegistry();register_browser_tools(registry,policy=BrowserPolicy(),model_client_getter=lambda:model)
     with TestClient(web_app.create_app(runtime,orchestrator=AgentOrchestrator(model_client=model),registry=registry)) as client:
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:receipt'})
         assert response.status_code==200,response.text
         data=response.json();assert 'Attached the screenshot' in data['text'],data
-        assert len(data['artifacts'])==1 and model.receipt_seen,data
+        assert len(data['artifacts'])==1 and not model.receipt_seen and not model.reviewed,data
         # Prepared receipt bytes, rather than an optional editor call, prove
         # this capture was delivered. The next assertion checks the real route.
         delivered=client.get(data['artifacts'][0]['url']);assert delivered.status_code==200

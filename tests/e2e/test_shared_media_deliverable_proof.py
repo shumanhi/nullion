@@ -116,7 +116,7 @@ def test_shared_download_is_support_not_a_duplicate_deliverable(tmp_path,monkeyp
                     assert any('PAGE' in value.split() for value in fields)
         turns=[row for row in runtime.store.list_conversation_events(cid) if row.get('event_type')=='conversation.chat_turn']
         assert turns[-1]['response_fulfilled'] is True
-        assert model.reviews==1 and len(downloaded)==1 and len(collected)==1
+        assert model.reviews == 0 and len(downloaded) == 1 and (len(collected) == 1)
         from nullion.search_coverage import discovery_ledger
         ledger=discovery_ledger(turns[-1]['tool_results'])
         assert any(row['url']==final_url for row in ledger['observed_sources'])

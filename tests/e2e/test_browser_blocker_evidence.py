@@ -127,7 +127,7 @@ def test_disabled_requested_choice_reaches_web_as_grounded_blocker(tmp_path,monk
             assert report['report_status']=='blocked' and report['observations'][0]['control_state']['disabled'] is True
             assert report['observations'][0]['evidence_kind']=='source_blocker' and not result.json()['artifacts']
             assert turns[-1].get('response_fulfilled') is True,json.dumps({'turn':turns[-1],'events':runtime.store.list_conversation_events(cid)},ensure_ascii=False)
-            assert model.browser_calls==2 and model.plans==(2 if replan else 1)
+            assert model.browser_calls == 2 and model.plans == 0
             history=client.get('/api/chat/history/'+cid+'?sync_runtime=1').json()['messages']
             assert any(r['role']=='bot' and detail in r['text'] for r in history)
     finally:server.shutdown();server.server_close()

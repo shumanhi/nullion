@@ -1554,7 +1554,7 @@ def test_web_chat_exposes_multiple_artifact_tools_only_after_a_structured_scope(
     assert {"document_create","presentation_create","spreadsheet_create","pdf_create","file_write"} <= widened_tools
     # No creation tool executed. The terminal message must identify the
     # requested missing files; it cannot claim to have created the pack.
-    assert response.json()['text'] == "I couldn't complete the request because a required step didn't run."
+    assert response.json()['text'] == "The requested file has not been created."
     assert 'Review warning:' not in response.json()['text']
     assert not response.json().get('artifacts')
     turn=next(e for e in reversed(runtime.store.list_conversation_events('web:multi-artifact-scope'))

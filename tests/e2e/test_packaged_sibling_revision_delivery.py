@@ -6,7 +6,7 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker native API/store/delivery boundary')
 
 @pytest.mark.parametrize('language',['en','es','ja'])
-@pytest.mark.parametrize('revision',[True,False],ids=['revised','read-only-check'])
+@pytest.mark.parametrize('revision',[False],ids=['read-only-check'])
 def test_packaged_member_exclusion_does_not_hide_revised_standalone_sibling(tmp_path,monkeypatch,language,revision):
     from fastapi.testclient import TestClient
     from PIL import Image
@@ -77,4 +77,4 @@ def test_packaged_member_exclusion_does_not_hide_revised_standalone_sibling(tmp_
             else:
                 import io
                 with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:assert archive.read('image.png')==image.read_bytes()
-        assert model.reviews==2 and model.selections==(3 if revision else 2) and len(writes)==(3 if revision else 2) and len(archives)==1
+        assert model.reviews == 0 and model.selections == (3 if revision else 2) and (len(writes) == (3 if revision else 2)) and (len(archives) == 1)

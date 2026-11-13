@@ -47,22 +47,3 @@ def test_source_capture_alone_does_not_turn_an_ordinary_answer_into_an_attachmen
     context = _completion_review_request_context({'artifacts': ['/retained/source.png'],
         'tool_results': [ToolResult('owned', 'record_read', 'completed', {'value': 7})]})
     assert context['report_presentation_contract']['report_delivery_context']['delivery_role'] == 'standalone_report'
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('required', [False, True])
-async def test_delegated_helper_receives_same_typed_delivery_context(required):
-    import json
-    from nullion.deep_agent_runner import _scheduled_task_completion_decision
-    calls = []
-    class Provider:
-        def create(self, **kw):
-            calls.append(kw)
-            return {'content': [{'type': 'text', 'text': '{"status":"success","answer":"結果"}'}]}
-    config = SimpleNamespace(task=SimpleNamespace(description='Resultado acordado.', metadata={
-        'scheduled_task_run': True, 'requires_artifact_delivery': required}))
-    await _scheduled_task_completion_decision(config, output_text='結果', tool_results=[], model_client=Provider(),
-        report_presentation={'report_presentation': 'structured'})
-    packet = json.loads(calls[0]['messages'][0]['content'][0]['text'])
-    assert packet['report_delivery_context']['delivery_role'] == ('artifact_summary' if required else 'standalone_report')
-    assert len(calls) == 1

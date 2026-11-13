@@ -69,31 +69,6 @@ def test_observer_metadata_survives_later_runtime_checkpoint(tmp_path):
     assert rows[0]['event_type'] == 'timing'
 
 
-def test_requirement_transport_retry_uses_larger_budget_and_is_request_bounded():
-    import json
-    from types import SimpleNamespace
-    from nullion.agent_orchestrator import _extract_completion_requirement_contract
-    from nullion.model_clients import ModelClientTimeoutError
-    from nullion.tools import ToolRegistry, ToolResult, ToolSpec, ToolRiskLevel, ToolSideEffectClass
-    registry = ToolRegistry()
-    registry.register(ToolSpec('lookup', 'Read selected source', ToolRiskLevel.LOW,
-        ToolSideEffectClass.READ, False, 2), lambda inv: None)
-    class Provider:
-        budgets = []
-        reasoning_effort = 'high'
-        def create(self, **kw):
-            self.budgets.append(kw['timeout'])
-            raise ModelClientTimeoutError('Controlled slow transport')
-    provider = Provider()
-    state = {'orchestrator': SimpleNamespace(model_client=provider), 'tool_registry': registry,
-        'user_message': '選択した情報を確認して。', 'tool_results': [ToolResult('r', 'lookup', 'completed', {'count': 1})]}
-    for _ in range(6):
-        assert _extract_completion_requirement_contract(state) == ()
-    assert provider.budgets == [60, 60]
-    assert provider.reasoning_effort == 'high'
-    state['user_message'] = '別の対象を確認。'
-    _extract_completion_requirement_contract(state)
-    assert provider.budgets == [60, 60, 60]
 
 
 def test_cron_repair_budget_retains_late_check_scope_and_identity():

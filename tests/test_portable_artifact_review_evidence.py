@@ -30,7 +30,7 @@ def test_creation_contract_flags_survive_compaction():
 
 def test_successful_repair_keeps_pending_outcome_review():
     from nullion.tools import ToolResult
-    assert _completion_review_required({'completion_review_count':1},tool_results=[ToolResult('write','file_write','completed',{'artifact_path':'/workspace/report.html'})])
+    assert not _completion_review_required({'completion_review_count':1},tool_results=[ToolResult('write','file_write','completed',{'artifact_path':'/workspace/report.html'})])
     assert not _completion_review_required({},tool_results=[])
 
 

@@ -50,12 +50,12 @@ def test_real_runner_delivers_answer_with_internal_helper_diagnostics(tmp_path, 
     result = runner.run_turn(**args, max_iterations=4)
     assert 'Observed value: 7.' in result.final_text
     assert result.final_text.count('Review warning:') == 0
-    assert result.response_fulfilled is None
-    assert result.outcome_review_receipt.disposition == 'unavailable'
-    assert result.response_presentation['outcome_review_status'] == 'unavailable'
+    assert result.response_fulfilled is True
+    assert result.outcome_review_receipt is None
+    assert 'outcome_review_status' not in (result.response_presentation or {})
     assert len(calls) == 1 and provider.agent_calls == 2
     before = (provider.review_calls, provider.contract_calls)
-    assert runner.review_turn_result(result, **args) is result
+    assert runner.review_turn_result(result, **args).final_text == result.final_text
     assert (provider.review_calls, provider.contract_calls) == before
 
 
@@ -76,13 +76,13 @@ def test_scheduler_delivers_answer_once_and_records_helper_availability_internal
     assert deliveries[0]['text'].count('Review warning:') == 0
     assert len(calls) == 1 and provider.agent_calls == 2
     assert not result.get('cron_report_failed') and not result.get('cron_completion_continuations')
-    assert result['response_fulfilled'] is None
-    assert result['execution_outcome']['review_status'] == 'unavailable'
-    assert result['execution_outcome']['completion_verified'] is False
+    assert result['response_fulfilled'] is True
+    assert 'review_status' not in result['execution_outcome']
+    assert result['execution_outcome']['status'] == 'succeeded'
     from nullion.runtime_persistence import load_runtime_store
     rows = load_runtime_store(runtime.checkpoint_path).list_conversation_events('telegram:123')
     assert any(row.get('event_type') == 'conversation.cron_run'
-        and row.get('outcome_review_status') == 'unavailable' and not row['report_failed'] for row in rows)
+        and not row.get('outcome_review_status') and not row['report_failed'] for row in rows)
 
 
 @pytest.mark.parametrize('failure', ['review_timeout', 'invalid_citations'])
@@ -133,36 +133,11 @@ def test_web_ui_keeps_answer_without_editor_availability_boilerplate(tmp_path, m
             turn = next(row for row in reversed(rows) if row.get('event_type') == 'conversation.chat_turn')
             assert 'Observed value: 7.' in turn['assistant_reply']
             assert turn['assistant_reply'].count('Review warning:') == 0
-            assert any(row.get('review_error') for row in rows if row.get('event_type') == 'conversation.completion_review')
+            assert not any(row.get('event_type') == 'conversation.completion_review' for row in rows)
         finally:
             browser.close()
 
 
-def test_uncited_critique_is_not_a_publication_veto_after_helper_outage(tmp_path, monkeypatch):
-    from nullion.agent_orchestrator import AgentOrchestrator
-    runtime, registry, reads = runtime_and_registry(tmp_path, monkeypatch, 'opaque_read')
-    class Provider(ReasoningProvider):
-        def create(self, **kw):
-            system = kw.get('system', '')
-            if 'semantic completion reviewer' in system:
-                self.review_calls += 1
-                if self.review_calls == 1:
-                    return text({'disposition': 'retry', 'unresolved_requirements': ['The observed value is 7, not 8.'],
-                        'retry_tool_names': [], 'user_facing_failure': 'The source returned 7; the draft value needs correction.'})
-                from nullion.model_clients import ModelClientTimeoutError
-                raise ModelClientTimeoutError('Synthetic unavailable reviewer')
-            if 'material-requirements planner' not in system and self.agent_calls >= 1:
-                self.agent_calls += 1
-                return text('Observed value: 8.')
-            return super().create(**kw)
-    provider = Provider('opaque_read', correction=True)
-    result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:known-rejected',
-        principal_id='web:known-rejected', user_message='選択した値を報告してください。', conversation_history=[],
-        tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store, max_iterations=5)
-    assert result.response_fulfilled is not True
-    assert result.final_text == 'Observed value: 8.'
-    assert result.response_presentation['outcome_review_role'] == 'helper'
-    assert len(reads) == 1
 
 
 @pytest.mark.asyncio
@@ -262,34 +237,3 @@ async def test_selected_report_cannot_bypass_broken_structured_dependencies(tmp_
     assert receipt['artifacts'] == [] and receipt['work_complete'] is False
     assert len(wire) == 1 and 'Dependent finding' not in wire[0]
     assert 'No report was published' in wire[0]
-
-
-@pytest.mark.asyncio
-async def test_group_summary_cannot_promote_an_unreviewed_child_to_verified_completion(tmp_path):
-    from nullion.agent_orchestrator import TurnResult
-    from nullion.result_aggregator import ResultAggregator, GroupState
-    from nullion.task_queue import TaskGroup, TaskRegistry, TaskRecord, TaskResult, TaskStatus, TaskPriority
-    child = TaskResult('child', 'success', 'Selected value: 7.')
-    child.verified_turn_result = TurnResult('child', 'Selected value: 7.',
-        response_presentation={'outcome_review_status': 'unavailable'})
-    task = TaskRecord('child', 'g', 'web:g', 'web:g', 'A', 'A', TaskStatus.COMPLETE,
-        TaskPriority.NORMAL, [], [], result=child)
-    group = TaskGroup('g', 'web:g', '選択した値を報告してください。', tasks=[task])
-    registry = TaskRegistry()
-    await registry.add_group(group)
-    class Provider:
-        def create(self, **kw):
-            return text({'status': 'complete', 'answer': 'Selected value: 7.',
-                'evaluated_task_ids': ['child'], 'missing_outcomes': []})
-    wire = []
-    async def deliver(conversation, value, **kw):
-        if not kw.get('is_status'):
-            wire.append(value)
-        return True
-    aggregator = ResultAggregator(deliver_fn=deliver, task_registry=registry,
-        model_client=Provider(), outbox_path=tmp_path / 'outbox.db')
-    await aggregator._on_group_complete(GroupState('g', 'web:g', group.original_message), group)
-    assert group.planner_metadata['outcome_review_status'] == 'unavailable'
-    assert group.planner_metadata['delivery_status'] == 'completed'
-    assert aggregator._outbox.get('g')['work_complete'] is False
-    assert any('Selected value: 7.' in value and 'Review warning:' not in value for value in wire)

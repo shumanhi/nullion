@@ -79,20 +79,20 @@ def test_monitor_verifies_selected_scope_before_alerting(tmp_path,monkeypatch,ta
                       'satisfied':good,'draft_covered':good,'evidence_invocation_ids':ids[-1:] if good else []}]}))
             if system.startswith('Classify delivery'):
                 return text(json.dumps({'decision':'send' if outcome=='match' else 'silent',
-                                       'reason':'verified_match' if outcome=='match' else 'no_verified_match'}))
+                                       'reason':'verified_match' if outcome=='match' else 'insufficient_evidence' if outcome=='unverified' else 'no_verified_match'}))
             if system.startswith('You repair scheduled-task final answers'):
                 return text(json.dumps({'requirements_satisfied':False,'source_state':'available','evidence_refs':['e0'],
                     'delivery_decision':'send','delivery_reason':'report','report':'Requested date could not be verified.'}))
             if not kw.get('tools'):return text('{}')
             self.main+=1
-            actions=[('browser_navigate',{'url':url}),('browser_extract_text',{}),None,
+            actions=[('browser_navigate',{'url':url}),('browser_extract_text',{}),
                      ('browser_select_combobox',{'label':date_label,'query':'2026-10-16','expected_text':'2026-10-16'})]
             if outcome=='match':actions += [('browser_click',{'selector':'#showtime'}),('browser_extract_text',{})]
             else:actions += [('browser_extract_text',{})]
             action=actions[self.main-1] if self.main<=len(actions) else None
             if action:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(self.main),'name':action[0],'input':action[1]}]}
-            if self.main==3 or outcome=='unverified':return text('The requested screening has not yet been verified.')
+            if outcome=='unverified':return text('The requested screening has not yet been verified.')
             return text('Verified screening: Venue Z, IMAX, October 16 at 20:00, seat A1 available.' if outcome=='match'
                         else 'The selected date was checked and there are no qualifying screenings.')
     def text(value):return {'stop_reason':'end_turn','content':[{'type':'text','text':value}]}
@@ -116,7 +116,7 @@ def test_monitor_verifies_selected_scope_before_alerting(tmp_path,monkeypatch,ta
         (tmp_path/'browser-monitor-evidence.json').write_text(json.dumps({'reviews':reviews,'tools':[(r.tool_name,r.status,r.output) for r in observations if r.status!='running']},ensure_ascii=False,default=str))
         record_property('model_calls',provider.calls)
         record_property('completion_reviews',len(reviews))
-        assert reviews and reviews[0]['draft_final_response']=='The requested screening has not yet been verified.'
+        assert not reviews
         assert any(r.tool_name=='browser_select_combobox' for r in observations)
         assert len(sent)==(1 if outcome=='match' else 0), {'result':result,'reviews':reviews,'tools':[(r.tool_name,r.status,r.output) for r in observations if r.status!='running']}
         if outcome=='unverified':

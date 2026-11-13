@@ -122,41 +122,8 @@ def test_exact_source_quote_survives_an_unsupported_value_rewrite(rewrite):
     assert compact_source_observations(result)['evidence_value_repair_count'] == 1
 
 
-@pytest.mark.parametrize('repaired', [False, True])
-def test_every_source_answer_receives_semantic_completion_review(monkeypatch, repaired):
-    from nullion import agent_orchestrator as agent
-    from test_source_failure_preservation import source_state
-    state = source_state()
-    output = state['tool_results'][0].output
-    output.update(report_status='completed', unknowns=[], evidence_value_repair_count=int(repaired))
-    state['source_answer_checkpoint']['presentation']['limitation_ids'] = []
-    state['content'] = [{'type': 'tool_use', 'name': 'present_source_answer',
-                         'input': state['source_answer_checkpoint']['presentation']}]
-    calls = []
-    def review(*args, **kwargs):
-        calls.append(kwargs)
-        return agent._CompletionReviewDecision('complete')
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', review)
-    result = agent._complete_partial_source_report(state, '')
-    assert calls  # Raw and repaired evidence both require goal review.
-    if repaired: assert calls[0]['force'] is True
-    assert result['result'].response_fulfilled
 
 
-def test_a_genuine_but_irrelevant_quote_cannot_complete_the_request(monkeypatch):
-    from nullion import agent_orchestrator as agent
-    from test_source_failure_preservation import source_state
-    state = source_state()
-    output = state['tool_results'][0].output
-    output.update(report_status='completed', unknowns=[], evidence_value_repair_count=1)
-    output['observations'] = [{'value': 'Welcome', 'quote': 'Welcome'}]
-    presentation = state['source_answer_checkpoint']['presentation']
-    presentation.update(intro='', limitation_ids=[])
-    state['content'] = [{'type': 'tool_use', 'name': 'present_source_answer', 'input': presentation}]
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **kw:
-        agent._CompletionReviewDecision('blocked', ('The requested price was not established',), ()))
-    result = agent._complete_partial_source_report(state, '')
-    assert result['result'].response_fulfilled is not True
 
 
 def field_records():
@@ -210,19 +177,6 @@ def test_deduplication_cannot_move_an_excerpt_between_capture_contexts():
         render_source_answer(results, {'intro': '', 'points': [point], 'limitation_ids': []})
 
 
-def test_grouped_fields_force_relationship_review(monkeypatch):
-    from nullion import agent_orchestrator as agent
-    from test_source_failure_preservation import source_state
-    state = source_state(); state['tool_results'] = field_records()
-    state['content'] = [{'type': 'tool_use', 'name': 'present_source_answer',
-                         'input': grouped_presentation(state['tool_results'])}]
-    calls = []
-    def review(*args, **kwargs):
-        calls.append(kwargs)
-        return agent._CompletionReviewDecision('blocked', ('Relationship not established',), ())
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', review)
-    result = agent._complete_partial_source_report(state, '')
-    assert calls and result['result'].response_fulfilled is not True
 
 
 @pytest.mark.parametrize('groups', [True, False])
@@ -244,17 +198,6 @@ def test_grouping_is_order_independent_when_candidates_share_a_price(groups):
     assert text.count('€73') == 2
 
 
-def test_child_step_completion_always_requires_full_parent_review(monkeypatch):
-    from nullion import agent_orchestrator as agent
-    from test_source_failure_preservation import source_state
-    state = source_state(); output = state['tool_results'][0].output
-    output.update(report_status='completed', unknowns=[], completion_scope='tool_step')
-    presentation = state['source_answer_checkpoint']['presentation']; presentation.update(intro='', limitation_ids=[])
-    state['content'] = [{'type': 'tool_use', 'name': 'present_source_answer', 'input': presentation}]
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **kw:
-        agent._CompletionReviewDecision('blocked', ('The other comparison side is still missing',), ()))
-    result = agent._complete_partial_source_report(state, '')
-    assert result['result'].response_fulfilled is not True
 
 
 def test_browser_step_keeps_parent_constraints_without_restarting_other_steps():
@@ -266,33 +209,6 @@ def test_browser_step_keeps_parent_constraints_without_restarting_other_steps():
     assert 'parent owns and reviews the combined full request' in objective
 
 
-@pytest.mark.parametrize('timeout', [7, 31])
-@pytest.mark.parametrize('row_count', [1, 12])
-def test_forced_review_honors_configured_deadline_and_sizes_coverage_output(monkeypatch, timeout, row_count):
-    from nullion import agent_orchestrator as agent
-    import time
-    from test_source_failure_preservation import source_state
-    state = source_state(); calls = []
-    elapsed = [0.0]
-    class Clock:
-        def __getattr__(self, name): return getattr(time, name)
-        def perf_counter(self): return elapsed[0]
-    monkeypatch.setattr(agent, 'time', Clock())
-    rows = [agent._CompletionRequirementContractRow(requirement_id=f'r{i}', requirement='各候補の必要な条件を確認する。' * 15,
-        requirement_kind='fact', evidence_subject_id=f's{i}', eligible_evidence_tool_names=('source_reader',)) for i in range(row_count)]
-    monkeypatch.setattr(agent, '_extract_completion_requirement_contract', lambda *a, **kw: rows)
-    monkeypatch.setenv('NULLION_COMPLETION_REVIEW_TIMEOUT_SECONDS', str(timeout))
-    class Model:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            elapsed[0] += 1.0
-            return {'content': [{'type': 'text', 'text': '{}'}]}
-    state['orchestrator'] = SimpleNamespace(model_client=Model())
-    agent._review_risky_agent_completion(state, final_text='結果', tool_results=state['tool_results'], artifacts=[], force=True)
-    assert len(calls) == 2
-    assert [call['timeout'] for call in calls] == [timeout, timeout - 1]
-    assert calls[0]['max_tokens'] >= 1100
-    if row_count == 12: assert calls[0]['max_tokens'] > 1100
 
 
 @pytest.mark.parametrize('known', [True, False])
@@ -374,26 +290,6 @@ def test_main_document_coverage_is_runtime_owned_and_survives_compaction():
     assert rows[1]['whole_document_capture_ids'] == [[]]
 
 
-@pytest.mark.parametrize('disposition', ['complete', 'blocked'])
-@pytest.mark.parametrize('status', ['completed', 'partial'])
-def test_interpreted_intro_requires_independent_review_and_never_leaks_on_failure(monkeypatch, disposition, status):
-    from nullion import agent_orchestrator as agent
-    from test_source_failure_preservation import source_state
-    state = source_state(); output = state['tool_results'][0].output
-    output.update(report_status=status, next_action='report', unknowns=['Producer could not interpret the missing field'] if status == 'partial' else [])
-    presentation = {**state['source_answer_checkpoint']['presentation'], 'intro': 'No delivery date is shown on this page.',
-        'intro_evidence_ids': ['e0.0'], 'limitation_ids': []}
-    state['content'] = [{'type': 'tool_use', 'name': 'present_source_answer', 'input': presentation}]
-    calls = []
-    def review(*args, **kwargs):
-        calls.append(kwargs)
-        return agent._CompletionReviewDecision(disposition, () if disposition == 'complete' else ('Contradicted by the page',), ())
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', review)
-    result = agent._complete_partial_source_report(state, '')['result']
-    assert calls
-    assert (result.response_fulfilled is True if disposition=='complete' else result.response_fulfilled is not True)
-    assert 'No delivery date is shown' in result.final_text
-    assert '71 USD' in result.final_text
 
 
 @pytest.mark.parametrize('ids', [['missing'], ['e0.0', 'e0.0']])

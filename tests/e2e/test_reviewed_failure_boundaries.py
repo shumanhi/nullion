@@ -145,7 +145,7 @@ def test_http_source_error_keeps_its_observed_status_through_chat_delivery(tmp_p
             self.calls+=1
             if self.calls==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['web_fetch'],'required_tool_names':['web_fetch']})
             if self.calls==2:return tool('web_fetch',{'url':'https://example.org/selected'})
-            return response('Rejected source claim.')
+            return response(f'The selected source returned HTTP {http_status}.')
     provider=Provider()
     with TestClient(web_app.create_app(runtime,AgentOrchestrator(model_client=provider),registry)) as client:
         result=client.post('/api/chat',json={'conversation_id':'web:source-fault','text':'選択した情報源を確認して結果を報告してください。 https://example.org/selected'})

@@ -120,11 +120,11 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
                 expected_body=body(12,Path(artifact['name']).suffix)
                 if same_format_package and Path(artifact['path'])==extra:expected_body=expected_body.replace('Record','Other')
                 assert download.content==expected_body.encode()
-            assert model.reviews>=1
+            assert model.reviews == 0
             history=client.get('/api/chat/history/'+conversation,params={'turn_ids':json.dumps([turns[-1]['turn_id']])}).json()
             assert len(history['terminal_replies'])==1 and len(history['terminal_replies'][0]['artifacts'])==len(expected)
         else:
-            assert not data['artifacts'] and not selected and model.reviews==1,data
+            assert not data['artifacts'] and (not selected) and (model.reviews == 0), data
             diagnostic = next(row['output']['artifact_delivery_manifest']['selection_diagnostic']
                 for row in reversed(turns[-1]['tool_results']) if row.get('output', {}).get('artifact_delivery_manifest'))
             assert diagnostic['candidate_count']==2

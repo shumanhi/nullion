@@ -6,26 +6,6 @@ from nullion.tool_repair_contract import (plan_revision_recovery, unresolved_pla
     exhausted_plan_revision_tool)
 
 
-@pytest.mark.parametrize('case',['partial_observation','protocol_correction','real_conflict','mutation_conflict'])
-def test_action_review_separates_admissible_steps_from_final_coverage(case):
-    calls=[]
-    class Provider:
-        def create(self,**kw):
-            calls.append(json.loads(kw['messages'][0]['content'][0]['text']))
-            value={'decision':'proceed','issues':[], 'issue_kind':'outcome_coverage_gap','step_effect':'observation'}
-            if case=='protocol_correction' and len(calls)==1:
-                value.update(decision='revise',issues=['More evidence may be needed later.'])
-            elif case in {'real_conflict','mutation_conflict'}:
-                value.update(decision='revise',issue_kind='concrete_conflict',
-                    step_effect='mutation' if case=='mutation_conflict' else 'observation',issues=['対象が違います。'])
-            return {'content':[{'type':'text','text':json.dumps(value)}]}
-    spec=ToolSpec('opaque_action','Inspect a selected resource',ToolRiskLevel.HIGH,ToolSideEffectClass.DANGEROUS_EXEC,True,3)
-    result=assess_action(model_client=Provider(),request='選択した対象を調べて。',context={},
-        invocation=ToolInvocation('i','opaque_action','p',{'target':'a'}),spec=spec,evidence=[],now='2026-11-03T00:00:00Z')
-    assert result.decision==('revise' if case in {'real_conflict','mutation_conflict'} else 'proceed')
-    assert len(calls)==(2 if case=='protocol_correction' else 1)
-    assert result.error is None
-    assert ('protocol_validation_errors' in calls[-1]) is (case=='protocol_correction')
 
 
 def rejected(ident,tool='opaque_action'):

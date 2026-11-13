@@ -71,7 +71,7 @@ def test_internal_working_file_is_proven_but_only_final_is_delivered(tmp_path,mo
         assert len(data['artifacts'])==1 and data['artifacts'][0]['name']=='published.docx',data
         document=Document(io.BytesIO(client.get(data['artifacts'][0]['url']).content));content=' '.join(p.text for p in document.paragraphs)
         assert '12 units' in content and '10 units' not in content
-        assert len(writes)==2 and model.reviews==1 and working.exists()
+        assert len(writes) == 2 and model.reviews == 0 and working.exists()
         turn=next(row for row in reversed(runtime.store.list_conversation_events(cid)) if row.get('event_type')=='conversation.chat_turn')
         assert turn.get('response_fulfilled') is True,turn
         history=client.get('/api/chat/history/'+cid,params={'turn_ids':json.dumps([turn['turn_id']])}).json()

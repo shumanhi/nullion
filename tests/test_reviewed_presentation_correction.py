@@ -110,38 +110,6 @@ def test_legacy_review_and_typed_partial_findings_still_preserve_their_verdict()
     assert parse(payload).supported_findings[0].text == payload['supported_findings'][0]['text']
 
 
-@pytest.mark.parametrize('changed', ['request', 'evidence', 'reply', 'file', 'selection'])
-def test_replacement_review_cache_reuses_only_the_same_outcome(tmp_path, monkeypatch, changed):
-    from nullion import agent_orchestrator as agent
-    from nullion.tools import ToolResult
-    review = replace(parse(correction_payload()), execution_satisfied=True)
-    artifact = tmp_path/'report.txt'; artifact.write_text('version one')
-    state = {'user_message': '対象を報告。', 'principal_id': 'web:one', 'conversation_id': 'web:one',
-             'tool_flow_context': {}, 'tool_results': [], 'artifacts': []}
-    results = [ToolResult('source', 'opaque_read', 'completed', {'value': 7})]
-    calls = []
-    def perform(*args, **kwargs):
-        calls.append(True)
-        return review
-    monkeypatch.setattr(agent, '_perform_completion_review', perform)
-    paths = [str(artifact)]
-    first = agent._review_risky_agent_completion(state, final_text='Old draft', tool_results=results, artifacts=paths, force=True)
-    assert first is review
-    assert agent._review_risky_agent_completion(state, final_text=review.corrected_reply,
-        tool_results=results, artifacts=paths, force=True) is review
-    assert len(calls) == 1
-    text = review.corrected_reply
-    if changed == 'request': state['user_message'] += ' 別の対象。'
-    elif changed == 'evidence': results[0].output['value'] = 8
-    elif changed == 'reply': text += ' Additional claim.'
-    elif changed == 'selection': state['source_answer_checkpoint'] = {'presentation': {'points': []}}
-    else:
-        import os
-        stamp = artifact.stat()
-        artifact.write_text('version two')
-        os.utime(artifact, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    agent._review_risky_agent_completion(state, final_text=text, tool_results=results, artifacts=paths, force=True)
-    assert len(calls) == 2
 
 
 def test_planner_rejects_an_execution_prerequisite_with_no_possible_evidence():

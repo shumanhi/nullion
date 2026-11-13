@@ -102,7 +102,7 @@ def test_linked_page_and_image_are_packaged_then_delivered_once(tmp_path,monkeyp
         with zipfile.ZipFile(io.BytesIO(client.get(next(item['url'] for item in data['artifacts'] if item['path']==str(output))).content)) as z:
             assert set(z.namelist())=={'page.html','image.png'}
             assert z.read('page.html').decode()==html and z.read('image.png')==image.read_bytes()
-        assert len(writes)==2+int(mixed_formats) and len(archives)==1 and model.selections==2 and model.reviews==1
+        assert len(writes) == 2 + int(mixed_formats) and len(archives) == 1 and (model.selections == 2) and (model.reviews == 0)
         if standalone_sibling:
             assert client.get(next(row['url'] for row in data['artifacts'] if row['path']==str(draft))).content==standalone.encode()
         linked=writes[0].output

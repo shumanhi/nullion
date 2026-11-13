@@ -69,7 +69,12 @@ def test_web_tool_reply_obeys_session_verbose_setting(tmp_path,monkeypatch,enabl
             page.goto(server.base_url,wait_until='domcontentloaded')
             box=page.locator('#user-input');expect(box).to_be_enabled(timeout=15000)
             box.fill(f'Lee {source} y responde con el valor. No cambies el archivo ni envíes adjuntos.')
-            box.press('Enter')
+            # A streamed text chunk is not a persisted terminal reply.
+            with page.expect_response(lambda response: response.request.method=='POST'
+                    and response.url.endswith('/message')
+                    and (response.request.post_data_json or {}).get('role')=='bot'
+                    and ((response.request.post_data_json or {}).get('metadata') or {}).get('history_message_kind')=='terminal_reply',timeout=20000):
+                box.press('Enter')
             bubble=page.locator('#messages .msg.bot .bubble').filter(has_text='Lectura completada: 42.')
             expect(bubble).to_have_count(1,timeout=20000)
             raw=bubble.get_attribute('data-raw-text')

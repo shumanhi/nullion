@@ -61,6 +61,7 @@ def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkey
             if not names:return text('{}')
             self.phase+=1
             if self.phase==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_run_task'],'required_tool_names':['browser_run_task']})
+            if self.phase==3:return text("The supplied reference image is retained. The remote page presented an access challenge.")
             assert self.phase==2
             return tool('browser_run_task',{'task':prompt,'url':'https://reference.example/page'})
     model=Provider();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model
@@ -74,5 +75,5 @@ def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkey
             'attachments':[{'path':str(source),'name':source.name,'media_type':'image/png'}]})
         assert result.status_code==200,result.text
         reply=result.json()['text'];assert 'reference image is retained' in reply and 'access challenge' in reply,reply
-        assert not result.json()['artifacts'] and calls==[1] and model.reviews==1
-        assert captured[-1].response_fulfilled is False and captured[-1].response_presentation['source_answer_verified'] is True
+        assert not result.json()['artifacts'] and calls == [1] and (model.reviews == 0)
+        assert captured[-1].outcome_review_receipt is None

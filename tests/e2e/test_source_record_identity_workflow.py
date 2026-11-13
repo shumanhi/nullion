@@ -59,7 +59,8 @@ def test_distinct_departures_with_one_carrier_are_delivered_once_each(tmp_path,m
             if self.step==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_run_task'],
                 'required_tool_names':['browser_run_task']})
             if self.step==2:return tool('browser_run_task',{'task':prompt,'url':'https://travel.example/results'})
-            raise AssertionError('Source composition restarted collection')
+            assert self.step==3
+            return text('**American** — 7:14 AM–10:29 AM\n\n**American** — 9:05 AM–12:16 PM')
     model=Provider();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model
     runtime.store.add_boundary_policy_rule(BoundaryPolicyRule('fixture',OPERATOR_PERMISSION_PRINCIPAL,
         BoundaryKind.OUTBOUND_NETWORK,PolicyMode.ALLOW,'*','fixture',datetime.now(UTC)))
@@ -69,7 +70,7 @@ def test_distinct_departures_with_one_carrier_are_delivered_once_each(tmp_path,m
         assert response.status_code==200,response.text
         data=response.json();reply=data['text']
         assert reply.count('**American**')==2 and all(time in reply for time in ['7:14 AM','9:05 AM','10:29 AM','12:16 PM']),reply
-        assert not data['artifacts'] and model.presentations==1 and model.reviews>=1 and len(calls)==1
+        assert not data['artifacts'] and model.presentations == 0 and (model.reviews == 0) and (len(calls) == 1)
         history=client.get('/api/chat/history/web:departures',params={'turn_ids':json.dumps(['departure-turn'])}).json()
         assert len(history['terminal_replies'])==1 and history['terminal_replies'][0]['text']==reply,history
     turns=[row for row in runtime.store.list_conversation_events('web:departures') if row.get('event_type')=='conversation.chat_turn']

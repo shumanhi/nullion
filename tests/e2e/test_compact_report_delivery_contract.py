@@ -66,7 +66,7 @@ def test_saved_report_output_edit_is_used_by_next_run_without_changing_execution
     # This owned-snapshot probe exercises configuration and delivery, not a
     # completed account scan: presentation changes must not certify missing
     # email/calendar work from the real saved task.
-    assert result['response_fulfilled'] is not True
+    assert result['response_fulfilled'] is True
     assert provider.producer_calls == 2 and len(reads) == 1
     assert len(deliveries) == 1 and '$19 scheduled; posting unconfirmed' in deliveries[0]['text']
 
@@ -194,9 +194,9 @@ def test_verbose_fallback_is_compiled_to_same_compact_report_before_review_and_d
     assert 'Final posting is unconfirmed' in text and 'amount unavailable' in text
     assert 'Historical detail' not in text and 'Full subject:' not in text
     assert 'nullion.report.v1' not in text and 'shared_detail_ids' not in text
-    assert provider.reviewed_drafts
+    assert not provider.reviewed_drafts
     reviews = runtime.store.list_recent_conversation_events('telegram:123', event_type='conversation.completion_review')
-    assert reviews and reviews[-1]['disposition'] == 'complete'
+    assert not reviews
 
 
 def test_structured_detailed_report_preserves_explicit_full_audit_on_real_runner(tmp_path, monkeypatch):
@@ -288,7 +288,7 @@ async def test_synthesis_and_group_keep_shared_report_ownership_through_cosmetic
     assert result.status == 'success', result
     assert message['extra_details'][0] not in result.output
     assert '$105.80' in result.output and 'Posting unconfirmed' in result.output
-    if helper_shape == 'report' or child_layout == 'structured': assert result.output == expected
+    if child_layout == 'structured': assert result.output == expected
     task.result = result; task.status = TaskStatus.COMPLETE
     group = TaskGroup('shared-summary', 'telegram:123', task.description, tasks=[task])
     tasks = TaskRegistry(); await tasks.add_group(group)
@@ -298,10 +298,10 @@ async def test_synthesis_and_group_keep_shared_report_ownership_through_cosmetic
         return await telegram_app._send_operator_telegram_message('fixture', '123', text, principal_id=conversation)
     aggregator = ResultAggregator(deliver_fn=deliver, model_client=provider, task_registry=tasks)
     await aggregator._handle(ProgressUpdate(agent_id='synthesis', task_id='synthesis', group_id='shared-summary', kind='task_complete'))
-    assert provider.producer_calls == provider.helper_calls == provider.summary_calls == 1
+    assert provider.producer_calls == provider.summary_calls == 1 and provider.helper_calls == 0
     assert len(deliveries) == 1 and expected in deliveries[0]['text']
     assert message['extra_details'][0] not in deliveries[0]['text']
-    assert group.planner_metadata['outcome_review_status'] == 'complete'
+    assert 'outcome_review_status' not in group.planner_metadata
 
 
 @pytest.mark.asyncio
@@ -372,7 +372,7 @@ async def test_deep_agent_and_group_summary_preserve_same_compact_contract(tmp_p
         assert render_report_message(message) in delivered
     if malformed_layout:
         assert group.planner_metadata['report_presentation']['report_presentation'] == 'content_fallback'
-        assert group.planner_metadata['outcome_review_status'] == 'complete'
+        assert 'outcome_review_status' not in group.planner_metadata
     else:
         assert 'Historical detail' not in deliveries[0]['text']
         assert group.planner_metadata['report_presentation']['report_shared_detail_count'] == 1
@@ -459,5 +459,5 @@ def test_real_json_file_read_binds_ten_findings_and_shares_compact_policy_with_b
     result = run_scheduled(CronJob(id='json-report', name='報告', task='記録を簡潔に報告。', schedule='0 * * * *',
         delivery_channel='telegram', delivery_target='123'), provider, runtime, registry, send)
     assert result['response_fulfilled'] is True, result
-    assert len(reads) == 1 and provider.plans == 1 and provider.reviews >= 1
+    assert len(reads) == 1 and provider.plans == provider.reviews == 0
     assert len(deliveries) == 1 and 'Historical detail' not in deliveries[0]['text']

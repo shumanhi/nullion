@@ -82,11 +82,11 @@ def test_single_browser_capture_supports_distinct_subjects_in_one_final_report(t
     with TestClient(web_app.create_app(runtime,orchestrator=AgentOrchestrator(model_client=model),registry=registry)) as client:
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':conversation});assert response.status_code==200,response.text;data=response.json()
         assert not model.errors,model.errors
-        assert len(data['artifacts'])==1 and model.phase==4 and model.reviews==1 and len(worker_calls)==1,data
+        assert len(data['artifacts']) == 1 and model.phase == 4 and (model.reviews == 0) and (len(worker_calls) == 1), data
         assert client.get(data['artifacts'][0]['url']).content==expected.encode()
         restored=bootstrap_persistent_runtime(tmp_path/'runtime.db')
         turns=[r for r in restored.store.list_conversation_events(conversation) if r.get('event_type')=='conversation.chat_turn']
         assert len([r for r in turns[-1]['tool_results'] if r['tool_name']=='file_write'])==1
 
         reviews=[r for r in restored.store.list_conversation_events(conversation) if r.get('event_type')=='conversation.completion_review']
-        assert reviews and reviews[-1]['disposition']=='complete' and reviews[-1].get('review_error') is None,reviews
+        assert not reviews

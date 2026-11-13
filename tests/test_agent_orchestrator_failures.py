@@ -7315,7 +7315,7 @@ def test_connector_capability_failures_recover_to_browser_scope_before_giving_up
         max_iterations=5,
     )
 
-    assert result.response_fulfilled is not True
+    assert result.response_fulfilled is True
     assert result.final_text == "Recovered with browser."
     assert [tool.tool_name for tool in result.tool_results] == [
         "connector_request",

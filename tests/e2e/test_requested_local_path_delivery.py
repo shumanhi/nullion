@@ -87,5 +87,5 @@ def test_exact_local_path_survives_real_web_turn(tmp_path,monkeypatch,prompt):
                 target_id='123',tool_results=evidence,send_text=send)
     asyncio.run(deliver())
     assert len(sent)==3 and all(path in text for text in sent),sent
-    assert len(reads)==3 and len(reviews)==3
+    assert len(reads)==3 and reviews==[]
     assert sum(elapsed)/len(elapsed)<1.5 and max(elapsed)<3,elapsed

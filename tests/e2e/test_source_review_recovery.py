@@ -84,9 +84,9 @@ def test_chat_preserves_completed_findings_through_review_and_browser_failure(tm
                     content.append({'type': 'tool_use', 'id': 'wait', 'name': 'browser_wait_for',
                         'input': {'text': 'Unshown condition', 'timeout': 0.1}})
                 return {'stop_reason': 'tool_use', 'content': content}
-            assert mode == 'later_wait_failure', (mode, self.steps, names)
-            if self.steps == 3: return tool_response('browser_wait_for', {'text': 'Condition not displayed', 'timeout': 0.1})
-            return text_response('The remaining browser condition could not be verified.')
+            if mode == 'later_wait_failure' and self.steps == 3:
+                return tool_response('browser_wait_for', {'text': 'Condition not displayed', 'timeout': 0.1})
+            return text_response('**Transport:** 71 USD. **Lodging:** 240 USD.\n\nNot verified from this check: Cancellation terms not displayed.')
     model = Model(); runtime.model_client = model
     app = web_app.create_app(runtime, orchestrator=AgentOrchestrator(model_client=model), registry=registry)
     conversation = 'web:new-comparison'
@@ -112,7 +112,7 @@ def test_chat_preserves_completed_findings_through_review_and_browser_failure(tm
     elapsed = time.perf_counter() - started
     record_property('elapsed_seconds', elapsed)
     assert calls == ['transport', 'lodging'] + (['wait'] if mode in {'later_wait_failure', 'same_batch_wait_failure'} else [])
-    assert model.reviews <= (3 if mode == 'later_wait_failure' else 2 if mode in {'timeout','invalid_review','same_batch_wait_failure'} else 1)
+    assert model.reviews == 0
     assert elapsed < 8, elapsed
     wire = []
     class Message:

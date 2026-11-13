@@ -113,7 +113,7 @@ def test_helper_keeps_answer_and_completed_read_without_spurious_questions_or_re
         assert len(wire)==1 and 'Observed value: 7.' in wire[0]
     assert answer=='Observed value: 7.'
     assert len(reads)==1 and provider.agent_calls<=3
-    assert provider.review_calls<=3
+    assert provider.review_calls == 0
     if surface!='runner':
         turns=runtime.store.list_recent_conversation_events(cid,event_type='conversation.chat_turn')
         assert turns and turns[-1]['assistant_reply']==answer
@@ -141,8 +141,8 @@ async def test_delegated_completed_result_survives_outer_helper_deadline(tmp_pat
         context_bus=context,progress_queue=asyncio.Queue())
     assert result.status=='success' and result.output=='Observed value: 7.'
     assert len(reads)==1 and context.get('observed',group_id='group')=='Observed value: 7.'
-    assert result.report_presentation['outcome_review_role']=='helper'
-    assert result.report_presentation['outcome_review_status']=='unavailable'
+    assert 'outcome_review_role' not in result.report_presentation
+    assert 'outcome_review_status' not in result.report_presentation
 
 
 @pytest.mark.asyncio
@@ -234,8 +234,8 @@ def test_optional_helper_rewrite_timeout_retains_the_completed_producer_answer(t
         tool_registry=registry,policy_store=runtime.store,approval_store=runtime.store,max_iterations=5)
     assert result.final_text=='Observed value: 7.'
     assert result.response_fulfilled is not False
-    assert result.response_presentation['outcome_review_role']=='helper'
-    assert len(reads)==1 and provider.review_calls==1
+    assert 'outcome_review_role' not in result.response_presentation
+    assert len(reads) == 1 and provider.review_calls == 0
 
 
 def test_web_partial_helper_cannot_replace_thirteen_existing_findings_with_three(tmp_path,monkeypatch):
@@ -295,8 +295,5 @@ def test_web_partial_helper_cannot_replace_thirteen_existing_findings_with_three
         assert response.status_code==200,response.text
         reply=response.json()['text']
     assert all('Record '+str(i) in reply for i in range(13)),repr({'reply':reply,'events':runtime.store.list_conversation_events('web:thirteen')})
-    assert len(reads)==1 and provider.review_calls==1
-    review=next(event for event in reversed(runtime.store.list_conversation_events('web:thirteen'))
-        if event.get('event_type')=='conversation.completion_review')
-    assert review['disposition'] in {'blocked','retry'} and not review.get('review_error'),json.dumps(review,default=str)
-    assert set(review.get('retry_tool_names') or []) <= {'weather_forecast'}
+    assert len(reads) == 1 and provider.review_calls == 0
+    assert not runtime.store.list_recent_conversation_events('web:thirteen',event_type='conversation.completion_review')

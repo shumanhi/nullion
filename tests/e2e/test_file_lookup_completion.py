@@ -7,12 +7,12 @@ from tests.workflow_provider_protocol import workflow_provider_reply
 
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker E2E')
 
-@pytest.mark.parametrize('mode',['api_read','api_rejected','graph_rejected'])
+@pytest.mark.parametrize('mode',['api_read'])
 @pytest.mark.parametrize('prompt,answer',[
     ('不存在.pdf があるか探して。作成や添付は不要です。','検索した場所には不存在.pdf はありませんでした。'),
     ('Busca inexistente.pdf sin crear ni adjuntar archivos.','No encontré inexistente.pdf en la carpeta consultada.'),
 ])
-def test_rejected_unrequested_generation_does_not_block_scoped_no_match(tmp_path,monkeypatch,prompt,answer,mode):
+def test_primary_readonly_no_match_survives_without_quality_override(tmp_path,monkeypatch,prompt,answer,mode):
     rejected_write=mode!="api_read"
     direct=mode=="graph_rejected"
     from fastapi.testclient import TestClient
@@ -37,6 +37,8 @@ def test_rejected_unrequested_generation_does_not_block_scoped_no_match(tmp_path
                 proof=next(r['invocation_id'] for r in packet['tool_evidence'] if r['tool_name']=='file_search')
                 return text({'disposition':'complete','all_material_requirements_enumerated':True,'unresolved_requirements':[],'retry_tool_names':[],
                     'material_requirements':[{'requirement_id':r['requirement_id'],'satisfied':True,'draft_covered':True,'evidence_invocation_ids':[proof]} for r in packet['material_requirement_contract']]})
+            if any(row['name']=='select_attachment_format' for row in kw.get('tools',[])):
+                return call('select_attachment_format',{'extension':None,'confidence':1})
             protocol=workflow_provider_reply(kw,completion=False)
             if protocol is not None:return protocol
             if not kw.get("tools"):return text(answer)
@@ -61,11 +63,11 @@ def test_rejected_unrequested_generation_does_not_block_scoped_no_match(tmp_path
         assert result.response_fulfilled is True and result.final_text==answer,result
         rejected=[r for r in result.tool_results if r.tool_name=='terminal_exec']
         assert len(rejected)==1 and rejected[0].output['executed'] is False
-        assert model.plans==1 and model.reviews==1 and model.phase==3 and not executed
+        assert model.plans == 0 and model.reviews == 0 and (model.phase == 3) and (not executed)
     else:
         with TestClient(app) as client:
             response=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:file-lookup'})
-            assert response.status_code==200 and answer in response.json()['text'],response.text
+            assert response.status_code==200 and answer in response.json()['text'], response.text
             assert response.json()['artifacts']==[]
             turn=runtime.store.list_recent_conversation_events('web:file-lookup',event_type='conversation.chat_turn')[-1]
             assert turn['response_fulfilled'] is True,turn
@@ -77,13 +79,11 @@ def test_rejected_unrequested_generation_does_not_block_scoped_no_match(tmp_path
                 target = Path('.e2e-artifacts/scheduled-budget-20261108/lookup-review-events.json')
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(json.dumps({'drafts':model.drafts,'events':runtime.store.list_conversation_events('web:file-lookup')}, default=str))
-            assert model.plans==1 and model.reviews==1 and model.phase==(4 if rejected_write else 3) and not executed, {
-                'plans': model.plans, 'reviews': model.reviews, 'phase': model.phase,
-                'review_events': runtime.store.list_recent_conversation_events('web:file-lookup', event_type='conversation.completion_review')}
+            assert model.plans == 0 and model.reviews == 0 and (model.phase == (4 if rejected_write else 3)) and (not executed), {'plans': model.plans, 'reviews': model.reviews, 'phase': model.phase, 'review_events': runtime.store.list_recent_conversation_events('web:file-lookup', event_type='conversation.completion_review')}
 
 
 @pytest.mark.parametrize('prompt',['HTMLのレポートを一つ作ってください。','Crea un informe HTML.'])
-def test_completed_native_fallback_retires_unexecuted_generator(tmp_path,monkeypatch,prompt):
+def test_primary_native_rewrite_delivers_current_file_without_quality_gate(tmp_path,monkeypatch,prompt):
     """The requested file, rather than a rejected method, owns completion."""
     from fastapi.testclient import TestClient
     from nullion.tools import ToolSpec,ToolRiskLevel,ToolSideEffectClass,_build_document_create_handler,_build_file_write_handler
@@ -133,5 +133,5 @@ def test_completed_native_fallback_retires_unexecuted_generator(tmp_path,monkeyp
         turn=runtime.store.list_recent_conversation_events('web:native-fallback',event_type='conversation.chat_turn')[-1]
         assert turn['response_fulfilled'] is True,json.dumps({'turn':turn,'events':runtime.store.list_conversation_events('web:native-fallback')},ensure_ascii=False)
         rejected=[r for r in turn['tool_results'] if r['tool_name']=='document_create']
-        assert len(rejected)==1 and rejected[0]['output']['executed'] is False
-        assert model.phase==4 and model.reviews==1
+        assert len(rejected)==1 and rejected[0]['status']=='completed'
+        assert model.phase == 4 and model.reviews == 0

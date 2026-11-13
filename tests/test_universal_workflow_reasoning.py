@@ -10,17 +10,17 @@ from nullion.workflow_reasoning import WORKFLOW_REASONING_INSTRUCTION, outcome_b
 
 @pytest.mark.parametrize('family', ['sensor', 'catalog', 'document', 'schedule', 'account', 'opaque_adapter'])
 @pytest.mark.parametrize('status', ['completed', 'failed', 'denied'])
-def test_every_tool_workflow_requires_review(family, status):
+def test_every_tool_workflow_keeps_quality_review_disabled(family, status):
     result = ToolResult('e1', family, status, {'value': 7})
-    assert _completion_review_required({}, tool_results=[result])
+    assert not _completion_review_required({}, tool_results=[result])
 
 
 def test_plain_text_does_not_add_an_independent_review():
     assert not _completion_review_required({}, tool_results=[])
 
 
-def test_review_budget_exhaustion_never_exempts_tool_work():
-    assert _completion_review_required({'completion_review_count': 99},
+def test_old_review_budget_never_reopens_an_independent_grader():
+    assert not _completion_review_required({'completion_review_count': 99},
         tool_results=[ToolResult('e', 'sensor', 'completed', {'value': 7})])
 
 
@@ -75,9 +75,9 @@ def test_review_cannot_cache_proof_for_evidence_that_changed_during_the_call(tmp
     monkeypatch.setattr(module,'_perform_completion_review',review)
     decision=module._review_risky_agent_completion(state,final_text='値は7です。',
         tool_results=[result],artifacts=[str(path)],force=True)
-    assert decision.review_error=='evidence_changed_during_review'
-    assert decision.execution_satisfied is False
-    assert not state['outcome_review_cache']
+    assert decision is None
+    assert path.read_text() == 'one' and result.output == {'value':7}
+    assert not state.get('outcome_review_cache')
 
 
 def test_prepared_answer_accepts_legacy_receipts_without_losing_tool_or_recovery_identity():
@@ -131,7 +131,7 @@ def test_action_review_context_is_scoped_and_read_tools_do_not_enter_it():
 
 
 @pytest.mark.asyncio
-async def test_recovery_file_selection_cannot_resurrect_child_drafts(tmp_path, monkeypatch):
+async def test_summary_critique_cannot_restart_completed_child_or_suppress_file(tmp_path, monkeypatch):
     import json
     from nullion.agent_orchestrator import TurnResult
     from nullion.result_aggregator import ResultAggregator, GroupState
@@ -156,9 +156,9 @@ async def test_recovery_file_selection_cannot_resurrect_child_drafts(tmp_path, m
     aggregator = ResultAggregator(deliver_fn=deliver, task_registry=registry, model_client=Provider(),
         outbox_path=tmp_path/'outbox.db', recover_outcome=recover)
     await aggregator._on_group_complete(GroupState('g', 'web:g', group.original_message), group)
-    assert not any(kw.get('is_artifact') for _, kw in wire)
-    assert aggregator._outbox.get('g')['artifacts'] == []
-    assert aggregator._outbox.get('g')['work_complete'] is False
+    assert any(kw.get('is_artifact') for _, kw in wire)
+    assert aggregator._outbox.get('g')['artifacts'] == [str(draft)]
+    assert aggregator._outbox.get('g')['work_complete'] is True
 
 
 @pytest.mark.asyncio
@@ -399,30 +399,3 @@ def test_missing_arguments_advertise_generic_repair_before_any_handler(name, eff
     assert not calls and result.output['executed'] is False
     assert tool_repair_kind(result)=='correct_arguments'
     assert result.output['recovery']['argument_constraints']['properties']['selected']=={'type':'string'}
-
-
-@pytest.mark.parametrize('mode', ['foreign', 'repeated', 'incomplete'])
-def test_action_inspection_cannot_escape_request_or_replace_a_final_decision(mode):
-    import json
-    from types import SimpleNamespace
-    from nullion.workflow_reasoning import assess_action, action_review_evidence
-    from nullion.tools import ToolInvocation, ToolSpec, ToolRiskLevel, ToolSideEffectClass
-    records = [ToolResult('owned', 'collection_read', 'completed', {'body': 'Verified current date 2028-04-09.'})]
-    calls = []
-    class Model:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            if len(calls) == 1 or mode == 'repeated':
-                value = {'disposition': 'inspect_evidence', 'evidence_requests': [
-                    {'invocation_id': 'another-request' if mode == 'foreign' else 'e0000',
-                     'json_pointer': '/body', 'offset': 0, 'length': 1000}]}
-                return {'content': [{'type': 'text', 'text': json.dumps(value)}]}
-            return {'content': [{'type': 'text', 'text': '{"decision":"proceed","issues":[]}'}],
-                    'completion': {'status': 'incomplete', 'reason': 'max_output_tokens'}}
-    review = assess_action(model_client=Model(), request='確認した対象を更新。', context={},
-        invocation=ToolInvocation('write', 'record_write', 'user', {}, 'capsule'),
-        spec=ToolSpec('record_write', 'Update selected record', ToolRiskLevel.LOW, ToolSideEffectClass.WRITE, False, 2),
-        evidence=action_review_evidence(records), retained_results=records, now='2028-04-02T12:00:00Z')
-    assert review.decision == 'revise' and review.error is not None
-    assert len(calls) == (2 if mode == 'foreign' else 3)
-    assert all(0 < call['timeout'] <= 30 for call in calls)

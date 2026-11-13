@@ -62,7 +62,7 @@ def test_weather_location_object_is_reviewed_once_and_report_downloads(tmp_path,
         response = client.post("/api/chat", json={"text":prompt, "conversation_id":"web:weather-proof"}); assert response.status_code == 200
         data = response.json(); assert len(data["artifacts"]) == 1 and "review could not" not in data["text"], data
         assert client.get(data["artifacts"][0]["url"]).content == content.encode()
-        assert model.reviews == 1 and len(fetches) == 1
+        assert model.reviews == 0 and len(fetches) == 1
     stored = bootstrap_persistent_runtime(tmp_path/"runtime.db")
     turn = next(r for r in stored.store.list_conversation_events("web:weather-proof") if r.get("event_type") == "conversation.chat_turn")
     assert len([r for r in turn["tool_results"] if r["tool_name"] == "weather_forecast"]) == 1

@@ -20,3 +20,28 @@ def source_presentation_response(kwargs):
         'answer_status': 'partial_results' if limits else 'verified_results', 'limitation_ids': limits}
     return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'present',
         'name': 'present_source_answer', 'input': draft}]}
+
+
+def native_png_directives(kwargs, *, latest_only=False):
+    """A scripted primary selects real capture paths from its tool messages."""
+    decoder = json.JSONDecoder()
+    paths = []
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {'path', 'artifact_paths'}:
+                    for path in (item if isinstance(item, list) else [item]):
+                        if isinstance(path, str) and path.endswith('.png') and path not in paths: paths.append(path)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value: visit(item)
+        elif isinstance(value, str):
+            for index, char in enumerate(value):
+                if char != '{': continue
+                try: decoded, _ = decoder.raw_decode(value[index:])
+                except ValueError: continue
+                # Decoded scalar strings are never recursively decoded.
+                if isinstance(decoded, (dict, list)): visit(decoded)
+    visit(kwargs['messages'])
+    assert paths, 'Primary must select captures actually returned by the browser'
+    return '\n\n' + '\n'.join('MEDIA:' + path for path in (paths[-1:] if latest_only else paths))

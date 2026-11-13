@@ -149,10 +149,8 @@ def test_selected_goal_survives_restart_formatted_quote_and_wrong_roster(
                 return call('request_tool_scope',{'capabilities':['web'],'tool_names':[tool_name]})
             if not names:return text('{}')
             assert original_request in json.dumps(kw['messages'],ensure_ascii=False)
-            if not reads:return call(tool_name,{'phase':'properties' if revision_mode and self.proposals else 'roster'})
+            if not reads:return call(tool_name,{'phase':'properties' if revision_mode else 'roster'})
             if revision_mode:return text('\n'.join(values))
-            if len(reads)==1 and not self.drafts:
-                self.drafts+=1;return text('Aoi — Ren')
             if len(reads)==1:return call(tool_name,{'phase':'properties'})
             return text('\n'.join(values))
     model=Model();orchestrator=AgentOrchestrator(model_client=model)
@@ -186,11 +184,10 @@ def test_selected_goal_survives_restart_formatted_quote_and_wrong_roster(
             for r in runtime.store.list_approval_requests()]},ensure_ascii=False)
     assert 'Other relevant sources remain unchecked' not in reply and 'incomplete' not in reply
     assert reads==(['properties'] if revision_mode else ['roster','properties'])
-    if revision_mode:assert model.proposals==['roster','properties']
+    if revision_mode:assert model.proposals == []
     events=runtime.store.list_recent_conversation_events(conversation,limit=100)
     turn=next(r for r in reversed(events) if r.get('event_type')=='conversation.chat_turn')
     assert all(value in turn['assistant_reply'] for value in values)
     assert turn['parent_turn_id']==parent
     reviews=[r for r in events if r.get('event_type')=='conversation.completion_review']
-    assert [r['disposition'] for r in reviews]==(['complete'] if revision_mode else ['retry','complete']),json.dumps(reviews,ensure_ascii=False)
-    assert not reviews[-1]['search_coverage_errors']
+    assert not reviews

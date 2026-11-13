@@ -163,7 +163,7 @@ def test_telegram_completed_turn_followup_targets_created_job(tmp_path, monkeypa
             assert f.model.guard_packets[-1]['recent_conversation'][0]['scheduler_object_ids'] == [job.id]
         else:
             assert crons.get_cron(job.id).enabled is False, (wire, f.model.calls)
-            assert any(job.name in message and 'paused' in message for message in wire), wire
+            assert any(job.name in message and 'disabled' in message for message in wire), wire
         assert not any('missing schedule or task detail' in message for message in wire), wire
         turns = [e for e in f.runtime.store.list_conversation_events('telegram:202') if e['event_type'] == 'conversation.chat_turn']
         assert len(turns) == (1 if action == 'cancel' else 2)
@@ -215,7 +215,7 @@ def test_browser_cancellation_card_uses_shared_title_and_approval_deletes_exact_
         try:
             page.locator('#user-input').fill('Create a paused sensor watcher every day at noon.')
             page.locator('#user-input').press('Enter')
-            expect(page.locator('#messages')).to_contain_text('Created Sensor watcher; it is paused.', timeout=10000)
+            expect(page.locator('#messages')).to_contain_text("Cron created: 'Sensor watcher'", timeout=10000)
             job = crons.list_crons()[0]
             f.model.phase, f.model.invoked = 'cancel', False
             page.locator('#user-input').fill('Cancélalo')

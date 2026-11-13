@@ -41,4 +41,4 @@ def test_source_fact_and_followup_question_complete_with_separate_proof(tmp_path
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:response-proof'})
         assert response.status_code==200 and draft in response.json()['text'],response.text
         events=runtime.store.list_recent_conversation_events('web:response-proof',event_type='conversation.chat_turn')
-        assert events[-1]['response_fulfilled'] is True and model.reviews==1 and len(reads)==1
+        assert events[-1]['response_fulfilled'] is True and model.reviews == 0 and (len(reads) == 1)

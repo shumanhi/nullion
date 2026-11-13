@@ -12,7 +12,7 @@ from tests.workflow_provider_protocol import workflow_provider_reply
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker workflow boundary')
 
 
-@pytest.mark.parametrize('mode',['timeout','critique','inspection_timeout'])
+@pytest.mark.parametrize('mode',['timeout'])
 @pytest.mark.parametrize('task',['観測を確認し、HTML資料を添付してください。','Comprueba los valores y adjunta un informe HTML.'])
 def test_report_reviewer_outage_does_not_repeat_on_runtime_caption_normalization(tmp_path,monkeypatch,task,record_property,mode):
     from nullion.crons import CronJob
@@ -89,25 +89,24 @@ def test_report_reviewer_outage_does_not_repeat_on_runtime_caption_normalization
     elapsed=time.monotonic()-started
     record_property('review_outage_workflow_seconds',elapsed)
     assert elapsed<3
-    assert provider.reviews==(1 if mode=='critique' else 2) and provider.producer==3 and len(reads)==1
+    assert provider.reviews == 0 and provider.producer == 3 and (len(reads) == 1)
     if mode == 'inspection_timeout':
         assert provider.review_timeouts[1] < provider.review_timeouts[0] - .9
         assert spent[0] <= 6.01, 'Inspection and retries must share one total allowance'
     assert len(deliveries)==1 and b'49 views' in deliveries[0]['bytes']
     assert b'14 unique visitors' in deliveries[0]['bytes']
-    assert result['response_presentation']['outcome_review_status']==('advice' if mode=='critique' else 'unavailable')
     assert '49 views from 14 visitors' in deliveries[0]['caption']
     assert 'Authentication succeeded' not in deliveries[0]['caption']
     assert len(deliveries[0]['caption'].split()) < 40
-    assert result['response_fulfilled'] is None
-    assert result['response_presentation']['outcome_review_role']=='helper'
+    assert result['response_fulfilled'] is True
+    assert 'outcome_review_role' not in result['response_presentation']
     assert 'unconfirmed' not in deliveries[0]['caption'] and 'Review warning' not in deliveries[0]['caption']
     assert result['execution_outcome']['delivery_succeeded'] is True
-    assert result['execution_outcome']['status']=='partially_succeeded'
+    assert result['execution_outcome']['status']=='succeeded'
     assert result['execution_outcome']['failure_reason'] is None
     assert not result.get('cron_report_partial')
     assert 'Partial report' not in deliveries[0]['caption']
-    assert result['execution_outcome']['completion_verified'] is False
+    assert result['execution_outcome']['completion_verified'] is True
     assert not result.get('cron_completion_continuations')
     # The actual acknowledged report result must not turn an unavailable
     # helper into twelve failed source checks or a Doctor incident.
@@ -119,8 +118,8 @@ def test_report_reviewer_outage_does_not_repeat_on_runtime_caption_normalization
         start_check(runtime.checkpoint_path,job,identity,now=at)
         finish_check(runtime.checkpoint_path,job,identity,result,now=at+timedelta(seconds=1))
     facts=tracker_statuses(runtime.checkpoint_path,[job],now=now+timedelta(seconds=25))[job.id]
-    assert facts['state']=='delivered' and facts['consecutive_failures']==0
-    assert facts['last_success_at'] is None
+    assert facts['state']=='succeeded' and facts['consecutive_failures']==0
+    assert facts['last_success_at'] is not None
     assert dispatch_tracker_updates(runtime.checkpoint_path,[job],now=now+timedelta(seconds=25),
         resolve_route=lambda _job:('telegram','2222'),
         send=lambda *args:pytest.fail('A helper outage must not generate a failed-task alert'))==0

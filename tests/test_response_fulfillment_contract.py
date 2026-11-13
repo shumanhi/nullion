@@ -157,7 +157,7 @@ def test_terminal_stdout_paths_must_exist_under_artifact_roots(tmp_path):
     )
 
     assert decision.satisfied is False
-    assert decision.reply == "I couldn't attach the requested file."
+    assert decision.reply == "The requested file is not available for delivery."
 
 
 def test_scheduler_mutation_defers_future_artifact_requirements_to_cron_run():

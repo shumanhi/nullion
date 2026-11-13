@@ -146,19 +146,16 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
             elif self.step == 2:
                 calls = [('pdf_create', {'output_path': str(pdf), 'text_pages': ['# Comparison\n\nPrices unavailable.'], 'title': 'Comparison'})]
             elif self.step == 3:
-                return response(f'Done — attached report.pdf.\nMEDIA:{pdf}')
-            elif self.step == 4:
-                assert self.review_calls == 1, json.dumps({'planner': self.planner_calls, 'history': kwargs['messages']})
                 calls = [('browser_snapshot', {})]
-            elif 5 <= self.step <= 7:
-                window = windows[self.step - 5]
+            elif 4 <= self.step <= 6:
+                window = windows[self.step - 4]
                 calls = [('browser_type_field', {'selector': '#route', 'text': 'AAA-BBB'}),
                     ('browser_type_field', {'selector': '#window', 'text': window}),
                     ('browser_type_field', {'selector': '#mode', 'text': 'direct'}),
                     ('browser_click_element', {'selector': '#search'}), ('browser_extract_text', {})]
-            elif self.step == 8:
+            elif self.step == 7:
                 calls = [('pdf_create', {'title': 'Comparison'})]
-            elif self.step == 9:
+            elif self.step == 8:
                 assert 'pdf_create requires at least one' in json.dumps(kwargs['messages'])
                 records = model_evidence(kwargs['messages'])
                 matching = [r for r in records if r.get('tool_name') == 'browser_extract_text' and 'WINDOW ' in json.dumps(r.get('output'))]
@@ -168,7 +165,7 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
                 body += '\n' + '\n\n'.join(r['output']['text'] for r in matching)
                 body += f'\n\n*Cheapest:* {windows[1]} — USD 180\n\n[Open source]({source_link})'
                 calls = [('pdf_create', {'output_path': str(pdf), 'text_pages': [body], 'title': 'Comparison'})]
-            elif self.step == 10:
+            elif self.step == 9:
                 return response(f'Compared all three windows. Cheapest: {windows[1]}, USD 180.\nMEDIA:{pdf}')
             else:
                 raise AssertionError(f'Unexpected recovery loop {self.step}')
@@ -186,7 +183,7 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
             e for e in runtime.store.list_conversation_events('telegram:report-user')
             if e.get('event_type')=='conversation.completion_review']},ensure_ascii=False)
         assert result.response_fulfilled is True, json.dumps([{k:e.get(k) for k in ['disposition','review_error','response_diagnostics','unresolved_requirements']} for e in runtime.store.list_conversation_events('telegram:report-user') if e.get('event_type')=='conversation.completion_review'])
-        assert model.review_calls == 2 and model.step == 10
+        assert model.review_calls == 0 and model.step == 9
         assert queries == [('AAA-BBB', window, 'direct') for window in windows]
         reader = PdfReader(pdf)
         text = '\n'.join(page.extract_text() for page in reader.pages)
@@ -204,7 +201,7 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
         assert len(failures) == 1 and failures[0].output['reason'] == 'invalid_tool_arguments'
         events = runtime.store.list_conversation_events('telegram:report-user')
         reviews = [e for e in events if e.get('event_type') == 'conversation.completion_review']
-        assert [e['disposition'] for e in reviews] == ['retry', 'complete']
+        assert not reviews
         record_property('elapsed_seconds', time.perf_counter() - started)
     finally:
         server.shutdown()

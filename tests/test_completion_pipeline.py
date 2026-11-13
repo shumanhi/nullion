@@ -140,7 +140,7 @@ def test_graph_has_one_terminal_review_owner():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
             and call.func.id == '_review_risky_agent_completion' for call in ast.walk(node))]
-    assert owners == ['_complete_agent_turn']
+    assert owners == [], 'No independent reviewer may own a terminal result'
 
 
 def test_content_preparation_cannot_change_source_receipts_or_action_authority():

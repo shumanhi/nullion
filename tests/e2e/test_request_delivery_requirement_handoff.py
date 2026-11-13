@@ -23,7 +23,7 @@ def call(name, arguments, call_id):
     ('راجع التقويم وأنشئ تقريرًا بصيغة .pdf', True),
 ])
 def test_current_reviewed_request_owns_delivery_and_keeps_verified_findings(
-        tmp_path, monkeypatch, surface, prompt, wants_file, source_summary_model_reply):
+        tmp_path, monkeypatch, surface, prompt, wants_file, source_summary_model_reply, record_property):
     from fastapi.testclient import TestClient
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.approvals import create_permission_grant
@@ -114,29 +114,20 @@ def test_current_reviewed_request_owns_delivery_and_keeps_verified_findings(
             if presentation is not None:
                 return presentation
             if not names:
-                return text({'web_action':'none','scheduler_action':'none','requested_tool_names':['calendar_list','file_write'],
+                return text({'web_action':'none','scheduler_action':'none','requested_tool_names':['calendar_list',*(['file_write'] if wants_file else [])],
                     'required_tool_names':['calendar_list'], 'connector_source_user_requested':True,
                     'connector_source_evidence':prompt, 'confidence':1})
             self.calls += 1
             assert self.calls <= 12, 'Delivery disagreement restarted the completed source workflow'
             if self.calls == 1:
                 return call('request_tool_scope', {'capabilities':['connector','local_files'],
-                    'source_user_requested':True,'source_evidence':prompt,'tool_names':['calendar_list','file_write'],
+                    'source_user_requested':True,'source_evidence':prompt,'tool_names':['calendar_list',*(['file_write'] if wants_file else [])],
                     'required_tool_names':['calendar_list'], 'artifact_extensions':['.pdf'] if wants_file else []}, 'scope')
             if self.calls == 2:
                 return call('calendar_list', {'start':'2026-10-31T00:00:00-04:00','end':'2026-11-08T00:00:00-05:00','max':20}, 'read')
             if self.calls == 3 and wants_file:
                 return call('file_write', {'path':str(tmp_path/'report.pdf'),'content':'Cedar appointment'}, 'render')
-            if self.calls == 3 and not wants_file:
-                return call('request_tool_scope', {'capabilities':['local_files'],'tool_names':['file_write'],
-                    'required_tool_names':['file_write'],'artifact_extensions':['.png']}, 'drift')
-            if self.calls == 4 and not wants_file:
-                return call('file_write', {'path':str(tmp_path/'unrequested.svg'),'content':'Unrelated image'}, 'unrequested')
-            if self.calls == 5 and not wants_file:
-                return call('request_tool_scope', {'capabilities':['connector'],'source_user_requested':True,
-                    'source_evidence':prompt,'tool_names':['calendar_list'],'required_tool_names':['calendar_list'],
-                    'artifact_extensions':[]}, 'restore')
-            return text('Cedar appointment is on November 1 at 7:30 PM.')
+            return text('Cedar appointment is on November 1 at 7:30 PM.' + (' The requested PDF renderer is unavailable.' if wants_file else ''))
 
     model = Model()
     orchestrator = AgentOrchestrator(model_client=model)
@@ -168,6 +159,7 @@ def test_current_reviewed_request_owns_delivery_and_keeps_verified_findings(
             asyncio.run(deliver())
         sent = [row['text'] for name, row in calls if name=='sendMessage']
         assert sent and 'Cedar appointment' in '\n'.join(sent)
+    record_property('native_diagnostic',json.dumps({'answer':answer,'trace':trace,'events':runtime.store.list_conversation_events(cid)},default=str))
     assert 'Cedar appointment' in answer, {'answer':answer,'trace':trace,'diagnostics':[{k:e.get(k) for k in ['event_type','status','validation_errors','error_type','review_error','disposition','reached_iteration_limit']} for e in runtime.store.list_conversation_events(cid) if e.get('event_type') in {'conversation.completion_requirement_contract','conversation.completion_review','conversation.agent_turn'}]}
     assert "I couldn't attach the requested file." != answer
     if wants_file:

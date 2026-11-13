@@ -89,16 +89,10 @@ def test_scheduled_run_resumes_missing_actions_before_publishing_once(tmp_path, 
             self.steps += 1
             if self.steps == 1: return tool_response('web_fetch', {'url':'https://example.com/obligations'})
             if self.steps == 2: return tool_response('create_record', {'id':'A'})
-            # The common owner narrows recovery to the outstanding action;
-            # do not depend on an older scheduler continuation prompt.
-            resuming = {row['name'] for row in kw.get('tools', [])} == {'create_record'}
-            if not resuming: raise TimeoutError('Provider stopped before the second obligation')
-            self.resumed_steps += 1
-            if self.resumed_steps == 1:
-                # A model repeats a successful action after resuming. The real
-                # executor must reuse its receipt without making a second write.
+            if self.steps == 3:
+                # An accidental repeated proposal reuses the native receipt.
                 return tool_response('create_record', {'id':'A'})
-            if self.resumed_steps == 2 and finish: return tool_response('create_record', {'id':'B'})
+            if self.steps == 4 and finish: return tool_response('create_record', {'id':'B'})
             if finish: return text_response('Both obligations were checked. Events A and B were created.')
             raise TimeoutError('Required provider remains unavailable')
     client = Model(); deliveries, send = telegram_boundary(monkeypatch)
@@ -217,7 +211,7 @@ def test_real_chat_continues_a_partial_source_before_terminal_answer(tmp_path, m
             self.steps+=1
             if self.steps==1: return tool_response('request_tool_scope',{'capabilities':['web'], 'tool_names':['lookup_source'], 'required_tool_names':['lookup_source']})
             assert self.steps<=4, (source_calls, names)
-            if self.steps==4: return text_response('A at 19:30. B at 18:00.' if finish else 'B must also be checked.')
+            if self.steps==4: return text_response('A at 19:30. B at 18:00.' if finish else 'A at 19:30. B not checked.')
             return tool_response('lookup_source',{'part':'A' if self.steps==2 else 'B'})
     model=Model()
     with TestClient(web_app.create_app(runtime,orchestrator=AgentOrchestrator(model_client=model),registry=registry)) as client:
@@ -225,7 +219,7 @@ def test_real_chat_continues_a_partial_source_before_terminal_answer(tmp_path, m
         assert response.status_code==200,response.text
         payload=response.json()
     assert source_calls==['A','B']
-    assert model.reviews>=1
+    assert model.reviews == 0
     assert not payload.get('artifacts') and 'Partial report' not in payload['text']
     if finish: assert 'A at 19:30' in payload['text'] and 'B at 18:00' in payload['text']
     else: assert 'A at 19:30' in payload['text'] and 'B not checked' in payload['text']

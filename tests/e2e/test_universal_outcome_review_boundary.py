@@ -54,7 +54,7 @@ class ReasoningProvider:
         self.agent_calls += 1
         if self.agent_calls == 1:
             return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read', 'name': self.name, 'input': {}}]}
-        return text('Observed value: 8.' if self.correction and self.agent_calls == 2 else 'Observed value: 7.')
+        return text('Observed value: 7.')
 
 
 def runtime_and_registry(tmp_path, monkeypatch, name):
@@ -81,9 +81,9 @@ def test_successful_calls_still_review_and_correct_the_delivered_answer(tmp_path
         user_message=prompt, conversation_history=[], tool_registry=registry,
         policy_store=runtime.store, approval_store=runtime.store, max_iterations=5)
     assert result.final_text == 'Observed value: 7.' and result.response_fulfilled is True
-    assert len(calls) == 1 and provider.agent_calls == 3
-    assert provider.contract_calls == 1 and provider.review_calls == 2
-    assert result.outcome_review_receipt.disposition == 'complete'
+    assert len(calls) == 1 and provider.agent_calls == 2
+    assert provider.contract_calls == provider.review_calls == 0
+    assert result.outcome_review_receipt is None
 
 
 def test_unsupported_expiry_opinion_cannot_create_a_clarification_gate(tmp_path, monkeypatch):
@@ -93,29 +93,12 @@ def test_unsupported_expiry_opinion_cannot_create_a_clarification_gate(tmp_path,
     result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:review', principal_id='web:review',
         user_message='Vérifie cette date.', conversation_history=[], tool_registry=registry,
         policy_store=runtime.store, approval_store=runtime.store, max_iterations=4)
-    assert result.response_fulfilled is None
+    assert result.response_fulfilled is True
     assert result.final_text == 'Observed value: 7.'
     assert not result.response_presentation.get('needs_input')
     assert len(calls) == 1
 
 
-def test_direct_result_gets_review_once_and_changed_draft_invalidates_it(tmp_path, monkeypatch):
-    from nullion.agent_orchestrator import AgentOrchestrator, TurnResult
-    from nullion.tools import ToolInvocation
-    runtime, registry, calls = runtime_and_registry(tmp_path, monkeypatch, 'resource_read')
-    provider = ReasoningProvider('resource_read')
-    runner = AgentOrchestrator(model_client=provider)
-    evidence = registry.invoke(ToolInvocation('direct', 'resource_read', 'web:review', {}))
-    result = TurnResult('direct', 'Observed value: 7.', [evidence])
-    kwargs = dict(conversation_id='web:review', principal_id='web:review', user_message='Report the selected value.',
-        conversation_history=[], tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store)
-    reviewed = runner.review_turn_result(result, **kwargs)
-    assert reviewed.response_fulfilled is True and provider.review_calls == 1
-    assert runner.review_turn_result(reviewed, **kwargs) is reviewed
-    assert provider.review_calls == 1
-    reviewed.final_text = 'Changed answer'
-    runner.review_turn_result(reviewed, **kwargs)
-    assert provider.review_calls == 2 and len(calls) == 1
 
 
 def test_plain_turns_reason_in_existing_call_without_review_dependency(tmp_path, monkeypatch):
@@ -144,80 +127,6 @@ def test_plain_turns_reason_in_existing_call_without_review_dependency(tmp_path,
     assert len(calls) == 5 and statistics.mean(elapsed) < .1 and max(elapsed) < .2
 
 
-@pytest.mark.parametrize('decision', ['clarify', 'revise', 'invalid', 'unavailable', 'proceed'])
-@pytest.mark.parametrize('prompt', ['Change the selected resource.', '選択した対象を変更してください。'])
-def test_action_preflight_blocks_mistakes_before_any_write(tmp_path, monkeypatch, decision, prompt):
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime, registry, _ = runtime_and_registry(tmp_path, monkeypatch, 'resource_read')
-    writes = []
-    def write(inv):
-        writes.append(inv.arguments)
-        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 7})
-    registry.register(ToolSpec('resource_write', 'Change selected resource', ToolRiskLevel.LOW,
-        ToolSideEffectClass.WRITE, False, 2), write)
-    class Provider(ReasoningProvider):
-        preflights = 0
-        def create(self, **kw):
-            system = kw.get('system', '')
-            if 'Workflow action preflight.' in system:
-                self.preflights += 1
-                packet = json.loads(kw['messages'][0]['content'][0]['text'])
-                assert packet['original_request'] == prompt
-                assert packet['proposed_action']['arguments'] == {'target': 'selected'}
-                if decision == 'unavailable':
-                    raise TimeoutError('external model timeout')
-                if decision == 'invalid':
-                    return text({'decision': 'proceed', 'issues': [], 'approval_granted': True})
-                if decision == 'clarify':
-                    return text({'decision': 'clarify', 'issues': ['Two selected targets conflict.'],
-                        'question': 'Which target should I change?', 'options': ['First target', 'Second target']})
-                if decision == 'revise':
-                    return text({'decision': 'revise', 'issues': ['Use the target already supplied in context.']})
-                return text({'decision': 'proceed', 'issues': []})
-            if 'material-requirements planner' in system:
-                return text({'all_material_requirements_enumerated': True, 'requested_artifact_extensions': [],
-                    'material_requirements': [{'requirement': 'Change selected resource', 'requirement_kind': 'action',
-                        'evidence_subject_id': 'resource', 'eligible_evidence_tool_names': ['resource_write']}]})
-            if 'semantic completion reviewer' in system:
-                if decision == 'revise':
-                    return text({'disposition': 'blocked', 'unresolved_requirements': ['The proposed target was not corrected.'],
-                        'user_facing_failure': 'I stopped before changing the wrong target.', 'retry_tool_names': []})
-                self.name = 'resource_write'
-                return super().create(**kw)
-            self.agent_calls += 1
-            if self.agent_calls == 1:
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'write',
-                    'name': 'resource_write', 'input': {'target': 'selected'}}]}
-            return text('Observed value: 7.')
-    provider = Provider('resource_write')
-    result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:action', principal_id='web:action',
-        user_message=prompt, conversation_history=[], tool_registry=registry,
-        policy_store=runtime.store, approval_store=runtime.store, max_iterations=3)
-    assert len(writes) == (1 if decision == 'proceed' else 0)
-    assert provider.preflights == (2 if decision == 'invalid' else 1)
-    if decision == 'revise':
-        audit=next(row for row in runtime.store.list_conversation_events('web:action')
-            if row.get('event_type')=='conversation.action_review')
-        assert audit['issues']==['Use the target already supplied in context.']
-    if decision == 'proceed':
-        assert result.response_fulfilled is True, json.dumps(runtime.store.list_conversation_events('web:action'), ensure_ascii=False)
-    elif decision == 'clarify':
-        assert '1. First target\n2. Second target' in result.final_text
-        assert result.response_fulfilled is False
-        # A direct-result delivery check must preserve the already reviewed
-        # clarification rather than launch a new request or repeat the action.
-        before = provider.agent_calls
-        preserved = AgentOrchestrator(model_client=provider).review_turn_result(result,
-            conversation_id='web:action', principal_id='web:action', user_message=prompt,
-            conversation_history=[], tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store)
-        assert preserved is result and provider.agent_calls == before
-    elif decision == 'revise':
-        assert result.response_fulfilled is not True
-        assert result.tool_results[-1].output['executed'] is False
-        assert result.tool_results[-1].output['reason'] == 'request_plan_conflict'
-    else:
-        assert result.response_fulfilled is False
 
 
 def test_preflight_cannot_grant_an_approval_and_approved_resume_writes_once(tmp_path, monkeypatch):
@@ -295,9 +204,9 @@ def test_real_web_ui_renders_corrected_outcome_and_stores_review_evidence(tmp_pa
             page.locator('#send-btn').click()
             expect(page.locator('#messages')).to_contain_text('Observed value: 7.', timeout=20000)
             assert 'Observed value: 8.' not in page.locator('#messages').inner_text()
-            assert len(calls) == 1 and provider.review_calls >= 2
+            assert len(calls) == 1 and provider.review_calls == 0
             events = runtime.store.list_conversation_events('web:universal-ui')
-            assert any(row.get('event_type') == 'conversation.completion_review' and row.get('disposition') == 'complete' for row in events)
+            assert not any(row.get('event_type') == 'conversation.completion_review' for row in events)
             turn = next(row for row in reversed(events) if row.get('event_type') == 'conversation.chat_turn')
             assert turn['assistant_reply'] == 'Observed value: 7.'
             assert any(row['tool_name'] == 'weather_forecast' and row['status'] == 'completed' for row in turn['tool_results'])
@@ -324,75 +233,10 @@ async def test_real_deep_agent_uses_shared_outcome_repair_before_publishing_cont
     assert result.status == 'success', result
     assert result.output == 'Observed value: 7.' and len(calls) == 1
     assert context.get('observed', group_id='group') == 'Observed value: 7.'
-    assert provider.review_calls == 2
+    assert provider.review_calls == 0
     assert result.verified_turn_result.response_fulfilled is True
 
 
-@pytest.mark.asyncio
-async def test_real_group_detects_missing_outcome_and_continues_with_owned_receipts(tmp_path, monkeypatch):
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.result_aggregator import ResultAggregator, GroupState
-    from nullion.task_queue import TaskRegistry, TaskGroup, TaskRecord, TaskResult, TaskPriority, TaskStatus
-    from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime, registry, calls = runtime_and_registry(tmp_path, monkeypatch, 'resource_read')
-    units = []
-    def unit_read(inv):
-        units.append(inv)
-        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 'kg'})
-    registry.register(ToolSpec('unit_read', 'Read the selected resource unit', ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 2), unit_read)
-    class Provider(ReasoningProvider):
-        group_mode = False
-        def create(self, **kw):
-            system = kw.get('system', '')
-            if 'You are summarizing the results' in system:
-                packet = json.loads(kw['messages'][0]['content'][0]['text'])
-                return text({'status': 'partial', 'answer': 'The selected value is 7. Its unit is still missing.',
-                    'evaluated_task_ids': [row['task_id'] for row in packet['task_results']], 'missing_outcomes': ['Report the unit.'],
-                    'assistance_plan':{'kind':'execution_improvement','task_ids':['child'],'tool_names':['unit_read']}})
-            if not self.group_mode:
-                return super().create(**kw)
-            if 'material-requirements planner' in system:
-                return text({'all_material_requirements_enumerated': True, 'requested_artifact_extensions': [],
-                    'material_requirements': [{'requirement': 'Report the selected value and its unit together.',
-                        'requirement_kind': 'fact', 'evidence_subject_id': 'resource',
-                        'eligible_evidence_tool_names': ['resource_read', 'unit_read']}]})
-            if 'semantic completion reviewer' in system:
-                packet = json.loads(kw['messages'][0]['content'][0]['text'])
-                evidence = [row['invocation_id'] for row in packet['tool_evidence'] if row['tool_name'] in {'resource_read', 'unit_read'} and row['status'] == 'completed']
-                assert len(evidence) == 2 and '7 kg' in packet['draft_final_response']
-                return text({'disposition': 'complete', 'unresolved_requirements': [], 'retry_tool_names': [],
-                    'all_material_requirements_enumerated': True, 'material_requirements': [{
-                    'requirement_id': row['requirement_id'], 'satisfied': True, 'draft_covered': True,
-                    'evidence_invocation_ids': evidence} for row in packet['material_requirement_contract']]})
-            if not units:
-                assert 'completed' in json.dumps(kw['messages'])
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'units', 'name': 'unit_read', 'input': {}}]}
-            return text('The selected value is 7 kg.')
-    provider = Provider('resource_read'); runner = AgentOrchestrator(model_client=provider)
-    child = runner.run_turn(conversation_id='web:group', principal_id='web:group', user_message='Report the selected value.',
-        conversation_history=[], tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store)
-    task_result = TaskResult('child', 'success', child.final_text)
-    task_result.verified_turn_result = child
-    task = TaskRecord('child', 'group', 'web:group', 'web:group', 'Read value', 'Report the selected value.',
-        TaskStatus.COMPLETE, TaskPriority.NORMAL, ['resource_read', 'unit_read'], [], result=task_result)
-    group = TaskGroup('group', 'web:group', '選択した値と単位を一緒に教えて。', tasks=[task])
-    task_registry = TaskRegistry(); await task_registry.add_group(group)
-    runner._group_execution_contexts = {'group': (registry, runtime.store, runtime.store)}
-    provider.group_mode = True
-    wire = []
-    async def deliver(conversation, message, **kw):
-        if not kw.get('is_status'):
-            wire.append(message)
-        return True
-    aggregator = ResultAggregator(deliver_fn=deliver, task_registry=task_registry, model_client=provider,
-        outbox_path=tmp_path/'outbox.db', recover_outcome=runner._recover_group_outcome)
-    await aggregator._on_group_complete(GroupState('group', 'web:group', group.original_message), group)
-    assert len(calls) == 1 and len(units) == 1
-    assert any('7 kg' in message for message in wire), wire
-    assert group.planner_metadata['outcome_review_status'] == 'complete'
-    assert group.planner_metadata['delivery_status'] == 'completed'
-    await aggregator._on_group_complete(GroupState('group', 'web:group', group.original_message), group)
-    assert len(calls) == len(units) == 1
 
 
 def test_cancellation_during_action_review_never_executes_the_write(tmp_path, monkeypatch):
@@ -408,6 +252,7 @@ def test_cancellation_during_action_review_never_executes_the_write(tmp_path, mo
             if 'Workflow action preflight.' in kw.get('system', ''):
                 cancelled.set()
                 return text({'decision': 'proceed', 'issues': []})
+            cancelled.set()
             return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'w', 'name': 'resource_write', 'input': {}}]}
     result = AgentOrchestrator(model_client=Provider()).run_turn(conversation_id='web:cancel', principal_id='web:cancel',
         user_message='Apply the selected change.', conversation_history=[], tool_registry=registry,
@@ -434,6 +279,7 @@ async def test_delegated_timeout_during_preflight_cannot_start_a_late_write(tmp_
             if 'Workflow action preflight.' in kw.get('system', ''):
                 started.set(); release.wait(5); finished.set()
                 return text({'decision': 'proceed', 'issues': []})
+            started.set(); release.wait(5); finished.set()
             return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'w', 'name': 'resource_write', 'input': {}}]}
     task = TaskRecord('child', 'group', 'web:timeout', 'web:timeout', 'Change resource', 'Apply selected change.',
         TaskStatus.RUNNING, TaskPriority.NORMAL, ['resource_write'], [])
@@ -451,7 +297,7 @@ async def test_delegated_timeout_during_preflight_cannot_start_a_late_write(tmp_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('mode', ['malformed', 'missing_task', 'contradictory', 'clarify'])
-async def test_combined_delivery_rejects_invalid_or_incomplete_goal_review(tmp_path, mode):
+async def test_combined_delivery_ignores_retired_grade_fields(tmp_path, mode):
     from nullion.result_aggregator import ResultAggregator, GroupState
     from nullion.task_queue import TaskGroup, TaskRegistry, TaskRecord, TaskResult, TaskStatus, TaskPriority
     task = TaskRecord('child', 'g', 'web:g', 'web:g', 'Read value', 'Report value', TaskStatus.COMPLETE,
@@ -476,12 +322,12 @@ async def test_combined_delivery_rejects_invalid_or_incomplete_goal_review(tmp_p
         outbox_path=tmp_path/'outbox.db')
     await aggregator._on_group_complete(GroupState('g', 'web:g', group.original_message), group)
     assert group.planner_metadata['delivery_status'] == 'completed'
-    assert aggregator._outbox.get('g')['work_complete'] is False
+    assert aggregator._outbox.get('g')['work_complete'] is True
     assert wire
     if mode == 'clarify': assert '1. Metric\n2. Imperial' in wire[-1]
     else:
         assert 'Value: 7.' in wire[-1] and 'Review warning:' not in wire[-1]
-        assert group.planner_metadata['outcome_verified'] is False
+        assert group.planner_metadata['outcome_verified'] is True
 
 
 def test_mission_approval_resume_retains_actual_pending_batch_and_prior_evidence(tmp_path, monkeypatch):
@@ -533,40 +379,6 @@ def test_mission_approval_resume_retains_actual_pending_batch_and_prior_evidence
     assert {r.tool_name for r in final.tool_results if r.status == 'completed'} == {'resource_read', 'guarded_write'}
 
 
-def test_action_preflight_repairs_wrong_target_and_executes_only_corrected_plan(tmp_path, monkeypatch):
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime, registry, _ = runtime_and_registry(tmp_path, monkeypatch, 'resource_read')
-    writes = []
-    def write(inv):
-        writes.append(inv.arguments['target'])
-        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'target': 'selected', 'value': 7})
-    registry.register(ToolSpec('resource_write', 'Update selected resource', ToolRiskLevel.LOW,
-        ToolSideEffectClass.WRITE, False, 2), write)
-    class Provider(ReasoningProvider):
-        proposals = []
-        def create(self, **kw):
-            system = kw.get('system', '')
-            if 'Workflow action preflight.' in system:
-                packet = json.loads(kw['messages'][0]['content'][0]['text'])
-                target = packet['proposed_action']['arguments']['target']
-                self.proposals.append(target)
-                return text({'decision': 'revise', 'issues': ['Use the selected target from the request.']} if target == 'other'
-                    else {'decision': 'proceed', 'issues': []})
-            if 'material-requirements planner' in system or 'semantic completion reviewer' in system:
-                return super().create(**kw)
-            self.agent_calls += 1
-            if self.agent_calls < 3:
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(self.agent_calls),
-                    'name': 'resource_write', 'input': {'target': 'other' if self.agent_calls == 1 else 'selected'}}]}
-            return text('Observed value: 7.')
-    provider = Provider('resource_write')
-    result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:repair-action',
-        principal_id='web:repair-action', user_message='選択された対象だけを更新してください。', conversation_history=[],
-        tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store)
-    assert result.response_fulfilled is True, result
-    assert writes == ['selected'] and provider.proposals == ['other', 'selected']
-    assert result.tool_results[0].output['executed'] is False
 
 
 def test_review_receipt_survives_temporary_tool_scope_and_delivery_bookkeeping(tmp_path, monkeypatch):
@@ -642,7 +454,7 @@ def test_weather_chat_refines_parent_locality_using_structured_postal_evidence(t
 
 @pytest.mark.parametrize('status', ['completed', 'failed'])
 @pytest.mark.parametrize('effect', ['write', 'external_write', 'account_write'])
-def test_completion_repair_reuses_dispatched_action_even_after_result_failure(tmp_path, monkeypatch, status, effect):
+def test_native_accepted_dispatch_is_not_replayed_for_result_failure(tmp_path, monkeypatch, status, effect):
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
     from tests.workflow_provider_protocol import workflow_provider_reply
@@ -679,7 +491,7 @@ def test_completion_repair_reuses_dispatched_action_even_after_result_failure(tm
         policy_store=runtime.store, approval_store=runtime.store, max_iterations=5)
     assert len(dispatched) == 1, result
     assert len([row for row in result.tool_results if row.tool_name == 'opaque_dispatch']) == 1
-    assert result.response_fulfilled is not True
+    assert model.reviews == 0
     assert result.final_text == 'Operation accepted.'
     receipt = result.tool_results[0]
     assert receipt.status == status
@@ -761,45 +573,16 @@ def test_accepted_background_setup_finishes_without_waiting_for_future_match(tmp
         user_message=prompt, conversation_history=[], tool_registry=registry, policy_store=runtime.store,
         approval_store=runtime.store, max_iterations=4)
     assert result.response_fulfilled is True and 'still pending' in result.final_text, result
-    assert len(writes) == 1 and model.checks == 2
+    assert len(writes) == 1 and model.checks == 0
     assert '7' not in result.final_text
     assert result.final_text.count('Configured the requested observation.') == 1
     assert [row.tool_name for row in result.tool_results] == ['collection_read', 'opaque_accept']
     with sqlite3.connect(runtime.checkpoint_path) as db:
         assert db.execute('SELECT state FROM accepted_jobs').fetchone()[0] == 'waiting'
-    contract_event = next(row for row in runtime.store.list_conversation_events('web:background')
-        if row.get('event_type') == 'conversation.completion_requirement_contract')
-    assert [row['requirement_kind'] for row in contract_event['requirement_rows']] == ['action', 'constraint']
-    assert all('requirement' not in row for row in contract_event['requirement_rows'])
+    assert not any(row.get('event_type') == 'conversation.completion_requirement_contract'
+        for row in runtime.store.list_conversation_events('web:background'))
 
 
-def test_direct_shortcut_repair_receives_actual_evidence_without_rereading(tmp_path, monkeypatch):
-    from nullion.agent_orchestrator import AgentOrchestrator, TurnResult
-    from nullion.tools import ToolInvocation
-    runtime, registry, reads = runtime_and_registry(tmp_path, monkeypatch, 'resource_read')
-    observed = registry.invoke(ToolInvocation('actual-read', 'resource_read', 'web:direct-repair', {}))
-    class Provider(ReasoningProvider):
-        def create(self, **kw):
-            if 'semantic completion reviewer' in str(kw.get('system', '')):
-                packet = json.loads(kw['messages'][0]['content'][0]['text'])
-                if '7' not in packet['draft_final_response']:
-                    self.review_calls += 1
-                    return text({'disposition': 'retry', 'unresolved_requirements': ['Report the observed value.'], 'retry_tool_names': []})
-                return super().create(**kw)
-            if 'material-requirements planner' in str(kw.get('system', '')):
-                return super().create(**kw)
-            retained = next(message for message in kw['messages'] if any(
-                'request_continuation_tool_evidence' in block.get('text', '') for block in message.get('content', [])))
-            assert 'actual-read' in json.dumps(retained) and '7' in json.dumps(retained)
-            self.agent_calls += 1
-            return text('Observed value: 7.')
-    provider = Provider('resource_read')
-    result = AgentOrchestrator(model_client=provider).review_turn_result(
-        TurnResult('direct', 'Read complete.', [observed]), conversation_id='web:direct-repair',
-        principal_id='web:direct-repair', user_message='観測値を教えて。', conversation_history=[],
-        tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store)
-    assert result.response_fulfilled is True and '7' in result.final_text
-    assert len(reads) == 1 and provider.agent_calls == 1 and provider.review_calls == 2
 
 
 @pytest.mark.parametrize('prompt', ['Report the selected resource value.', '選択した対象の値を教えて。'])
@@ -951,93 +734,4 @@ def test_review_retains_runtime_validated_read_selection(tmp_path, monkeypatch, 
         user_message=prompt,conversation_history=[],tool_registry=registry,policy_store=runtime.store,
         approval_store=runtime.store,max_iterations=5)
     assert result.response_fulfilled is True and result.final_text=='Observed value: 7.'
-    assert len(reads)==1 and provider.review_calls==1+bool(contradictory_input)
-
-
-@pytest.mark.parametrize('prompt',['Report the selected record value.','選択した記録の値を教えて。'])
-@pytest.mark.parametrize('record_count',[1,6,24])
-@pytest.mark.parametrize('invalid_request',[None,'schema','foreign','pointer'])
-def test_review_inspects_retained_full_evidence_without_repeating_source_read(tmp_path,monkeypatch,prompt,record_count,invalid_request):
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.runtime import bootstrap_persistent_runtime
-    from nullion.tools import ToolRegistry,ToolSpec,ToolRiskLevel,ToolSideEffectClass,ToolResult
-    runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');registry=ToolRegistry();reads=[]
-    padding=320 if record_count==24 else 700
-    body='A'*padding+'\nReading = 7.\n'+'Z'*padding
-    def read(inv):
-        reads.append(inv)
-        return ToolResult(inv.invocation_id,inv.tool_name,'completed',{'id':'chosen','summary':'Read complete',
-            **({'message':{'id':'chosen','body':body}} if record_count==1 else
-               {'messages':[{'id':str(i),'body':body} for i in range(record_count)]})})
-    registry.register(ToolSpec('opaque_record_read','Read selected record',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,2),read)
-    class Provider(ReasoningProvider):
-        inspections=0
-        invalid_sent=False
-        review_timeouts=()
-        def create(self,**kw):
-            if 'semantic completion reviewer' in kw.get('system',''):
-                if self.review_timeouts:
-                    assert 0 < kw['timeout'] <= self.review_timeouts[-1]
-                self.review_timeouts=(*self.review_timeouts, kw['timeout'])
-                packet=json.loads(kw['messages'][0]['content'][0]['text'])
-                evidence=next(row for row in packet['tool_evidence'] if row['tool_name']==self.name)
-                if 'additional_evidence' not in packet:
-                    assert 'Reading = 7.' not in json.dumps(evidence['output'])
-                    if invalid_request and not self.invalid_sent:
-                        self.invalid_sent=True
-                        request={'invocation_id':evidence['invocation_id'],
-                            'json_pointer':'/message/body' if record_count==1 else '/messages/0/body',
-                            'offset':0,'length':12000}
-                        if invalid_request=='schema':request['length']=12001
-                        elif invalid_request=='foreign':request['invocation_id']='foreign-request'
-                        else:request['json_pointer']='/unavailable/body'
-                        return text({'disposition':'inspect_evidence','evidence_requests':[request]})
-                    if invalid_request:
-                        assert packet['evidence_inspection_validation_error']['status']=='invalid_evidence_inspection'
-                    self.inspections+=1
-                    return text({'disposition':'inspect_evidence','evidence_requests':[{
-                        'invocation_id':evidence['invocation_id'],'json_pointer':('/message/body' if record_count==1 else '/messages/'+str(i)+'/body'),
-                        'offset':0,'length':12000} for i in range(record_count)]})
-                assert len(packet['additional_evidence'])==record_count
-                from nullion.agent_orchestrator import _completion_review_request_timeout
-                assert 0 < kw['timeout'] <= _completion_review_request_timeout(kw['max_tokens'], request_chars=len(json.dumps(packet,ensure_ascii=False)))
-                for inspected in packet['additional_evidence']:
-                    assert inspected['invocation_id']==evidence['invocation_id']
-                    assert inspected['content']==body and inspected['complete'] is True
-            return super().create(**kw)
-    provider=Provider('opaque_record_read')
-    result=AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:inspect',principal_id='web:inspect',
-        user_message=prompt,conversation_history=[],tool_registry=registry,policy_store=runtime.store,
-        approval_store=runtime.store,max_iterations=4)
-    assert result.response_fulfilled is True and result.final_text=='Observed value: 7.', json.dumps([
-        {k:row.get(k) for k in ('event_type','review_error','response_diagnostics','disposition','reason')}
-        for row in runtime.store.list_conversation_events('web:inspect')
-        if row.get('event_type') in {'conversation.completion_review', 'conversation.completion_requirement_contract'}])
-    assert len(reads)==1 and provider.inspections==1 and provider.review_calls==1 and provider.agent_calls==2
-    review=next(row for row in runtime.store.list_conversation_events('web:inspect') if row.get('event_type')=='conversation.completion_review')
-    assert review['model_attempts']==2+bool(invalid_request)
-    assert review['response_diagnostics'][int(bool(invalid_request))]['status']=='evidence_inspected'
-    assert review['review_error'] is None
-
-
-def test_repeated_invalid_inspection_stops_without_new_source_execution(tmp_path,monkeypatch):
-    from nullion.agent_orchestrator import AgentOrchestrator
-    runtime,registry,reads=runtime_and_registry(tmp_path,monkeypatch,'record_read')
-    class Provider(ReasoningProvider):
-        rejected=0
-        def create(self,**kw):
-            if 'semantic completion reviewer' in kw.get('system',''):
-                self.rejected+=1
-                return text({'disposition':'inspect_evidence','evidence_requests':[
-                    {'invocation_id':'another-request','json_pointer':''}]})
-            return super().create(**kw)
-    provider=Provider('record_read')
-    result=AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:rejected-inspection',
-        principal_id='web:rejected-inspection',user_message='記録の値を確認。',conversation_history=[],
-        tool_registry=registry,policy_store=runtime.store,approval_store=runtime.store,max_iterations=5)
-    assert result.response_fulfilled is None and not result.artifacts
-    assert 'Observed value: 7.' in result.final_text and 'Review warning:' not in result.final_text
-    assert len(reads)==1 and provider.agent_calls==2 and provider.rejected==2
-    reviews=[r for r in runtime.store.list_conversation_events('web:rejected-inspection')
-        if r.get('event_type')=='conversation.completion_review']
-    assert reviews[-1]['review_error']=='invalid_evidence_inspection'
+    assert len(reads) == 1 and provider.review_calls == 0

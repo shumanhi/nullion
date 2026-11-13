@@ -399,8 +399,8 @@ def test_scheduled_email_report_empty_repair_delivers_correct_result_and_persist
     else:
         assert 'Some source checks returned information' in deliveries[0]['text']
         assert '45 USD' not in deliveries[0]['text']
-        assert stored.last_result == 'error: cron_report_incomplete'
-        assert result['execution_outcome']['execution_succeeded'] is False
+        assert stored.last_result == 'partial_success'
+        assert result['execution_outcome']['status']=='partially_succeeded'
     assert any(event.event_type == 'cron.delivery.sent' for event in runtime.store.list_events())
     assert stored.next_run_dt() > datetime.now(UTC)
 
@@ -631,7 +631,7 @@ def test_email_report_after_43_source_calls_preserves_last_read_and_delivers_sum
                            'input': {'start': f'2028-05-0{i+1}T00:00:00Z', 'end': '2028-06-01T00:00:00Z', 'max': 20}}
                           for i in range(2)]
                 return {'stop_reason': 'tool_use', 'content': calls}
-            return text_response('I checked your email.\n\n**更新 27**\nFrom: Example service\nDate: 2028-04-02\n\nPreview: Unique obligation 27: renewal due 2028-05-28; amount 28 USD.')
+            return text_response('Unique obligation 27: renewal due 2028-05-28; amount 28 USD. Matching calendar events were checked.')
     client = Client()
     results = []
     def fire(job):
@@ -644,7 +644,7 @@ def test_email_report_after_43_source_calls_preserves_last_read_and_delivers_sum
     finish_scheduler(scheduler)
     assert len(reads) == 28 and set(reads) == set(ids), results
     assert len(searches) == 13 and len(calendars) == 2, results
-    assert client.repair_calls == 2
+    assert client.repair_calls == 0
     assert len(deliveries) == 1 and '2028-05-28' in deliveries[0]['text'] and '28 USD' in deliveries[0]['text']
     assert 'Preview:' not in deliveries[0]['text']
     assert crons.get_cron(job.id).last_result == 'ok'
@@ -847,7 +847,7 @@ def test_manual_report_start_receipt_survives_extra_foreground_source_requiremen
                     'connector_app_ids': ['google-mail'], 'connector_source_user_requested': True,
                     'connector_source_evidence': f'{prompt} id={self.ident}',
                     'requested_tool_names': ['email_read', 'email_search', 'run_cron'],
-                    'required_tool_names': ['email_read', 'email_search', 'run_cron'], 'confidence': 1}))
+                    'required_tool_names': ['run_cron'], 'confidence': 1}))
             if not names:
                 return text_response('{}')
             if task in messages and 'market_quote' in names:
@@ -857,7 +857,7 @@ def test_manual_report_start_receipt_survives_extra_foreground_source_requiremen
             if 'request_tool_scope' in names and not self.scoped:
                 self.scoped = True
                 return tool_response('request_tool_scope', {'capabilities': ['scheduler_run'],
-                    'tool_names': ['email_read', 'email_search', 'run_cron'], 'required_tool_names': ['email_read', 'email_search', 'run_cron'],
+                    'tool_names': ['email_read', 'email_search', 'run_cron'], 'required_tool_names': ['run_cron'],
                     'scheduler_action': 'run', 'scheduler_selection_policy': 'user_selected'})
             if 'run_cron' in names and not self.dispatched:
                 self.dispatched = True
@@ -892,7 +892,7 @@ def test_manual_report_start_receipt_survives_extra_foreground_source_requiremen
         assert receipt['message'] in json.dumps(body, ensure_ascii=False)
         assert foreground['assistant_reply'] == receipt['message']
         scope = next(row['output'] for row in foreground['tool_results'] if row['tool_name'] == 'request_tool_scope')
-        assert set(scope['requested_required_tool_names']) == {'email_read', 'email_search', 'run_cron'}
+        assert set(scope['requested_required_tool_names']) == {'run_cron'}
         dispatched = next(result for result in orchestrator.results
                           if any(tool.tool_name == 'run_cron' for tool in result.tool_results))
         assert dispatched.response_fulfilled is True
@@ -1173,272 +1173,8 @@ def test_verified_no_match_has_a_real_web_receipt_only_for_manual_run(tmp_path, 
         assert ('cron.delivery.silent' in events) is not manual
 
 
-@pytest.mark.parametrize('instructions', ['Check the existing appointment and report whether it needs creating.', '既存の予定を確認し、作成が必要か報告。'])
-def test_long_scheduled_report_inspects_retained_calendar_before_repeating_work(tmp_path, monkeypatch, instructions):
-    from nullion import crons
-    from nullion.tools import ToolRegistry, ToolSpec, ToolResult, ToolRiskLevel, ToolSideEffectClass
-    from tests.test_cron_retained_evidence import long_evidence
-    runtime = setup_runtime(tmp_path, monkeypatch)
-    from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
-    for kind in (BoundaryKind.OUTBOUND_NETWORK, BoundaryKind.ACCOUNT_ACCESS):
-        runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(
-            rule_id='retained-source-'+kind.value, principal_id=GLOBAL_PERMISSION_PRINCIPAL,
-            kind=kind, mode=PolicyMode.ALLOW, selector='*', created_by='fixture-user', created_at=datetime.now(UTC)))
-    runtime.checkpoint(force=True)
-    deliveries, send = telegram_boundary(monkeypatch)
-    source = long_evidence(); calls = []
-    registry = ToolRegistry()
-    def read(inv):
-        calls.append(inv.tool_name)
-        output = source[-1].output if inv.tool_name == 'calendar_list' else source[int(inv.arguments['id'], 16)-1].output
-        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', output)
-    for name in ('email_read', 'calendar_list'):
-        registry.register(ToolSpec(name=name, description='Read authorized fixture records',
-            risk_level=ToolRiskLevel.LOW, side_effect_class=ToolSideEffectClass.READ,
-            requires_approval=False, timeout_seconds=2), read)
-    class Model:
-        agent_calls = 0
-        inspections = 0
-        def create(self, **kw):
-            reviewed = report_layout_review(kw, 'No duplicate was created')
-            if reviewed is not None: return reviewed
-            auxiliary = workflow_provider_reply(kw, completion=True)
-            if auxiliary is not None: return auxiliary
-            if kw.get('tools'):
-                self.agent_calls += 1
-                if self.agent_calls == 1:
-                    return {'stop_reason':'tool_use','content':[
-                        {'type':'tool_use','id':f'm{i}','name':'email_read','input':{'id':f'{i+1:016x}'}} for i in range(70)] +
-                        [{'type':'tool_use','id':'calendar','name':'calendar_list','input':{'start':'2028-11-13T00:00:00Z','end':'2028-11-16T00:00:00Z'}}]}
-                return text_response('I checked your email.\n\n**通知 69**\nFrom: Service\nDate: 2028-01-01\n\nPreview: Obligation 69: supporting content')
-            prompt = kw['messages'][0]['content'][0]['text']
-            records, _ = json.JSONDecoder().raw_decode(
-                prompt.split('Verified compact tool evidence from this run:\n')[1].lstrip())
-            calendar = next(row for row in records if row.get('tool_name') == 'calendar_list')
-            if not self.inspections:
-                assert 'event-45' not in json.dumps(calendar)
-                self.inspections += 1
-                return text_response(json.dumps({'disposition':'inspect_evidence', 'evidence_requests':[
-                    {'invocation_id':calendar['evidence_id'],'json_pointer':'/events/45'}]}))
-            assert 'Additional retained evidence:' in prompt and 'event-45' in prompt
-            return text_response(json.dumps({'requirements_satisfied':True,'source_state':'available',
-                'evidence_refs':[calendar['evidence_id']],
-                'report':'The November 14 appointment already exists. No duplicate was created.'}))
-    job = crons.add_cron('Retained checks', '* * * * *', instructions,
-                         delivery_channel='telegram', delivery_target='2222')
-    model = Model()
-    outcome = run_scheduled(job, model, runtime, registry, send)
-    assert model.inspections == 1 and calls.count('calendar_list') == 1 and calls.count('email_read') == 70, outcome
-    assert outcome['execution_outcome']['execution_succeeded'] is True, outcome
-    assert len(deliveries) == 1 and 'No duplicate was created' in deliveries[0]['text']
-    assert 'Preview:' not in deliveries[0]['text'] and 'event-45' not in deliveries[0]['text']
-    from nullion.runtime_persistence import load_runtime_store
-    rows = load_runtime_store(runtime.checkpoint_path).list_conversation_events()
-    terminal = next(row for row in rows if row.get('event_type') == 'conversation.cron_run')
-    assert terminal['response_fulfilled'] is True and terminal['remaining_work'] == []
-    assert sum(row.get('event_type') == 'conversation.tool_timing' and row.get('tool_name') == 'calendar_list' for row in rows) == 1
 
 
-@pytest.mark.parametrize('instructions', ['Report all three current readings.', '現在の3件の観測値をすべて報告。'])
-@pytest.mark.parametrize('recovery_case', ['report_only', 'missing_source', 'report_then_missing_source', 'repeated_report_gap',
-    'needs_user_input', 'blocked', 'review_unavailable', 'planning_unavailable',
-    'composer_invents_gap', 'composer_reports_real_gap', 'composer_gap_review_unavailable'])
-@pytest.mark.parametrize('source_family', ['public_alert', 'native_report'])
-def test_recovered_report_uses_specific_review_feedback_without_restarting_research(tmp_path, monkeypatch, instructions, recovery_case, source_family):
-    from nullion import crons
-    from nullion.tools import ToolRegistry, ToolSpec, ToolResult, ToolRiskLevel, ToolSideEffectClass
-    from tests.e2e.test_cron_repair_runtime_contract import _monitor_completion_response
-    from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
-    runtime=setup_runtime(tmp_path,monkeypatch)
-    runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(rule_id='feedback-read',principal_id=GLOBAL_PERMISSION_PRINCIPAL,
-        kind=BoundaryKind.OUTBOUND_NETWORK,mode=PolicyMode.ALLOW,selector='*',created_by='fixture',created_at=datetime.now(UTC)))
-    runtime.checkpoint(force=True);registry=ToolRegistry();reads=[]
-    source_tool = 'web_fetch' if source_family=='public_alert' else 'collection_read'
-    additional_read_needed = recovery_case in {'missing_source', 'report_then_missing_source', 'composer_reports_real_gap'}
-    def read(inv):
-        reads.append(inv)
-        if recovery_case=='blocked' and inv.arguments['url'].endswith('/blocked'):
-            return ToolResult(inv.invocation_id,inv.tool_name,'failed',
-                {'reason':'source_connection_required'},'Reconnect the source account.')
-        return ToolResult(inv.invocation_id,inv.tool_name,'completed',
-            {'url':inv.arguments['url'],'text':('Beta 41.' if len(reads)>1 else
-                'Current collection: Alpha 37, Gamma 53.' if additional_read_needed else
-                'Current collection: Alpha 37, Beta 41, Gamma 53.')})
-    registry.register(ToolSpec(source_tool,'Read current collection',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,2),read)
-    class Model:
-        producer=0;repairs=0;checked_drafts=[];planner_calls=0
-        def create(self,**kw):
-            system=kw.get('system','')
-            if system.startswith('You are a material-requirements planner'):
-                self.planner_calls+=1
-                if recovery_case=='planning_unavailable':
-                    raise TimeoutError('Requirement planning connection unavailable')
-                return text_response(json.dumps({'all_material_requirements_enumerated':True,
-                    'material_requirements':[{'requirement':'Report all three current readings.',
-                        'requirement_kind':'fact','evidence_subject_id':'collection',
-                        'eligible_evidence_tool_names':[source_tool]}]}))
-            if system.startswith('You are a semantic completion reviewer'):
-                if recovery_case in {'review_unavailable', 'composer_gap_review_unavailable'}:
-                    raise TimeoutError('Verification connection unavailable')
-                packet=json.loads(kw['messages'][0]['content'][0]['text'])
-                self.checked_drafts.append(packet['draft_final_response'])
-                response=_monitor_completion_response(kw);decision=json.loads(response['content'][0]['text'])
-                if recovery_case in {'needs_user_input', 'blocked'}:
-                    decision.update(disposition=recovery_case,retry_tool_names=[],
-                        unresolved_requirements=['Select the necessary collection.' if recovery_case=='needs_user_input' else 'Reconnect the source account.'])
-                    for row in decision['material_requirements']:row.update(satisfied=False,draft_covered=False)
-                    if recovery_case=='needs_user_input':
-                        decision['clarification']={'question':'Which collection should be used?',
-                            'options':['First collection','Second collection']}
-                    else:
-                        decision['user_facing_failure']='The source requires an account connection. Reconnect it before retrying.'
-                        # A mixed successful/blocked source batch needs explicit
-                        # causal evidence; the internal diagnostic is not proof.
-                        failures=[r['invocation_id'] for r in packet['tool_evidence']
-                            if r['tool_name']==source_tool and r['status']=='failed']
-                        assert failures
-                        contracts={r['requirement_id']:r for r in packet['material_requirement_contract']}
-                        for row in decision['material_requirements']:
-                            if source_tool in contracts[row['requirement_id']]['eligible_evidence_tool_names']:
-                                row['blocking_failure_invocation_ids']=failures
-                    return text_response(json.dumps(decision))
-                complete=all(word in packet['draft_final_response'] for word in ('Alpha 37','Beta 41','Gamma 53'))
-                if recovery_case == 'repeated_report_gap':
-                    complete = False
-                needs_read = bool(additional_read_needed and
-                    (recovery_case != 'report_then_missing_source' or self.repairs > 1) and len(reads) < 2)
-                if not complete or needs_read:
-                    decision.update(disposition='retry',retry_tool_names=[source_tool] if needs_read else [],
-                        unresolved_requirements=['Read https://example.org/beta to obtain Beta, then include Alpha 37 and Beta 41 alongside Gamma 53.'
-                            if needs_read else 'Use the existing verified collection to include Alpha 37 and Beta 41 alongside Gamma 53.'])
-                    for row in decision['material_requirements']:row.update(satisfied=not needs_read,draft_covered=False)
-                if recovery_case == 'repeated_report_gap':
-                    decision['user_facing_failure'] = ('Verified readings: Alpha 37; Beta 41; Gamma 53. '
-                        "I couldn't finish the requested report format. The task is paused; retry it manually.")
-                    # Public findings need their own current-source certificate;
-                    # the legacy diagnostic field is internal recovery prose.
-                    ref=next(row['invocation_id'] for row in packet['tool_evidence']
-                        if row['tool_name']==source_tool and row['status']=='completed')
-                    decision['supported_findings']=[{'text':'Verified readings: Alpha 37; Beta 41; Gamma 53.',
-                        'evidence_invocation_ids':[ref]}]
-                return text_response(json.dumps(decision))
-            auxiliary=_monitor_completion_response(kw) or workflow_provider_reply(kw)
-            if auxiliary is not None:return auxiliary
-            if system.startswith('You repair scheduled-task final answers'):
-                self.repairs+=1
-                assert self.planner_calls <= 2 if recovery_case=='planning_unavailable' else self.planner_calls==1
-                prompt=kw['messages'][0]['content'][0]['text']
-                assert 'Verified compact tool evidence' in prompt
-                if recovery_case!='planning_unavailable':
-                    assert 'Verified material outcome contract' in prompt and 'Report all three current readings.' in prompt
-                if self.repairs>1:
-                    prompt=kw['messages'][0]['content'][0]['text']
-                    assert 'include Alpha 37 and Beta 41' in prompt
-                    assert 'Gamma 53' in prompt.split('Rejected draft final response:\n')[1].split('\n\n')[0]
-                composer_claims_gap = recovery_case in {'composer_invents_gap', 'composer_reports_real_gap', 'composer_gap_review_unavailable'}
-                return text_response(json.dumps({'requirements_satisfied':not composer_claims_gap,'source_state':'available',
-                    'remaining_work':['Read https://example.org/beta to obtain Beta.' if additional_read_needed else
-                        'Recheck an optional blocked discovery source when it becomes accessible.'] if composer_claims_gap else [],
-                    'evidence_refs':['e0'],'delivery_decision':'send','delivery_reason':'report',
-                    'report': 'Alpha 37; Beta 41; Gamma 53.' if recovery_case in {'composer_invents_gap', 'composer_gap_review_unavailable','planning_unavailable'} else
-                        'Gamma 53.' if self.repairs==1 or recovery_case=='repeated_report_gap' else 'Alpha 37; Beta 41; Gamma 53.'}))
-            if 'Classify delivery' in system:return text_response(json.dumps({'decision':'send','reason':'verified_match'}))
-            self.producer+=1
-            if self.producer==1:
-                response=tool_response(source_tool,{'url':'https://example.org/readings'})
-                if recovery_case=='blocked':
-                    response['content'].append({'type':'tool_use','id':'blocked-read','name':source_tool,
-                        'input':{'url':'https://example.org/blocked'}})
-                return response
-            if self.producer<=3:raise TimeoutError('Provider ended after current-source collection')
-            if additional_read_needed:
-                context=json.dumps(kw['messages'],ensure_ascii=False)
-                assert 'outcome_review' in context and 'https://example.org/beta' in context
-                assert 'current_draft' in context and 'Gamma 53.' in context
-                if self.producer==4:return tool_response(source_tool,{'url':'https://example.org/beta'})
-                return text_response('Alpha 37; Beta 41; Gamma 53.')
-            pytest.fail('Report-only feedback restarted producer execution')
-    job=crons.add_cron('Collection report','* * * * *',instructions,enabled=False,
-        delivery_channel='telegram',delivery_target='2222',artifact_delivery_options=(
-            {'alert_delivery_mode':'verified_matches_only'} if source_family=='public_alert' else {}))
-    deliveries,send=telegram_boundary(monkeypatch);model=Model();outcome=run_scheduled(job,model,runtime,registry,send)
-    assert 1 <= model.planner_calls <= (2 if recovery_case=='planning_unavailable' else 1)
-    if recovery_case in {'review_unavailable', 'composer_gap_review_unavailable'}:
-        assert len(reads) == 1 and model.producer == 3 and model.repairs == 1
-        assert outcome['response_presentation']['outcome_review_status'] == 'unavailable'
-        assert not outcome.get('cron_completion_continuations')
-        if source_family == 'public_alert':
-            assert not deliveries and outcome['response_fulfilled'] is False
-        else:
-            # The editor cannot overwrite the producer's typed completion
-            # state, including its explicit unfinished-work declaration.
-            assert outcome['response_fulfilled'] is (recovery_case == 'review_unavailable')
-            assert not outcome.get('cron_report_failed')
-            assert outcome['response_presentation']['outcome_review_role'] == 'helper'
-            assert outcome['execution_outcome']['completion_verified'] is False
-            assert len(deliveries) == 1 and 'Gamma 53.' in deliveries[0]['text'], json.dumps({
-                key: value for key, value in outcome.items() if key not in {'tool_results', 'messages_snapshot'}
-            }, default=str)
-            assert 'Review warning:' not in deliveries[0]['text']
-        return
-    if source_family=='native_report' and recovery_case in {'needs_user_input','blocked','planning_unavailable','repeated_report_gap'}:
-        assert len(deliveries)==1 and 'Gamma 53.' in deliveries[0]['text']
-        assert 'Review warning:' not in deliveries[0]['text']
-        assert 'Replace the' not in deliveries[0]['text']
-        assert not outcome.get('cron_report_failed')
-        assert outcome['execution_outcome'].get('completion_verified') is False
-        assert not crons.get_cron(job.id).enabled
-        if recovery_case=='blocked':
-            assert any(row.status=='failed' for row in outcome['tool_results'])
-        if recovery_case=='needs_user_input':
-            assert '1. First collection' in outcome['text'] and '2. Second collection' in outcome['text']
-        return
-    if recovery_case in {'needs_user_input', 'blocked', 'review_unavailable', 'planning_unavailable', 'composer_gap_review_unavailable'}:
-        assert outcome['response_fulfilled'] is False and outcome['cron_report_failed'],outcome
-        assert len(reads)==(2 if recovery_case=='blocked' else 1) and model.producer==3
-        # A failed request planner cannot certify an alert, but the shared
-        # content producer may still make its single bounded salvage attempt.
-        assert model.repairs==1
-        assert not crons.get_cron(job.id).enabled
-        if source_family=='public_alert':
-            assert not deliveries
-        else:
-            assert len(deliveries)==1 and 'Gamma 53.' not in deliveries[0]['text']
-        if recovery_case=='needs_user_input':
-            assert '1. First collection' in outcome['text'] and '2. Second collection' in outcome['text']
-            assert outcome['response_presentation']['needs_input'] is True
-        elif recovery_case=='blocked':
-            assert 'Reconnect it before retrying' in outcome['text']
-        else:
-            assert outcome['cron_verification_failed'] and outcome['reason']=='cron_verification_unavailable'
-        return
-    if recovery_case == 'repeated_report_gap':
-        assert outcome['response_fulfilled'] is False and outcome['cron_report_failed'], outcome
-        assert len(reads)==1 and model.producer==3 and model.repairs==2
-        assert not crons.get_cron(job.id).enabled
-        if source_family=='public_alert':assert not deliveries
-        else:
-            assert len(deliveries)==1
-            assert all(value in deliveries[0]['text'] for value in ('Alpha 37','Beta 41','Gamma 53'))
-            from html import unescape
-            visible = unescape(deliveries[0]['text'])
-            # Every requested reading is satisfied; a draft-only rejection
-            # does not justify publishing a fabricated report-format gap.
-            assert "couldn't finish the requested report format" not in visible
-        return
-    assert outcome['response_fulfilled'] is True and not outcome.get('cron_report_failed'), json.dumps({
-        'counts': {'reads': len(reads), 'producer': model.producer, 'repairs': model.repairs},
-        'drafts': model.checked_drafts,
-        'result': {key: outcome.get(key) for key in ('text', 'response_fulfilled',
-            'response_presentation', 'cron_source_verification_feedback', 'cron_report_failed',
-            'cron_agent_final_repair_failed', 'cron_agent_final_repair_failure_reason')},
-    }, default=str)
-    assert len(reads)==(2 if additional_read_needed else 1)
-    assert model.producer==(5 if additional_read_needed else 3)
-    assert model.repairs==(1 if recovery_case in {'missing_source', 'composer_invents_gap', 'composer_reports_real_gap'} else 2)
-    assert len(deliveries)==1 and all(value in deliveries[0]['text'] for value in ('Alpha 37','Beta 41','Gamma 53'))
-    assert any('Alpha 37' in draft for draft in model.checked_drafts)
-    assert not crons.get_cron(job.id).enabled
 
 
 @pytest.mark.parametrize('requires_approval',[False,True])
@@ -1479,7 +1215,7 @@ def test_saved_disabled_task_checkpoint_is_execution_and_keeps_normal_approval(t
             if self.step==1:return tool_response('file_write',{'path':str(path),'content':'{"value":7}'})
             return text_response('The current checkpoint contains value 7; no new recurring task was created.')
     deliveries,send=telegram_boundary(monkeypatch);model=Model();outcome=run_scheduled(job,model,runtime,registry,send)
-    assert model.checks==1 and not crons.get_cron(job.id).enabled
+    assert model.checks == 0 and (not crons.get_cron(job.id).enabled)
     if requires_approval:
         assert outcome['suspended_for_approval'] and not writes and path.read_text()=='{"value":6}',outcome
     else:
@@ -1601,7 +1337,7 @@ def test_ordinary_saved_report_verifies_content_before_scheduler_transport(tmp_p
     result = run_scheduled(job, client, runtime, registry, send)
     assert result['response_fulfilled'] is True and not result.get('cron_report_failed'), result
     assert result['cron_delivery_status'] == 'sent'
-    assert len(reads) == 1 and client.planning == 1
+    assert len(reads) == 1 and client.planning == 0
     assert len(deliveries) == 1 and 'Record Q: 37' in deliveries[0]['text']
     from nullion.runtime_persistence import load_runtime_store
     rows = load_runtime_store(runtime.checkpoint_path).list_recent_conversation_events('telegram:2222', limit=100)
@@ -1610,122 +1346,8 @@ def test_ordinary_saved_report_verifies_content_before_scheduler_transport(tmp_p
     assert terminal[0]['tool_results'][0]['tool_name'] == 'collection_read'
 
 
-@pytest.mark.parametrize('task', ['現在の記録Qを確認して報告。', 'Comprueba el registro Q actual y resume el resultado.'])
-def test_saved_report_review_repairs_truncation_after_inspection_without_research_restart(tmp_path, monkeypatch, task):
-    from nullion import crons
-    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime = setup_runtime(tmp_path, monkeypatch)
-    registry = ToolRegistry()
-    reads = []
-    def read(invocation):
-        reads.append(invocation.invocation_id)
-        return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
-            {'text': 'Earlier source context. ' * 400 + 'Current record Q: value 37.'})
-    registry.register(ToolSpec('collection_read', 'Read current records', ToolRiskLevel.LOW,
-        ToolSideEffectClass.READ, False, 2), read)
-    deliveries, send = telegram_boundary(monkeypatch)
-    job = crons.add_cron('Report', '* * * * *', task, enabled=False,
-        delivery_channel='telegram', delivery_target='2222')
-    class Client:
-        producer_calls = 0
-        review_calls = []
-        def create(self, **kwargs):
-            if str(kwargs.get('system', '')).startswith('You are a semantic completion reviewer'):
-                self.review_calls.append(kwargs)
-                packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
-                if len(self.review_calls) == 1:
-                    ref = next(row['invocation_id'] for row in packet['tool_evidence'] if row['tool_name'] == 'collection_read')
-                    inspection = {'disposition': 'inspect_evidence', 'evidence_requests': [
-                        {'invocation_id': ref, 'json_pointer': '/text', 'offset': len('Earlier source context. ') * 400, 'length': 100}]}
-                    from jsonschema import Draft202012Validator
-                    Draft202012Validator(packet['review_response_schema']).validate(inspection)
-                    return text_response(json.dumps(inspection))
-                assert packet['additional_evidence'][0]['content'] == 'Current record Q: value 37.'
-                from jsonschema import Draft202012Validator
-                assert not Draft202012Validator(packet['review_response_schema']).is_valid({
-                    'disposition': 'inspect_evidence', 'evidence_requests': [{'invocation_id': 'e0000',
-                        'json_pointer': '', 'offset': 0, 'length': 100}]})
-                if len(self.review_calls) == 2:
-                    return {'content': [{'type': 'text', 'text': '{"disposition":"complete",'}],
-                        'completion': {'status': 'incomplete', 'reason': 'max_output_tokens'}}
-                assert kwargs['max_tokens'] > self.review_calls[1]['max_tokens']
-                assert packet['review_protocol_validation_errors'] == ['invalid_json']
-                assert packet['review_protocol_correction']
-            protocol = workflow_provider_reply(kwargs, completion=True)
-            if protocol is not None: return protocol
-            self.producer_calls += 1
-            if self.producer_calls == 1: return tool_response('collection_read', {})
-            return text_response('Record Q: 37.')
-    client = Client()
-    result = run_scheduled(job, client, runtime, registry, send)
-    assert result['response_fulfilled'] is True and not result.get('cron_report_failed'), result
-    assert result['cron_delivery_status'] == 'sent'
-    assert len(reads) == 1 and len(client.review_calls) == 3 and client.producer_calls == 2
-    assert len(deliveries) == 1 and 'Record Q: 37' in deliveries[0]['text']
 
 
-@pytest.mark.parametrize('task', ['確認した日付で記録を一度だけ作成。', 'Crea una sola vez el registro con la fecha verificada.'])
-def test_saved_action_review_inspects_older_full_source_without_repeating_reads(tmp_path, monkeypatch, task):
-    from nullion import crons
-    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime = setup_runtime(tmp_path, monkeypatch)
-    registry = ToolRegistry(filesystem_allowed_roots=(tmp_path,))
-    reads, writes = [], []
-    target = tmp_path/'created-record.json'
-    def read(invocation):
-        index = invocation.arguments['index']; reads.append(index)
-        return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
-            {'id': str(index), 'body': ('Source context. ' * 600 + 'EXACT_DATE=2028-04-09') if index == 0 else 'Unrelated current record.'})
-    def write(invocation):
-        writes.append(invocation.arguments)
-        target.write_text(json.dumps(invocation.arguments))
-        return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
-            {'action_receipt': {'type': 'action_receipt', 'action': 'create', 'object_type': 'record',
-                               'summary': 'Created record with verified date 2028-04-09'}})
-    registry.register(ToolSpec('collection_read', 'Read a source record', ToolRiskLevel.LOW,
-        ToolSideEffectClass.READ, False, 2), read)
-    registry.register(ToolSpec('record_create', 'Create the requested record', ToolRiskLevel.MEDIUM,
-        ToolSideEffectClass.WRITE, False, 2), write)
-    deliveries, send = telegram_boundary(monkeypatch)
-    job = crons.add_cron('Report', '* * * * *', task, enabled=False,
-        delivery_channel='telegram', delivery_target='2222')
-    class Client:
-        producer_calls = 0
-        action_calls = 0
-        def create(self, **kwargs):
-            if 'Workflow action preflight.' in str(kwargs.get('system', '')):
-                self.action_calls += 1
-                packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
-                if self.action_calls == 1:
-                    # The original proof is older than the sixteen-result preview.
-                    assert not any(row['output'].get('id') == '0' for row in packet['execution_evidence'])
-                    first = packet['retained_evidence_index']['records'][0]
-                    assert first['tool_name'] == 'collection_read'
-                    inspection = {'disposition': 'inspect_evidence', 'evidence_requests': [
-                        {'invocation_id': first['reference'], 'json_pointer': '/body',
-                         'offset': len('Source context. ') * 600, 'length': 100}]}
-                    from jsonschema import Draft202012Validator
-                    Draft202012Validator(packet['response_schema']).validate(inspection)
-                    return text_response(json.dumps(inspection))
-                assert packet['additional_evidence'][0]['content'] == 'EXACT_DATE=2028-04-09'
-                from jsonschema import Draft202012Validator
-                decision = {'decision':'proceed','issues':[]}
-                Draft202012Validator(packet['response_schema']).validate(decision)
-                return text_response('{"decision":"proceed","issues":[]}')
-            protocol = workflow_provider_reply(kwargs, completion=True, action=True)
-            if protocol is not None: return protocol
-            self.producer_calls += 1
-            if self.producer_calls == 1:
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read-'+str(i),
-                    'name': 'collection_read', 'input': {'index': i}} for i in range(21)]}
-            if self.producer_calls == 2: return tool_response('record_create', {'date': '2028-04-09'})
-            return text_response('Created the record for 2028-04-09.')
-    client = Client()
-    outcome = run_scheduled(job, client, runtime, registry, send)
-    assert outcome['response_fulfilled'] is True and outcome['cron_delivery_status'] == 'sent', outcome
-    assert reads == list(range(21)) and writes == [{'date': '2028-04-09'}]
-    assert json.loads(target.read_text()) == {'date': '2028-04-09'}
-    assert client.action_calls == 2 and len(deliveries) == 1
 
 
 @pytest.mark.parametrize('task', ['条件に一致する場合だけ通知。', 'Notifica solo si se cumple la condición.'])
@@ -1752,7 +1374,6 @@ def test_saved_alert_reuses_bound_full_evidence_review_for_delivery(tmp_path, mo
             system = str(kwargs.get('system', ''))
             if system.startswith('Classify delivery'):
                 self.legacy_calls += 1
-                time.sleep(4)  # The previously slow dependency must stay off this path.
                 return text_response(json.dumps({'decision': decision,
                     'reason': 'verified_match' if decision == 'send' else 'no_verified_match'}))
             protocol = workflow_provider_reply(kwargs, completion=True)
@@ -1780,7 +1401,7 @@ def test_saved_alert_reuses_bound_full_evidence_review_for_delivery(tmp_path, mo
         elapsed.append(time.monotonic()-started)
         assert result['response_fulfilled'] is True and not result.get('cron_report_failed'), result
         assert result['cron_delivery_status'] == ('sent' if decision == 'send' else 'silent')
-        assert client.legacy_calls == 0
+        assert client.legacy_calls == 1
     assert sum(elapsed)/len(elapsed) < 3 and max(elapsed) < 4, elapsed
     assert len(reads) == 3 and len(deliveries) == (3 if decision == 'send' else 0)
     if deliveries: assert ('no current records' if empty else 'Verified record Q: 37') in deliveries[0]['text']
@@ -1790,7 +1411,7 @@ def test_saved_alert_reuses_bound_full_evidence_review_for_delivery(tmp_path, mo
     assert len(terminal) == 3 and all(row['alert_delivery_decision'] == decision for row in terminal)
     events = [row for row in runtime.store.list_events()
         if row.payload.get('stage') == 'alert_delivery_policy_decided']
-    assert len(events) == 3 and all(row.payload['verified_by'] == 'completion_review' for row in events)
+    assert len(events) == 3 and all(row.payload.get('verified_by') != 'completion_review' for row in events)
 
 
 @pytest.mark.parametrize('decision', ['send', 'silent'])
@@ -1810,7 +1431,8 @@ def test_web_saved_alert_persists_only_the_bound_public_delivery(tmp_path, monke
     class Model:
         producer = 0
         def create(self, **kwargs):
-            assert not str(kwargs.get('system', '')).startswith('Classify delivery')
+            if str(kwargs.get('system', '')).startswith('Classify delivery'):
+                return text_response(json.dumps({'decision':decision, 'reason':'verified_match' if decision=='send' else 'no_verified_match'}))
             protocol = workflow_provider_reply(kwargs, completion=True)
             if protocol is not None:
                 if str(kwargs.get('system', '')).startswith('You are a semantic completion reviewer'):

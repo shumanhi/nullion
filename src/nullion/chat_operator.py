@@ -3122,15 +3122,17 @@ def _reply_context_prompt(reply_context: dict[str, object] | None) -> str | None
         parts.append(f"to message id {reply_to_message_id}")
     if reply_to_text:
         parts.append(f"from {source}: {_trim_context_text(reply_to_text, 2000)}")
+    if reply_context.get("reply_to_has_attachment") is True:
+        parts.append("with attached media from that exact message; use that media as the reference, not an earlier topic")
     return " ".join(parts) + "."
 
 
-def _reply_context_is_explicit_bot_anchor(reply_context: dict[str, object] | None) -> bool:
+def _reply_context_is_explicit_anchor(reply_context: dict[str, object] | None) -> bool:
     if not isinstance(reply_context, dict):
         return False
-    if reply_context.get("reply_to_from_bot") is not True:
+    if reply_context.get("reply_to_from_bot") is not True and reply_context.get("reply_to_has_attachment") is not True:
         return False
-    return bool(str(reply_context.get("reply_to_text") or "").strip())
+    return bool(str(reply_context.get("reply_to_text") or "").strip() or reply_context.get("reply_to_has_attachment") is True)
 
 
 def _selected_pending_request(runtime, conversation_result, selected_request=None):
@@ -23546,7 +23548,7 @@ def _render_chat_turn(
 
     thread = _get_chat_thread(runtime, chat_id)
     reply_context_prompt = _reply_context_prompt(reply_context)
-    explicit_reply_anchor = _reply_context_is_explicit_bot_anchor(reply_context)
+    explicit_reply_anchor = _reply_context_is_explicit_anchor(reply_context)
     reply_context_text = (
         str(reply_context.get("reply_to_text") or "").strip()
         if isinstance(reply_context, dict)
@@ -24281,11 +24283,11 @@ def _render_chat_turn(
         # Reuse context already loaded for this turn. Outcome review must not
         # forget known profile facts or durable restrictions and ask again.
         turn_tool_flow_context["known_user_context"] = memory_context[:6000]
-    if reply_context_text:
+    if reply_context_text or (isinstance(reply_context, dict) and reply_context.get("reply_to_has_attachment") is True):
         turn_tool_flow_context["request_context"] = {
             "quoted_message": {
                 key: value for key, value in (reply_context or {}).items()
-                if key in {"platform", "reply_to_message_id", "reply_to_turn_id", "reply_to_from_bot", "reply_to_text"}
+                if key in {"platform", "reply_to_message_id", "reply_to_turn_id", "reply_to_from_bot", "reply_to_text", "reply_to_has_attachment"}
             }
         }
     turn_tool_flow_context.update(
@@ -25772,9 +25774,10 @@ def _render_chat_turn(
                         and result.output.get("result_kind") == "source_observations"
                         for result in turn_result.tool_results or ()
                     )
-                    helper_content = ((turn_result.response_presentation or {}).get('outcome_review_role') == 'helper'
+                    from nullion.execution_outcome import owned_prepared_answer
+                    producer_content = (owned_prepared_answer(turn_result, effective_prompt) is not None
                         and bool(str(reply or '').strip()))
-                    if helper_content or (source_observations and str(reply or "").strip()) or (
+                    if producer_content or (source_observations and str(reply or "").strip()) or (
                         _reply_visible_text_references_all_artifact_paths(
                             reply,
                             completed_path_tuple,
