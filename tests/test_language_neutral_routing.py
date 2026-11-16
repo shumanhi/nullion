@@ -393,6 +393,7 @@ def test_compact_message_only_delivery_contract_omits_artifact_handbook(tmp_path
     assert "answer the user's actual question first" in prompt.lower()
     assert "exactly one numbered choice list" in prompt
     assert "Never answer only" in prompt
+    assert "source/action URLs from retained evidence" in prompt
     assert "artifact directory" not in prompt
     assert "spreadsheet_create" not in prompt
     assert "terminal_exec" not in prompt

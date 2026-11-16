@@ -91,14 +91,14 @@ _OPERATOR_COMMAND_SPECS: tuple[OperatorCommandSpec, ...] = (
     OperatorCommandSpec("/chat <message>", "Talk to Nullion Assistant", "chat"),
     OperatorCommandSpec("/planner <message>", "Run a step-by-step planned task", "planner"),
     OperatorCommandSpec("/stop", "Stop active work in this session", "stop"),
-    OperatorCommandSpec("/new", "Clear conversation history and start fresh", "new"),
+    OperatorCommandSpec("/new", "Start fresh while keeping saved history", "new"),
     OperatorCommandSpec("/verbose [on|off|status]", "Toggle activity details", "verbose"),
     OperatorCommandSpec("/thinking [on|off|status]", "Show or hide provider reasoning summaries separately", "thinking"),
     OperatorCommandSpec("/streaming [on|off|status]", "Toggle streamed chat replies where supported", "streaming"),
     OperatorCommandSpec("/update [--ignore-checks|--force]", "Update Nullion safely with automatic rollback", "update"),
-    OperatorCommandSpec("/restart", "Restart the bot process", "restart"),
+    OperatorCommandSpec("/restart", "Restart Nullion", "restart"),
     OperatorCommandSpec("/models", "Show available and saved models", "models"),
-    OperatorCommandSpec("/model <provider> <model_name>", "Switch to a different model", "model"),
+    OperatorCommandSpec("/model [provider] <model_name>", "Switch to a different model", "model"),
     OperatorCommandSpec("/memory [all]", "Show saved memory", "memory"),
     OperatorCommandSpec("/memory delete <n|entry_id|last-hour|24h|all>", "Delete saved memory", None),
     OperatorCommandSpec("/approvals", "List pending approval requests", "approvals"),
@@ -123,7 +123,7 @@ _OPERATOR_COMMAND_SPECS: tuple[OperatorCommandSpec, ...] = (
     OperatorCommandSpec("/version", "Show installed version", "version"),
     OperatorCommandSpec("/health", "Show runtime health summary", "health"),
     OperatorCommandSpec("/doctor [diagnose|n|start n|complete n|dismiss n]", "Diagnose, list, or act on Doctor health actions", "doctor"),
-    OperatorCommandSpec("/doctor run <id> <doctor:action>", "Run a Doctor playbook action from text-only chat", None),
+    OperatorCommandSpec("/doctor run <id> doctor:<action>", "Run a Doctor playbook action from text-only chat", None),
     OperatorCommandSpec("/uptime", "Show current operator runtime uptime", "uptime"),
     OperatorCommandSpec("/status", "Show full runtime status", "status"),
     OperatorCommandSpec("/status active", "Show active work only", None),
@@ -258,15 +258,31 @@ def _service_stop_result(service: object | None) -> SessionStopResult:
     )
 
 
-def _render_command_reference(title: str, specs: tuple[OperatorCommandSpec, ...]) -> str:
-    commands = {spec.command for spec in specs}
+def operator_command_invocation(command: str, *, platform: str = '') -> str:
+    """Render a catalog command for the selected transport."""
+    aliases = {spec.head: spec.telegram_command for spec in _OPERATOR_COMMAND_SPECS if spec.telegram_command}
+    head, _, arguments = command.partition(' ')
+    if platform == 'telegram':
+        head = '/' + aliases.get(head, head[1:])
+    elif platform == 'slack':
+        head = '/nullion ' + head[1:]
+    return head + (' ' + arguments if arguments else '')
+
+
+def _render_command_reference(title: str, specs: tuple[OperatorCommandSpec, ...], *, platform: str = '') -> str:
     lines = [title]
-    lines.extend(
-        f"{command} — {description}"
-        for command, description in operator_command_suggestions()
-        if command in commands
-    )
+    for spec in specs:
+        if spec.hidden_from_suggestions:
+            continue
+        usage = operator_command_invocation(spec.command, platform=platform)
+        lines.append(f'{usage} — {spec.description}')
     return "\n".join(lines)
+
+
+def operator_command_reference(*, platform: str = '', full: bool = False) -> str:
+    """One command catalog; only invocation syntax varies by transport."""
+    return _render_command_reference('Nullion — full command reference' if full else 'Nullion operator commands',
+        _OPERATOR_COMMAND_SPECS, platform=platform)
 
 
 _UNKNOWN_COMMAND = (
@@ -545,7 +561,7 @@ def _doctor_action_cmd(runtime: PersistentRuntime, action: str, token: str | Non
 
 def _doctor_run_cmd(runtime: PersistentRuntime, token: str | None, command: str | None) -> str:
     if token is None or command is None:
-        return "Usage: /doctor run <n|action_id> <doctor:action>"
+        return "Usage: /doctor run <n|action_id> doctor:<action>"
     resolved = _resolve_doctor_action(runtime, token)
     normalized_token = _normalize_mention_suffix(token)
     if resolved is None:
@@ -570,9 +586,13 @@ def _reminder_cmd(runtime: PersistentRuntime, parts: list[str]) -> str:
     if len(parts) != 3 or parts[1].lower() != "cancel":
         return "Usage: /reminder cancel <task_id>"
     task_id = _normalize_mention_suffix(parts[2])
-    removed = runtime.store.remove_reminder(task_id)
-    runtime.store.scheduled_tasks.pop(task_id, None)
-    runtime.checkpoint()
+    cancel = getattr(runtime, "cancel_reminder", None)
+    if callable(cancel):
+        removed = cancel(task_id)
+    else:
+        removed = runtime.store.remove_reminder(task_id)
+        runtime.store.scheduled_tasks.pop(task_id, None)
+        runtime.checkpoint()
     if removed:
         return f"Cancelled reminder {task_id}."
     return f"Reminder not found: {task_id}"

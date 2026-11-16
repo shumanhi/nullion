@@ -4,6 +4,8 @@ import json
 import os
 import shlex
 import sys
+import time
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,7 +25,7 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
 ])
 @pytest.mark.parametrize('outside_delivery_root', [False, True])
 @pytest.mark.parametrize('predelete', [False, True])
-def test_terminal_creation_delivers_bytes_from_owned_directory(tmp_path, monkeypatch, extension, prompt, script, outside_delivery_root, predelete):
+def test_terminal_creation_delivers_bytes_from_owned_directory(tmp_path, monkeypatch, extension, prompt, script, outside_delivery_root, predelete, runtime_environment=False):
     from datetime import UTC, datetime
     from fastapi.testclient import TestClient
     from nullion import web_app, chat_store
@@ -37,6 +39,22 @@ def test_terminal_creation_delivers_bytes_from_owned_directory(tmp_path, monkeyp
     monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off');chat_store._store=None
     if outside_delivery_root:
         script=script.replace("'result"+extension+"'", repr(str(tmp_path/('result'+extension))))
+    if runtime_environment:
+        # Only this installed runtime has the opaque fixture package. A login
+        # shell choosing the global Python reproduces the live missing-library
+        # failure without relying on a particular globally installed package.
+        environment = tmp_path / "runtime environment"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(environment)],
+            check=True, capture_output=True, timeout=20)
+        python = environment / "bin" / "python3"
+        site = subprocess.check_output([str(python), "-c", "import sysconfig;print(sysconfig.get_path('purelib'))"], text=True).strip()
+        Path(site, "fixture_runtime_37.py").write_text("value = 37\n")
+        previous = subprocess.run(['bash', '-lc', 'python3 -c "import fixture_runtime_37"'],
+            cwd=tmp_path, capture_output=True, text=True, timeout=5)
+        assert previous.returncode != 0 and 'ModuleNotFoundError' in previous.stderr
+        script = "import fixture_runtime_37;assert fixture_runtime_37.value == 37;" + script
+        monkeypatch.setattr(sys, "prefix", str(environment))
+        monkeypatch.setattr(sys, "executable", str(python))
     script+=";from pathlib import Path;Path('verification.txt').write_text('Internal verification note')"
     if outside_delivery_root:script+=';print('+repr(str(tmp_path/('result'+extension)))+')'
     registry=ToolRegistry()
@@ -62,10 +80,13 @@ def test_terminal_creation_delivers_bytes_from_owned_directory(tmp_path, monkeyp
             if 'select_attachment_format' in names:return tool('select_attachment_format',{'extension':extension,'confidence':1})
             if not names:return text('{}')
             self.phase+=1
+            if runtime_environment and self.phase > 3:
+                time.sleep(2)  # Previously slow recovery must never re-enter.
+                raise AssertionError('Unexpected library-recovery model round')
             if self.phase==1:return tool('request_tool_scope',{'capabilities':['local_shell'],
                 'tool_names':['terminal_exec'],'required_tool_names':['terminal_exec'],'artifact_extensions':[extension]})
             if self.phase==2 or (predelete and self.phase==3):
-                command=shlex.quote(sys.executable)+' -c '+shlex.quote(script)
+                command=('python3' if runtime_environment else shlex.quote(sys.executable))+' -c '+shlex.quote(script)
                 if predelete and self.phase==2:command='rm -f never-created-for-this-test.csv; '+command
                 return tool('terminal_exec',{'command':command})
             return text('Created the requested file.'+('\nMEDIA:'+str(tmp_path/('result'+extension)) if outside_delivery_root else ''))
@@ -79,7 +100,9 @@ def test_terminal_creation_delivers_bytes_from_owned_directory(tmp_path, monkeyp
         permission='tool:terminal_exec',granted_by='fixture',granted_at=datetime.now(UTC)))
     runtime.checkpoint();model=Provider();runtime.model_client=model
     with TestClient(web_app.create_app(runtime,orchestrator=AgentOrchestrator(model_client=model),registry=registry)) as client:
+        started=time.monotonic()
         result=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:terminal-artifact'})
+        elapsed=time.monotonic()-started
         assert result.status_code==200,result.text
         data=result.json()
         assert len(data['artifacts'])==1,(data,[(r.text,r.artifact_paths,r.artifacts) for r in shared_results])
@@ -95,3 +118,27 @@ def test_terminal_creation_delivers_bytes_from_owned_directory(tmp_path, monkeyp
             assert len(guards)==1 and guards[0]['output']['command_executed'] is False
         delivered=client.get(artifact['url']);assert delivered.status_code==200
         assert delivered.content==path.read_bytes() and len(delivered.content)>20
+
+        if runtime_environment:
+            turns=[row for row in runtime.store.list_conversation_events('web:terminal-artifact')
+                   if row.get('event_type')=='conversation.chat_turn']
+            commands=[row for row in turns[-1]['tool_results'] if row['tool_name']=='terminal_exec']
+            assert model.phase==3 and len(commands)==1 and commands[0]['status']=='completed',commands
+            import io
+            from docx import Document
+            assert 'North 12 South 19 Total 31' in '\n'.join(
+                paragraph.text for paragraph in Document(io.BytesIO(delivered.content)).paragraphs)
+            return elapsed
+
+
+def test_runtime_python_libraries_deliver_docx_without_repair_rounds(tmp_path, monkeypatch, record_property):
+    elapsed=[]
+    for index,prompt in enumerate(('Crea el documento adjunto.', '添付文書を作成してください。', 'أنشئ المستند المرفق.')):
+        root=tmp_path/str(index);root.mkdir()
+        with monkeypatch.context() as scoped:
+            elapsed.append(test_terminal_creation_delivers_bytes_from_owned_directory(root,scoped,'.docx',prompt,
+                "from docx import Document;d=Document();d.add_paragraph('North 12 South 19 Total 31');d.save('result.docx')",
+                False,False,runtime_environment=True))
+    record_property('runtime_python_elapsed_seconds',json.dumps(elapsed))
+    assert sum(elapsed)/len(elapsed)<5,elapsed
+    assert max(elapsed)<8,elapsed

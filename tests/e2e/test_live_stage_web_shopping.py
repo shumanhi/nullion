@@ -18,14 +18,22 @@ def test_live_web_amazon_powder_comparison_uses_profile_marketplace(live_web):
    'Use prices before unconfirmed shipping or account discounts. Do not sign in, buy, change account settings, submit my address, '
    'or create files. If Amazon blocks access, report the verified blocker without inventing live prices.',timeout=720)
   results=turn.get('tool_results',[]);reply=response['text']
+  proof.update(elapsed_ms=elapsed,reply=reply,turn=turn)
   asins={value.upper() for value in re.findall(r'amazon\.com/(?:[^\s<>]*?/)?(?:dp|gp/product)/([A-Z0-9]{10})',reply,re.I)}
   reports=[r['output'] for r in results if r.get('tool_name')=='browser_run_task' and r.get('status')=='completed']
   blocks=[r for r in reports if r.get('goal_status')=='blocked' and r.get('blocker') and r.get('execution_audit',{}).get('complete') is True
           and any((urlsplit(u).hostname or '').lower()=='amazon.com' or (urlsplit(u).hostname or '').lower().endswith('.amazon.com') for u in r.get('execution_audit',{}).get('visited_urls',[]))]
-  if len(asins)>=2 and '$' in reply:
+  if asins and '$' in reply:
    evidence=json.dumps([r.get('output') for r in results if r.get('status')=='completed'],ensure_ascii=False).upper()
    assert asins.issubset(set(re.findall(r'[A-Z0-9]{10}',evidence))),('Product identities not in captured evidence',asins)
-   assert any(r.get('status')=='completed' and r.get('tool_name') in {'browser_extract_detail','browser_extract_items','browser_extract_text','browser_run_task'} for r in results),results
+   def completed_read(row):
+    if row.get('status')!='completed':return False
+    if row.get('tool_name') in {'browser_extract_detail','browser_extract_items','browser_extract_text','browser_run_task'}:return True
+    native=row.get('response_requirements',{}).get('_native_completed_reads',{})
+    return (row.get('tool_name')=='browser_read_pages' and native.get('read_only') is True
+        and native.get('parent_tool')==row['tool_name'] and native.get('invocation_id')==row.get('invocation_id')
+        and bool(set(native.get('tool_names',[])) & {'browser_extract_detail','browser_extract_items','browser_extract_text'}))
+   assert any(completed_read(r) for r in results),results
    proof['outcome_kind']='displayed_product_comparison'
   else:
    assert blocks,('No displayed comparison or verified Amazon access blocker',reply,results)

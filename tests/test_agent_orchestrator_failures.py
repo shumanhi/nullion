@@ -2072,7 +2072,7 @@ def test_weather_model_context_keeps_current_daily_and_next_24_hours_only() -> N
     assert "\"hourly\"" not in payload_text
 
 
-def test_web_search_model_context_keeps_three_compact_source_records() -> None:
+def test_web_search_model_context_keeps_all_compact_source_records() -> None:
     results = [
         {
             "title": f"Result {index}",
@@ -2093,11 +2093,11 @@ def test_web_search_model_context_keeps_three_compact_source_records() -> None:
     payload = json.loads(payload_text)
 
     assert payload["output"]["query"] == "structured search query"
-    assert len(payload["output"]["results"]) == 2
-    assert payload["output"]["results_compaction"] == {"shown": 2, "total": 12}
+    assert len(payload["output"]["results"]) == 12
+    assert payload["output"]["results_compaction"] == {"shown": 12, "total": 12}
     assert len(payload["output"]["results"][0]["snippet"]) <= 350
     assert "irrelevant_payload" not in payload_text
-    assert len(payload_text) < 3_000
+    assert len(payload_text) < 10_000
 
 
 def test_completed_tool_use_history_compacts_large_artifact_inputs_and_counts_them() -> None:
@@ -2408,7 +2408,8 @@ def test_focused_artifact_model_context_is_compacted_to_verified_evidence_packet
     serialized = json.dumps(compacted)
     packet = compacted[-1]["content"][0]["text"]
 
-    assert "terminal-call" not in serialized
+    assert "terminal-call" in serialized  # Exact retained identity survives the preview.
+    assert not any(b.get("type") in {"tool_use", "tool_result"} for m in compacted for b in m.get("content", []) if isinstance(b, dict))
     assert "raw terminal output" not in serialized
     assert "Create the required HTML report" in serialized
     assert "Focused artifact production packet" in serialized
@@ -2571,7 +2572,7 @@ def test_artifact_producer_focus_is_ephemeral_across_model_iterations() -> None:
     }
 
     first = _agent_turn_model_node(state)
-    assert model.calls[-1] == ["spreadsheet_create"]
+    assert model.calls[-1] == ["spreadsheet_create", "inspect_retained_evidence"]
     assert model.timeouts[-1] >= 90
     assert first["tool_registry"] is registry
 
@@ -2590,7 +2591,7 @@ def test_artifact_producer_focus_is_ephemeral_across_model_iterations() -> None:
             ],
         }
     )
-    assert model.calls[-1] == ["pdf_create"]
+    assert model.calls[-1] == ["pdf_create", "inspect_retained_evidence"]
     assert model.timeouts[-1] >= 90
     assert second["tool_registry"] is registry
 
@@ -2642,6 +2643,7 @@ def test_next_artifact_call_compacts_completed_producer_payload_pair() -> None:
         messages,
         state={
             "tool_registry": registry,
+            "invocation_metadata":{"xlsx-result":{"tool_use_id":"xlsx-call"}},
             "tool_flow_context": {
                 "requires_artifact_delivery": True,
                 "artifact_extensions": [".xlsx", ".pdf"],

@@ -176,6 +176,27 @@ def test_background_or_write_cannot_borrow_read_source_from_history(provider,lin
     assert not result.output['connector_source_user_requested']
 
 
+@pytest.mark.parametrize('source', ['Prepare the selected email for confirmation', '確認するメールを用意してください', 'Prepara el correo para confirmar'])
+def test_selected_action_clarification_exposes_only_approval_guarded_write(provider, source):
+    from dataclasses import replace
+    from nullion.turn_context_policy import TurnToolEvidence
+    tools = registry()
+    spec = tools.get_spec('email_send')
+    tools.unregister('email_send')
+    tools.register(replace(spec, requires_approval=True), lambda invocation: pytest.fail('Scope executed an account write'))
+    evidence = TurnToolEvidence(context_linked=True, current_user_message='2', numbered_option_selected=True,
+        linked_user_messages=(source,))
+    result, widened = ScopedTurnToolRegistry(tools, evidence=evidence).apply_scope_request(
+        ToolInvocation('scope','request_tool_scope','web:linked', {'capabilities':['connector'],
+            'tool_names':['email_send'], 'required_tool_names':['email_send'],
+            'source_user_requested':True, 'source_evidence':source}))
+    assert result.output['source_evidence_verified']
+    assert widened.can_invoke_tool('email_send')
+    assert widened.get_spec('email_send').requires_approval is True
+    # Visibility does not create approval state or invoke the adapter. The E2E
+    # exercises the native pending card and exact attachment payload separately.
+
+
 def test_linked_request_context_reads_only_same_conversation_selected_ancestors():
     from types import SimpleNamespace
     from nullion.chat_operator import _linked_request_user_messages

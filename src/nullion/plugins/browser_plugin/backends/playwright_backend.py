@@ -391,7 +391,7 @@ def _base_locator_for_target(page: "Page", target: dict[str, Any]):
     if placeholder and hasattr(page, "get_by_placeholder"):
         return page.get_by_placeholder(placeholder)
     role = str(target.get("role") or "").strip()
-    name = str(target.get("name") or "").strip()
+    name = str(target.get("name") or target.get("text") or "").strip()
     if role and hasattr(page, "get_by_role"):
         kwargs = {"name": name} if name else {}
         return page.get_by_role(role, **kwargs)
@@ -791,7 +791,8 @@ async def _locator_value_matches(locator: Any, text: str) -> bool | None:
 class PlaywrightBackend:
     """Headless Chromium backend via Playwright.
 
-    One Page per session_id. Sessions are isolated browser contexts.
+    One Page per session_id. Independent tasks use isolated browser contexts;
+    explicitly related read tabs share their task's context.
     """
 
     BACKEND_NAME = "playwright"
@@ -801,6 +802,8 @@ class PlaywrightBackend:
         self._playwright = None
         self._browser: "Browser | None" = None
         self._pages: dict[str, "Page"] = {}
+        self._contexts: dict[str, "BrowserContext"] = {}
+        self._context_roots: dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._headless = (
             os.environ.get("NULLION_BROWSER_HEADLESS", "true").lower() != "false"
@@ -817,13 +820,21 @@ class PlaywrightBackend:
             self._browser = await _launch_playwright_browser(pw.chromium, headless=self._headless)
         return self._browser
 
+    def share_session_context(self, parent: str, child: str) -> None:
+        root = self._context_roots.setdefault(parent, parent)
+        if child in self._pages and self._context_roots.get(child) != root:
+            raise ValueError("Cannot move an open browser tab to another task's context")
+        self._context_roots[child] = root
+
     async def _get_page(self, session_id: str) -> "Page":
         async with self._lock:
             if session_id not in self._pages:
-                browser = await self._ensure_browser()
-                ctx: "BrowserContext" = await browser.new_context(
-                    user_agent=_context_user_agent(browser.version),
-                )
+                root = self._context_roots.setdefault(session_id, session_id)
+                ctx = self._contexts.get(root)
+                if ctx is None:
+                    browser = await self._ensure_browser()
+                    ctx = await browser.new_context(user_agent=_context_user_agent(browser.version))
+                    self._contexts[root] = ctx
                 self._pages[session_id] = await ctx.new_page()
         return self._pages[session_id]
 
@@ -838,8 +849,9 @@ class PlaywrightBackend:
         return f"Opened browser session {session_id}"
 
     async def navigate(self, session_id: str, url: str) -> str:
+        from nullion.plugins.browser_plugin.browser_session import goto_with_settled_failure
         page = await self._get_page(session_id)
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        response = await goto_with_settled_failure(page, url)
         status = response.status if response else 0
         return f"Navigated to {url} (status {status})"
 
@@ -938,6 +950,14 @@ class PlaywrightBackend:
 
     async def screenshot(self, session_id: str, mode: str = "auto") -> BrowserScreenshotResult:
         page = await self._get_page(session_id)
+        from ..browser_session import DOCUMENT_CONTENT_SCRIPT
+        has_document_content=None
+        if getattr(page,'url',None)=='about:blank':
+            try:
+                value=await page.evaluate(DOCUMENT_CONTENT_SCRIPT)
+                has_document_content=value if type(value) is bool else None
+            except Exception:
+                pass
         requested_mode = mode if mode in {"auto", "viewport", "full_page"} else "auto"
         layout = await self._page_layout(page)
         viewport_width = layout.get("viewportWidth")
@@ -971,6 +991,7 @@ class PlaywrightBackend:
             document_width=document_width,
             document_height=document_height,
             is_clipped=not full_page and exceeds_viewport,
+            has_document_content=has_document_content,
         )
 
     async def scroll(self, session_id: str, direction: str, amount: int) -> None:
@@ -1036,17 +1057,26 @@ class PlaywrightBackend:
         page = await self._get_page(session_id)
         return await page.evaluate(script)
 
-    async def close_session(self, session_id: str) -> None:
+    async def close_session(self, session_id: str) -> bool:
         async with self._lock:
-            page = self._pages.pop(session_id, None)
-        if page:
-            try:
-                await page.context.close()
-            except Exception:
-                pass
+            page = self._pages.get(session_id)
+            root = self._context_roots.get(session_id, session_id)
+            context = self._contexts.get(root) if not any(
+                key != session_id and value == root for key, value in self._context_roots.items()) else None
+            if context is not None or page is not None:
+                if context is not None:
+                    await context.close()
+                else:
+                    await page.close()
+                self._pages.pop(session_id, None)
+                self._context_roots.pop(session_id, None)
+                if context is not None:
+                    self._contexts.pop(root, None)
+                return True
+        return False
 
     async def shutdown(self) -> None:
-        for session_id in list(self._pages):
+        for session_id in set(self._pages) | set(self._context_roots):
             await self.close_session(session_id)
         if self._browser:
             try:

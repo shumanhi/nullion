@@ -1204,7 +1204,7 @@ def test_semantic_setup_rejects_unusable_prepared_source(fixture,status,expected
         json.dumps(probe[0],sort_keys=True):{'reading':23}}}
     result=f.registry.invoke(ToolInvocation('prepare','create_live_tracker','web:alpha',{
         'name':'観測','duration_seconds':90,'probe':probe,
-        'matcher':{'kind':'semantic','instruction':'必要な値を通知'}},flow_context=context))
+        'matcher':{'kind':'semantic','history_mode':'records','instruction':'必要な値を通知'}},flow_context=context))
     assert result.status==expected
     assert len(f.store.list('workspace_admin'))==(1 if status=='no_match' else 0)
     if status=='unknown':

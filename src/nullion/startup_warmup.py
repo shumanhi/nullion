@@ -124,6 +124,18 @@ def run_chat_startup_warmup(
 
     step("chat_context", warm_chat_contexts)
 
+    def warm_memory_snapshot() -> None:
+        from nullion import chat_operator
+        from nullion.runtime_persistence import read_persisted_memory_entries
+
+        checkpoint = getattr(runtime, "checkpoint_path", None)
+        if checkpoint is not None and chat_operator._feature_enabled("NULLION_MEMORY_ENABLED"):
+            # Read-only warming of the existing revision-aware snapshot cache;
+            # no reinforcement, writes, owner changes or cached consent policy.
+            read_persisted_memory_entries(checkpoint)
+
+    step("memory_snapshot", warm_memory_snapshot)
+
     for warmer_name, warmer in tuple(context_warmers or ()):
         normalized_name = str(warmer_name or "").strip() or "context"
         if callable(warmer):

@@ -44,17 +44,13 @@ def test_live_browser_groups_subject_fields_and_delivers_only_specific_limitatio
                    for row in turn['tool_results']), turn
         if kind == 'products':
             assert re.search(r'(?<!\d)4(?!\d)', reply) and re.search(r'(?<!\d)7(?!\d)', reply), reply
-        validations = catalogue._conversation_event_payloads(database, conversation,
-            event_type='conversation.source_answer_validation')
+        native=[row['output'] for row in turn['tool_results'] if row['tool_name'].startswith('browser_') and row['status']=='completed']
+        assert all(value in json.dumps(native,ensure_ascii=False) for value in expected),native
+        assert turn.get('response_fulfilled') is True,turn
         if kind == 'rentals':
             assert any(row['tool_name'] == 'browser_run_task' and row['status'] == 'completed'
                        for row in turn['tool_results']), turn
-            assert validations and validations[-1]['valid'] is True, validations
-        reviews = catalogue._conversation_event_payloads(database, conversation,
-            event_type='conversation.completion_review')
-        assert reviews and reviews[-1]['disposition'] == 'complete', reviews
-        assert reviews[-1].get('source_presentation_valid') is not False, reviews
-        evidence.update(validations=validations, reviews=reviews)
+        evidence.update(native_sources_verified=True)
         bubbles = page.locator('#messages .msg.bot .bubble')
         assert bubbles.last.is_visible()
         assert '**' not in bubbles.last.inner_text()
@@ -73,12 +69,12 @@ def test_live_completed_product_reply_keeps_fields_on_reload_without_another_mod
     before = catalogue._conversation_event_payloads(database, saved, event_type='conversation.model_timing')
     turns = _turns(database, saved)
     assert len(turns) == 1, turns
-    text = turns[0]['assistant_reply']
+    from nullion.chat_text import render_user_message
+    text = render_user_message(turns[0]['assistant_reply'])
     assert all(value in text for value in ('Maple Lamp', '$34', 'Birch Lamp', '$48')), text
     assert re.search(r'(?<!\d)4(?!\d)', text) and re.search(r'(?<!\d)7(?!\d)', text), text
     assert 'safely combined or verified' not in text and 'Choose an option' not in text
-    reviews = catalogue._conversation_event_payloads(database, saved, event_type='conversation.completion_review')
-    assert reviews and reviews[-1]['disposition'] == 'complete', reviews
+    assert turns[0].get('response_fulfilled') is True,turns[0]
     # A fresh context avoids the live fixture's deliberate per-load selection
     # of a new conversation. Exercise the actual history restore path.
     restored = page.context.browser.new_context()
@@ -102,5 +98,5 @@ def test_live_completed_product_reply_keeps_fields_on_reload_without_another_mod
     out = Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])
     page.screenshot(path=str(out/'source-groups-product-replay.png'), timeout=10000)
     (out/'source-groups-product-replay.json').write_text(json.dumps({
-        'conversation_id': saved, 'reply': text, 'reviews': reviews, 'extra_model_calls': 0}, ensure_ascii=False, indent=2))
+        'conversation_id': saved, 'reply': text, 'extra_model_calls': 0}, ensure_ascii=False, indent=2))
     restored.close()

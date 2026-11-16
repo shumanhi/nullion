@@ -19,9 +19,27 @@ def test_live_scoped_recommendation_resolves_real_contenders_without_exhaustive_
     assert '0.07' in response['text'] and '0.75' in response['text'],response
     assert origin+'/sample/2' in response['text'] and origin+'/sample/1' in response['text']
     assert 'Other relevant sources remain unchecked' not in response['text']
-    reviews=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_review')
-    assert reviews[-1]['disposition']=='complete' and not reviews[-1]['search_coverage_errors'],reviews
-    assert reviews[-1]['comparison_mode']=='bounded',reviews[-1]
-    coverage=reviews[-1]['search_coverage'];assert coverage['comparison_scope']['scope_disclosed']
-    assert coverage['comparison_scope']['ranking_complete'] and coverage['coverage_sufficient']
+    # The producer owns completion. Verify its native records and published
+    # answer instead of requiring the retired secondary grading event.
+    assert turn.get('response_fulfilled') is True,turn
+    reads=[row for result in turn.get('tool_results',[]) if result.get('status')=='completed'
+        and result.get('tool_name')=='browser_read_pages'
+        for row in result.get('output',{}).get('pages',[]) if row.get('status')=='completed']
+    selected={row.get('page_url') for row in reads if row.get('read_kind')=='detail'}
+    assert {origin+'/sample/1',origin+'/sample/2'}<=selected,reads
+    discovered={item.get('url') for result in turn.get('tool_results',[])
+        if result.get('status')=='completed' and result.get('tool_name') in {'browser_read_pages','browser_extract_items'}
+        for item in result.get('output',{}).get('items',[]) if item.get('url')}
+    for result in turn.get('tool_results',[]):
+        if result.get('status')!='completed':continue
+        output=result.get('output',{})
+        records=[output.get('record',{}),*[row.get('record',{}) for row in output.get('details',[])]]
+        for record in records:
+            if str(record.get('url','')).rstrip('/')==origin+'/comparison':
+                discovered.update(link['url'] for link in record.get('links',[]) if link.get('url'))
+    assert discovered and (selected & discovered) < discovered, 'A bounded comparison must not read the entire catalog'
+    assert elapsed < 90000, f'Bounded comparison exceeded 90 seconds: {elapsed/1000:.1f}s'
+    evidence=__import__('json').dumps([r['output'] for r in turn.get('tool_results',[])
+        if r.get('status')=='completed' and r.get('tool_name')=='browser_read_pages'],ensure_ascii=False)
+    assert all(value in evidence for value in ('$7.00','$75.00','$0.07','$0.75'))
     assert not errors and not response['artifacts']

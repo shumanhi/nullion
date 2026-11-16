@@ -42,6 +42,7 @@ STRUCTURED_ARTIFACT_PRODUCER_TOOLS = frozenset(
         "pdf_create",
         "pdf_edit",
         "image_generate",
+        "image_render",
         "browser_screenshot",
         "presentation_create",
         "spreadsheet_create",
@@ -139,6 +140,7 @@ class ResponseFulfillmentDecision:
     satisfied: bool
     reply: str
     missing_requirements: tuple[str, ...] = ()
+    partial_report_ready: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1207,9 +1209,21 @@ def artifact_media_plain_replacement_guard_result(
     prior_tool_results: Iterable[ToolResult] | None,
     *,
     required_embedded_media_extensions: Iterable[object] | None = None,
+    declared_artifact_extensions: Iterable[object] | None = None,
+    source_artifact_delivery_requested: bool | None = None,
 ) -> ToolResult | None:
     prior_results = tuple(prior_tool_results or ())
-    if invocation.tool_name == "image_generate" and (
+    context = invocation.flow_context or {}
+    from nullion.artifacts import normalize_artifact_extensions
+    declared = set(normalize_artifact_extensions(declared_artifact_extensions
+        if declared_artifact_extensions is not None else context.get("required_artifact_extensions")
+        or context.get("artifact_extensions") or ()))
+    source_delivery = source_artifact_delivery_requested if source_artifact_delivery_requested is not None else context.get("source_artifact_delivery_requested")
+    prior_source_delivery = any(r.tool_name == 'request_tool_scope' and r.status == 'completed'
+        and isinstance(r.output,dict) and r.output.get('source_artifact_delivery_requested') is True for r in prior_results)
+    creative_image_output = bool(source_delivery is False and not prior_source_delivery
+        and declared and declared.issubset(IMAGE_ATTACHMENT_EXTENSIONS))
+    if invocation.tool_name == "image_generate" and not creative_image_output and (
         any(_browser_image_collection_failed(result) for result in prior_results)
         or any(_browser_page_context_used(result) for result in prior_results)
     ):
@@ -1225,9 +1239,12 @@ def artifact_media_plain_replacement_guard_result(
             {
                 "reason": "sourced_image_collection_failed",
                 "message": error,
+                "failure_scope": "tool", "executed": False, "retryable": False,
+                "terminal_user_action_required": True,
                 "required_tools": ["browser_extract_items", "browser_image_collect"],
             },
             error,
+            response_requirements={"_native_unavailable_file_producer_formats": sorted(IMAGE_ATTACHMENT_EXTENSIONS)},
         )
     extension = _artifact_invocation_media_extension(invocation)
     if (invocation.tool_name == "spreadsheet_create"
@@ -2129,6 +2146,13 @@ def operation_failure_reply(tool_results: Iterable[ToolResult], *, required_tool
         return "I couldn't finish because the browser operation failed. The requested result wasn't confirmed."
     if any(normalize_tool_status(result.status) == "denied" for result in failures):
         return "I couldn't complete the request because the required action wasn't authorized."
+    from nullion.tool_partial_capture import has_native_partial_capture
+    captures = [result for result in failures if has_native_partial_capture(result)]
+    if captures:
+        output = captures[-1].output
+        if output['execution_outcome'] == 'timeout':
+            return f"The command timed out after {output['timeout_seconds']}s. Its captured output is incomplete."
+        return f"The command ended with exit code {output['exit_code']}. Its captured output is incomplete."
     if failures:
         return "I couldn't complete the request because a required step failed."
     return "I couldn't complete the request because a required step didn't run."
@@ -2163,7 +2187,8 @@ def evaluate_response_fulfillment(
     frame = None if reviewed_requirements is not None else _active_frame_for_contract(store, conversation_id)
     if reviewed_requirements is not None:
         required_attachment_extensions = reviewed_requirements['required_attachment_extensions']
-    completed_tool_names = {result.tool_name for result, status in normalized_results if status == "completed"}
+    from nullion.tools import completed_runtime_tool_names
+    completed_tool_names = completed_runtime_tool_names(result for result, _status in normalized_results)
     attempted_tool_names = {result.tool_name for result, _status in normalized_results}
 
     current_scopes = [result.output for result, status in normalized_results
@@ -2177,6 +2202,7 @@ def evaluate_response_fulfillment(
     failed_tools = {result.tool_name for result, status in normalized_results if status in {"failed", "denied", "error"}}
     for scope in current_scopes:
         superseded_tools.update(name for name in scope.get("retired_preparatory_read_tools", ()) if name in failed_tools)
+        superseded_tools.update(name for name in scope.get("retired_unavailable_artifact_producers", ()) if name in failed_tools)
     required_tool_names = tuple(name for name in (required_tool_names or ()) if name not in superseded_tools)
     if reviewed_requirements is not None and 'eligible_evidence_tool_names' in reviewed_requirements:
         required_tool_names = tuple(name for name in required_tool_names
@@ -2251,6 +2277,9 @@ def evaluate_response_fulfillment(
         required_extension = None
 
     reply_valid_media_paths = _reply_valid_media_paths(reply, artifact_roots=artifact_roots)
+    from nullion.artifact_lifecycle import invalid_candidate_identities, identity
+    invalid_generated = invalid_candidate_identities(result for result, _status in normalized_results)
+    reply_valid_media_paths = tuple(path for path in reply_valid_media_paths if identity(path) not in invalid_generated)
     reply_valid_media_identities = _path_identity_set(reply_valid_media_paths)
     excluded_paths = {
         str(Path(path).expanduser())
@@ -2262,6 +2291,7 @@ def evaluate_response_fulfillment(
         *(artifact_paths or ()),
         *artifact_paths_from_tool_results(result for result, _status in normalized_results),
     ]
+    combined_artifact_paths = [path for path in combined_artifact_paths if identity(path) not in invalid_generated]
     invalid_plain_media_artifact_paths = {
         str(Path(path).expanduser())
         for path in artifact_plain_replacement_artifact_paths(result for result, _status in normalized_results)
@@ -2397,6 +2427,11 @@ def evaluate_response_fulfillment(
         review = execution_review
         has_completed_output = any(status == 'completed' and result.tool_name != 'request_tool_scope'
             and result.output for result, status in normalized_results)
+        from nullion.tool_partial_capture import has_native_partial_capture
+        captured_tools = {result.tool_name for result, _ in normalized_results if has_native_partial_capture(result)}
+        has_publishable_output = has_completed_output or bool(captured_tools)
+        capture_only_gap = bool(captured_tools) and all(
+            item.startswith('tool:') and item[5:] in captured_tools for item in missing)
         selected_media = {str(Path(path).expanduser().resolve()) for path in
             (*existing_deliverables, *valid_reply_media)}
         def media_is_selected(path):
@@ -2410,12 +2445,13 @@ def evaluate_response_fulfillment(
             # The primary owns its answer; native missing receipts change
             # fulfillment, not ownership. Keep its findings and add the exact
             # native limitation once through the shared message renderer.
-            if preserve_authored_reply and has_completed_output and authored_reply and response not in authored_reply:
+            if preserve_authored_reply and has_publishable_output and authored_reply and response not in authored_reply:
                 from nullion.chat_text import UserMessage, render_user_message
                 response = render_user_message(UserMessage(paragraphs=(authored_reply,), footer=response))
-            elif preserve_authored_reply and has_completed_output and response in authored_reply:
+            elif preserve_authored_reply and has_publishable_output and response in authored_reply:
                 response = authored_reply
-            return ResponseFulfillmentDecision(False, response, tuple(missing))
+            return ResponseFulfillmentDecision(False, response, tuple(missing),
+                partial_report_ready=bool(preserve_authored_reply and capture_only_gap and authored_reply))
         partial_reply = (review.partial_reply if review else None) or (
             reviewed_requirements.get('partial_reply') if reviewed_requirements else None)
         if partial_reply:
@@ -2586,6 +2622,29 @@ def evaluate_response_execution_outcome(
             if str(path or "").strip() and str(Path(path).expanduser()) not in excluded_paths
         ]
     delivered_artifacts = combined_artifacts if platform_artifact_count or delivery_status in {"sent", "saved"} else ()
+    if decision.satisfied:
+        # A rejected file-production method is not a request-wide blocker once
+        # an admitted alternative produced the selected, verified final bytes.
+        # The registry alone attests these formats: account effects, source-only
+        # reads and required native actions cannot be cleared by an attachment.
+        selected=_existing_deliverable_paths(combined_artifacts,artifact_roots=artifact_roots)
+        selected_ids=_path_identity_set(selected)
+        required=set(required_tool_names or ())
+        alternatives=[]
+        for completed in tool_results:
+            if normalize_tool_status(completed.status)!='completed' or completed.tool_name in {'code_mode','request_tool_scope'}:
+                continue
+            paths=[path for path in artifact_paths_from_tool_results([completed]) if _path_matches_identities(path,selected_ids)]
+            if paths:alternatives.append((completed.invocation_id,{Path(path).suffix.lower() for path in paths}))
+        for failed in tool_results:
+            facts=failed.output if isinstance(failed.output,dict) else {}
+            metadata=failed.response_requirements if isinstance(failed.response_requirements,dict) else {}
+            formats=metadata.get('_native_unavailable_file_producer_formats')
+            if (failed.status!='failed' or failed.tool_name in required or facts.get('failure_scope')!='tool'
+                    or facts.get('terminal_user_action_required') is not True or not isinstance(formats,list)):
+                continue
+            receipts=[identity for identity,extensions in alternatives if extensions.intersection(formats)]
+            if receipts:failed.recovered_by=tuple(dict.fromkeys([*failed.recovered_by,*receipts]))
     from nullion.execution_review_evidence import reviewed_execution_evidence
     review = reviewed_execution_evidence(tool_results, user_message, reply)
     outcome = build_execution_outcome(

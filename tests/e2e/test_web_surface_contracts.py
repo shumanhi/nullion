@@ -198,11 +198,13 @@ def test_output_lists_links_and_literal_code_render_through_real_web_chat(tmp_pa
             expect(anchor).to_have_attribute('href','https://example.com')
             assert anchor.evaluate('e => getComputedStyle(e).color') in {'rgb(147, 197, 253)','rgb(196, 181, 253)'}
             assert code.evaluate('e => getComputedStyle(e.parentElement).whiteSpace')=='pre'
-            expect(bubble.locator('tbody tr td')).to_have_count(3)
-            assert bubble.locator('tbody tr td').all_text_contents() == ['', '19:30', '未対応']
+            # The shared compact policy renders malformed tables as readable
+            # text on all surfaces; both cell values must survive that policy.
+            expect(bubble).to_contain_text('Time: 19:30')
+            expect(bubble).to_contain_text('未対応')
             assert bubble.evaluate('e => e.scrollWidth <= e.clientWidth')
             stored=[e for e in runtime.store.list_conversation_events(page.evaluate("localStorage.getItem('nullion_conv_id')")) if e.get('event_type')=='conversation.chat_turn']
-            assert stored[-1]['assistant_reply']==report
+            assert stored[-1]['assistant_reply']==bubble.get_attribute('data-raw-text')
             assert stored[-1]['user_message']==request
             screenshots=Path(__file__).resolve().parents[2]/'.e2e-artifacts/full-output-review-20261010'
             screenshots.mkdir(parents=True, exist_ok=True)
@@ -1370,6 +1372,8 @@ def test_web_chat_scheduler_setup_scopes_future_artifact_work_to_cron_run(
                             "name": "request_tool_scope",
                             "input": {
                                 "capabilities": ["scheduler_mutate", "web", "local_files"],
+                                "scheduler_action": "mutate",
+                                "required_tool_names": ["create_cron"],
                                 "artifact_extensions": [".docx", ".pptx", ".xlsx", ".csv", ".pdf", ".html"],
                                 "embedded_media_artifact_extensions": [".xlsx"],
                                 "tool_names": [
@@ -1414,6 +1418,14 @@ def test_web_chat_scheduler_setup_scopes_future_artifact_work_to_cron_run(
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime-scheduler-scope.db")
     registry = ToolRegistry(filesystem_allowed_roots=[tmp_path])
     handler_calls: list[str] = []
+    from nullion import crons
+    from nullion.tools import _build_create_cron_handler
+    monkeypatch.setattr(crons,'_RUNTIME_DB_PATH',tmp_path/'scheduler-state.db')
+    create_handler=_build_create_cron_handler()
+    def execute(invocation):
+        handler_calls.append(invocation.tool_name)
+        assert invocation.tool_name=='create_cron','Future report work ran during scheduler setup'
+        return create_handler(invocation)
 
     for name, tags in (
         ("list_crons", ("scheduler", "cron")),
@@ -1438,10 +1450,7 @@ def test_web_chat_scheduler_setup_scopes_future_artifact_work_to_cron_run(
                 capability_tags=tags,
                 input_schema={"type": "object", "properties": {}},
             ),
-            lambda invocation: (
-                handler_calls.append(invocation.tool_name)
-                or ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"message": "Cron created."})
-            ),
+            execute,
         )
 
     model_client = SchedulerSetupClient()
@@ -1465,7 +1474,10 @@ def test_web_chat_scheduler_setup_scopes_future_artifact_work_to_cron_run(
         )
 
     assert response.status_code == 200
-    assert response.json()["text"] == "Cron created."
+    assert 'Cron created' in response.json()['text'] and "couldn't" not in response.json()['text'],response.json()
+    jobs=crons.load_crons()
+    assert len(jobs)==1 and jobs[0].name=='Random website artifact stress test'
+    assert 'research random websites' in jobs[0].task
     assert "couldn't attach" not in response.json()["text"]
     assert handler_calls == ["create_cron"]
     assert model_client.visible_tools_by_call[1] == {"request_tool_scope", "list_crons", "create_cron", "chat_history_search", "memory_search"}
@@ -3882,7 +3894,7 @@ def test_browser_ui_uses_saved_history_before_asking_numbered_clarification(
             playwright.stop()
 
 
-def test_browser_ui_shows_reply_before_slow_persistence_cleanup(tmp_path: Path, monkeypatch) -> None:
+def test_browser_ui_shows_progress_during_save_then_one_finalized_reply(tmp_path: Path, monkeypatch) -> None:
     from nullion import chat_operator
     from nullion import web_app
     from nullion.runtime import bootstrap_persistent_runtime
@@ -3937,10 +3949,12 @@ def test_browser_ui_shows_reply_before_slow_persistence_cleanup(tmp_path: Path, 
             )
             page.locator("#user-input").fill("latency-e2e-42")
             page.locator("#send-btn").click()
-            expect(page.locator(".msg.bot .bubble").filter(has_text="visible before save")).to_have_count(1, timeout=800)
+            expect(page.locator('.status-bubble').filter(has_text='Finishing your response')).to_have_count(1, timeout=800)
             assert save_started.wait(timeout=1)
             assert not save_finished.is_set()
             assert save_finished.wait(timeout=3)
+            expect(page.locator(".msg.bot .bubble").filter(has_text="visible before save")).to_have_count(1, timeout=3000)
+            expect(page.locator('.status-bubble')).to_have_count(0)
             expect(page.locator("#send-btn")).to_be_enabled(timeout=3000)
             assert not errors
         finally:

@@ -9,7 +9,7 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Doc
 @pytest.mark.parametrize('recovery_bound',[False,True])
 @pytest.mark.parametrize('mixed_formats',[False,True])
 @pytest.mark.parametrize('prompt',['Deliver the web page with its image as one portable bundle.','Entrega la página y su imagen en un paquete portátil.','画像付きページを持ち運べる一つのファイルにまとめてください。'])
-def test_linked_page_and_image_are_packaged_then_delivered_once(tmp_path,monkeypatch,prompt,mixed_formats,recovery_bound,standalone_sibling,standalone_extension):
+def test_linked_page_and_image_are_packaged_then_delivered_once(tmp_path,monkeypatch,prompt,mixed_formats,recovery_bound,standalone_sibling,standalone_extension,budget_exhausted=False):
     from fastapi.testclient import TestClient
     from PIL import Image
     from nullion import web_app,chat_store
@@ -67,6 +67,14 @@ def test_linked_page_and_image_are_packaged_then_delivered_once(tmp_path,monkeyp
                 self.selections+=1
                 assert 'needs_packaging' in kw['tools'][0]['input_schema']['properties']['status']['enum']
                 if self.selections==1:
+                    if budget_exhausted:
+                        from nullion.research_budget import current_budget
+                        budget=current_budget();assert budget is not None
+                        budget.activate();budget.finish_research('model_call_limit')
+                        if budget_exhausted=='deadline':
+                            import time
+                            budget.writing_started=time.monotonic()-61
+                        else:budget.writing_calls=8
                     # Deliberately omit the ready standalone sibling. The final
                     # packaging selection must recover it without a new write.
                     return tool('select_artifact_delivery',{'status':'needs_packaging','selected_ids':['a0',*(['a2'] if mixed_formats else [])],'reason':'The page needs its referenced local image in the final portable package.'})
@@ -110,3 +118,11 @@ def test_linked_page_and_image_are_packaged_then_delivered_once(tmp_path,monkeyp
         assert linked['linked_image_assets'][0]['path']==str(image)
         history=client.get('/api/chat/history/web:portable-page').json()
         assert 'working.html' not in json.dumps(history.get('terminal_replies'))
+
+
+@pytest.mark.parametrize('prompt',['Entrega la página y su imagen en un paquete portátil.','画像付きページを持ち運べる一つのファイルにまとめてください。'])
+@pytest.mark.parametrize('exhaustion',['calls','deadline'])
+def test_exhausted_research_writer_finishes_typed_local_packaging(tmp_path,monkeypatch,prompt,exhaustion):
+    test_linked_page_and_image_are_packaged_then_delivered_once(tmp_path,monkeypatch,prompt,
+        mixed_formats=True,recovery_bound=True,standalone_sibling=True,standalone_extension='.html',
+        budget_exhausted=exhaustion)

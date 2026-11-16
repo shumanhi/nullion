@@ -1,4 +1,4 @@
-"""Default multi-round work completes through the real chat/persistence boundary."""
+"""Explicit exhaustive work completes through the real chat/persistence boundary."""
 from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
@@ -8,7 +8,7 @@ import pytest
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason='Container E2E only')
 
 
-def test_default_budget_completes_more_than_twenty_four_model_rounds(tmp_path, monkeypatch, record_property):
+def test_declared_exhaustive_budget_completes_more_than_twenty_four_model_rounds(tmp_path, monkeypatch, record_property):
     from fastapi.testclient import TestClient
     from nullion import web_app
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -49,10 +49,16 @@ def test_default_budget_completes_more_than_twenty_four_model_rounds(tmp_path, m
                     'input':{'extension':None,'confidence':1}}]}
             if not names:
                 return {'content':[{'type':'text','text':'{}'}]}
+            if self.rounds == 30:
+                # The shared budget can retire source tools before the final
+                # writing call. Completed findings remain sufficient to answer.
+                self.rounds += 1
+                return {'stop_reason':'end_turn','content':[{'type':'text','text':'Collected all 30 observations: 18°C.'}]}
             if 'web_fetch' not in names:
                 assert not any(m.get('role') == 'assistant' for m in kwargs.get('messages', [])), json.dumps(kwargs.get('messages', [])[-2:])
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'scope', 'name':'request_tool_scope',
-                    'input':{'capabilities':['web'],'tool_names':['web_fetch'],'required_tool_names':['web_fetch']}}]}
+                    'input':{'capabilities':['web'],'tool_names':['web_fetch'],'required_tool_names':['web_fetch'],'research_effort':'exhaustive',
+                        'research_questions':['Collect all thirty station observations']}}]}
             self.rounds += 1
             if self.rounds <= 30:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':f'read-{self.rounds}',

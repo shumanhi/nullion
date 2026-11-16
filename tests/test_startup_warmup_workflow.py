@@ -112,6 +112,32 @@ def test_chat_startup_warmup_scheduler_is_nonblocking_and_once_per_surface(tmp_p
     assert calls == ["telegram"]
 
 
+def test_startup_warms_revision_checked_memory_without_reinforcement_or_writes(tmp_path,monkeypatch):
+    import sqlite3
+    from nullion import crons, runtime_persistence
+    from nullion.memory import remember_text_fact, memory_entries_for_owner
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.startup_warmup import run_chat_startup_warmup
+    from nullion.tools import ToolRegistry
+    monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'))
+    monkeypatch.setenv('NULLION_MEMORY_ENABLED','true')
+    monkeypatch.setenv('NULLION_KEY_STORAGE','local')
+    monkeypatch.setattr(crons,'list_crons',lambda *a,**k:[])
+    path=tmp_path/'runtime.db';runtime=bootstrap_persistent_runtime(path)
+    entry=remember_text_fact(runtime.store,owner='workspace:alpha',key='連絡',value='確認する',source='structured')
+    runtime.checkpoint(force=True)
+    def memory_rows():
+        with sqlite3.connect(path) as connection:
+            return connection.execute('select collection,item_key,payload,updated_at from memory order by item_key').fetchall()
+    before=memory_rows()
+    runtime_persistence._MEMORY_READ_CACHE.pop(str(path.resolve()),None)
+    result=run_chat_startup_warmup(runtime,registry=ToolRegistry(),settings=SimpleNamespace(enabled_skill_packs=()))
+    assert 'memory_snapshot' in result.warmed
+    assert memory_rows()==before and runtime.store.get_user_memory_entry(entry.entry_id).use_score==0
+    monkeypatch.setattr(runtime_persistence,'_runtime_memory_cipher_for',lambda path:(_ for _ in ()).throw(AssertionError('Warm snapshot should be reused')))
+    assert memory_entries_for_owner(runtime.store,entry.owner,checkpoint_path=path)[0].value=='確認する'
+
+
 def test_slack_and_discord_adapters_schedule_startup_warmup(monkeypatch) -> None:
     from nullion import discord_app, slack_app, startup_warmup
 

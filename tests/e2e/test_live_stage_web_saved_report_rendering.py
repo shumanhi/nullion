@@ -1,5 +1,6 @@
 """Replay a captured report through real stage delivery without rereading sources."""
 import json
+import hashlib
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -77,12 +78,14 @@ def test_live_completed_report_receipt_matches_caption_and_download_bytes(live_w
         body, media_type = catalogue._artifact_bytes(base, artifact, timeout=30)
         assert len(body) == artifact['size_bytes'] and body
         name = Path(artifact['name']).name
+        original_download = Path(os.environ['NULLION_LIVE_REPORT_REPLAY_FILE']).parent/name
+        assert original_download.is_file(), 'The captured receipt must include its original download bytes'
+        assert hashlib.sha256(body).digest() == hashlib.sha256(original_download.read_bytes()).digest(), name
         if name.endswith('.html'):
-            visible, _ = catalogue._validate_html_visual_content(name, body)
-            for token in ('Repository metrics', 'Scope', 'Source freshness'):
-                assert ''.join(token.casefold().split()) in ''.join(visible.casefold().split()), visible
+            catalogue._validate_html_visual_content(name, body)
         (output / name).write_bytes(body)
-        downloads.append({'name': name, 'bytes': len(body), 'media_type': media_type})
+        downloads.append({'name': name, 'bytes': len(body), 'media_type': media_type,
+                          'sha256': hashlib.sha256(body).hexdigest()})
     (output / 'result.json').write_text(json.dumps({'original_conversation': original, 'caption': caption,
                                                   'downloads': downloads}, indent=2))
     page.screenshot(path=str(output / 'web.png'), full_page=False)

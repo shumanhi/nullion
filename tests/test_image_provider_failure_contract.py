@@ -26,6 +26,29 @@ def test_configured_image_provider_rejection_retains_failure_without_placeholder
         {'prompt':'風景','output_path':str(output)}))
     assert result.status == 'failed' and result.output['http_status_code'] == status
     assert result.output['retryable'] is (status == 429 or status >= 500)
-    assert result.output['failure_scope'] == 'invocation'
+    assert result.output['failure_scope'] == ('tool' if status in {401,402} else 'invocation')
+    assert bool(result.output.get('terminal_user_action_required')) is (status in {401,402})
     assert not output.exists() and not output.with_suffix('.svg').exists()
     assert not result.output.get('fallback_used')
+
+
+@pytest.mark.parametrize('terminal,scope,expected',[(True,'tool',True),(False,'tool',False),(True,'invocation',False)])
+def test_only_native_terminal_failure_changes_required_tool_availability(terminal,scope,expected):
+    from types import SimpleNamespace
+    from nullion.agent_orchestrator import _completion_review_scope_contract,_filtered_scope_result
+    from nullion.tools import ToolResult
+    registry=SimpleNamespace(scheduled_source_scope={'required_tool_names':['create_visual']})
+    failed=ToolResult('failed','create_visual','failed',{'failure_scope':scope,'terminal_user_action_required':terminal})
+    contract=_completion_review_scope_contract(registry,[failed])
+    assert ('create_visual' in contract['unavailable_required_tool_names']) is expected
+    assert ('create_visual' in contract['missing_callable_required_tool_names']) is not expected
+    assert contract['requested_required_tool_names']==['create_visual']
+    success=ToolResult('later','create_visual','completed',{})
+    assert not _completion_review_scope_contract(registry,[failed,success])['unavailable_required_tool_names']
+    result=ToolResult('scope','request_tool_scope','completed',{'available_tools':['create_visual'],
+        'required_tool_names':['create_visual'],'requested_required_tool_names':['create_visual']})
+    filtered=_filtered_scope_result(result,unavailable_tool_names=['create_visual'])
+    assert filtered.output['available_tools']==[] and filtered.output['required_tool_names']==[]
+    assert filtered.output['unavailable_required_tool_names']==['create_visual']
+    assert filtered.output['unavailable_tools']==['create_visual']
+    assert result.output['available_tools']==['create_visual']

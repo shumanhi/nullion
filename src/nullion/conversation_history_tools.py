@@ -67,7 +67,7 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
             "search_scope": {
                 "type": "string",
                 "enum": ["workspace", "recent_conversation"],
-                "description": "Search workspace history, or only the recent current conversation for lightweight turn context.",
+                "description": "Search workspace history, or only the recent current conversation. Linked source-file retrieval defaults to the current conversation when omitted. Select workspace explicitly for a file from another conversation.",
             },
             "read_turn_id": {"type": "string", "maxLength": 500,
                 "description": "Exact turn_id from a saved match to read, instead of running another ranked search."},
@@ -736,7 +736,12 @@ def _conversation_events_after_reset(
     if callable(getattr(store, "list_conversation_events", None)):
         list_events = getattr(store, "list_conversation_events")
         try:
-            events = list_events()
+            # Select typed history/reset rows before copying payloads. Timing,
+            # activity and connector receipts cannot contribute saved dialogue.
+            try:
+                events = list_events(event_types=('conversation.chat_turn', 'conversation.session_reset'))
+            except TypeError:
+                events = list_events()  # Compatibility with older store adapters.
         except Exception:
             try:
                 events = list_events(conversation_id)

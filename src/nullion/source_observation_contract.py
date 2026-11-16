@@ -14,28 +14,42 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
     if not isinstance(observations, list):
         return None
     compact = {key: output[key] for key in (
-        'backend', 'result_kind', 'report_status', 'artifact_paths', 'artifact_descriptors', 'continuation', 'goal_status', 'next_action', 'format',
-        'elapsed_seconds', 'steps', 'page_url', 'rejected_observations', 'rejection_counts', 'omitted_unknown_count', 'evidence_value_repair_count', 'completion_scope', 'source_record_binding',
+        'result_kind', 'report_status', 'continuation', 'goal_status', 'next_action',
+        'page_url', 'omitted_unknown_count', 'completion_scope', 'source_record_binding',
         'artifact_delivery_manifest', 'artifact_producer_receipt_id',
     ) if key in output}
+    # Execution diagnostics describe how evidence was collected, not the
+    # requested findings. Add them only after facts and required limitations.
+    optional = {key: output[key] for key in ('backend', 'format', 'elapsed_seconds', 'steps',
+        'rejected_observations', 'rejection_counts', 'evidence_value_repair_count') if key in output}
     compact['blocker'] = str(output['blocker'])[:1000] if output.get('blocker') else None
+    cleanup = output.get('browser_tab_cleanup')
+    if isinstance(cleanup, Mapping):
+        compact['browser_tab_cleanup'] = {key: cleanup[key] for key in
+            ('created_target_count', 'closed_count', 'verified') if key in cleanup}
+        compact['browser_tab_cleanup']['remaining_target_count'] = cleanup.get('remaining_target_count',
+            len(cleanup.get('remaining_target_ids') or ()))
+    if isinstance(output.get('performance'), Mapping):
+        optional['performance'] = {key: output['performance'][key] for key in
+            ('model_calls', 'capture_ms', 'model_ms', 'input_tokens', 'output_tokens', 'total_tokens',
+             'reasoning_tokens', 'usage_reported_calls') if type(output['performance'].get(key)) in (int, float)}
     captured = output.get('captured_documents')
     audit = output.get('execution_audit')
     if isinstance(audit, Mapping):
         compact['execution_audit'] = {key: audit[key] for key in ('version', 'complete', 'read_only_actions_only',
             'downloaded_file_count', 'host_file_actions_enabled', 'captures_are_internal', 'deliverable_file_count') if key in audit}
         if isinstance(audit.get('action_names'), list):
-            compact['execution_audit']['action_names'] = audit['action_names'][:30]
+            optional['action_names'] = audit['action_names'][:30]
         # Retain a bounded navigation inventory only when it is complete.
         urls = audit.get('visited_urls')
         if isinstance(urls, list) and len(json.dumps(urls, ensure_ascii=False)) < 2200:
-            compact['execution_audit']['visited_urls'] = urls
-            compact['execution_audit']['url_inventory_complete'] = audit.get('url_inventory_complete') is True
+            optional['visited_urls'] = urls
+            optional['url_inventory_complete'] = audit.get('url_inventory_complete') is True
     compact['unknowns'] = []
     unknowns = output.get('unknowns') if isinstance(output.get('unknowns'), list) else []
     for value in unknowns[:30]:
         compact['unknowns'].append(str(value)[:1000])
-        if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars // 2:
+        if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars // 3:
             compact['unknowns'].pop()
     if len(compact['unknowns']) < len(unknowns):
         compact['omitted_unknown_count'] = int(compact.get('omitted_unknown_count') or 0) + len(unknowns) - len(compact['unknowns'])
@@ -47,7 +61,7 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
     identities = {}
     documents = {}
     omitted = int(output.get('omitted_observation_count') or 0)
-    for item in observations:
+    for observation_index, item in enumerate(observations):
         if not isinstance(item, Mapping):
             omitted += 1
             continue
@@ -62,6 +76,21 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
         source_index = identities.get(identity, len(compact['sources']))
         new_source = identity not in identities
         record = {key: item[key] for key in ('label', 'value', 'quote', 'control_state', 'covers_main_document', 'semantic_role', 'evidence_kind') if key in item}
+        control = record.get('control_state')
+        if isinstance(control, Mapping) and isinstance(control.get('options'), list):
+            # A select's entire option catalog is optional context, not the
+            # selected value or a set of available actions. Keep grounded
+            # findings after it from losing their space to that catalog.
+            control = dict(control)
+            options = control.pop('options')
+            control['option_count'] = len(options)
+            control['selected_options'] = [option for option in options
+                if isinstance(option, Mapping) and option.get('selected') is True]
+            control['options_inspection_pointer'] = f'/observations/{observation_index}/control_state/options'
+            if str(control.get('tag') or '').upper() == 'SELECT':
+                control.pop('text', None)
+                control['text_omitted'] = True
+            record['control_state'] = control
         if record.get('covers_main_document') is True and record.get('value') == record.get('quote') and isinstance(record.get('quote'), str):
             record['value'] = next((line.strip() for line in record['quote'].splitlines() if line.strip()), record['value'])
         record['source_index'] = source_index
@@ -83,6 +112,23 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
         compact['omitted_observation_count'] = omitted
         compact['report_status'] = ('partial' if compact['observations']
             and output.get('report_status') != 'blocked' else 'blocked')
+    for key, value in optional.items():
+        if key == 'url_inventory_complete' and 'visited_urls' not in compact.get('execution_audit', {}):
+            continue
+        target = compact.get('execution_audit', {}) if key in {
+            'action_names', 'visited_urls', 'url_inventory_complete'} else compact
+        target[key] = value
+        if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars - 160:
+            target.pop(key)
+    # File/capture inventories are optional context. Their full native receipts
+    # remain available to artifact verification and retained-evidence lookup;
+    # they must not displace the source's accepted answer findings.
+    for key in ('artifact_paths', 'artifact_descriptors'):
+        if key not in output:
+            continue
+        compact[key] = output[key]
+        if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars - 160:
+            compact.pop(key)
     # Recovery hints are useful, but cannot displace already verified facts in
     # a small context budget. The full native result remains inspectable.
     if isinstance(captured, list) and captured:
@@ -133,6 +179,27 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
                 compact['captured_document_index'].pop()
                 break
         compact['omitted_captured_document_index_count'] = len(captured) - len(compact['captured_document_index'])
+    elif isinstance(output.get('captured_document_count'), int) and output['captured_document_count'] > 0:
+        # A continuation may compact an already bounded model view. Preserve
+        # exact lookup references while keeping facts ahead of optional indexes.
+        compact['captured_document_count'] = output['captured_document_count']
+        inspection = output.get('captured_document_inspection')
+        if isinstance(inspection, Mapping):
+            compact['captured_document_inspection'] = dict(inspection)
+            if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars - 160:
+                compact.pop('captured_document_inspection')
+        index_rows = output.get('captured_document_index')
+        if isinstance(index_rows, list):
+            compact['captured_document_index'] = []
+            for row in index_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                compact['captured_document_index'].append(dict(row))
+                if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars - 160:
+                    compact['captured_document_index'].pop()
+                    break
+            compact['omitted_captured_document_index_count'] = max(0,
+                output['captured_document_count'] - len(compact['captured_document_index']))
     # Diagnostics never displace grounded facts or become answer evidence.
     # Keep enough rejected input to distinguish capture/formatting failures
     # from an external source blocker in a durable turn record.
@@ -1311,10 +1378,14 @@ def pending_source_continuation(tool_results):
         if normalize_tool_status(getattr(result, 'status', None)) != 'completed':
             continue
         output = getattr(result, 'output', None)
+        if pending and pending.get('kind') == 'alternate_tool' and isinstance(output, Mapping) and getattr(result, 'tool_name', None) in (pending.get('tool_names') or ()):
+            # A successful controller handoff resolves this continuation, not
+            # the user's request. Normal producer/tool contracts still apply.
+            pending = None
         if not isinstance(output, Mapping) or output.get('result_kind') != 'source_observations':
             continue
         continuation = output.get('continuation')
-        if isinstance(continuation, Mapping) and continuation.get('kind') == 'alternative_source':
+        if isinstance(continuation, Mapping) and continuation.get('kind') in {'alternative_source', 'alternate_tool'}:
             pending = dict(continuation)
         elif (pending and output.get('report_status') == 'completed' and not output.get('blocker')
               and _source_observation_identities(output)):

@@ -34,7 +34,7 @@ def test_live_stage_keeps_answer_after_two_failed_waits(live_web):
 def _assert_observed_price_stock(tools):
     import json
     reads=[t for t in tools if t['status']=='completed' and t['tool_name'] in
-        {'browser_extract_text','browser_extract_detail','browser_run_js','browser_assert_page_state'}]
+        {'browser_extract_text','browser_extract_detail','browser_run_js','browser_assert_page_state','browser_read_pages'}]
     assert reads,tools
     observed=json.dumps([t.get('output') for t in reads],ensure_ascii=False)
     assert '51.77' in observed and '22' in observed,reads

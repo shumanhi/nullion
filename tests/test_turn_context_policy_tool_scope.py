@@ -37,6 +37,24 @@ def _spec(name: str, capability_tags: tuple[str, ...] = ()) -> ToolSpec:
     )
 
 
+@pytest.mark.parametrize('linked,retrieval,explicit,expected',[
+    (True,True,None,'recent_conversation'),(True,True,'workspace','workspace'),
+    (False,True,None,None),(True,False,None,None)])
+@pytest.mark.parametrize('prompt',['同じ資料をください','Devuelve el mismo archivo','Renvoyez le document'])
+def test_linked_file_retrieval_defaults_to_its_thread_without_changing_explicit_scope(linked,retrieval,explicit,expected,prompt):
+    calls=[];base=ToolRegistry()
+    base.register(_spec('chat_history_search',('conversation_history',)),lambda invocation:
+        calls.append(invocation) or ToolResult(invocation.invocation_id,invocation.tool_name,'completed',{'matches':[]}))
+    scoped=ScopedTurnToolRegistry(base,evidence=TurnToolEvidence(context_linked=linked,current_user_message=prompt),
+        tool_scope_decision=TurnToolScopeDecision(valid=True,source_artifact_retrieval_only=retrieval,
+            source_artifact_delivery_requested=retrieval,requested_tool_names=('chat_history_search',)))
+    args={'query':'record'}
+    if explicit is not None:args['search_scope']=explicit
+    result=scoped.invoke(ToolInvocation('lookup','chat_history_search','test',args))
+    assert result.status=='completed' and calls[0].arguments.get('search_scope')==expected
+    assert args.get('search_scope')==explicit
+
+
 def _registry() -> ToolRegistry:
     registry = ToolRegistry()
     for spec in (
@@ -562,7 +580,9 @@ def test_cached_connector_app_fragment_does_not_make_scope_decision_apply(monkey
     ) is False
 
 
-def test_explicit_connector_tool_identifier_can_select_scope_without_app_id(monkeypatch) -> None:
+@pytest.mark.parametrize("message", ["email_search", "Usa email_search, solo encabezados.",
+    "email_search で件名だけ。本文は読まないで。"])
+def test_explicit_connector_tool_identifier_can_select_scope_without_app_id(monkeypatch, message) -> None:
     provider = {
         "active_app_ids": ("google-mail",),
         "structured_tools": ("email_search", "email_read", "email_attachment_read"),
@@ -578,7 +598,6 @@ def test_explicit_connector_tool_identifier_can_select_scope_without_app_id(monk
         lambda: [provider],
     )
     client = _ScopeClient('{"web_action":"none","scheduler_action":"none","confidence":0.95}')
-    message = "email_search"
     evidence = build_turn_tool_evidence(user_message=message, conversation_result=None)
 
     assert turn_tool_scope_decision_may_apply(evidence, user_message=message) is True
@@ -593,6 +612,7 @@ def test_explicit_connector_tool_identifier_can_select_scope_without_app_id(monk
     names = {definition["name"] for definition in scoped.list_tool_definitions()}
     assert {"request_tool_scope", "email_search", "email_read"} <= names
     assert "email_attachment_read" not in names
+    assert scoped.turn_tool_scope_decision.required_tool_names == ()
     assert client.calls == []
 
 
@@ -3704,6 +3724,29 @@ def test_required_file_download_is_a_web_source_entry_without_browser_navigation
     assert 'browser_navigate' not in widened.turn_tool_scope_decision.required_tool_names
 
 
+@pytest.mark.parametrize('prompt', ['Close the selected tab.', 'Cierra la pestaña seleccionada.', '選択したタブを閉じて。'])
+def test_browser_close_scope_does_not_require_unrelated_navigation(prompt):
+    scoped = scoped_turn_tool_registry(_registry(), evidence=build_turn_tool_evidence(
+        user_message=prompt, conversation_result=None))
+    result, widened = scoped.apply_scope_request(ToolInvocation('scope-close', 'request_tool_scope', 'member', {
+        'capabilities': ['web'], 'tool_names': ['browser_close'], 'required_tool_names': ['browser_close']}))
+    assert result.status == 'completed'
+    assert set(result.output['required_tool_names']) == {'browser_close'}
+    assert 'browser_navigate' not in widened.turn_tool_scope_decision.required_tool_names
+
+
+def test_optional_close_visibility_does_not_become_an_execution_duty():
+    scoped = scoped_turn_tool_registry(_registry(), evidence=build_turn_tool_evidence(
+        user_message='選択した情報源を確認', conversation_result=None))
+    result, _ = scoped.apply_scope_request(ToolInvocation('optional-close', 'request_tool_scope', 'member', {
+        'capabilities': ['web'], 'tool_names': ['browser_navigate', 'browser_close'],
+        'required_tool_names': ['browser_navigate']}))
+    assert set(result.output['required_tool_names']) == {'browser_navigate'}
+    result, _ = scoped.apply_scope_request(ToolInvocation('close-visibility', 'request_tool_scope', 'member', {
+        'capabilities': ['web'], 'tool_names': ['browser_close'], 'required_tool_names': []}))
+    assert not result.output['required_tool_names']
+
+
 def test_request_tool_scope_web_capability_requires_callable_web_entry_tool() -> None:
     scoped = scoped_turn_tool_registry(
         _registry(),
@@ -4029,7 +4072,7 @@ def test_scope_classifier_prompt_guides_direct_mailbox_reads(monkeypatch) -> Non
     )
 
     request_text = repr(client.calls[0])
-    assert "google-mail/email_search/email_read" in request_text
+    assert "Optional continuations are not requirements" in request_text
     assert decision.skill_pack_action == "connector"
     assert decision.connector_app_ids == ("google-mail",)
     assert decision.connector_source_user_requested is True
@@ -4799,7 +4842,7 @@ def test_tool_scope_classifier_prompt_exposes_weather_and_image_scopes(monkeypat
     assert "weather_forecast" in client.calls[0]["system"]
     assert "image_generate" in client.calls[0]["system"]
     assert "Do not choose weather merely because a request mentions a day, date, time, or location" in client.calls[0]["system"]
-    assert "google-calendar/calendar_list" in client.calls[0]["system"]
+    assert "active provider's declared tool metadata" in client.calls[0]["system"]
     assert "eligible set discovered through list_crons" in client.calls[0]["system"]
     assert stored
 
@@ -5021,3 +5064,94 @@ def test_collection_scope_discards_cached_mandatory_detail_reads(monkeypatch, pr
 def test_native_embedding_requirement_survives_without_a_separate_source_tool(tool,extension):
     from nullion.turn_context_policy import _supported_scope_embedded_media_extensions
     assert _supported_scope_embedded_media_extensions([tool],[extension]) == (extension,)
+
+
+@pytest.mark.parametrize('effect,source_only,has_fact,replaced',[
+    (ToolSideEffectClass.WRITE,False,True,True),
+    (ToolSideEffectClass.WRITE,False,False,False),
+    (ToolSideEffectClass.WRITE,True,True,False),
+    (ToolSideEffectClass.ACCOUNT_WRITE,False,True,False),
+])
+def test_revised_production_plan_replaces_only_runtime_failed_file_producer(monkeypatch,effect,source_only,has_fact,replaced):
+    monkeypatch.setenv("NULLION_TERMINAL_ENABLED","1")
+    monkeypatch.setenv("NULLION_IMAGE_GENERATE_ENABLED","true")
+    registry=ToolRegistry()
+    registry.register(ToolSpec('image_generate','Producer',ToolRiskLevel.LOW,effect,False,5,
+        produced_artifact_extensions=('.png',),source_artifact_only=source_only),lambda _:None)
+    registry.register(ToolSpec('terminal_exec','Local renderer',ToolRiskLevel.LOW,ToolSideEffectClass.DANGEROUS_EXEC,False,5),lambda _:None)
+    scoped=ScopedTurnToolRegistry(registry,evidence=build_turn_tool_evidence(user_message='図 .png',conversation_result=None),
+        tool_scope_decision=TurnToolScopeDecision(requested_tool_names=('image_generate',),required_tool_names=('image_generate',),
+            requested_artifact_extensions=('.png',),valid=True))
+    result,widened=scoped.apply_scope_request(ToolInvocation('new-plan','request_tool_scope','web:fixture',
+        {'capabilities':['local_shell'],'tool_names':['terminal_exec'],'required_tool_names':['terminal_exec'],'artifact_extensions':['.png']},
+        flow_context={'_runtime_unavailable_artifact_producers':['image_generate']} if has_fact else {}))
+    assert result.status=='completed',result
+    assert ('image_generate' not in widened.turn_tool_scope_decision.required_tool_names) is replaced, result.output
+    assert widened.turn_tool_scope_decision.requested_artifact_extensions==('.png',)
+    assert 'terminal_exec' in widened.turn_tool_scope_decision.required_tool_names, result.output
+
+
+@pytest.mark.parametrize('prompt', ['Collect replacement artwork', 'Recoge la imagen alternativa', '代わりの画像を取得'])
+@pytest.mark.parametrize('has_fact', [False, True])
+def test_source_image_replacement_retires_unavailable_intermediate_producer(monkeypatch, prompt, has_fact):
+    monkeypatch.setenv('NULLION_IMAGE_GENERATE_ENABLED', 'true')
+    reader = 'browser_image_collect'
+    registry = ToolRegistry()
+    registry.register(ToolSpec('image_generate', 'Optional artwork', ToolRiskLevel.LOW, ToolSideEffectClass.WRITE,
+        False, 5, produced_artifact_extensions=('.png',)), lambda _: None)
+    registry.register(ToolSpec(reader, 'Collect verified source artwork', ToolRiskLevel.LOW, ToolSideEffectClass.READ,
+        False, 5, capability_tags=('required_scope_only',), source_artifact_only=True, source_artifact_extensions=('.png',)), lambda _: None)
+    registry.register(ToolSpec('document_create', 'Document', ToolRiskLevel.LOW, ToolSideEffectClass.WRITE,
+        False, 5, produced_artifact_extensions=('.docx',)), lambda _: None)
+    scoped = ScopedTurnToolRegistry(registry, evidence=build_turn_tool_evidence(user_message=prompt, conversation_result=None), tool_scope_decision=TurnToolScopeDecision(
+        requested_tool_names=('image_generate', 'document_create'), required_tool_names=('image_generate', 'document_create'),
+        requested_artifact_extensions=('.docx',), valid=True))
+    result, widened = scoped.apply_scope_request(ToolInvocation('replacement', 'request_tool_scope', 'web:fixture',
+        {'capabilities': ['local_files', 'web'], 'tool_names': [reader, 'document_create'],
+         'required_tool_names': [reader, 'document_create'], 'artifact_extensions': ['.docx'],
+         'embedded_media_artifact_extensions': ['.docx']},
+        flow_context={'_runtime_unavailable_artifact_producers': ['image_generate']} if has_fact else {}))
+    assert result.status == 'completed', result
+    assert ('image_generate' not in widened.turn_tool_scope_decision.required_tool_names) is has_fact
+    assert result.output['retired_unavailable_artifact_producers'] == (['image_generate'] if has_fact else [])
+    assert widened.turn_tool_scope_decision.requested_artifact_extensions == ('.docx',)
+    assert {reader, 'document_create'}.issubset(widened.turn_tool_scope_decision.required_tool_names)
+
+
+@pytest.mark.parametrize('prompt',['設定してください','Configura la tarea','اضبط المهمة'])
+def test_scheduler_configuration_does_not_require_hidden_future_producers(prompt):
+    scoped=ScopedTurnToolRegistry(_registry(),
+        evidence=build_turn_tool_evidence(user_message=prompt,conversation_result=None),
+        tool_scope_decision=TurnToolScopeDecision(valid=True))
+    result,widened=scoped.apply_scope_request(ToolInvocation('future-plan','request_tool_scope','member',{
+        'capabilities':['scheduler_mutate','web','local_files'],
+        'tool_names':['create_cron','file_write','pdf_create','browser_navigate'],
+        'required_tool_names':['create_cron','file_write','pdf_create'],
+        'artifact_extensions':['.pdf','.html']}))
+    assert result.status=='completed'
+    assert result.output['required_tool_names']==['create_cron']
+    assert result.output['artifact_extensions']==[]
+    assert not {'file_write','pdf_create','browser_navigate'}.intersection(result.output['available_tools'])
+    assert widened.turn_tool_scope_decision.required_tool_names==('create_cron',)
+
+
+@pytest.mark.parametrize('extensions', [[], ['.csv']])
+def test_typed_production_scope_supplies_shared_guidance_after_compact_start(extensions):
+    from nullion.reasoning_guidance import ARTIFACT_PRODUCTION_GUIDANCE
+    from nullion.source_selection import compact_scope_evidence
+    scoped = ScopedTurnToolRegistry(_registry(), evidence=TurnToolEvidence(),
+        tool_scope_decision=TurnToolScopeDecision(valid=True))
+    result, _ = scoped.apply_scope_request(ToolInvocation('scope', 'request_tool_scope', 'test', {
+        'capabilities': ['local_files'], 'tool_names': ['file_write'],
+        'required_tool_names': ['file_write'], 'artifact_extensions': extensions,
+    }))
+    assert result.status == 'completed'
+    if extensions:
+        from nullion.artifacts import artifact_root_for_principal
+        assert result.output['artifact_output_root'] == str(artifact_root_for_principal('test'))
+        assert result.output['artifact_production_guidance'] == ARTIFACT_PRODUCTION_GUIDANCE
+        assert compact_scope_evidence(result.output, original_chars=12000)[
+            'artifact_production_guidance'] == ARTIFACT_PRODUCTION_GUIDANCE
+    else:
+        assert 'artifact_production_guidance' not in result.output
+        assert 'artifact_output_root' not in result.output

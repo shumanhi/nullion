@@ -116,6 +116,16 @@ def test_websocket_spreadsheet_request_uses_valid_schema_and_delivers_real_xlsx(
             tool_names = {str(tool.get("name") or "") for tool in converted}
             self.saw_spreadsheet_schema = self.saw_spreadsheet_schema or "spreadsheet_create" in tool_names
             if "spreadsheet_create" not in tool_names:
+                if "request_tool_scope" in tool_names:
+                    return {
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "id": "scope-spreadsheet",
+                            "name": "request_tool_scope", "input": {
+                                "capabilities": ["files"], "tool_names": ["spreadsheet_create"],
+                                "required_tool_names": ["spreadsheet_create"],
+                                "artifact_extensions": [".xlsx"],
+                            }}],
+                    }
                 return {
                     "stop_reason": "end_turn",
                     "content": [{"type": "text", "text": '{"config_action": null}'}],

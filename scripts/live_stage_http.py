@@ -12,7 +12,9 @@ def read_json(request, *, timeout=10, retry_seconds=8, opener=None):
     deadline = time.monotonic() + retry_seconds
     while True:
         try:
-            with open_request(request, timeout=min(timeout, max(.01, deadline-time.monotonic()))) as response:
+            # A stalled connection must leave time for another read within
+            # the same total budget. Never apply this policy to mutations.
+            with open_request(request, timeout=min(timeout, 2.0, max(.01, deadline-time.monotonic()))) as response:
                 return json.load(response)
         except (URLError, OSError) as exc:
             if isinstance(exc, HTTPError) and exc.code not in {502, 503, 504}:

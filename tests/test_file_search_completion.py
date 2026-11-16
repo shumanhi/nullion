@@ -50,3 +50,11 @@ def test_missing_independent_contract_never_retires_required_tools():
     registry=SimpleNamespace(scheduled_source_scope={'required_tool_names':['pdf_create']})
     result=ToolResult('reject','pdf_create','failed',{'executed':False,'reason':'request_plan_conflict','review_decision':'revise'})
     assert _completion_review_scope_contract(registry,[result])['missing_callable_required_tool_names']==['pdf_create']
+
+
+@pytest.mark.parametrize('pattern',['不存在.pdf','inexistente.pdf','missing.pdf'])
+def test_negative_filename_presentation_keeps_native_search_subject(tmp_path,pattern):
+    from nullion.response_sanitizer import _file_search_payload_summary
+    result=search(tmp_path,pattern=pattern)
+    assert result.output['pattern']==pattern
+    assert pattern in _file_search_payload_summary([result])

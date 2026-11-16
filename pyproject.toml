@@ -27,6 +27,7 @@ dependencies = [
   "openpyxl>=3.1,<4",
   "pillow>=10,<12",
   "pypdf>=6,<7",
+  "pypdfium2>=5,<6",
   "mistune>=3.1,<4",
   "python-docx>=1.1,<2",
   "python-pptx>=1.0,<2",
@@ -57,7 +58,8 @@ nullion-webview  = "nullion.webview_app:cli"
 nullion-recovery = "nullion.recovery:cli"
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "coverage>=7,<8", "pypdfium2>=5,<6"]
+codemode = ["pydantic-monty==1.6.0"]
+test = ["pydantic-monty==1.6.0", "pytest>=8,<10", "pytest-asyncio>=0.24,<2", "coverage>=7,<8"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

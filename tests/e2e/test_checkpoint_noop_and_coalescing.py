@@ -1,4 +1,5 @@
 """Actual Web/SQLite boundaries stay responsive and preserve pending saves."""
+from nullion import runtime_checkpoints
 import os
 import statistics
 import threading
@@ -128,7 +129,7 @@ def test_web_approval_completion_preserves_queued_forced_save(tmp_path, monkeypa
         finally:
             release.set()
         deadline = time.monotonic() + 8
-        while id(runtime) in web_app._WEB_CHECKPOINT_INFLIGHT:
+        while id(runtime) in runtime_checkpoints._CHECKPOINT_INFLIGHT:
             assert time.monotonic() < deadline, 'Background writer did not finish'
             time.sleep(.01)
         assert calls == [False, True], calls

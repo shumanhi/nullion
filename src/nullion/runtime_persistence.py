@@ -499,11 +499,14 @@ def _runtime_memory_cipher_for(db_path: Path) -> Fernet:
     return Fernet(key)
 
 
-def _encode_sqlite_runtime_payload(collection: str, checkpoint_path: Path, payload: dict[str, object]) -> str:
+def _encode_sqlite_runtime_payload(
+    collection: str, checkpoint_path: Path, payload: dict[str, object], memory_cipher: Fernet | None = None,
+) -> str:
     text = json.dumps(payload, sort_keys=True)
     if collection not in _ENCRYPTED_SQLITE_COLLECTIONS:
         return text
-    encrypted = _runtime_memory_cipher_for(checkpoint_path).encrypt(text.encode("utf-8")).decode("ascii")
+    cipher = memory_cipher if memory_cipher is not None else _runtime_memory_cipher_for(checkpoint_path)
+    encrypted = cipher.encrypt(text.encode("utf-8")).decode("ascii")
     return _ENCRYPTED_RUNTIME_MEMORY_PREFIX + encrypted
 
 
@@ -512,13 +515,16 @@ def _encrypt_sqlite_runtime_memory_text(checkpoint_path: Path, text: str) -> str
     return _ENCRYPTED_RUNTIME_MEMORY_PREFIX + encrypted
 
 
-def _decode_sqlite_runtime_payload(collection: str, checkpoint_path: Path, payload: str) -> dict[str, object]:
+def _decode_sqlite_runtime_payload(
+    collection: str, checkpoint_path: Path, payload: str, memory_cipher: Fernet | None = None,
+) -> dict[str, object]:
     if collection not in _ENCRYPTED_SQLITE_COLLECTIONS:
         return json.loads(payload)
     if not payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX):
         raise ValueError("Runtime memory payload is not encrypted")
     encrypted = payload.removeprefix(_ENCRYPTED_RUNTIME_MEMORY_PREFIX).encode("ascii")
-    decrypted = _runtime_memory_cipher_for(checkpoint_path).decrypt(encrypted).decode("utf-8")
+    cipher = memory_cipher if memory_cipher is not None else _runtime_memory_cipher_for(checkpoint_path)
+    decrypted = cipher.decrypt(encrypted).decode("utf-8")
     return json.loads(decrypted)
 
 
@@ -1432,11 +1438,18 @@ def read_persisted_memory_entries(path: str | Path) -> list[UserMemoryEntry] | N
             if cached is not None and cached[0] == fingerprint:
                 return [replace(entry) for entry in cached[1]]
         entries = []
+        memory_cipher = None
         for collection, payload in conn.execute("SELECT collection, payload FROM memory"):
             if collection not in collections:
                 continue
             try:
-                entries.append(_deserialize_user_memory_entry(_decode_sqlite_runtime_payload(collection, target, payload)))
+                # One consistent encrypted snapshot uses one verified key.
+                # Keep this local to the read: later revisions/key rotations
+                # still resolve the current key and verify every row.
+                if memory_cipher is None and payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX):
+                    memory_cipher = _runtime_memory_cipher_for(target)
+                entries.append(_deserialize_user_memory_entry(
+                    _decode_sqlite_runtime_payload(collection, target, payload, memory_cipher)))
             except (ValueError, KeyError, TypeError, InvalidToken) as exc:
                 raise ValueError("Persisted memory could not be verified") from exc
         with _MEMORY_READ_CACHE_LOCK:
@@ -2194,14 +2207,17 @@ def _save_runtime_store_sqlite(
     # Encoding can traverse large tool histories and encrypted memory. Finish
     # it before acquiring a SQLite write transaction so readers remain usable.
     encoded_collections = []
+    memory_cipher = None
     for table_name, collections in _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE.items():
         for collection in collections:
             rows = payload.get(collection, [])
             if not isinstance(rows, list):
                 rows = []
+            if rows and collection in _ENCRYPTED_SQLITE_COLLECTIONS and memory_cipher is None:
+                memory_cipher = _runtime_memory_cipher_for(target)
             encoded_rows = {
                 _sqlite_collection_item_key(collection, index, row):
-                    _encode_sqlite_runtime_payload(collection, target, row)
+                    _encode_sqlite_runtime_payload(collection, target, row, memory_cipher)
                 for index, row in enumerate(rows)
             }
             encoded_collections.append((table_name, collection, encoded_rows))
@@ -2213,6 +2229,8 @@ def _save_runtime_store_sqlite(
         conn.executescript(_sqlite_runtime_ddl())
         conn.execute("BEGIN IMMEDIATE")
         mutations = []
+        native_reminder_ids = {str(row[0]).removeprefix("native_reminder:") for row in conn.execute(
+            "SELECT key FROM runtime_meta WHERE key GLOB 'native_reminder:*'")}
         # Compare before dirtying pages. In rollback-journal mode, cache spills
         # otherwise keep an exclusive reader lock during later history scans.
         for table_name, collection, encoded_rows in encoded_collections:
@@ -2228,6 +2246,12 @@ def _save_runtime_store_sqlite(
             changed_rows = [(collection, item_key, row_payload, now)
                 for item_key, row_payload in encoded_rows.items()
                 if existing_rows.get(item_key) != row_payload]
+            if collection in {"scheduled_tasks", "reminders"}:
+                # The current DB pair owns native reminder state, including
+                # deletion tombstones and delivery claims. A snapshot may have
+                # started before that commit or come from a stale process.
+                stale_keys.difference_update(native_reminder_ids)
+                changed_rows = [row for row in changed_rows if row[1] not in native_reminder_ids]
             mutations.append((table_name, collection, stale_keys, changed_rows))
         conn.execute("INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
                      ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)))
@@ -2280,6 +2304,13 @@ def _conversation_checkpoint_state_rows(store, conversation_id, conn):
     # identity as well as clearing the active pointer, including background
     # frames which do not own a chat head.
     closed_rows = []
+    for collection, key, values in (
+        ("conversation_commits", "idempotency_keys", store.list_committed_idempotency_keys(conversation_id)),
+        ("conversation_ingress_ids", "ingress_ids", store.list_conversation_ingress_ids(conversation_id)),
+    ):
+        previous = persisted(collection, conversation_id) or {}
+        closed_rows.append((collection, {"conversation_id": conversation_id,
+                                  key: sorted(set(previous.get(key) or ()) | set(values))}))
     seen_closed = set()
     for event in store.list_recent_conversation_events(conversation_id, limit=128):
         if event.get("event_type") != "conversation.session_stopped":
@@ -2341,13 +2372,6 @@ def _conversation_checkpoint_state_rows(store, conversation_id, conn):
                     payload = previous
                 rows.append(("conversation_branches", payload))
         current = store.get_conversation_turn(current.parent_turn_id) if current.parent_turn_id else None
-    for collection, key, values in (
-        ("conversation_commits", "idempotency_keys", store.list_committed_idempotency_keys(conversation_id)),
-        ("conversation_ingress_ids", "ingress_ids", store.list_conversation_ingress_ids(conversation_id)),
-    ):
-        previous = persisted(collection, conversation_id) or {}
-        rows.append((collection, {"conversation_id": conversation_id,
-                                  key: sorted(set(previous.get(key) or ()) | set(values))}))
     frame_id = store.active_task_frames.get(conversation_id)
     frame = store.task_frames.get(frame_id) if frame_id else None
     if not stale_head and frame is not None and frame.conversation_id == conversation_id:
@@ -2367,6 +2391,127 @@ def _conversation_checkpoint_state_rows(store, conversation_id, conn):
             rows.append(("active_task_frames", _serialize_active_task_frame(conversation_id, str(payload["frame_id"]))))
     return rows
 
+
+
+def read_runtime_reminders(path: str | Path):
+    """Read only reminder state, without loading history or touching the schema."""
+    source = Path(path)
+    with sqlite_connection(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
+        conn.execute("BEGIN")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?)",
+            ("reminders_crons", "runtime_meta"))}
+        if tables != {"reminders_crons", "runtime_meta"}:
+            return None
+        reminders = {}
+        tasks = {}
+        for collection, payload in conn.execute(
+                "SELECT collection,payload FROM reminders_crons WHERE collection IN (?,?)",
+                ("reminders", "scheduled_tasks")):
+            data = json.loads(payload)
+            if collection == "reminders":
+                row = _deserialize_reminder(data)
+                reminders[row.task_id] = row
+            else:
+                row = _deserialize_scheduled_task(data)
+                tasks[row.task_id] = row
+        native_ids = {str(row[0]).removeprefix("native_reminder:") for row in conn.execute(
+            "SELECT key FROM runtime_meta WHERE key GLOB 'native_reminder:*'")}
+    return reminders, {key: value for key, value in tasks.items() if key in reminders}, native_ids
+
+
+def commit_runtime_reminder(path: str | Path, *, task_id: str,
+                            task: ScheduledTask | None, reminder: ReminderRecord | None,
+                            previous_reminder: ReminderRecord | None,
+                            timeout_seconds: float = 10) -> Path:
+    """Atomically commit one reminder pair, with optimistic concurrency control.
+
+    SQLite owns this short write; do not wait for the full-snapshot file lock
+    while another thread encodes history or makes a backup. A native ownership
+    marker prevents that older snapshot from overwriting or resurrecting it.
+    """
+    target = Path(path)
+    if not _is_sqlite_runtime_path(target):
+        raise ValueError("Targeted reminder persistence requires SQLite")
+    if not task_id or (task is None) != (reminder is None):
+        raise ValueError("A reminder and its scheduled task must be committed together")
+    if any(row is not None and row.task_id != task_id for row in (task, reminder, previous_reminder)):
+        raise ValueError("Reminder identity does not match the scheduled task")
+    if reminder is None and previous_reminder is None:
+        raise ValueError("Deleting a reminder requires its current version")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC).isoformat()
+    with sqlite_connection(str(target), timeout=timeout_seconds) as conn:
+        conn.executescript(_sqlite_runtime_ddl())
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT payload FROM reminders_crons WHERE collection=? AND item_key=?",
+            ("reminders", task_id)).fetchone()
+        current = _deserialize_reminder(json.loads(row[0])) if row else None
+        if current != previous_reminder:
+            raise ValueError("The reminder changed before this update; refresh its current state and retry")
+        if reminder is not None:
+            if previous_reminder is None and conn.execute(
+                    "SELECT 1 FROM reminders_crons WHERE collection=? AND item_key=?",
+                    ("scheduled_tasks", task_id)).fetchone():
+                raise ValueError("The scheduled task identity is already in use")
+            conn.executemany("INSERT OR REPLACE INTO reminders_crons "
+                "(collection,item_key,payload,updated_at) VALUES (?,?,?,?)", [
+                    ("scheduled_tasks", task_id, json.dumps(_serialize_scheduled_task(task), sort_keys=True), now),
+                    ("reminders", task_id, json.dumps(_serialize_reminder(reminder), sort_keys=True), now)])
+        else:
+            conn.execute("DELETE FROM reminders_crons WHERE item_key=? AND collection IN (?,?)",
+                (task_id, "scheduled_tasks", "reminders"))
+        conn.execute("INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)",
+            ("native_reminder:" + task_id, now))
+        conn.execute("INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)",
+            ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)))
+    return target
+
+
+def checkpoint_pending_approvals(store: RuntimeStore, path: str | Path, approval_ids: Iterable[str],
+                                 *, timeout_seconds: float = 10) -> Path:
+    """Commit exact pending approvals and continuations before notifying users.
+
+    Never serialize unrelated history or resurrect an independently decided
+    approval. Full snapshots remain the background coordinator's responsibility.
+    """
+    target = Path(path)
+    if not _is_sqlite_runtime_path(target):
+        return save_runtime_store(store, target, merge_existing=True)
+    deadline = perf_counter() + max(0.0, timeout_seconds)
+    snapshots = []
+    for identity in dict.fromkeys(approval_ids):
+        approval = store.get_approval_request(identity)
+        if approval is None or approval.status is not ApprovalStatus.PENDING:
+            continue
+        suspended = store.get_suspended_turn(identity)
+        snapshots.append((_serialize_approval(approval),
+                          _serialize_suspended_turn(suspended) if suspended is not None else None))
+    if not snapshots:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC).isoformat()
+    with _runtime_store_file_lock(target, timeout_seconds=max(0.0, deadline - perf_counter())), \
+            sqlite_connection(str(target), timeout=max(0.0, deadline - perf_counter())) as conn:
+        conn.executescript(_sqlite_runtime_ddl())
+        conn.execute("BEGIN IMMEDIATE")
+        for approval, suspended in snapshots:
+            identity = approval["approval_id"]
+            previous = conn.execute("SELECT payload FROM approvals WHERE collection=? AND item_key=?",
+                                    ("approval_requests", identity)).fetchone()
+            if previous and json.loads(previous[0]).get("status") != ApprovalStatus.PENDING.value:
+                continue
+            for collection, payload in (("approval_requests", approval), ("suspended_turns", suspended)):
+                if payload is None:
+                    continue
+                table = _SQLITE_RUNTIME_TABLES[collection]
+                if collection == "suspended_turns":
+                    previous = conn.execute(f"SELECT payload FROM {table} WHERE collection=? AND item_key=?",
+                                            (collection, identity)).fetchone()
+                    if previous and str(json.loads(previous[0]).get("created_at") or "") > str(payload["created_at"]):
+                        continue
+                conn.execute(f"INSERT OR REPLACE INTO {table} (collection,item_key,payload,updated_at) VALUES (?,?,?,?)",
+                             (collection, identity, _encode_sqlite_runtime_payload(collection, target, payload), now))
+    return target
 
 
 def checkpoint_runtime_events(store: RuntimeStore, path: str | Path, events: Iterable[Event],
@@ -2523,9 +2668,14 @@ def _load_runtime_store_sqlite_payload(
                 (collection,),
             ).fetchall()
             decoded_rows: list[dict[str, object]] = []
+            memory_cipher = None
             for row in rows:
                 try:
-                    decoded = _decode_sqlite_runtime_payload(collection, source, str(row["payload"]))
+                    raw_payload = str(row["payload"])
+                    if (collection in _ENCRYPTED_SQLITE_COLLECTIONS and memory_cipher is None
+                            and raw_payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX)):
+                        memory_cipher = _runtime_memory_cipher_for(source)
+                    decoded = _decode_sqlite_runtime_payload(collection, source, raw_payload, memory_cipher)
                     _validate_sqlite_runtime_row(collection, decoded)
                     decoded_rows.append(decoded)
                 except Exception as exc:

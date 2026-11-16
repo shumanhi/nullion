@@ -1,5 +1,6 @@
 """Real browser interaction, selected controls, API persistence and delivery."""
 from __future__ import annotations
+from tests.browser_model_protocol import browser_schema_messages
 
 from tests.workflow_provider_protocol import workflow_provider_reply
 import json
@@ -29,6 +30,7 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
     monkeypatch.setenv('NULLION_BROWSER_USE_PYTHON', worker)
     monkeypatch.setenv('NULLION_BROWSER_BLOCK_PRIVATE', 'false')
     monkeypatch.setenv('NULLION_BROWSER_HEADLESS', 'true')
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
     monkeypatch.setenv('NULLION_BROWSER_USE_SANDBOX', 'false')
     monkeypatch.delenv('NULLION_BROWSER_USE_CDP_URL', raising=False)
     monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT', str(tmp_path / 'workspaces'))
@@ -64,7 +66,8 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
             ('تحقق من المخزون والإعدادات المختارة', 'المخزون', '12 units'),
         )):
             prompt = f'{prompt} {url}'
-            report = {'goal_status': 'answered', 'next_action': 'report', 'unknowns': [], 'blocker': None,
+            report = {'goal_status': 'partial', 'next_action': 'report', 'unknowns': [], 'blocker': None,
+                'pending_controls': [{'source_id': 0, 'control_index': 2}],
                 'observations': [{'label': label, 'value': value, 'quote': value},
                     {'label': '日付', 'value': '2026-10-10', 'quote': '2026-10-10', 'control_index': 0},
                     {'label': '人数', 'value': '2', 'quote': '2', 'control_index': 1}]}
@@ -76,7 +79,7 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
                     protocol_reply = workflow_provider_reply(kwargs, completion=False)
                     if protocol_reply is not None: return protocol_reply
                     texts = [text for m in kwargs['messages'] for text in ([m['content']] if isinstance(m.get('content'), str) else [part.get('text', '') for part in m.get('content', []) if part.get('type') == 'text'])]
-                    schema_messages = [text for text in texts if text.startswith('Return valid JSON matching this schema: ')]
+                    schema_messages = [m['content'] for m in browser_schema_messages(kwargs)]
                     def reply(text):
                         return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': text}]}
                     if schema_messages:
@@ -107,11 +110,12 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
                             action = {'select_captured_option': {'source_id': source_id, 'control_index': 2, 'option_value': '18:00'}}
                         elif self.browser_calls == 7:
                             assert '"selected_value": "18:00"' in '\n'.join(texts)
+                            report['goal_status'] = 'answered'
+                            report['pending_controls'] = []
                             report['observations'].append({'label': '時刻', 'value': '18:00', 'quote': '18:00', 'control_index': 2})
                             action = {'record_observations': report}
                         else:
-                            assert self.browser_calls == 8
-                            action = {'done': {'data': report, 'success': True}}
+                            pytest.fail('A grounded terminal report must not need a redundant done call')
                         schema = json.loads(schema_messages[-1].split(': ', 1)[1])
                         payload = {'evaluation_previous_goal': 'Observed current controls', 'memory': 'Use live values',
                             'next_goal': 'Record current result', 'action': [action]}
@@ -134,11 +138,14 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
                         return source_presentation_response(kwargs)
                     if self.outer_calls == 1:
                         return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'scope', 'name': 'request_tool_scope',
-                            'input': {'capabilities': ['web'], 'tool_names': ['browser_run_task'],
+                            'input': {'capabilities': ['web'], 'tool_names': ['browser_read_pages', 'browser_run_task'],
                                 'required_tool_names': ['browser_run_task'], 'artifact_extensions': ['.png']}}]}
                     if self.outer_calls == 2:
-                        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'browse', 'name': 'browser_run_task',
-                            'input': {'task': prompt, 'url': url, 'max_steps': 10}}]}
+                        return {'stop_reason': 'tool_use', 'content': [
+                            {'type':'tool_use','id':'native-first','name':'browser_read_pages',
+                             'input':{'pages':[{'url':url,'read_kind':'text'}]}},
+                            {'type': 'tool_use', 'id': 'browse', 'name': 'browser_run_task',
+                            'input': {'task': prompt, 'url': url, 'max_steps': 10, 'execution_kind': 'adaptive_interaction', 'interaction_reason': 'Inspect live dynamic controls and their selected state'}}]}
                     assert self.outer_calls == 3
                     return reply(f'{label}: {value}. 日付: 2026-10-10. 人数: 2.')
 
@@ -157,16 +164,24 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
             assert response.json()['artifacts'] == [], response.json()
             turns = [e for e in runtime.store.list_conversation_events(f'web:controls-{number}') if e.get('event_type') == 'conversation.chat_turn']
             output = next(result['output'] for result in turns[-1]['tool_results'] if result['tool_name'] == 'browser_run_task')
-            assert output['rejected_observations'] == 3, output
+            assert output.get('rejected_observations') == 3, output
             assert output['rejection_counts'] == {'source_not_captured': 3}, output
             assert output['report_status'] == 'completed', output
             assert {row['value'] for row in output['observations']} == {value, '2026-10-10', '2', '18:00'}, output
             assert len(output['page_url']) > 6000 and len(json.dumps(output)) < 12000, output
             assert all(descriptor['role'] == 'source' for descriptor in output['artifact_descriptors'])
-            assert model.browser_calls == 8 and model.outer_calls == 3
+            assert model.browser_calls == 7 and model.outer_calls == 3
         record_property('dynamic_browser_average_seconds', sum(samples) / len(samples))
         assert sum(samples) / len(samples) < 25, samples
         assert max(samples) < 35, samples
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def explicit_independent_sdk_fixture(monkeypatch):
+    # These anonymous-provider fixtures exercise the independent SDK mode.
+    # Managed login preservation has its own real shared-CDP/cookie contract.
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL', raising=False)

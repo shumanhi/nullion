@@ -1,4 +1,5 @@
 """Actual SDK actions must expose extracted DOM values to the next model step."""
+from tests.browser_model_protocol import browser_schema_messages
 from tests.workflow_provider_protocol import workflow_provider_reply
 import json, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ def test_completed_sdk_history_is_auditable_after_step_limit(tmp_path, monkeypat
     worker = os.environ.get("NULLION_BROWSER_USE_TEST_PYTHON", "/tmp/nullion-browser-sdk/bin/python")
     if not __import__("pathlib").Path(worker).is_file(): pytest.skip("Installed SDK worker required")
     for key, value in {"NULLION_HOME":str(tmp_path), "NULLION_BROWSER_BLOCK_PRIVATE":"false", "NULLION_BROWSER_HEADLESS":"true", "NULLION_BROWSER_USE_SANDBOX":"false", "ANONYMIZED_TELEMETRY":"false"}.items(): monkeypatch.setenv(key, value)
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
     monkeypatch.delenv("NULLION_BROWSER_USE_CDP_URL", raising=False)
     from playwright.sync_api import sync_playwright
     with sync_playwright() as playwright:
@@ -35,10 +37,10 @@ def test_completed_sdk_history_is_auditable_after_step_limit(tmp_path, monkeypat
             except Exception as exc:self.errors.append(repr(exc));raise
         def _create(self, **kwargs):
             self.calls += 1
-            schema_message = next(m["content"] for m in kwargs["messages"] if isinstance(m.get("content"), str) and m["content"].startswith("Return valid JSON matching this schema: "))
+            schema_message = browser_schema_messages(kwargs)[0]['content']
             schema = json.loads(schema_message.split(": ", 1)[1])
             if self.calls == 1:
-                action = {"record_observations":{"goal_status":"partial", "next_action":"report", "observations":[
+                action = {"record_observations":{"goal_status":"partial", "next_action":"alternative_source", "observations":[
                     {"label":"Item price", "value":"$37", "quote":"Total $37", "source_url":url,"semantic_role":"attribute"}],
                     "unknowns":["An additional field was not displayed"], "blocker":None}}
             else:
@@ -71,3 +73,11 @@ def test_completed_sdk_history_is_auditable_after_step_limit(tmp_path, monkeypat
         assert url in result["execution_audit"]["visited_urls"]
         assert time.monotonic()-started < 35
     finally: server.shutdown(); server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def explicit_independent_sdk_fixture(monkeypatch):
+    # These anonymous-provider fixtures exercise the independent SDK mode.
+    # Managed login preservation has its own real shared-CDP/cookie contract.
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL', raising=False)

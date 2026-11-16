@@ -171,6 +171,8 @@ def test_preferences_load_save_prompt_profile_and_timezone(tmp_path, monkeypatch
     profile_prompt = build_profile_prompt({"name": "Himan", "address": "10024", "notes": ""})
     assert "Address: 10024" in profile_prompt
     assert "Default location:" in profile_prompt
+    assert "different task" in profile_prompt
+    assert "before asking for a city" in profile_prompt
     assert "weather" in profile_prompt
     assert build_profile_prompt({}) is None
 

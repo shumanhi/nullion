@@ -54,6 +54,7 @@ def test_budget_approval_resumes_same_run_through_web_api_once(tmp_path, monkeyp
         task += '\n指定の設定を一度だけ更新。' if task.startswith('選択') else '\nActualiza una vez el ajuste seleccionado.'
     class Provider:
         replay_requested = False
+        scope_declared = False
         def create(self, **kw):
             system = kw.get('system') or ''
             if 'material-requirements planner' in system:
@@ -81,6 +82,11 @@ def test_budget_approval_resumes_same_run_through_web_api_once(tmp_path, monkeyp
             if protocol is not None:
                 return protocol
             assert kw.get('tools'), 'A new unscoped setup/model path was introduced'
+            if target_count == 24 and not self.scope_declared:
+                self.scope_declared = True
+                return tool_response('request_tool_scope', {'capabilities':['web'],
+                    'tool_names':['browser_extract_text'], 'research_effort':'exhaustive',
+                    'research_questions':['Inspect all twenty-four selected records']})
             if with_action and not writes:
                 return tool_response('opaque_update', {})
             if len(reads) == (3 if with_action else 4):
@@ -101,7 +107,8 @@ def test_budget_approval_resumes_same_run_through_web_api_once(tmp_path, monkeyp
     agent_conversation = origin+':background:selected-run' if manual else None
     first = run_scheduled(job, provider, runtime, registry, lambda *a: pytest.fail('No delivery before approval'),
         agent_conversation_id=agent_conversation)
-    assert first['suspended_for_approval'] and reads == list('ABC' if with_action else 'ABCD'), {key: value for key, value in first.items()
+    initial_reads = (3 if with_action else 4) - int(target_count == 24)
+    assert first['suspended_for_approval'] and reads == list('ABCD'[:initial_reads]), {key: value for key, value in first.items()
         if key not in {'tool_results', 'response_presentation', '_cron_retained_text_report'}}
     ident = first['approval_id']
     before = runtime.store.get_suspended_turn(ident).resume_token['scheduled_execution']

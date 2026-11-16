@@ -32,12 +32,13 @@ def test_saved_policy_reaches_chat_scheduled_report_and_doctor_without_another_m
     from nullion.tools import ToolRegistry
     isolate_preferences(tmp_path,monkeypatch)
     systems=[]
+    authored='🔔 **結果**\n\n| 項目 | 変化 |\n|---|---|\n| A | 43 → 45 |\n| B | 31 → 34 |\n\n[Source](https://example.test/result)'
     class Model:
         def create(self,**kw):
             protocol=workflow_provider_reply(kw,completion=True)
             if protocol is not None:return protocol
             systems.append(kw.get('system',''))
-            return {'content':[{'type':'text','text':'🔔 **結果**\n\n- A: 43 → 45\n- B: 31 → 34\n\n[Source](https://example.test/result)'}]}
+            return {'content':[{'type':'text','text':authored}]}
     model=Model();app,runtime,db=setup(tmp_path,monkeypatch,model)
     samples=[]
     with TestClient(app) as client:
@@ -52,6 +53,17 @@ def test_saved_policy_reaches_chat_scheduled_report_and_doctor_without_another_m
             value=reply.json()['text'];assert '43 → 45' in value and '31 → 34' in value
             assert ('🔔' in value)==(emoji!='none')
             assert ('**' in value)==(markdown!='plain')
+            cid=f'web:policy-{index}'
+            from urllib.parse import urlencode
+            restored=client.get('/api/chat/history/'+cid+'?'+urlencode({'turn_ids':json.dumps([reply.json()['turn_id']])})).json()
+            assert restored['terminal_replies'][0]['text']==value
+            # The browser persists visible messages through this real route.
+            # Also cover a legacy stored table, before shared canonicalization.
+            assert client.post('/api/chat/history/'+cid+'/message',headers=headers,
+                json={'role':'bot','text':authored}).status_code==200
+            saved=client.get('/api/chat/history/'+cid).json()['messages']
+            assert [row['text'] for row in saved if row['role']=='bot']==[value]
+            assert '|---|' not in value
             samples.append(time.monotonic()-started)
         assert len(systems)==3, 'Formatting must not add an ordinary-turn model call'
         # Background callers with no chat preference history use that exact policy.

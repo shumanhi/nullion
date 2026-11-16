@@ -17,7 +17,8 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
     ('أرسل صورة للصفحة الحالية.', True),
     ('Describe la página sin adjuntar la captura de investigación.', False),
 ])
-def test_source_capture_material_contract_controls_real_api_delivery(tmp_path, monkeypatch, prompt, wants_file):
+@pytest.mark.parametrize('format_explicit', [True, False])
+def test_source_capture_material_contract_controls_real_api_delivery(tmp_path, monkeypatch, prompt, wants_file, format_explicit):
     import io
     import socket
     from PIL import Image
@@ -36,8 +37,10 @@ def test_source_capture_material_contract_controls_real_api_delivery(tmp_path, m
     original = socket.getaddrinfo
     monkeypatch.setattr(socket, 'getaddrinfo', lambda host, *a, **kw: original('127.0.0.1' if host=='capture.localhost' else host, *a, **kw))
     monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT', str(tmp_path/'workspaces'))
-    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'auto')
-    monkeypatch.setenv('NULLION_BROWSER_HEADLESS', 'false')
+    # This container explicitly selects its own browser; reconnect/consent is
+    # covered separately and must not be bypassed by silent Auto fallback.
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.setenv('NULLION_BROWSER_HEADLESS', 'true')
     monkeypatch.setenv('NULLION_TASK_DECOMPOSITION_ENABLED', '0')
     monkeypatch.setattr(auto_backend, '_is_cdp_reachable', lambda: False)
     monkeypatch.setattr(auto_backend, '_reuse_preferred_cdp_if_available', lambda: False)
@@ -63,8 +66,8 @@ def test_source_capture_material_contract_controls_real_api_delivery(tmp_path, m
             if self.phase == 1: return call('request_tool_scope', {'capabilities':['web'],
                 'tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'] if wants_file else ['browser_navigate','browser_extract_text'],
                 'required_tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'] if wants_file else ['browser_navigate','browser_extract_text'],
-                'artifact_extensions':['.png'] if wants_file and not self.opening else [], 'source_artifact_delivery_requested':wants_file and not self.opening, 'source_artifact_request_evidence':prompt if wants_file and not self.opening else ''})
-            if self.phase == 2: return call('browser_screenshot', {}) if not self.opening and wants_file else call('browser_navigate', {'url':url})
+                'artifact_extensions':['.png'] if format_explicit and wants_file and not self.opening else [], 'source_artifact_delivery_requested':wants_file and not self.opening, 'source_artifact_request_evidence':prompt if wants_file and not self.opening else ''})
+            if self.phase == 2: return call('browser_screenshot', {}) if not self.opening and wants_file else call('browser_navigate', {'url':url, 'keep_open':self.opening,'retention_request_evidence':f'Open this cart and keep it open: {url}'})
             if self.phase == 3 and not self.opening and not wants_file: return call('browser_extract_text', {})
             # Deliberately no MEDIA directive or path: material contract owns delivery.
             return text('The cart is open.' if self.opening else 'Current cart: Cedar.')

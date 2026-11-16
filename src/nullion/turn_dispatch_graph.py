@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -45,6 +46,9 @@ class TurnDispatchDecision:
     reason: str = "default_independent"
     target_active_turn_index: int | None = None
     work_ack_recommended: bool = False
+    clarification_targets: tuple[tuple[str, str], ...] = ()
+    clarification_effect: ConversationTurnDisposition = ConversationTurnDisposition.CONTINUE
+    resolved_message: str | None = None
 
     @property
     def should_wait(self) -> bool:
@@ -57,6 +61,9 @@ class _StructuredTurnDisposition:
     reason: str
     target_active_turn_index: int | None = None
     target_is_explicit: bool = False
+    needs_clarification: bool = False
+    clarification_effect: ConversationTurnDisposition = ConversationTurnDisposition.CONTINUE
+    plausible_target_indexes: tuple[int, ...] | None = None
 
 
 class _TurnDispatchState(TypedDict, total=False):
@@ -68,7 +75,12 @@ class _TurnDispatchState(TypedDict, total=False):
     disposition: ConversationTurnDisposition
     disposition_reason: str
     target_active_turn_index: int | None
+    needs_clarification: bool
+    clarification_effect: ConversationTurnDisposition
+    target_context_selected: bool
     decision: TurnDispatchDecision
+    candidate_contexts: tuple[dict, ...]
+    plausible_target_indexes: tuple[int, ...] | None
 
 
 def _normalize_node(state: _TurnDispatchState) -> dict[str, object]:
@@ -129,6 +141,8 @@ def _model_turn_disposition(
     current_text: str,
     active_turn_texts: tuple[str, ...],
     active_turn_followup_evidence: bool,
+    target_context_selected: bool = False,
+    candidate_contexts: tuple[dict, ...] = (),
 ) -> _StructuredTurnDisposition | None:
     if model_client is None or not active_turn_texts:
         return None
@@ -136,32 +150,45 @@ def _model_turn_disposition(
     if not callable(create):
         return None
     active_payload = [
-        {"index": index, "user_request": _trim_active_request_text(text)}
-        for index, text in enumerate(active_turn_texts[-3:], start=max(0, len(active_turn_texts) - 3))
+        {**(candidate_contexts[index] if index < len(candidate_contexts) else {}),
+         "index": index, "user_request": _trim_active_request_text(text)}
+        for index, text in enumerate(active_turn_texts)
     ]
     system = (
         "Classify whether the current user message should link to one active or recent request "
         "or run as a separate request. Return only JSON with keys relationship, effect, confidence, "
-        "target_index, and target_is_explicit. "
-        "relationship must be one of: follow_up, separate. effect must be one of: continue, revise, interrupt. "
+        "target_index, target_is_explicit, and plausible_target_indexes. "
+        "relationship must be one of: follow_up, separate, ambiguous. effect must be one of: continue, revise, interrupt. "
         "For follow_up, target_index must be the index of exactly one active_requests item. "
         "For separate, target_index must be null. "
         "target_is_explicit must be true only when the current_message itself semantically identifies, "
         "modifies, or requests work on a specific active_requests item. Set target_is_explicit false for "
         "generic agreement, acknowledgement, permission, or continuation messages that could refer to "
         "an earlier completed turn instead of the active request. "
+        "Use ambiguous when the message refers to prior work but does not identify which request it means. "
+        "For ambiguous, plausible_target_indexes must list only candidates the requested work can meaningfully "
+        "apply to, based on their last reply and tool evidence. Do not list every recent conversation. "
+        "A request can identify its target semantically through a result or page from that conversation, "
+        "without repeating the original request title. A greeting with no page is not a page-work candidate. "
+        "The presence of a URL, file, or running task in the candidates does not identify the user's target. "
+        "Even one running candidate is not enough to resolve an unanchored, vague reference: it may refer "
+        "to a recently completed request. Never guess a target for a revision or cancellation. "
         "Use continue when the active request should still produce its own result, revise when the current "
         "message changes the active request's requested output or parameters, and interrupt when the active "
         "request should be replaced. "
         "Use semantic understanding across languages. Do not split the current user message into multiple tasks."
     )
+    if target_context_selected:
+        system += (" This is sequential recovery within an already selected request context, not concurrent task "
+            "admission. A semantic reference to that selected context can be follow_up without an explicit name.")
     user = json.dumps(
         {
             "active_requests": active_payload,
             "current_message": current_text,
-            "allowed_relationships": ["follow_up", "separate"],
+            "allowed_relationships": ["follow_up", "separate", "ambiguous"],
             "allowed_effects": ["continue", "revise", "interrupt"],
             "allowed_target_indexes": [item["index"] for item in active_payload],
+            "target_context_selected": target_context_selected,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -178,10 +205,25 @@ def _model_turn_disposition(
     if payload is None:
         return None
     relationship = str(payload.get("relationship") or "").strip().lower()
+    raw_effect = payload.get("effect")
+    clarification_effect = (ConversationTurnDisposition(raw_effect)
+        if isinstance(raw_effect, str) and raw_effect in {"continue", "revise", "interrupt"}
+        else ConversationTurnDisposition.CONTINUE)
     try:
         confidence = float(payload.get("confidence", 0))
     except Exception:
         confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    plausible = payload.get("plausible_target_indexes")
+    if (isinstance(plausible, list) and all(type(i) is int and 0 <= i < len(active_payload) for i in plausible)):
+        plausible = tuple(dict.fromkeys(plausible))
+    else:
+        plausible = None
+    if relationship == "ambiguous" or (relationship == "follow_up" and confidence < 0.55):
+        return _StructuredTurnDisposition(ConversationTurnDisposition.INDEPENDENT,
+            "ambiguous_dispatch_target", needs_clarification=True, clarification_effect=clarification_effect,
+            plausible_target_indexes=plausible)
     if confidence < 0.55:
         return None
     explicit_field = payload.get("target_is_explicit")
@@ -191,8 +233,9 @@ def _model_turn_disposition(
         # semantic target can link ordinary follow-ups without requiring a
         # URL, filename, or attachment in either message. Ambiguous assent
         # still needs a stronger runtime anchor.
-        if not (active_turn_followup_evidence or target_is_explicit):
-            return None
+        if not target_is_explicit and not (target_context_selected and active_turn_followup_evidence):
+            return _StructuredTurnDisposition(ConversationTurnDisposition.INDEPENDENT,
+                "ambiguous_dispatch_target", needs_clarification=True, clarification_effect=clarification_effect)
         target_index = payload.get("target_index")
         if target_index is None and len(active_turn_texts) == 1 and active_turn_followup_evidence:
             target_index = 0
@@ -234,30 +277,29 @@ def _model_turn_disposition(
 
 def _classify_node(state: _TurnDispatchState) -> dict[str, object]:
     active_turn_ids = tuple(state.get("active_turn_ids", ()))
+    model_decision = None
     if not active_turn_ids:
         disposition = ConversationTurnDisposition.INDEPENDENT
         reason = "no_active_turn"
         target_active_turn_index = None
     else:
-        model_decision = _model_turn_disposition(
-            model_client=state.get("model_client"),
-            current_text=str(state.get("text") or ""),
-            active_turn_texts=tuple(state.get("active_turn_texts", ())),
-            active_turn_followup_evidence=bool(state.get("active_turn_followup_evidence", True)),
-        )
+        try:
+            model_decision = _model_turn_disposition(
+                model_client=state.get("model_client"),
+                current_text=str(state.get("text") or ""),
+                active_turn_texts=tuple(state.get("active_turn_texts", ())),
+                active_turn_followup_evidence=bool(state.get("active_turn_followup_evidence", True)),
+                target_context_selected=bool(state.get("target_context_selected", False)),
+                candidate_contexts=tuple(state.get("candidate_contexts", ())),
+            )
+        except Exception:
+            # The user can choose a typed target even when the optional
+            # relationship provider is unavailable. Existing work stays live.
+            logger.warning("Concurrent request target classification unavailable")
         if model_decision is None:
-            if (
-                state.get("model_client") is not None
-                and bool(state.get("active_turn_followup_evidence", True))
-                and len(active_turn_ids) == 1
-            ):
-                disposition = ConversationTurnDisposition.CONTINUE
-                reason = "structured_active_followup_evidence"
-                target_active_turn_index = 0
-            else:
-                disposition = ConversationTurnDisposition.INDEPENDENT
-                reason = "no_structured_dispatch_decision"
-                target_active_turn_index = None
+            disposition = ConversationTurnDisposition.INDEPENDENT
+            reason = "no_structured_dispatch_decision"
+            target_active_turn_index = None
         else:
             disposition = model_decision.disposition
             reason = model_decision.reason
@@ -266,6 +308,10 @@ def _classify_node(state: _TurnDispatchState) -> dict[str, object]:
         "disposition": disposition,
         "disposition_reason": reason,
         "target_active_turn_index": target_active_turn_index,
+        "needs_clarification": bool(active_turn_ids and state.get("model_client") is not None
+            and (model_decision is None or model_decision.needs_clarification)),
+        "clarification_effect": model_decision.clarification_effect if model_decision else ConversationTurnDisposition.CONTINUE,
+        "plausible_target_indexes": model_decision.plausible_target_indexes if model_decision else None,
     }
 
 
@@ -274,6 +320,18 @@ def _dispatch_node(state: _TurnDispatchState) -> dict[str, object]:
     disposition = state.get("disposition") or ConversationTurnDisposition.INDEPENDENT
     reason = str(state.get("disposition_reason") or "default_independent")
     target_active_turn_index = state.get("target_active_turn_index")
+    if state.get("needs_clarification"):
+        plausible = state.get("plausible_target_indexes")
+        targets = tuple(zip(active_turn_ids, state.get("active_turn_texts", ())))
+        if plausible is not None:
+            targets = tuple(targets[index] for index in plausible)
+            if not targets:
+                return {"decision": TurnDispatchDecision(policy=TurnDispatchPolicy.PARALLEL,
+                    reason="no_plausible_dispatch_target")}
+        return {"decision": TurnDispatchDecision(
+            policy=TurnDispatchPolicy.PARALLEL, reason="ambiguous_dispatch_target",
+            clarification_targets=targets,
+            clarification_effect=state.get("clarification_effect", ConversationTurnDisposition.CONTINUE))}
     if active_turn_ids and disposition in {
         ConversationTurnDisposition.CONTINUE,
         ConversationTurnDisposition.REVISE,
@@ -334,6 +392,8 @@ def route_turn_dispatch_with_context(
     active_turn_texts: tuple[str, ...] = (),
     active_turn_followup_evidence: bool = True,
     model_client: object | None = None,
+    target_context_selected: bool = False,
+    candidate_contexts: tuple[dict, ...] = (),
 ) -> TurnDispatchDecision:
     final_state = _compiled_turn_dispatch_graph().invoke(
         {
@@ -342,6 +402,8 @@ def route_turn_dispatch_with_context(
             "active_turn_texts": tuple(active_turn_texts),
             "active_turn_followup_evidence": bool(active_turn_followup_evidence),
             "model_client": model_client,
+            "target_context_selected": target_context_selected,
+            "candidate_contexts": candidate_contexts,
         },
         config={"configurable": {"thread_id": "turn-dispatch"}},
     )
@@ -419,7 +481,7 @@ class ActiveTurnRegistration:
     conversation_id: str
     turn_id: str
     decision: TurnDispatchDecision
-    dependency_tasks: tuple[asyncio.Task, ...]
+    dependency_tasks: tuple[asyncio.Future, ...]
     cancellation_event: threading.Event
     publication_gate: TurnPublicationGate
     _tracker: "AsyncTurnDispatchTracker"
@@ -437,7 +499,9 @@ class ActiveTurnRegistration:
     async def wait_for_dependencies(self) -> None:
         for dependency_task in self.dependency_tasks:
             try:
-                await dependency_task
+                # Cancelling one successor must not cancel the shared signal
+                # or a predecessor which is still serving other successors.
+                await asyncio.shield(dependency_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -467,6 +531,8 @@ class AsyncTurnDispatchTracker:
         self._admission_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._publication_by_conversation: dict[str, dict[str, TurnPublicationGate]] = {}
         self._tasks_by_conversation: dict[str, dict[str, asyncio.Task]] = {}
+        self._completion_by_conversation: dict[str, dict[str, asyncio.Future]] = {}
+        self._done_callbacks: dict[tuple[str, str], object] = {}
         self._order_by_conversation: dict[str, list[str]] = {}
         self._text_by_conversation: dict[str, dict[str, str]] = {}
         self._superseded_by_conversation: dict[str, set[str]] = {}
@@ -527,21 +593,30 @@ class AsyncTurnDispatchTracker:
         active_turn_ids = tuple(active_order)
         active_turn_texts = tuple(active_texts_by_id.get(active_turn_id, "") for active_turn_id in active_order)
         dispatch_started_at = time.perf_counter()
-        if reply_context:
+        from .turn_dispatch_choices import dispatch_candidates, dispatch_candidate_contexts, record_dispatch_choice, selected_dispatch_choice, selected_conversation_option
+        choice = selected_dispatch_choice(runtime_store, conversation_key, text, reply_context)
+        if choice is not None:
+            decision = choice
+        elif reply_context:
             decision = TurnDispatchDecision(
                 policy=TurnDispatchPolicy.PARALLEL,
                 dependency_turn_ids=(),
                 disposition=ConversationTurnDisposition.INDEPENDENT,
                 reason="explicit_reply_context",
             )
+        elif (option := selected_conversation_option(runtime_store, conversation_key, text)) is not None:
+            decision = option
         elif active_turn_ids:
+            candidate_ids, candidate_texts = dispatch_candidates(
+                runtime_store, conversation_key, active_turn_ids, active_turn_texts)
             decision = await asyncio.to_thread(
                 route_turn_dispatch_with_context,
                 str(text or ""),
-                active_turn_ids=active_turn_ids,
-                active_turn_texts=active_turn_texts,
+                active_turn_ids=candidate_ids,
+                active_turn_texts=candidate_texts,
                 active_turn_followup_evidence=active_turn_followup_evidence,
                 model_client=model_client,
+                candidate_contexts=dispatch_candidate_contexts(runtime_store, conversation_key, candidate_ids, active_turn_ids),
             )
         else:
             # Keep the no-active-turn path synchronous. It is cheap and avoids
@@ -553,6 +628,11 @@ class AsyncTurnDispatchTracker:
                 active_turn_texts=active_turn_texts,
                 model_client=model_client,
             )
+        if decision.reason in {"ambiguous_dispatch_target", "dispatch_target_unavailable"}:
+            record_dispatch_choice(runtime_store, conversation_key, turn_key,
+                decision.resolved_message or str(text or ""), decision)
+        if decision.dependency_turn_ids and not set(decision.dependency_turn_ids).intersection(active_turn_ids):
+            decision = replace(decision, policy=TurnDispatchPolicy.PARALLEL)
         dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000
         # This is intentionally keyed by ids/counts rather than message text so
         # production latency triage can find wasted relationship preflights
@@ -573,7 +653,7 @@ class AsyncTurnDispatchTracker:
             active_order = list(self._order_by_conversation.get(conversation_key, []))
             active_tasks = self._tasks_by_conversation.setdefault(conversation_key, {})
             dependency_tasks = tuple(
-                active_tasks[dependency_turn_id]
+                self._completion_by_conversation[conversation_key][dependency_turn_id]
                 for dependency_turn_id in decision.dependency_turn_ids
                 if dependency_turn_id in active_tasks and active_tasks[dependency_turn_id] is not current_task
             )
@@ -606,6 +686,14 @@ class AsyncTurnDispatchTracker:
             publication_gate = TurnPublicationGate(on_revoke=record_revocation)
             self._publication_by_conversation.setdefault(conversation_key, {})[turn_key] = publication_gate
             active_tasks[turn_key] = current_task
+            self._completion_by_conversation.setdefault(conversation_key, {})[turn_key] = asyncio.get_running_loop().create_future()
+            # Retire orphan registrations even if an adapter exits before its
+            # normal finally block. Identity is unique for this registration.
+            def completed(_task):
+                if not _task.get_loop().is_closed():
+                    _task.get_loop().create_task(self.finish(conversation_key, turn_key))
+            current_task.add_done_callback(completed)
+            self._done_callbacks[(conversation_key, turn_key)] = completed
             self._order_by_conversation.setdefault(conversation_key, []).append(turn_key)
             self._text_by_conversation.setdefault(conversation_key, {})[turn_key] = str(text or "")
             self._cancel_events_by_conversation.setdefault(conversation_key, {})[turn_key] = cancellation_event
@@ -624,6 +712,13 @@ class AsyncTurnDispatchTracker:
         conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
         turn_key = _normalize_key(turn_id, fallback="")
         async with self._lock:
+            completions = self._completion_by_conversation.get(conversation_key)
+            if completions is not None:
+                completed = completions.pop(turn_key, None)
+                if completed is not None and not completed.done():
+                    completed.set_result(None)
+                if not completions:
+                    self._completion_by_conversation.pop(conversation_key, None)
             publications = self._publication_by_conversation.get(conversation_key)
             if publications is not None:
                 publications.pop(turn_key, None)
@@ -631,7 +726,10 @@ class AsyncTurnDispatchTracker:
                     self._publication_by_conversation.pop(conversation_key, None)
             active_tasks = self._tasks_by_conversation.get(conversation_key)
             if active_tasks is not None:
-                active_tasks.pop(turn_key, None)
+                task = active_tasks.pop(turn_key, None)
+                callback = self._done_callbacks.pop((conversation_key, turn_key), None)
+                if task is not None and callback is not None:
+                    task.remove_done_callback(callback)
                 if not active_tasks:
                     self._tasks_by_conversation.pop(conversation_key, None)
                     self._text_by_conversation.pop(conversation_key, None)
@@ -692,6 +790,9 @@ class AsyncTurnDispatchTracker:
             cancel_events = self._cancel_events_by_conversation.get(conversation_key)
             publications = self._publication_by_conversation.get(conversation_key, {})
             for turn_key, _task in tasks_to_cancel:
+                completed = self._completion_by_conversation.get(conversation_key, {}).get(turn_key)
+                if completed is not None and not completed.done():
+                    completed.set_result(None)
                 gate = publications.pop(turn_key, None)
                 if gate is not None:
                     gate.revoke()
@@ -700,6 +801,14 @@ class AsyncTurnDispatchTracker:
                     if cancel_event is not None:
                         cancel_event.set()
                 active_tasks.pop(turn_key, None)
+                callback = self._done_callbacks.pop((conversation_key, turn_key), None)
+                if callback is not None:
+                    _task.remove_done_callback(callback)
+                completions = self._completion_by_conversation.get(conversation_key)
+                if completions is not None:
+                    completions.pop(turn_key, None)
+                    if not completions:
+                        self._completion_by_conversation.pop(conversation_key, None)
                 if active_texts is not None:
                     active_texts.pop(turn_key, None)
                 if active_order is not None:

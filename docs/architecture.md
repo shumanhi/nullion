@@ -1,6 +1,129 @@
 # Runtime architecture
 
+## One assistant across every client
+
+All clients use one execution pipeline and one presentation layer. A request
+submitted through Web, Telegram, Slack, Discord or a future client must preserve
+the same goal and follow the same execution policy when its normalized context,
+permissions and runtime capabilities are equivalent.
+
+Ingress adapters translate transport input into a common request contract. They
+preserve reply identity, attachments, explicit actions and consent. The shared
+runtime owns context and memory, reasoning, planning when needed, tool scope and
+selection policy, execution, delegation, retries, recovery, approvals,
+cancellation, task state and final outcome selection. A client cannot substitute
+its own strategy prompt, execution loop or fallback agent. Required execution
+policy belongs at the shared runtime boundary with typed evidence; advice in a
+tool description alone does not enforce it.
+
+The runtime produces one common message/result contract. One presentation layer
+applies saved preferences; client output adapters render supported markup,
+escape, split, upload and transport that result, and return delivery
+acknowledgements. They cannot add requirements, discard usable findings, change
+the requested work or rerun it. Capability differences are explicit normalized
+facts with shared fallback/choice handling, rather than implicit client-specific
+assistant policies.
+
+Cross-client regression checks replay equivalent normalized requests and context
+with controlled model/tool decisions through the actual affected boundaries.
+They compare execution policy, action receipts, state changes and semantic
+outcomes, then check transport rendering separately. Independent live model runs
+may vary, but must obey the same policy. A successful Web replay alone does not
+establish successful Telegram, Slack or Discord behavior or delivery.
+
+Code Mode separates native execution from output selection. An invalid JSON
+pointer in a program's output projection retains its successful value and a
+bounded native evidence view; it cannot turn a completed read or write into a
+new execution obligation. The producer may use that evidence immediately or
+select saved values in the same interpreter without repeating native effects.
+Observed output contracts describe exact retained field paths and types, not
+invented aliases or guarantees about future responses. Ordinary plain turns do
+not load these contracts or acquire another model decision.
+
+Retained-evidence correction exposes copyable request-owned inspection requests
+and bounded field indexes. Unknown references are never guessed or rebound to
+another request. A failed pointer may name its valid parent for inspection, but
+that parent does not certify the missing field. Programs can handle a failed
+read locally, correct just that lookup and reuse successful windows. Existing
+inspection budgets, consent, approval, uncertain-write and cancellation rules
+remain authoritative across every client and continuation.
+
+Code Mode defaults to a cumulative 4,000,000-byte native transfer allowance per
+program and a 64,000,000-byte interpreter allocation budget. Operators can set
+`NULLION_CODE_MODE_MAX_TRANSFER_BYTES` (64,000–64,000,000) and
+`NULLION_CODE_MODE_MAX_MEMORY_BYTES` (8,000,000–512,000,000). Invalid settings use
+the defaults. The budgets are independent; serialized byte size does not predict
+the allocation cost of structured data. A request-owned session retains its
+configured limits through continuations and approval resumes. Plain chat does
+not load the interpreter or add a model call.
+The serialized checkpoint allowance scales with the configured memory budget
+(one quarter of it, with a 6,000,000-byte floor), so raising transfer capacity
+does not leave the old fixed checkpoint allowance as the next failure point.
+
+Large schema-declared source observations cross into the interpreter as an
+explicitly partial view prioritizing accepted facts over optional page captures.
+The host retains the exact receipt and an owned inspection reference. Opaque
+outputs are never silently reinterpreted. If the remaining transfer allowance
+cannot accommodate a result, native work stays completed and the program stops
+before another effect. The final model view retains bounded source findings
+even without a Python return value, with omission counts and exact references.
+
+Native tool objectives reuse verified selected request lineage, amendments and
+the owned question giving a numeric reply its meaning. Prior assistant text is
+reference data, and cannot grant action authority or revive a replaced request.
+An explicitly selected adaptive interaction continues after a successful native
+preflight within the same tool invocation; a page read alone cannot finish the
+requested form interaction. Read-only requests and pending source-access choices
+retain their existing lightweight path. Browser workers also receive the runtime's accepted date/time context; model
+arguments cannot replace that clock. Ingress, native policies and approval
+boundaries continue to own source access and side effects.
+
+Source compaction allocates space to accepted findings and their exact provenance
+before navigation inventories, model usage counters and other optional diagnostics.
+Nested schema-declared source values are projected before the Python return guard
+can discard them. The return allowance is 64,000 bytes per typed source
+bundle, capped at 256,000 bytes; it uses actual structured results, not prompt
+keywords or an extra classifier. Native receipts, VM variables, approvals and
+artifact bytes remain unchanged. The inference and stored-history boundaries use
+the same projection. Multi-source Code Mode views receive 16,000 characters per
+bundle, capped at 48,000 and bounded by the configured model-context ceiling.
+Omitted rows remain explicitly counted and inspectable by their owned receipt.
+
+A browser worker's validated `next_action=report` is a terminal handoff for both
+answered and useful partial results. A partial handoff remains partial and does
+not claim full user-request completion. Pending required controls and rejected
+observations still prevent termination. The parent retains responsibility for
+coverage and any further source work; the child does not need another model turn
+just to issue a redundant `done` action.
+
 ## Primary-agent completion
+
+Foreground persistence uses scoped durable writes where the storage contract is
+defined. Reminder creation, edits, cancellation and failed-delivery rollback
+commit the reminder and its one-off scheduled task together. A revision check
+rejects concurrent changes before publishing success in memory. Native reminder
+ownership markers also preserve deletion and delivery claims against older full
+snapshots; other processes refresh just this inventory before listing or polling.
+These commits do not wait for the Python/full-snapshot file locks used while
+encoding history and making backups. SQLite still serializes the short writes.
+
+The checkpoint audit also covers operator/button cancellation, display-setting
+events, memory-use reinforcement, tracker-notice history and generic messaging
+finalization. Display settings use a durable conversation write; secondary
+history/usage work uses the existing scoped receipt and coalesced background
+snapshot owner. Approval and permission transitions retain their synchronous
+durability boundary. Pending approval notifications commit only the exact
+approval and suspended continuation in one transaction before delivery; Web's
+turn binding uses the same commit. Full history snapshots run through the
+background coordinator. Failed or timed-out terminal operations retain captured
+streams and explicit incomplete-output metadata without claiming success.
+Inspection guidance prefers bounded reads and avoids cleanup mutations. On
+POSIX, terminal commands own a separate process session; timeout/interruption
+kills that session's pipeline descendants and bounds output draining.
+Legacy primary state changes in missions, Doctor/admin
+operations and approval workflows still use full checkpoints; backup, restore,
+update/restart and shutdown snapshots also remain. This is not a claim that all
+checkpoint call sites have been converted to incremental writes.
 
 The primary agent owns reasoning, tool use and the final answer. Nullion does not
 run a second AI requirements planner, action reviewer, completion grader or
@@ -17,6 +140,15 @@ Native runtime checks remain authoritative: principal and workspace ownership,
 tool registration and schemas, permissions, consent, approvals, cancellation,
 required action receipts, source selection, artifact integrity and final-version
 selection, byte-bound content receipts, and actual delivery acknowledgements.
+An unavailable local production method whose registered formats do not support
+the selected output does not remain an action obligation after an alternative
+producer has supplied the complete native file contract. Completion verifies
+current producer-owned files, required formats and counts, embedded media and
+task-frame obligations before retiring that method. Account actions, consent,
+explicit tool obligations and compatible producers remain required. Shared
+artifact guidance selects producers by format and asks the primary producer to
+measure text, wrap it within panels, and inspect final rendered pixels for
+clipping or overlap; metadata alone cannot establish visual quality.
 An accepted tool call is not a delivered file. An incomplete producer receipt
 remains incomplete; a successful upload does not certify its research. Native failures
 retain the authored findings and add a specific missing-receipt notice, rather
@@ -94,6 +226,33 @@ amendment. A status question does not authorize changing a saved job. A short
 cancellation can use the recent verified job receipt; ambiguous candidates need
 clarification rather than a guessed deletion.
 
+Unquoted, vague follow-ups do not amend the only running request by default.
+The shared admission graph uses its existing structured relationship decision
+to ask which request is meant, with numbered running/recent request choices.
+No cancellation token or publication gate is revoked until the user selects a
+validated target. Choices retain the original message, survive restart, expire,
+and cannot cross conversations, resets or explicit replies to another message.
+Numeric selections resolve locally; plain turns add no relationship model call
+or history scan. A selected choice is durably checkpointed even without tools.
+
+Native approval pauses execution, not presentation of completed deliverables.
+The shared chat handoff retains current-turn tool receipts and selected files
+with the pending action. Telegram renders the existing confirmation card with
+the message and attachment; Web renders the same draft and downloadable file.
+Sending remains pending and the request is not recorded as fulfilled.
+An exact source quote in the selected request ancestry can keep account tools
+visible across clarification answers. Account writes can use this continuation
+only when their registered metadata requires native approval. This restores the
+draft review handoff; it grants no permission and does not enable unguarded
+writes, unrelated-history sources or cancelled request ancestry.
+
+Shell producers declare `terminal_exec.output_paths` for generated files. Exact
+paths are validated and snapshotted before execution, then staged into the
+principal's artifact storage only when created or changed. This avoids relying
+on a bounded home-directory scan or parsing stdout as proof of file delivery.
+Existing files, escaped roots, missing outputs and unchanged files are not
+promoted by a declaration. Dedicated artifact producers remain preferred.
+
 ## Three kinds of background work
 
 | Work | Runtime path | State |
@@ -116,15 +275,213 @@ three-failure pauses remain independent of match delivery.
 
 ## Browser state
 
+The terminal preparation phase says "Preparing your response" for text and file
+results alike. A phase name inherited from artifact preparation does not prove
+that this request produced a file. Actual producer operations may still show
+file-specific progress from their registered metadata.
+
+Foreground progress uses one request-local fact collector in the shared chat
+pipeline. Only typed phase transitions, registered tool receipts and validated
+native batch counts update it. It never parses prompts/source prose, generates
+percentages, or claims that a completed read means the whole request is done.
+The collector builds the existing `UserMessage` contract and uses its shared
+presentation preferences. Web replaces its status area; messaging adapters edit
+one delayed, coalesced notice. Stop updates when the result is ready and remove
+the notice when delivery completes, keeping existing progress visible during uploads.
+Web's HTTP transport polls only the current request's in-memory snapshot; it
+does not resubmit work, load the dashboard or repeat execution. WebSocket
+progress and these snapshots receive the same shared content. Verbose
+tool logs remain optional. Fast replies need no extra notice, progress delivery
+cannot block final delivery, and cancellation/supersession closes the publisher.
+The initial working notice says: "Working on your request. Feel free to send
+other tasks — I can handle multiple at once." Later updates replace it with
+the current progress facts.
+The executing tool registry supplies lifecycle metadata before optional verbose
+activity suppression. Dynamically scoped history and runtime-owned inspection
+tools therefore update the same notice without exposing private results or
+depending on a client's base registry. This adds no inference calls.
+History lookup selects chat/reset event types before copying runtime payloads,
+preserving workspace and reset rules while excluding unrelated timing receipts.
+Retained inspection descriptors union overlapping ranges of the same unchanged
+owned source; fresh visible ranges are subtracted from carryover. Shorter
+subsequent reads cannot erase earlier coverage, and duplicate excerpts do not
+consume the budget needed for unique facts. Gaps and changed sources remain
+unverified and require their own reads.
+Retired-review cleanup discards verdicts but preserves validated source-window
+descriptors. Their content is always rebuilt from the current request-owned
+receipt and fingerprint; no old quality decision or copied fact is restored.
+Adaptive browser counters update the same notice with observed pages/findings
+without inventing a total or exposing captured source prose.
+The shared notice publisher checks request publication ownership before queued
+sends or edits, so revoked requests cannot publish stale updates. Approval waits
+remain distinct from denials in the lifecycle projection.
+Its delay starts when shared execution accepts the request, before memory and
+context preparation, so cold preparation does not postpone feedback. Telegram
+mirrors secondary chat history outside its event loop and bounds terminal-reply
+lookups to recent indexed turns. History mirroring cannot block typing refreshes
+or the completed answer; final network acknowledgements precede typing shutdown.
+Telegram typing refreshes retry transient failures; background refreshes reuse
+one connection pool for their active lifetime. Confirmed delivery stops typing
+before post-delivery persistence cleanup.
+The first Telegram typing signal starts before attachment processing and
+admission, while the separate progress notice retains its fast-turn delay.
+Publishing the terminal result releases active-turn ownership and dependency
+waiters before history cleanup finishes. Cancellation of one waiting successor
+cannot cancel its predecessor. Admission uses only genuinely active requests
+plus the current conversation family; older conversations remain recallable
+without becoming an indiscriminate clarification menu. The existing semantic
+decision receives bounded result/tool context and can filter plausible targets.
+Numbered replies to one current option group bind that group without another
+concurrent relationship inference.
+Explicit delivery of an existing source artifact uses its native descriptor
+format when the validated scope omits an extension. Only selected, completed
+source producers qualify; excluded formats and incidental research captures
+remain excluded. The same contract feeds Web downloads and messaging uploads.
+
+Public research uses one stopping rule across API search, browser-only reads,
+Code Mode and delegated tasks: resolve material requirements of the current
+request, then deliver. A positive shortlist does not require exhaustive source
+discovery. Optional background and media do not block delivery unless required
+by the current request or an applicable durable preference. An explicit complete
+inventory, comparison or broad negative conclusion retains its required coverage.
+This uses the existing primary model and typed source receipts, without another
+classifier call or a fixed page quota.
+
+That stopping guidance is backed by a request-owned research allowance shared
+across the primary LangGraph loop, Code Mode's native calls, common recovery,
+approval continuation, scheduled reports and Deep Agents. The primary's existing
+validated scope selects `research_effort` (`standard`, `extended`, `exhaustive`)
+and optional material `research_questions`; no prompt keyword classifier or
+additional ordinary-chat model call selects a policy. Standard defaults are 24
+native read units, eight research model attempts and 75 seconds of research;
+extended and exhaustive allow twice and four times that work. Independently
+batched reads count their items before admission. Scope widening and retrying
+programs do not reset spent work or upgrade an already-reading request.
+
+At exhaustion, both model visibility and the native boundary close external
+research. The primary retains exact source receipts, local inspection and
+requested production/actions, and composes findings with explicit unresolved
+facts. Writing has a separate 60-second/eight-call allowance; native local or
+action waits do not spend composition time, and completed productive writes
+renew only composition, never research. Artifact-capable model calls retain their
+registered generation timeout; only a structured non-source tool selection earns
+that generation time back. Selecting another source still spends research time.
+Artifact focusing alone never certifies that required source work is complete.
+Fixed-tool scheduled/delegated workflows expose the same scope control for
+declaring effort, while retaining exactly their existing tool permissions.
+Actual provider attempts and native calls are bounded, including a
+provider that ignores its timeout argument. Spent counters survive continuation
+without counting time waiting for the user's consent. `conversation.research_budget`
+records the phase, effort, reason, usage and limits without raw source payloads.
+
+Adapter-declared same-request snapshots reuse exact observations with origin
+invocation metadata. Writes, declared observation-changing navigation, and an
+explicit `research_refresh` invalidate snapshots; failures are never cached.
+Principal, adapter identity and declared context bindings isolate reuse. Code
+Mode supports `output_fields` JSON pointers into a final value and a bounded
+research projection (16,000 characters per typed source bundle, capped at
+48,000; other programs retain an 8,000-character ceiling), while exact native
+records and inspector-only windows stay
+available. The corresponding `NULLION_RESEARCH_*` environment settings tune the
+allowances without changing ordinary chat behavior.
+
+Native page batches enter the same discovery/observation ledger as individual
+reads. Successful page outcomes observe their containing pages; outbound links
+remain candidates, and failed reads prove no observation. The model checkpoint
+shares repeated invocation-id sets losslessly, keeping exact URLs and receipt
+identities while avoiding repeated large indexes. Code Mode model projections
+are bounded separately from artifact payloads; archival compaction retains the
+typed projection rather than reintroducing entire raw source collections.
+Original outputs and VM values remain intact and inspectable. Invalid local
+inspection pointers return request-owned keys and correction metadata, so a
+projection pointer error can be repaired without repeating external research.
+Scheduled report-writer errors record their typed cause and phase without
+source bodies or credentials. Writer timeouts retain the shared deadline and
+have a distinct user-facing cause. A delivered failure notice cannot become a
+retained partial report or a successful scheduled-run outcome; previously
+grounded partial findings and verified artifacts retain their existing receipts.
+Account-summary recovery uses all current-request sources and preserves their
+dated facts. It distinguishes reporting what a source says from certifying live
+account status, without imposing a new account-status audit on every summary.
+Presentation never selects a preferred source family from substring overlap
+with subjects, senders or event titles. A combined, paraphrased account answer
+remains authored content; raw-payload and copied-body protection apply separately.
+
+Release availability is shared by the Web update button and messaging notices.
+Active Telegram, Slack and Discord adapters check in the background, beginning
+30 seconds after startup. A SQLite cache and cross-process lease share one
+release lookup per hour; an installed HEAD change invalidates that cache. The
+target is the same released tag used by `/update`, never unreleased `main`
+commits or a downgrade from a development candidate. No chat turn waits for a
+release fetch or invokes a model to decide whether to show a notice.
+
+Each configured operator destination receives one notice per available release,
+with its native update command (`/nullion update` on Slack). Content uses the
+shared `UserMessage` contract. SQLite claims are committed before transport and
+survive checkpoints and restarts. Confirmed or uncertain deliveries are never
+replayed; only failures known to precede acceptance can retry. The adapters own
+escaping and native transport, while shared code owns availability and dedupe.
+Notices never install an update automatically.
+
+Ordinary turns expose registered public search and page-batch READ tools beside
+the existing cheap read defaults, including later turns with saved history.
+Their presence does not execute them, load connector inventories, or add a scope
+classifier. Account, outbound-network and approval boundaries still apply at
+invocation. Explicit independent search batches run at most two queries at once;
+dependent work waits for prerequisite evidence. Cancellation and deadlines stop
+new submissions while preserving completed findings and per-query failures.
+Model-context projections retain all returned source identities, exact URLs and
+prices while removing exact duplicate links and redundant fields. Full receipts
+remain in runtime storage. Completed reads use the existing shared progress
+contract; client adapters only render and transport it.
+
 Low-level browser tools keep session/page state and serialize operations on the
 same physical session. A tracker must carry trusted setup context and the
 verified physical session handle into repeated reads. Raw model aliases and a
 new task scope must not silently choose a different page. A browser restart can
 invalidate in-memory handles; source failure is distinct from a negative match.
 
-The optional delegated Browser Use worker is a different workflow: it performs
-bounded multi-step browsing in its configured isolated profile or dedicated CDP
-browser. It is not the worker used for frequent live polling.
+`browser_read_pages` executes a model-selected read plan in retained browser
+state. Independent URLs use at most two concurrent task-owned tabs, with
+navigation, observed readiness and structured extraction in one invocation.
+Explicitly related Playwright read tabs share their task's browser context,
+including cookies and storage, through Auto and recovery adapters. Unrelated
+tasks retain isolated contexts. Closing a read tab releases only that tab;
+the context closes after its last task/session lease is released, even when
+the parent has no open page or closes before its children.
+Text reads retain a bounded visible-link index with coverage alongside the text.
+The same index is used by ordinary `browser_extract_text`; links are source
+references rather than inferred real-world entities.
+Actual constituent reads receive registry-validated native receipts, so the
+runtime does not demand redundant navigation/extraction calls. These receipts
+cannot attest writes, come from adapter metadata rather than page payloads,
+and survive normal continuation and request-delivery metadata updates.
+
+The registered adaptive browser tool enforces a request-local native page read
+before starting its nested agent, even when the primary initially selects the
+adaptive tool. It returns that read as tool-step evidence so the primary can
+answer or decide which interaction remains. Current native observations of the
+same URL allow delegation; old conversation history cannot unlock it. Opaque
+request identity and objective digests prevent reuse across unrelated requests
+or amendments. An explicit typed source-capture delivery requirement can go
+directly to visual capture. A generated-image output requirement alone cannot
+promote research screenshots to the requested final image. Pending recovery consent and cancellation never unlock adaptive
+execution. This rule is shared tool execution policy for every client and adds
+no classifier or ordinary-chat model call.
+
+The optional delegated Browser Use worker performs adaptive multi-step browsing
+when interaction is needed. Auto/CDP mode reuses the configured managed browser;
+explicit Playwright/headless selection uses independent workspace-owned state.
+Neither multi-page research nor delegated browsing is the worker used for
+frequent live polling. The primary retains the original requested dimensions
+and decides when enough evidence has been gathered, without a separate planner
+or quality-grading call. Plain turns do not enter either browser path.
+
+Model timing events retain reported token counts when the provider supplies
+them. Nested browser performance records retain model/capture time, call count,
+reported usage and the count of calls with reported usage. Missing usage is
+unknown rather than zero; these measurements do not imply a provider quota
+percentage or billing estimate.
 
 ## Ownership and durability
 
@@ -403,11 +760,15 @@ rather than branch identity, and late reset/frame writers respect reset times so
 they cannot remove a newer frame or reactivate an older one. History-retaining
 archives continue to expose saved chat evidence for a later fresh conversation.
 
-A weather or market read completes a request directly only when the current structured
-`request_tool_scope` decision explicitly sets `direct_read_complete_request=true`,
-selects that one required read, and has no tracking or artifact obligation. Otherwise
-the existing agent continues with the observation and can finish setup or further work.
-No extra intent classifier runs on plain chat turns.
+Weather and market reads return their full structured receipts to the primary
+producer. `direct_read_complete_request=true` is a read-scope hint, not proof
+that a current-value template answers a date, period, units, field or comparison
+question. The producer selects the relevant observations and applies the shared
+presentation policy; no independent reviewer or extra intent classifier is added.
+When no model is available, the native weather fallback preserves every dated
+daily forecast rather than silently selecting the first row as “today”. Weather
+geocoding uses structured locality/region fields for a compact place label while
+preserving the exact resolved coordinates and source provenance.
 
 Live notification delivery persists the exact notification audit event with a bounded
 SQLite upsert. Durable chat history and the live notice ledger own delivery receipts;
@@ -415,11 +776,18 @@ a full runtime snapshot must not block `finish_notice`. If the secondary audit w
 is temporarily busy, the event remains in memory for the normal later checkpoint
 without turning an already delivered notification into a failed send.
 
-A typed artifact delivery contract with a visible producer uses the configured
-artifact model deadline even while research tools remain available. Keeping source
-access during generation must not silently revert to the shorter plain-chat deadline.
+A typed artifact delivery contract uses the configured artifact model deadline,
+including the research-to-production handoff before a producer is visible.
+Keeping source access during generation must not silently revert to the shorter plain-chat deadline.
 Plain turns keep their existing deadline and do not gain a classifier or extra model
 call. Model timeout diagnostics record the deadline used at the failed invocation.
+
+Declared output formats supported by selected registered producers remain output
+requirements even when a research tool also emits that format as incidental
+source evidence. Optional producers stay optional; the runtime does not invent
+another mandatory action. Native model interruptions without a final file retain
+their cause in the shared artifact manifest, so Web and messaging delivery report
+the interruption rather than replacing it with a generic attachment failure.
 
 The existing search-plan model may declare `source_discovery_required=false`
 for a comparison of finite requested subjects or properties. Every required
@@ -461,18 +829,120 @@ refresh before treating it as loaded. A forced save or missing checkpoint still
 writes. Building and merging a genuinely changed full snapshot remains proportional
 to retained state; scoped event saves remain the preferred hot-path operation.
 
-Web background checkpoint requests coalesce per runtime. A forced request arriving
+Web and Telegram background checkpoint requests use the same coordinator and
+coalesce per runtime. Current-turn conversation/head/ingress receipts are written
+incrementally, including commands without a chat head. Telegram completion no
+longer waits for a full snapshot; action and approval commits remain synchronous
+at their existing native boundaries. A runtime's own completed snapshot signature
+avoids an unnecessary full reload; another writer's unseen signature still needs
+refresh. Full snapshots remain proportional to retained state and are not a
+replacement for scoped foreground writes. A forced request arriving
 during a normal save forces the next pass; it does not force every later pass.
 Worker cleanup is bound to that worker's ownership token so a retiring worker
 cannot clear a newer worker's pending requests. Failure to start a worker clears
 its queue ownership so a later request can try again.
 
-Telegram finalization retains ownership of pending draft sends even when the
-short streaming wait times out. It drains those sends before deciding whether
-to edit an existing message or send a new one, and applies final formatting to
-the same message. An unsuccessful final edit withdraws the draft before fallback
+Unset streaming and thinking-display settings are authoritative indexed values;
+they never fall back to copying full history. Recent artifact receipts are read
+from the bounded current conversation index. Initial context uses compact
+capability awareness for discovery/native read scopes, retaining profile, memory,
+consent rules and exact tool discovery contracts. Connected-source, scheduler and
+artifact scopes keep their richer context, loaded after structured selection.
+Registered read-only tools use their metadata for this decision, including the
+initial uncached scope; an installed native read does not force a full contract.
+
+Composite adapters may attest that an invocation executed only declared native
+reads. The registry binds that receipt to the invocation and accepts only its
+registered read operations. Generic action-receipt enrichment preserves native
+metadata and does not describe an attested read-only invocation as an action.
+Selected-parent observations retain those facts and their timestamps across
+successive follow-ups, while action contracts and permission grants are excluded.
+A substantive answer is not replaced merely because it does not repeat search
+snippets: the primary agent owns its response to the current question.
+
+Source-result compaction branches on adapter-owned collection declarations,
+including collections returned by composite tools. Large model views retain row
+order, record counts, declared identity/context columns and original JSON
+pointers. Clipped values and omitted columns are explicit; exact records remain
+in the request-owned receipts and are accessible through retained inspection.
+Provider call-id ambiguity prevents replacing history blocks, but does not deny
+inspection of exact request-owned invocation ids. Extraction, artwork, report
+content and source-verification logic continue using the original receipts.
+The model view also preserves native-read strategy and its declared adaptive
+continuation. A native preflight does not imply that the interactive controller
+ran; the primary can select that continuation when page evidence leaves an
+interactive requirement unresolved.
+
+Research recovery and comparisons remain primary-agent reasoning. Existing
+inference receives focused guidance after observed discovery or an external
+source failure, without a reviewer, extra classifier or execution cap. A failed
+provider is distinct from absent availability; alternative routes must respect
+the user's source restrictions and consent. A shared comparison instruction
+normalizes quantities, calls for explicit arithmetic and distinguishes identical
+specifications from functional alternatives. No calculation tool is required.
+
+`ToolSpec.independent_batch` declares the array argument and explicit independence
+flag for a read tool. The shared tool graph validates each adjacent model call
+against its schema and adapter preflight before combining matching arguments
+within the declared array limit. The effective model transcript retains the
+actual merged invocation/result; a runtime audit records the original call IDs.
+Current-tab reads, different sessions, dependent plans, approvals, writes and
+invalid/blocked read plans remain separate. Browser reads retain their native
+two-tab concurrency limit; search batches use the same generic contract.
+
+Text previews use the shared `LatestTextUpdateQueue` on Telegram, Slack and
+Discord. Model token callbacks never wait for transport edits: at most one edit
+is in flight and the newest draft replaces older queued drafts. Finalization
+discards obsolete queued previews, retains ownership of the in-flight send,
+and applies final formatting to the same message. Completed answers are sent
+immediately on Web and Telegram rather than replayed as artificial streaming.
+An unsuccessful final edit withdraws the draft before fallback
 delivery; a draft is also withdrawn when a decision or attachment owns the final
 response. Typed already-delivered metadata survives response unwrapping.
+
+Browser Use source tasks reuse the SDK's fresh decision snapshot for captured
+evidence instead of independently taking another snapshot before and after
+each inference. The SDK's automatic vision mode uses text and controls first;
+a structured screenshot action includes the current image when visual inspection
+is needed. This action cannot create or attach an extra file. Existing runtime
+source screenshots remain available as evidence. Explicit page reads and completion checks still capture fresh
+state after actions. The adapter reports model/capture timings and publishes
+deduplicated runtime page/finding counts through the existing shared activity
+channel, including through the authenticated isolated-worker bridge. It never
+uses source prose as a progress message or claims that a finding completes the
+request. Optional progress failure does not fail the lookup; ordinary turns
+do not load the browser, poll progress or make another inference call.
+Nested model/capture timings and browser session-recovery reasons are preserved
+in tool timing events even when source receipts are compacted for history.
+Browser decisions use one native `browser_decision` schema through the configured
+model client and isolated-worker bridge. They are validated before the SDK acts;
+text-JSON compatibility still uses the same validator without another request.
+The schema is no longer appended as a large user message at every decision.
+
+Native browser tools try one bounded reconnect to the configured browser after a
+verified connection failure. Observation/navigation operations may replay; clicks,
+submissions and other uncertain actions do not. Reconnect restores uniquely
+identified task pages and never guesses between duplicate URLs. If reconnection
+fails, typed `user_choice_required` state pauses the run instead of triggering
+completion retries. The common `UserMessage` contract presents numbered recovery
+choices. A user-selected headless session applies only to that task, preserves
+the configured browser and other tasks, and is passed to the isolated SDK worker.
+Public-page work need not be signed in; account-only work may still need the
+original session. This recovery adds no model decision to ordinary requests.
+
+Auto/CDP controllers select one managed endpoint: the normal CDP setting wins
+over the older SDK-only override. A controller attach/capacity failure returns a
+typed `alternate_tool` handoff to ordinary browser tools on that existing session.
+It cannot silently launch an independent browser, discard the login, or claim the
+request is complete. Native browser opening/reading resolves the control handoff;
+the primary producer still completes the user's goal. Shared-browser shutdown
+detaches the controller rather than killing the user's browser. The explicitly
+non-interactive Playwright mode can use workspace-owned independent SDK state,
+with a storage-state lease and the configured visibility, without borrowing another
+browser's login. The SDK restores cookies and origin storage from a private workspace
+snapshot across worker restarts. A fresh snapshot before shutdown preserves sign-out
+without merging deleted cookies back from older state. Browser scratch profiles and
+files remain temporary; managed Auto/CDP profiles remain owned by the existing browser.
 
 Scheduled execution leases include process ownership. On POSIX, a verified dead
 owner can be reclaimed before expiry; live owners remain protected. Legacy tokens
@@ -870,7 +1340,9 @@ uncertain target. Acknowledged external alerts remain acknowledged if secondary
 history persistence fails. Outbox failure notices are attempted once across
 recovery, independently of retries for explicitly unsent result files.
 
-Explicit `/stop` releases the stopped conversation's retained tool-resource leases after cancellation, including browser tabs retained for follow-ups. The shared stop path scopes cleanup to `conversation:<id>` on all chat surfaces; it never requests global cleanup or closes another conversation's leases. Completed turns remain eligible for this cleanup, and repeated stops are idempotent.
+Transient tool resources belong to one shared chat request, including all of its recovery passes. The request's outer `finally` releases its browser tabs after success, failure, cancellation or suspension, independently of Code Mode. Ordinary research must never lease tabs to the whole conversation or retain them merely because `browser_open` ran. Browser profiles and authentication persist independently of transient tabs. Runtime-declared long-lived owners, such as active trackers, and pages intentionally opened for the user retain their separate leases. Failed close attempts retain exact ownership and get a bounded retry; a missing session yields a zero-count receipt, not proof that every browser tab closed. A close-only scope never creates a navigation requirement.
+
+Explicit `/stop` additionally releases the stopped conversation's retained tool-resource leases after cancellation. The shared stop path scopes cleanup to `conversation:<id>` on all chat surfaces; it never requests global cleanup or closes another conversation's leases. Repeated stops are idempotent.
 
 Scheduler follow-up context retains a bounded identity/timing index alongside sampled detailed rows. The index preserves exact names, selection identities, enabled state and human-readable schedules from the observed source page, allowing a wording correction without repeated reads of full task instructions. It reports index completeness and source-page continuation independently; omitted details and unseen source pages never become verified by compaction.
 
@@ -978,6 +1450,18 @@ even if its report requested termination. Disabled, stale or unknown control
 references do not cause continuation. This signal permits neither purchases nor
 automatic UI mutations; the normal browser executor and permissions still apply.
 
+A browser step may instead return `next_action=user_input` with a typed missing,
+ambiguous or conflicting prerequisite. Its source id and exact quotation must
+match the current captured document/control, including the final page capture.
+The adapter then ends the SDK step and returns the existing shared numbered
+user-choice contract, preserving partial findings without starting another source
+search. Primary and browser agents share input-resolution guidance: use saved
+profile values first, verify the meaning of selected values and repair conflicting
+selections before interpreting results. This is not a vendor-specific address
+resolver or an additional classifier/reviewer, and a typed clarification does not
+grant permission to act.
+
+
 Native-tool report corrections do not require a browser source-selection
 verdict. The completion parser receives whether a source-answer selection
 actually exists; a null verdict is valid when it does not, while an explicit
@@ -1037,6 +1521,13 @@ releases that lock, including on exceptions. Separate threads and processes stil
 acquire the OS lock; forked children cannot inherit the parent's reentrant
 ownership. This applies to full checkpoints, scoped writes and scheduler leases
 without changing their SQLite transaction or scheduling policies.
+Secondary chat and scheduled-delivery receipts share bounded foreground writes
+and a coalesced retry worker per database path. SQLite busy/locked errors defer
+these exact rows without replacing an already prepared response or replaying
+tools. The worker retains the originating store and rows across runtime reloads;
+primary actions, permissions and approvals keep their existing durable-commit
+requirements. Corruption and other permanent foreground storage errors still
+surface rather than being misclassified as contention.
 
 Loading or validating persisted conversation events builds the history indexes
 with execution observers suspended. Restoring a snapshot must never publish old
@@ -1136,3 +1627,309 @@ from upload, and platform adapters
 preserve the shared terminal failure explanation rather than replacing it with a
 generic attachment notice. The same delivery selection and presentation boundary
 continues to serve Web and messaging surfaces.
+
+
+### Context compression integrity
+
+Compaction changes model-facing views; request-owned native source records,
+action receipts and artifact bytes remain unchanged. Source observations use
+their typed compactor before generic collection projection, so large captured
+pages cannot displace accepted quotations, values, links and uncertainty.
+Recompacting a source view preserves its exact capture inspection references.
+Filename references defer output-versus-source selection to the primary model's
+structured tool scope, without a separate attachment-format classifier call.
+A quoted source-delivery request and one exact native filename match can select
+the existing file for delivery after root, existence and descriptor validation.
+Ambiguous matches and scopes that decline delivery cannot select attachments.
+Code Mode wrappers do not change native filename-discovery classification.
+
+Read-only artifact retrieval linked to a prior turn defaults history lookup to
+that conversation. An explicit workspace scope or saved-turn id still supports
+cross-conversation lookup. This uses the validated scope and linkage state,
+without interpreting phrases or adding a classifier to ordinary chat.
+
+Focused artifact packets contain bounded structured previews and explicit
+omission paths rather than cut JSON strings. They retain invocation identities;
+the common producer context exposes all retained records, including records
+outside the preview sample. Producers may inspect required omitted fields with
+the existing read-only retained-evidence tool instead of fetching the source
+again. Current inspection protocol pairs and user image/document inputs reach
+the consumer intact. Completed producer history is retired only using native
+invocation-to-protocol mappings, preserving failed attempts of the same tool.
+
+Delegated fallback summaries declare sampled result counts and omitted fields.
+Opaque ids, source cursors, paths, dates and URLs remain exact or the containing
+view is explicitly unavailable; shortened handles cannot become new tool input.
+These are model-view and recovery rules, not another grader or permission grant.
+Plain turns gain no model call, source fetch or broad database scan.
+
+### Request-owned Code Mode execution
+
+Research programs return selected findings, dates, regional scope, supporting
+passages, exact source URLs and unresolved questions together. The model view
+prioritizes a compact program value over duplicate native read inventories;
+full receipts remain available under their original invocation ids. Calendar
+adapters declare schedule record fields so bounded observations retain their
+times and exact identities without copying lengthy optional notes. Search
+snippets discover candidates; verified claims require underlying source evidence.
+
+The primary's structured scope decision also owns output and media format
+selection. Preparation does not run separate format/media model calls or scan
+all scheduler jobs for ordinary primary-agent turns. Explicit reply/job state
+continues to identify scheduled work.
+
+Designed PDF producers expose up to three bounded previews rendered from the
+actual PDF bytes, bound to both PDF and image hashes. These internal previews
+reach the existing composer, including through Code Mode; they are not delivered
+as attachments and rendering does not certify visual quality. PDFium rendering
+is serialized because its native API is not thread safe. Images preserve their
+full frame unless the author marks decorative art with `data-nullion-crop=true`.
+An inspection read cannot revoke a producer's embedded-media receipt or cause a
+replacement PDF. Shared attachment presentation supplies a readable caption if
+cleanup leaves only an icon or punctuation.
+Media checks use the latest completed producer at each path. The shared delivery
+manifest may select a separate plain memo beside an illustrated document without
+causing another image-only fallback file.
+`pdf_create.card_pages` accepts bounded page titles, subtitles and content cards
+with optional local images. It renders the same designed-PDF pipeline without
+requiring the model to generate repeated CSS, fixed-height panels or oversized
+brand artwork. Custom HTML remains available when the design needs it.
+
+The shared runtime retains the existing direct executor and an optional Monty
+Code Mode interface. `NULLION_CODE_MODE=on` with the `codemode` installation extra
+(`pip install '.[codemode]'`) exposes `code_mode` for scoped reads and writes
+across tool families. There is no gatekeeper module, per-tool redirection,
+intent classifier, or compilation of native tool calls into wrapper programs.
+The model produces a program when the sequence is understood; every `call_tool`
+uses the existing native execution boundary, including source consent, security,
+action review, approvals, cancellation, artifacts and activity. Scope changes
+remain explicit native controls. The sandbox cannot grant or widen permission.
+
+One request owns one logical Python session. Variables survive reasoning turns
+through trusted, bounded Monty checkpoints. A program pauses at the native call
+that requires approval, retaining completed operation receipts and its exact
+continuation. The shared approval path resumes that checkpoint, including when
+the pending operation is a write. It rechecks the native action under the new
+approval; earlier completed effects do not run again. SQLite compare-and-swap
+claims arbitrate duplicate workers and survive process restarts. A crash or
+unknown outcome leaves a non-replayable claim. Executable bytes come only from
+the private host-owned journal, never model arguments or source content. Terminal
+completion clears executable/source state and retains a small claim tombstone.
+If a native operation attaches an in-memory store to its first SQLite checkpoint,
+the journal migrates its existing sessions transactionally before the next read
+or claim. Existing durable revisions win; attaching persistence cannot reset a
+running or blocked claim or lose the request's Python variables.
+There is no automatic retry of a failed program or write. A recoverable native
+failure stops the feed by default. A program may explicitly use
+`call_tool(name, arguments, on_error="return")` to handle a failed read or a
+verified unexecuted operation and branch to a scoped fallback in Python.
+At most three such failures are handled per program; approvals, denials and
+uncertain writes still stop or pause. No failed operation is retried implicitly.
+An unhandled failure checkpoints globals and exposes typed repair diagnostics
+to the next reasoning step. A corrected program may continue that session. The
+same-request retry contract carries the session id, and the shared chat request
+owns heap cleanup through its final recovery pass. Composed diagnostics do not
+promote optional repair capabilities into new completion requirements. Unknown write outcomes
+cannot repeat the same native invocation; an unusable session ends the run
+instead of cycling tool-scope requests or requesting more iterations. Progress
+reports completed counts and active operations, rather than repeating generic
+working-with-results text after every tool. The shared progress message is one
+compact line with its current phase and at most three useful counts, including
+search-result totals when available. Zero findings and internal failed-step counters stay out of that notice;
+their native evidence and final limitations remain intact. Web renders the same
+content in a muted 12px status bubble. Messaging adapters retain their clients'
+normal text rendering, one editable notice and terminal cleanup.
+Preparation phases distinguish task context, saved context, tool preparation
+and the primary model's next step before native tool activity starts. Slow
+messaging requests preserve the initial acceptance notice, then coalesce edits
+to the newest phase; a completed source/tool fact may be the first visible view.
+Transport-acknowledged progress sends and edits contribute typed phase marks to
+the existing surface latency record, without source text or a new model call.
+
+Memory refreshes and normal checkpoint batches resolve their encryption cipher
+once per consistent batch, rather than accessing key storage for every row.
+The cipher stays local to that operation; snapshot revision invalidation,
+owner filtering, authenticated decryption, corruption handling and subsequent
+key rotation remain in the shared persistence path. Startup warms the existing
+revision-aware memory snapshot without reinforcing memory or changing consent.
+Ambiguous free-text follow-ups retain their existing relationship/permission
+checks; a warm cache or displayed progress phase never grants tool authority.
+Terminal tool-availability failures
+remain unavailable for the current request, including through scope refreshes,
+rather than being retried with different arguments. Image adapters retain HTTP
+authorization/payment refusals as provider-availability failures without
+producing a placeholder image. New requests can recheck availability after
+the user resolves the provider condition. When a model chooses a revised
+production plan, runtime-verified unavailable file producers may be replaced
+by an explicitly selected local producer. Requested formats stay mandatory;
+account actions, source-only retrieval and consent requirements are preserved.
+Actual output bytes and the normal delivery contract must still verify the
+replacement. Native control/scope-recovery receipts never substitute for the
+failed operation receipt. Programs without a final expression return bounded
+native observations and exact inspection references instead of an empty result,
+so the model need not reread a source merely to recover its contents.
+Screenshot preconditions distinguish an untouched blank tab from a local
+document populated by the current workflow. Playwright and CDP attest actual
+DOM content before capturing an `about:blank` document; a fresh empty tab still
+fails with the loaded-page repair contract. Rendering local content therefore
+does not require navigating to an unrelated external site. Artifact role,
+selection and delivery verification remain separate checks.
+Failed browser navigation also waits for the native error-document DOM event
+within a one-second bound before returning its original error. This prevents
+Chrome's late error redirect from aborting an immediate in-program fallback;
+it never retries the URL or creates a replacement session.
+Read-first prerequisites accept a verified native source error/timeout as an
+attempted read. The browser adapter records that exact attempted URL for the
+same request, allowing another controller without duplicating the failed read.
+Consent, policy and argument rejections do not satisfy these prerequisites.
+An assistant argument cannot change a configured desktop browser to headless.
+The native browser boundary requires either an explicitly headless deployment
+or a numeric reply bound to a stored native recovery choice and its exact parent
+turn. The shared chat pipeline carries that request-owned grant across clients;
+an unrelated turn or a website's proposed choices cannot authorize it. Rejected
+mode selections leave the configured profile/session intact and return a typed
+correction to use `mode="configured"`.
+
+The Browser Use adapter estimates startup event pressure from page/tab targets,
+which emit tab lifecycle events. Iframes and workers do not count as tabs. An
+actual capacity skip is reported as such; it is not an attempted attachment
+failure. Startup still has a bounded deadline and retains the managed browser
+and its login if another controller must continue.
+The native live-stage harness checks that a configured desktop endpoint belongs
+to the selected macOS browser before validation, rejecting Docker/proxy owners.
+It also fingerprints browser settings and fails if validation leaves them
+changed. Explicit remote/fixture validation requires a process-local opt-in;
+the harness never persists that override or restores over concurrent edits.
+
+LangChain/Deep Agents use the same composed tool interface and native permission
+boundary. Adapter fallback metadata cannot escape a program's selected tools.
+`ToolSpec.code_mode_allowed=False` excludes native control operations; other
+scoped tools are eligible in `on` mode. The transitional `read_only` setting
+permits reads and explicitly opted-in native UI controls only. Adapter-declared
+observation prerequisites are checked against completed native receipts before
+broad controller calls. No rules infer user intent from prose.
+
+Monty 1.6 runs locally without filesystem mounts or direct network access.
+The session registers lazy, explicitly selected CPython host modules for pure
+URL encoding/query helpers (`urllib.parse`), HTML escaping (`html`) and bounded
+text layout (`textwrap`). The model sees the exact export manifest and can use
+`describe_module(name)` for signatures. Normal imports and saved function
+bindings work across feeds and approval restarts. Whole Python module objects,
+arbitrary package loading and I/O functions are never exposed. Unique export
+names such as `quote_plus` have direct bindings; shared names such
+as `quote` require a module import. These bindings use the same bounded callable
+and canonical accounting as imports. Binary return values are represented as
+typed base64 data at the JSON result boundary; saved VM values remain bytes.
+Host helpers have separate call, input/output and expansion limits; native calls retain their
+existing scope, consent, approval and artifact contracts. Other installed
+libraries run through an explicitly scoped native tool in the same session.
+Unhandled missing-module errors return typed availability and recovery facts.
+Two unsupported-import failures spend the request's durable import-recovery
+budget and end truthfully instead of cycling scopes or extending iteration
+limits. Completed writes are retained and never replayed. This policy is shared
+by the orchestrator and LangChain/Deep Agents and adds no model call or package
+inventory scan to ordinary chat.
+Programs that only transform saved data or use pure helpers select
+`tool_names=[]`; this never authorizes a native operation. A live session keeps
+that data-processing interface even when no native tool is currently callable.
+Invalid program envelopes return exact field, size and scope constraints through
+the shared `correct_arguments` contract. Three consecutive validation failures
+end the request instead of consuming the model's entire iteration budget; a
+valid program resets that streak. Scope controls remain separate native calls.
+
+Recovery follows Monty's [exception guidance](https://pydantic.dev/docs/monty/quickstart/python/)
+and [snapshot contract](https://pydantic.dev/docs/monty/concepts/snapshots/):
+
+| Failure | Session handling | Action handling |
+| --- | --- | --- |
+| Syntax, type or ordinary runtime error | Preserve safe globals; return typed exception and source frame positions | At most three consecutive failed corrections; a completed program resets this streak; never replay an earlier feed |
+| Unsupported import | Return the host-module manifest and native-library recovery route; spend the durable import budget | Stop after two unhandled missing-module errors |
+| Native tool failure or approval | Stop or pause at the exact native call; retain a trusted continuation only when the feed ends safely | Apply the native repair/approval contract and preserve receipts |
+| Timeout or memory limit | Discard the heap, even if the worker still responds | End truthfully; retain completed action receipts |
+| Worker loss, mid-execution conversion failure or failed checkpoint restore | Mark the session unusable; no automatic replay or restore from the failed heap | Keep confirmed/unknown outcomes distinct; do not repeat writes |
+
+Host helper exceptions use Monty's exception channel. An unknown external
+function becomes a correctable `NameError` naming the function, never a new host
+capability. Sandbox guidance requires string exception/assert messages rather
+than unsupported structured exception arguments.
+Resource failures while draining a failed feed also prevent checkpoint reuse.
+Only runtime-owned, compatible checkpoints may be restored; suspension state
+and native approval receipts remain authoritative across restarts.
+Retained-evidence inspection is offered inside Code Mode when the current
+request has omitted native fields. It uses the existing inspector, ownership
+validation and shared 24,000-character view budget across the program's calls;
+it performs no new source reads. A native program whose arbitrary return value
+exceeds its return allowance first projects typed source findings; an arbitrary
+oversized value retains its execution result and native receipts, with an
+explicit omitted-value diagnostic and bounded native observations.
+Data-only oversized values still require a smaller return value. Neither path
+replays the program or certifies completion of the user's requested outcome.
+The native registry attests availability failures of local file producers
+separately from account actions and source-only tools. Once the final contract
+accepts an alternative's actual file bytes in the matching requested format,
+the shared outcome layer binds that success receipt to the optional failed
+method. A stale provider billing warning then cannot contradict a completed
+delivery. Required methods, account effects, approvals, absent files and
+unrelated successful tools remain unresolved until their own contracts pass.
+
+Execution time, memory, source size, native call count and transferred data are
+bounded. Programs use native APIs for file generation, account changes and other
+writes, and all calls preserve the original native receipt identities. Compaction
+retains operation receipts and exposes exact inspection references for omitted
+large values. Both execution interfaces share the existing presentation layer.
+Large program values also retain a bounded host-owned view of native findings,
+with exact invocation references. Accepted facts and selected control values
+precede optional selector catalogs, document text and capture inventories. The
+program's arbitrary return value cannot manufacture those native observations.
+The shared delivery boundary preserves a verified approval pause ahead of file
+captions, and preserves the native action receipt after approval. Preparing an
+attachment cannot replace either the pending action or its completed outcome.
+The orchestration deadline excludes time spent inside native tools, whose
+existing execution deadlines and cancellation remain authoritative. Timing
+receipts separate native wait from orchestration work. A valid slow source must
+not fail the next Python statement after its native operation has completed.
+Parallel CDP reads exclude tabs with an in-flight close acknowledgement from
+tab assignment, preventing another read from inheriting a closing target.
+
+The default `off` configuration preserves the old tool interface and executor;
+a missing optional dependency also keeps it available. Plain chat starts no
+worker, performs no checkpoint IO and gains no model call. Disabling Code Mode
+blocks stale program selections. No Node service is required. Stage changes and
+live acceptance are performed only after local verification and outside active
+user testing.
+
+### Native delegation preflight and saved local defaults
+
+`browser_run_task` owns its request-bound native read preflight, including when
+called first from Code Mode. It does not advertise a duplicate outer read
+prerequisite that could reject the program before its preflight runs. JavaScript
+page execution retains its observation prerequisite. A failed preflight records
+that delegated interaction did not execute; cancellation, source errors and user
+choice still prevent the adaptive worker from starting.
+
+The shared profile supplies the default local location across chat surfaces. An
+unrelated trip destination does not replace it. Current explicit locations and
+linked-task locations take precedence; independent-task and short-message guards
+retain profile defaults and ask only for information that remains unresolved.
+
+Native detail reads retain visible, scope-bound anchor labels and exact resolved
+URLs alongside their record, with explicit link counts and truncation metadata.
+Single and batched detail extraction use the same DOM program, so choosing a
+detail view cannot hide item links needed for subsequent verification.
+
+Shared comparison guidance distinguishes a quoted billing interval from actual
+usage duration. Derived effective rates use the verified usage quantity and
+retain the original source rate basis, rather than treating a weekly/monthly
+price label as proof of elapsed time.
+
+Explicit `keep_open` on browser open/navigation promotes only a successful
+session to a conversation-owned lease using runtime identity. Request cleanup
+still closes ordinary research sessions. Follow-up capture retains the original
+page state; browser close, conversation stop and shutdown release the lease.
+
+Native failed-process captures carry an invocation-bound incomplete-observation
+receipt. The primary can publish its authored partial report with a native
+limitation while fulfillment remains false. This ends redundant success nudges
+only when captured operations are the entire missing tool contract; missing
+actions and artifacts continue through their existing recovery boundaries.
+Raw streams are never automatically appended to final messages.

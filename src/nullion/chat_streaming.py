@@ -4,8 +4,80 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import asyncio
 import re
-from typing import Iterable
+import threading
+from typing import Awaitable, Callable, Iterable
+
+
+class LatestTextUpdateQueue:
+    """Coalesce transport previews without blocking the model's token reader.
+
+    At most one transport operation is in flight. New drafts replace queued
+    drafts; they never queue another network edit for every token. Finalization
+    waits for ownership of an existing send, then publishes the final answer.
+    """
+
+    def __init__(self, loop, publish: Callable[[str], Awaitable[object]], *, interval: float = 1.0,
+                 initial_delay: float = 0.0):
+        self._loop = loop
+        self._publish = publish
+        self._interval = interval
+        self._initial_delay = initial_delay
+        self._lock = threading.Lock()
+        self._latest: str | None = None
+        self._worker = None
+        self._error: BaseException | None = None
+        self._wake = asyncio.Event()
+
+    def submit(self, text: str) -> None:
+        with self._lock:
+            self._latest = text
+            if self._worker is None:
+                self._worker = asyncio.run_coroutine_threadsafe(self._run(), self._loop)
+
+    async def _run(self) -> None:
+        try:
+            # Select the newest value after the initial delay, so a delayed
+            # progress notice starts with real completed work, not a stale ack.
+            if self._initial_delay:
+                delay, self._initial_delay = self._initial_delay, 0
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                self._wake.clear()
+            while True:
+                with self._lock:
+                    text, self._latest = self._latest, None
+                    if text is None:
+                        self._worker = None
+                        return
+                await self._publish(text)
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=self._interval)
+                except TimeoutError:
+                    pass
+                self._wake.clear()
+        except BaseException as exc:
+            with self._lock:
+                self._error = exc
+                self._latest = None
+                self._worker = None
+
+    async def drain(self) -> None:
+        # The final answer supersedes drafts not yet sent. Never cancel an
+        # in-flight initial send: its acceptance may already be ambiguous.
+        with self._lock:
+            self._latest = None
+            worker = self._worker
+        self._wake.set()
+        if worker is not None:
+            await asyncio.wrap_future(worker)
+        with self._lock:
+            error, self._error = self._error, None
+        if error is not None:
+            raise error
 
 
 class ChatStreamingMode(str, Enum):

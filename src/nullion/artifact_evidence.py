@@ -34,6 +34,17 @@ def source_inventory_reference(output: object) -> dict[str, object] | None:
                     for key, value in counts.items())
             and sum(counts.values()) == count):
         reference["extension_counts"] = dict(counts)
+    real_count = source.get("real_record_count")
+    real_key = source.get("real_rows_key")
+    real_counts = source.get("real_extension_counts")
+    if (isinstance(real_count, int) and not isinstance(real_count, bool) and 0 <= real_count <= count
+            and isinstance(real_key, str) and 0 < len(real_key) <= 256
+            and isinstance(real_counts, dict) and len(real_counts) <= 128
+            and all(isinstance(key, str) and 0 < len(key) <= 64
+                    and isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                    for key, value in real_counts.items()) and sum(real_counts.values()) == real_count):
+        reference.update(real_rows_key=real_key, real_record_count=real_count,
+            real_extension_counts=dict(real_counts), metadata_record_count=count-real_count)
     return reference
 
 

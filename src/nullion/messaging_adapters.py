@@ -32,7 +32,7 @@ from nullion.approval_markers import split_tool_approval_marker, strip_tool_appr
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
 from nullion.builder import format_builder_proposal_notification
 from nullion.chat_attachments import guess_media_type, image_media_type_from_bytes
-from nullion.chat_text import UserMessage, make_markdown_tables_chat_readable, render_user_message
+from nullion.chat_text import UserMessage, render_user_message, WORKING_ACK_TEXT
 from nullion.config import NullionSettings
 from nullion.remediation import remediation_buttons_for_recommendation_code
 from nullion.response_sanitizer import _sanitize_local_paths, sanitize_user_visible_reply
@@ -43,7 +43,6 @@ from nullion.task_frames import TaskFrameStatus
 
 logger = logging.getLogger(__name__)
 from nullion.delivery_acknowledgement import UnconfirmedDelivery, send_error_replay_safety
-WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
 def should_emit_separate_working_ack(
@@ -1905,7 +1904,7 @@ def prepare_reply_for_platform_delivery(
 
     if reply is None:
         return PlatformDelivery(text=None, attachments=())
-    text = make_markdown_tables_chat_readable(sanitize_external_inline_markup(render_user_message(reply)))
+    text = sanitize_external_inline_markup(render_user_message(reply))
     text = _strip_platform_internal_markers(text)
     text = _rewrite_sandbox_artifact_links_for_delivery(text, principal_id=principal_id)
     if delivery_contract is None:
@@ -2167,6 +2166,10 @@ def prepare_reply_for_platform_delivery(
     delivery_text = sanitize_visible(
         delivery_text,
     )
+    # Filename cleanup can leave only a presentation icon. Detect an empty
+    # caption by Unicode content, without language-specific intent matching.
+    if not any(character.isalnum() for character in str(delivery_text or "")):
+        delivery_text = "Attached the requested file." if len(attachments) == 1 else f"Attached {len(attachments)} files."
     if unavailable_count:
         suffix = (
             f"I attached {len(attachments)} file{'s' if len(attachments) != 1 else ''}, "

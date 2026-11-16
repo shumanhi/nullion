@@ -85,7 +85,7 @@ def discovery_ledger(results, *, previous=None):
             continue
         # These are adapter-owned collection schemas, not prose classification.
         rows = output.get('source_candidates')
-        if output.get('result_kind') == 'browser_item_collection':
+        if output.get('result_kind') in {'browser_item_collection', 'browser_page_collection'}:
             rows = output.get('items')
         elif output.get('result_kind') == 'public_search_results':
             # Native search uses results, not source_candidates. These are
@@ -132,6 +132,15 @@ def discovery_ledger(results, *, previous=None):
                 if observed_url:
                     observations.setdefault(observed_url, []).append(ident)
         observed_urls = set()
+        if output.get('result_kind') == 'browser_page_collection':
+            # A native batch observes each successfully read page, never every
+            # outbound link on it. Failed and navigation-only pages prove none.
+            for item in output.get('pages', ()):
+                if (isinstance(item, Mapping) and item.get('status') == 'completed'
+                        and item.get('read_kind') in {'items', 'detail', 'text'}):
+                    observed = _url(item.get('page_url'))
+                    if observed:
+                        observed_urls.add(observed)
         declared_content = _declared_source_content(output, observed_urls=observed_urls)
         for observed_url in sorted(observed_urls):
             observations.setdefault(observed_url, []).append(ident)
@@ -421,7 +430,32 @@ def assess(value, *, context, positive_ids, references=None, evidence_parents=No
 
 
 def compact_context(context):
-    return json.dumps(context, ensure_ascii=False, separators=(',', ':'))
+    """Share repeated receipt sets without clipping source URLs or evidence ids."""
+    original = json.dumps(context, ensure_ascii=False, separators=(',', ':'))
+    if not isinstance(context, Mapping):
+        return original
+    view = dict(context)
+    sets = []
+    for field in ('candidates', 'observed_sources'):
+        rows = []
+        for original_row in context.get(field, ()):
+            row = dict(original_row)
+            for key in ('discovery_invocation_ids', 'observation_invocation_ids'):
+                values = row.get(key)
+                if not isinstance(values, list) or not values:
+                    continue
+                if values not in sets:
+                    sets.append(values)
+                row.pop(key)
+                row[key + '_ref'] = sets.index(values)
+            rows.append(row)
+        if field in context:
+            view[field] = rows
+    if sets:
+        view['receipt_sets'] = sets
+        view['receipt_set_contract'] = '*_invocation_ids_ref indexes receipt_sets; entries are exact native invocation ids.'
+    encoded = json.dumps(view, ensure_ascii=False, separators=(',', ':'))
+    return encoded if len(encoded) < len(original) else original
 
 
 def state_ledger(state, results):

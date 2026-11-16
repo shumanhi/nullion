@@ -115,7 +115,7 @@ def test_source_evidence_expires_but_promoted_delivery_is_durable(tmp_path, monk
     assert 'browser-source-evidence' in str(source)
     monkeypatch.setattr(adapter, 'browser_use_python', lambda: sys.executable)
     monkeypatch.setattr(worker, 'run_isolated_browser_task', lambda *a,**kw: result)
-    delivered = adapter.browser_task_handler(lambda: object(),adapter.BrowserPolicy())(ToolInvocation('png','browser_run_task','operator',{'task':'比較','url':'https://example.com'},flow_context={'requested_artifact_extensions':['.png']}))
+    delivered = adapter.browser_task_handler(lambda: object(),adapter.BrowserPolicy())(ToolInvocation('png','browser_run_task','operator',{'task':'比較','url':'https://example.com'},flow_context={'requested_artifact_extensions':['.png'],'source_artifact_delivery_requested':True}))
     durable = Path(delivered.output['artifact_paths'][0])
     root = workspace_storage_roots_for_principal('operator').scratch / 'browser-source-evidence'
     expire_browser_resources(root,now=time.time()+90000)

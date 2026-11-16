@@ -4,7 +4,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 import json
 import os
-import sys
 import threading
 from types import SimpleNamespace
 from urllib.request import urlopen
@@ -35,7 +34,8 @@ def test_verified_long_change_alert_reaches_history_and_platform_once(tmp_path, 
             deliveries.append((str(chat_id), text, kw))
             return SimpleNamespace(message_id=len(deliveries))
         async def send_document(self, *a, **kw): raise AssertionError('Result alerts are text')
-    monkeypatch.setitem(sys.modules, 'telegram', SimpleNamespace(Bot=Bot))
+    import telegram
+    monkeypatch.setattr(telegram, 'Bot', Bot)
     settings = NullionSettings(doctor_enabled=False, telegram=TelegramSettings(bot_token='12345:synthetic'))
     monkeypatch.setattr(config, 'load_settings', lambda *a, **kw: settings)
     monkeypatch.setattr(web_app, 'load_settings', lambda *a, **kw: settings)

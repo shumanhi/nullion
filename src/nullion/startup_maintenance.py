@@ -266,6 +266,10 @@ def _compact_tool_output(tool_name: str, output: object) -> object:
     if tool_name == "request_tool_scope" and isinstance(candidate, dict):
         from nullion.source_selection import compact_scope_evidence
         return compact_scope_evidence(candidate, original_chars=len(encoded))
+    from nullion.source_context_projection import compact_native_page_history
+    native_pages=compact_native_page_history(candidate,max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if native_pages is not None:
+        return native_pages
     from nullion.source_selection import compact_source_identity_evidence
     identity_evidence = compact_source_identity_evidence(candidate, encoded=encoded,
         max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)

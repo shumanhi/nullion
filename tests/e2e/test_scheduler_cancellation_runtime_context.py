@@ -166,7 +166,12 @@ def test_telegram_completed_turn_followup_targets_created_job(tmp_path, monkeypa
             assert any(job.name in message and 'disabled' in message for message in wire), wire
         assert not any('missing schedule or task detail' in message for message in wire), wire
         turns = [e for e in f.runtime.store.list_conversation_events('telegram:202') if e['event_type'] == 'conversation.chat_turn']
-        assert len(turns) == (1 if action == 'cancel' else 2)
+        # The approval handoff is a durable reply too. Recording it preserves
+        # follow-up context without claiming that the protected deletion ran.
+        assert len(turns) == 2
+        if action == 'cancel':
+            assert any(r['tool_name']=='delete_cron' and r['status'] in {'denied','approval_required'}
+                for r in turns[-1]['tool_results'])
         assert any(r['tool_name'] == 'create_cron' and r['status'] == 'completed' for r in turns[0]['tool_results'])
     asyncio.run(run())
 

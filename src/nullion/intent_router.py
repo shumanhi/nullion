@@ -110,13 +110,13 @@ def _previous_numbered_prompt_excerpt(previous_assistant_message: object) -> str
     return excerpt
 
 
-def _selected_numbered_option_context_from_message(
+def _matching_numbered_options(
     user_text: object,
     previous_assistant_message: object,
-) -> str | None:
+):
     match = _NUMERIC_REPLY_RE.fullmatch(str(user_text or ""))
     if not match:
-        return None
+        return None, []
     selected = match.group(1)
     lines = str(previous_assistant_message or "").splitlines()
     blocks: list[dict[str, list[str]]] = []
@@ -140,6 +140,22 @@ def _selected_numbered_option_context_from_message(
     if current_block:
         blocks.append(current_block)
     matching_blocks = [block for block in blocks if selected in block and block.get(selected)]
+    return selected, matching_blocks
+
+
+def has_unambiguous_numbered_selection(user_text: object, previous_assistant_message: object) -> bool:
+    """Recognize only the rendered numbered UI structure, in any language."""
+    selected, blocks = _matching_numbered_options(user_text, previous_assistant_message)
+    return selected is not None and len(blocks) == 1 and len(blocks[0]) >= 2
+
+
+def _selected_numbered_option_context_from_message(
+    user_text: object,
+    previous_assistant_message: object,
+) -> str | None:
+    selected, matching_blocks = _matching_numbered_options(user_text, previous_assistant_message)
+    if selected is None:
+        return None
     if len(matching_blocks) > 1:
         return (
             f"Structured numbered-option ambiguity: the user replied with option {selected}, "
@@ -147,7 +163,7 @@ def _selected_numbered_option_context_from_message(
             f"with option {selected}. Ask which group they meant before acting."
         )
     selected_lines: list[str] = []
-    for block in reversed(blocks):
+    for block in reversed(matching_blocks):
         selected_lines = block.get(selected, [])
         if selected_lines:
             break

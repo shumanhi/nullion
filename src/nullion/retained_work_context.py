@@ -101,15 +101,22 @@ INSPECT_DEFINITION = {
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["requests"],
         "properties": {"requests": {"type": "array", "minItems": 1, "maxItems": 128,
             "items": {"type": "object", "additionalProperties": False,
-                "required": ["invocation_id", "json_pointer", "offset", "length"],
+                "required": ["invocation_id", "json_pointer"],
                 "properties": {"invocation_id": {"type": "string", "minLength": 1},
                     "json_pointer": {"type": "string", "maxLength": 1024, "pattern": "^(/|$)"},
-                    "offset": {"type": "integer", "minimum": 0},
-                    "length": {"type": "integer", "minimum": 1, "maximum": 12000}}}}}},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "length": {"type": "integer", "minimum": 1, "maximum": 12000, "default": 2000}}}}}},
 }
 
 
-def producer_context(messages, results, invocation_metadata, *, include_unmapped=False, inspection_cache=None):
+def inspection_progress_spec():
+    """Metadata for the runtime-owned inspector; this grants no tool authority."""
+    from nullion.tools import ToolSpec, ToolRiskLevel, ToolSideEffectClass
+    return ToolSpec(INSPECT_TOOL, INSPECT_DEFINITION['description'], ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 2, capability_tags=('retained_evidence',))
+
+
+def producer_context(messages, results, invocation_metadata, *, include_unmapped=False, include_hidden=False, inspection_cache=None):
     """Return a bounded view plus a lazy evidence tool flag.
 
     Archive owned tool-result text only after its consumer has seen it. The
@@ -170,7 +177,12 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
     # A continuation can materialize owned receipts in typed frame context
     # instead of replaying protocol blocks. Preserve that existing ownership
     # contract: archival eligibility must never redefine a receipt as missing.
-    represented = {identity for rows in candidates.values() for identity in rows}
+    # Protocol metadata establishes ownership, not visibility after another
+    # compacting view removed those blocks. Hidden owned evidence still needs
+    # an exact inspection index when a caller requests continuation context.
+    represented = ({by_use[str(block.get('tool_use_id'))].invocation_id
+        for _, block in blocks} if include_hidden else
+        {identity for rows in candidates.values() for identity in rows})
     missing = set(owned) - represented
     def already_compacted(block):
         try:
@@ -183,7 +195,13 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
                and len(json.dumps(b.get("content", []), ensure_ascii=False)) > ARCHIVED_RESULT_CHARS
                for _, b in blocks))
     if not compact and not repeated and not (include_unmapped and missing):
-        return _shared_security_view(messages, by_use), False
+        # A fresh source view can need exact inspection before any archival
+        # pass. Reused provider call ids prevent message replacement, not safe
+        # inspection of request-owned invocation ids carried by that view.
+        projected_sources = any(isinstance(r.output, dict)
+            and isinstance(r.output.get('source_record_collections'), list)
+            and len(json.dumps(r.output, ensure_ascii=False)) > 14000 for r in owned.values())
+        return _shared_security_view(messages, by_use), projected_sources
     fresh_chars = sum(len(json.dumps(b.get('content', []), ensure_ascii=False))
         for _, b in blocks if str(b.get('tool_use_id')) in fresh_uses)
     # Exact fresh windows stay intact. Replaying the same windows again in the
@@ -196,8 +214,21 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
     cache = dict(inspection_cache or {})
     entries = cache.get('retained_inspection_windows') or ()
     if not isinstance(entries, (list, tuple)): entries = ()
-    cache['retained_inspection_windows'] = [w for w in entries
-        if isinstance(w, dict) and (w.get('invocation_id'), w.get('json_pointer'), w.get('offset'), w.get('length')) not in fresh_windows]
+    carryover = []
+    for entry in entries:
+        if (not isinstance(entry, dict) or type(entry.get('offset')) is not int
+                or type(entry.get('length')) is not int or entry['length'] <= 0):
+            continue
+        spans = [(entry['offset'], entry['offset'] + entry['length'])]
+        for identity, pointer, start, length in fresh_windows:
+            if (identity != entry.get('invocation_id') or pointer != entry.get('json_pointer')
+                    or type(start) is not int or type(length) is not int):
+                continue
+            end = start + length
+            spans = [(left, right) for a, b in spans for left, right in
+                ((a, min(b, start)), (max(a, end), b)) if left < right]
+        carryover.extend({**entry, 'offset': a, 'length': b-a} for a, b in spans)
+    cache['retained_inspection_windows'] = carryover
     from nullion.workflow_reasoning import retained_review_inspections
     inspected = retained_review_inspections(cache, results=list(owned.values()),
         max_chars=max(0, HISTORY_CHARS // 2 - fresh_chars))
@@ -249,7 +280,14 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
                     # from owned unchanged sources, rather than these previews.
                     output, omitted = {"result_kind": "retained_evidence_inspection", "archived": True}, [["windows"]]
                 else:
-                    output, omitted = compact_evidence_value(redact_value(result.output), max_chars=budget)
+                    from nullion.agent_orchestrator import _compact_tool_output_for_model_context
+                    # Archive the same typed view the producer already saw.
+                    # Raw Code Mode values duplicate entire native collections
+                    # and can obscure the exact pointers needed to reuse them.
+                    projected = _compact_tool_output_for_model_context(result.tool_name, result.output)
+                    output, omitted = compact_evidence_value(redact_value(projected), max_chars=budget)
+                    if projected != result.output:
+                        omitted = [[], *omitted]
                 payload = {"invocation_id": result.invocation_id, "status": result.status,
                     "error": result.error, "output": output,
                     "retained_evidence": {"preview_only": bool(omitted), "omitted_paths": omitted[:16],
@@ -298,5 +336,123 @@ def inspect_retained(arguments, results, *, max_chars=None):
     owned = [r for r in results if r.tool_name != INSPECT_TOOL]
     from nullion.workflow_reasoning import REVIEW_INSPECTION_CHAR_BUDGET
     return {"result_kind": "retained_evidence_inspection", "windows": inspect_review_evidence(
-        arguments["requests"], results=owned, references={}, visible_ids={r.invocation_id for r in owned},
+        [{"offset": 0, "length": 2000, **request} for request in arguments["requests"]],
+        results=owned, references={}, visible_ids={r.invocation_id for r in owned},
         _char_budget=REVIEW_INSPECTION_CHAR_BUDGET if max_chars is None else max(0, max_chars))}
+
+
+def output_field_contract(value, *, max_fields=24, max_depth=3):
+    """Describe observed fields without source values, IO or guessed aliases.
+
+    Array paths describe the first retained item only; the bounded index never
+    claims that unlisted fields or records are absent.
+    """
+    fields = []
+    complete = True
+
+    def kind(item):
+        if item is None:
+            return 'null'
+        if isinstance(item, bool):
+            return 'boolean'
+        if isinstance(item, dict):
+            return 'object'
+        if isinstance(item, (list, tuple)):
+            return 'array'
+        if isinstance(item, str):
+            return 'string'
+        return 'number' if isinstance(item, (int, float)) else 'unknown'
+
+    def visit(item, pointer, depth):
+        nonlocal complete
+        if isinstance(item, dict):
+            children = item.items()
+        elif isinstance(item, (list, tuple)):
+            children = enumerate(item[:1])
+            if len(item) > 1:
+                complete = False
+        else:
+            return
+        for key, child in children:
+            if isinstance(item, dict) and not isinstance(key, str):
+                complete = False
+                break
+            path = pointer + '/' + str(key).replace('~', '~0').replace('/', '~1')
+            if len(fields) >= max_fields or len(path) > 512:
+                complete = False
+                break
+            fields.append({'json_pointer': path, 'value_type': kind(child)})
+            if depth < max_depth:
+                visit(child, path, depth + 1)
+            elif isinstance(child, (dict, list, tuple)) and child:
+                complete = False
+
+    visit(value, '', 1)
+    return {'root_type': kind(value), 'fields': fields, 'fields_complete': complete}
+
+
+def inspection_request(identity, pointer=''):
+    """An executable reference to already-owned output, not new authority."""
+    return {'invocation_id': identity, 'json_pointer': pointer, 'offset': 0, 'length': 2000}
+
+
+def inspection_failure_output(arguments, results):
+    """Give a failed local lookup an exact, request-owned correction path."""
+    from nullion.redaction import redact_value
+    owned = {r.invocation_id: r for r in results if r.tool_name != INSPECT_TOOL}
+    errors = []
+    requests = arguments.get('requests', ()) if isinstance(arguments, dict) else ()
+    for index, request in enumerate(requests if isinstance(requests, list) else ()):
+        if not isinstance(request, dict):
+            continue
+        identity, pointer = request.get('invocation_id'), request.get('json_pointer')
+        if not isinstance(identity, str) or identity not in owned:
+            errors.append({'request_index': index, 'reason': 'unknown_invocation',
+                'owned_invocation_ids': list(owned)[-32:]})
+            continue
+        value = redact_value(owned[identity].output)
+        prefix = ''
+        if not isinstance(pointer, str) or pointer and not pointer.startswith('/'):
+            errors.append({'request_index': index, 'reason': 'invalid_pointer', 'valid_prefix': ''})
+            continue
+        for token in pointer.split('/')[1:] if pointer else ():
+            key = token.replace('~1', '/').replace('~0', '~')
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            elif (isinstance(value, list) and key.isascii() and key.isdecimal()
+                    and (key == '0' or not key.startswith('0')) and int(key) < len(value)):
+                value = value[int(key)]
+            else:
+                errors.append({'request_index': index, 'reason': 'invalid_pointer',
+                    'invocation_id': identity, 'valid_prefix': prefix,
+                    'inspection_request': inspection_request(identity, prefix),
+                    **({'available_keys': list(value)[:32]} if isinstance(value, dict) else
+                       {'array_length': len(value)} if isinstance(value, list) else {})})
+                break
+            prefix += '/' + token
+        else:
+            size = len(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True))
+            offset, length = request.get('offset', 0), request.get('length', 2000)
+            if type(offset) is not int or offset < 0 or offset > size or type(length) is not int or not 1 <= length <= 12000:
+                errors.append({'request_index': index, 'reason': 'invalid_window',
+                    'invocation_id': identity, 'json_pointer': pointer, 'total_chars': size,
+                    'inspection_request': inspection_request(identity, pointer)})
+    # Do not infer which receipt an invented id meant. Supply exact owned
+    # references and field shapes so a caller can select/copy one locally.
+    references = []
+    for result in reversed(list(owned.values())):
+        reference = {'tool_name': result.tool_name, 'status': result.status,
+            'inspection_request': inspection_request(result.invocation_id),
+            'output_contract': output_field_contract(redact_value(result.output), max_fields=8, max_depth=2)}
+        if len(json.dumps([*references, reference], ensure_ascii=False)) > 6000:
+            break
+        references.append(reference)
+    return {'reason': 'invalid_tool_arguments', 'executed': False, 'request_errors': errors,
+        'owned_references': references, 'omitted_reference_count': len(owned) - len(references),
+        'recovery': {'kind': 'correct_arguments', 'retry_tool_name': INSPECT_TOOL,
+            'instruction': 'Correct the indicated request using its owned invocation and original-output keys. '
+                'Projection columns and collection_views are model views, not original JSON pointers. '
+                'Copy an exact inspection_request; do not reconstruct identifiers. A valid-prefix request '
+                'inspects that actual parent, not the rejected field. Correct only the failed lookup in '
+                'the same program using on_error="return"; reuse successful windows and saved values. '
+                'Do not reopen sources to recover already retained data.'}}

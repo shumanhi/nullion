@@ -18,6 +18,11 @@ def test_native_corrected_report_has_one_title_and_preserves_required_content(li
     assert record['review']['disposition']=='complete' and not record['source_calls']
     page,frames,errors,database,cid,base=live_web
     body=record['delivery_text']
+    from nullion.chat_text import apply_presentation_preferences
+    from nullion.preferences import Preferences
+    saved=page.request.get(base+'/api/preferences').json()
+    prefs=Preferences(**{key:saved[key] for key in ('emoji_level','markdown_style','response_structure')})
+    expected=apply_presentation_preferences(body,preferences=prefs)
     assert page.request.post(base+'/api/chat/history/'+cid+'/message',data={'role':'user',
         'text':'Controlled native obligation report replay; fictional records, no account lookup.'}).ok
     assert page.request.post(base+'/api/chat/history/'+cid+'/message',data={'role':'bot','text':body}).ok
@@ -32,7 +37,7 @@ def test_native_corrected_report_has_one_title_and_preserves_required_content(li
         assert len(visible.split())<record['original_words']*.7
         assert bubble.locator('li').count()>=5 and not errors
         history=page.request.get(base+'/api/chat/history/'+cid).json()['messages']
-        assert [r['text'] for r in history if r['role']=='bot']==[body]
+        assert [r['text'] for r in history if r['role']=='bot']==[expected]
     out=Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])
     page.screenshot(path=str(out/'native-report-web.png'))
     (out/'native-report-web.json').write_text(json.dumps({'conversation_id':cid,'text':body,

@@ -1098,6 +1098,8 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
                             "text": json.dumps(
                                 {
                                     "requested_outcome": "unspecified",
+                                    "research_effort": "extended",
+                                    "research_questions": ["Verify the selected product constraints, price, stock and exact source"],
                                     "web_action": "browser_interaction",
                                     "scheduler_action": "none",
                                     "scheduler_toggle_enabled": None,
@@ -1199,6 +1201,8 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
             if "request_tool_scope" in visible and "browser_extract_items" not in visible:
                 return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "scope-browser",
                     "name": "request_tool_scope", "input": {"capabilities": ["web"],
+                    "research_effort": "extended",
+                    "research_questions": ["Verify the selected product constraints, price, stock and exact source"],
                     "tool_names": ["browser_extract_items", "browser_extract_detail", "browser_navigate", "browser_run_js",
                                    "browser_assert_page_state", "browser_snapshot", "browser_click_element", "browser_type_field"]}}]}
             sequence = [
@@ -2288,7 +2292,7 @@ def test_cron_delivery_contract_e2e_matrix_covers_text_file_both_silent_and_defa
     }
     web_search_leads_fallback = sanitize_user_visible_reply(
         user_message=cron_contract_task,
-        reply="The scheduled task report is ready.",
+        reply="",
         tool_results=[ToolResult("search-1", "web_search", "completed", web_search_output)],
     )
     internal_reference_text = "# Connector Routing Reference\n\n" + ("Use these internal endpoint notes. " * 20)

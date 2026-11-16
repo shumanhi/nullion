@@ -20,7 +20,8 @@ async def test_finish_waits_for_unacknowledged_draft_and_edits_same_message():
             return Draft()
     streamer = _TelegramTextDeltaStreamer(loop=asyncio.get_running_loop(), message=Message())
     emit = asyncio.create_task(asyncio.to_thread(streamer.emit, '**完了**'))
-    await emit  # emit's two-second wait expires; the SDK call is still pending.
+    await emit  # Transport remains in flight without blocking the producer.
+    await asyncio.sleep(.01)
     assert not streamer.has_sent_message and len(wire) == 1
     finishing = asyncio.create_task(streamer.finish('**完了**'))
     await asyncio.sleep(.01)
@@ -41,4 +42,4 @@ async def test_failed_pending_send_does_not_poison_finalization(monkeypatch):
     streamer = t._TelegramTextDeltaStreamer(loop=asyncio.get_running_loop(), message=Message())
     await asyncio.to_thread(streamer.emit, 'α')
     assert not await streamer.finish('α')
-    assert not streamer._pending_sends
+    assert streamer._updates._worker is None

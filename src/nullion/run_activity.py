@@ -439,6 +439,8 @@ def append_activity_trace_to_reply(
         skill_uses=skills,
         suspended_for_approval=suspended_for_approval,
     )
+    if reply and reply.rstrip().endswith(trace):
+        return reply
     return f"{reply.rstrip()}\n\n{trace}" if reply else trace
 
 

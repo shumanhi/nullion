@@ -16,12 +16,48 @@ and delivery acknowledgements remain enforced by the runtime.
 
 Online docs: https://www.nullion.ai/docs/
 
+## Shared architecture
+
+Nullion's architecture requires one execution pipeline and one shared
+presentation layer across every client. Equivalent requests with equivalent
+context, permissions and runtime capabilities follow the same execution policy.
+**The client changes how the result is displayed—not how the work is done.**
+
+```mermaid
+flowchart TD
+    A["Web · Telegram · Slack · Discord"] --> B["Input adapters<br/>Normalize messages, replies and attachments"]
+    C["Scheduled jobs · Live trackers"] --> D
+    B --> D["One common request contract"]
+
+    D --> E["Shared context<br/>Profile, memory, history and task state"]
+    E --> F["One execution pipeline<br/>Reasoning, tool selection, approvals,<br/>execution, retries and recovery"]
+
+    F --> G["Shared tools<br/>Browser, connectors, files and delegated workers"]
+    G -->|"Structured evidence and receipts"| F
+
+    F --> H["One result contract<br/>Answer, files, limitations and choices"]
+    H --> I["One shared presentation layer<br/>User preferences, structure, tone and emoji"]
+    I --> J["Client output adapters<br/>Markup, splitting, uploads and transport"]
+    J --> K["Delivered result"]
+    J -->|"Delivery acknowledgement"| F
+```
+
+Client adapters normalize incoming transport data and render or deliver the
+shared result. Context, reasoning, execution policy, approvals and recovery
+belong to the shared runtime. Platform capabilities are explicit inputs to that
+runtime rather than separate assistant policies.
+
+See [Runtime architecture](docs/architecture.md) for the detailed contract.
+
 ## Visual browser navigation
 
 Nullion 0.9 adds Browser Use for multi-step website navigation with the model you
 already configured. It can inspect rendered pages, compare displayed options,
 and attach screenshots alongside its findings. Useful partial results survive
 an interrupted run, with unavailable details clearly identified.
+Readable-page research can batch navigation and structured extraction in the
+configured browser, including limited parallel reads that preserve its login.
+Adaptive browser interaction remains available when a page needs it.
 
 Fresh installations prepare the isolated browser worker automatically. Existing
 installations can enable it with their app Python:
@@ -361,6 +397,28 @@ A new adapter still needs its own reply, approval and attachment acceptance
 checks; passing on one surface does not prove the others.
 
 ## Chat adapters
+
+All clients share compact initial context, indexed session preferences and the
+same completion persistence policy. Current-turn history and deduplication
+receipts use bounded SQLite writes; broader snapshots share one coalescing
+coordinator. Primary actions and approval commits retain their durability rules.
+Reminder creation, edits and cancellation commit only the reminder and its
+scheduled-task record, so they do not rewrite chat history before confirming.
+Adapter-declared read batches can combine adjacent model calls only when the
+plan explicitly marks them independent; dependent work keeps its order.
+
+Large source collections use compact previews with exact retained-record
+inspection, preserving links and quantities without repeatedly sending full
+page payloads to the model. The primary agent considers alternative routes
+when a source fails and distinguishes equivalent options from functional
+alternatives when comparing value.
+Progress notices also reflect saved-history searches, file work and evidence
+inspection through the same shared lifecycle events. Hiding private tool output
+does not hide progress or completion updates.
+Final preparation uses "Preparing your response" for both text and attachments.
+Artifact producers share format-aware generation and rendered-layout guidance;
+switching to a compatible producer does not require an obsolete intermediate
+file-writing step after the requested output has been verified.
 
 Nullion ships with Telegram, Slack, Discord, and Web UI adapters. Telegram remains the reference implementation; Slack and Discord use the same operator/runtime path with platform-specific connection code at the edge.
 

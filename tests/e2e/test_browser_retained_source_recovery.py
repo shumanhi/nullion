@@ -69,7 +69,7 @@ def test_parent_inspects_prior_capture_instead_of_repeating_browser_or_guessing_
             protocol=workflow_provider_reply(kw,completion=False)
             if protocol is not None:return protocol
             if not names:return text({})
-            if 'browser_run_task' not in names:return call('request_tool_scope',{'capabilities':['web'],
+            if not {'browser_run_task','pdf_create'} <= names:return call('request_tool_scope',{'capabilities':['web'],
                 'tool_names':['browser_run_task','pdf_create'],'required_tool_names':['browser_run_task','pdf_create'],'artifact_extensions':['.pdf']})
             if not browser_calls:return call('browser_run_task',{'url':'https://example.com/first','task':'Read both options.'})
             if not any('retained_evidence_inspection' in str(m) for m in kw.get('messages',[])):

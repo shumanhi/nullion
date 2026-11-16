@@ -12,6 +12,7 @@ from typing import Iterable, Mapping
 from urllib.parse import urlparse
 
 from nullion import runtime_cache
+from nullion.reasoning_guidance import CONTINUATION_ACTION_GUIDANCE, SCHEDULER_VERIFICATION_GUIDANCE
 from nullion.connector_prompt_context import (
     active_connector_provider_context_snapshot,
     cached_active_connector_app_id_providers,
@@ -51,6 +52,7 @@ _URL_BOUNDARY_TOOLS = frozenset(
         "browser_click_id",
         "browser_open",
         "browser_navigate",
+        "browser_read_pages",
         "browser_run_task",
         "browser_extract_text",
         "browser_extract_detail",
@@ -75,6 +77,7 @@ _URL_BOUNDARY_TOOLS = frozenset(
 _BROWSER_INTERACTION_SCOPE_TOOLS = (
     "browser_open",
     "browser_navigate",
+    "browser_read_pages",
     "browser_run_task",
     "browser_extract_text",
     "browser_extract_detail",
@@ -113,6 +116,7 @@ _DOCUMENT_EXTENSIONS = frozenset({".doc", ".docx"})
 _TEXT_WRITE_EXTENSIONS = frozenset({"", ".csv", ".htm", ".html", ".json", ".md", ".svg", ".tsv", ".txt", ".yaml", ".yml"})
 _STRUCTURED_ARTIFACT_TOOLS = frozenset(
     {
+        "image_render",
         "document_create",
         "pdf_create",
         "pdf_edit",
@@ -195,7 +199,7 @@ _SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES = frozenset(
     }
 )
 _SCOPE_REQUIRED_TOOL_CANDIDATES = (
-    _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES | _SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES
+    _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES | _SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES | {"browser_close"}
 )
 _CONNECTOR_TOOLS = frozenset({"connector_request"})
 _CONNECTOR_CAPABILITY_TAGS = frozenset({"connector"})
@@ -269,9 +273,11 @@ _LOCAL_FILE_LISTING_TOOLS = frozenset({"file_read", "file_search", "workspace_su
 _LOCAL_SHELL_TOOLS = frozenset({"terminal_exec"})
 _REUSABLE_LOCAL_TOOLS = frozenset({"local_tool_search", "local_tool_read", "local_tool_save", "local_tool_run"})
 _SCOPE_REQUEST_TOOL_NAME = "request_tool_scope"
-_PLAIN_DIRECT_SAFE_READ_TOOLS = frozenset({"market_quote", "weather_forecast", "chat_history_search", "memory_search"})
+_PLAIN_DIRECT_SAFE_READ_TOOLS = frozenset({"market_quote", "weather_forecast", "chat_history_search", "memory_search",
+                                         "web_search", "browser_read_pages"})
 _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
     name=_SCOPE_REQUEST_TOOL_NAME,
+    code_mode_allowed=False,
     description=(
         "Request the exact tool family needed for this turn when visible tools are insufficient. "
         "Call this before saying a registered capability is unavailable. "
@@ -289,6 +295,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "outcome, include that exact name in both tool_names and required_tool_names. This lets the runtime "
         "prevent a confident final reply from bypassing missing source evidence and report a structurally "
         "unavailable source when no compatible provider or registered tool exists. "
+        + CONTINUATION_ACTION_GUIDANCE + " " + SCHEDULER_VERIFICATION_GUIDANCE + " "
         "Use scheduler_* only for Nullion's own recurring jobs and "
         "reminders. If the current turn asks to manually start, trigger, run now, rerun, or otherwise execute "
         "an existing scheduled task, request scheduler_run with scheduler_action=\"run\" and include run_cron "
@@ -321,6 +328,9 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "set scheduler_selection_policy to delegate_one. "
         "When the turn needs a downloadable or attached file in a specific format, include artifact_extensions with the required "
         "final suffix so the runtime can expose the matching structured artifact tool. "
+        "An image file suffix does not by itself require image_generate. Use an appropriate local rendering plan for "
+        "structured graphics, charts or infographic layouts; image_generation is for model-generated imagery. "
+        "When a file producer is unavailable, an explicit revised local production plan may replace it while keeping the requested formats. "
         "Do not add intermediate or archive-member formats to artifact_extensions. Select exact helper tools such as "
         "file_write for supporting inputs without changing the requested final formats. "
         "For an existing report or document lookup, use chat_history_search with artifact_extensions matching the desired file type. "
@@ -587,6 +597,11 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                 ),
                 "items": {"type": "string", "enum": sorted(_EMBEDDED_MEDIA_ARTIFACT_EXTENSIONS)},
             },
+            "research_effort": {"type": "string", "enum": ["standard", "extended", "exhaustive"],
+                "description": "Research allowance for the original request. Use standard for a useful answer or shortlist, extended for a substantial comparison, and exhaustive only for explicitly comprehensive coverage. Choose before starting source reads; widening scope does not reset spent work."},
+            "research_questions": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 1200},
+                "description": "Material facts required by the original request, in the user's language. Exclude optional background, media and invented extra requirements."},
+            "research_refresh": {"type": "boolean", "description": "Discard same-request read snapshots only when a new observation is explicitly required. Does not reset the research allowance."},
             "tracking_mode": {"type":"string", "enum":["unspecified","live","recurring","clarify"],
                 "description":"Choose live for bounded urgent checks, recurring for continuing schedules. If intent or lifetime is uncertain, use clarify and ask numbered options before creating either."},
             "reason": {"type": "string", "description": "Brief structured reason for the requested scope."},
@@ -604,7 +619,7 @@ _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
 _REQUESTED_OUTCOMES = frozenset({"unspecified", "generated_media"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v55-linked-source-research"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v56-provider-read-contracts"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SCOPE_CAPABILITY_ALIASES = {
     "browser": "web",
@@ -891,20 +906,30 @@ def _source_quote_is_verified(evidence, quote, *, tool_names=(), registry=None):
         return False
     if normalized in " ".join(evidence.current_user_message.split()).casefold():
         return True
-    # Only an exact, structurally linked request can supply a source omitted
-    # by a clarification reply. It can select reads, never account writes.
+    # Clarifications can retain their selected request's account source. This
+    # selects capability visibility, never execution permission. Account writes
+    # must still expose the native approval gate; unguarded writes cannot borrow
+    # an earlier source. Local producers in a combined plan are not sources.
     names = tuple(tool_names)
     if not evidence.context_linked or not names or registry is None:
         return False
+    account_source_seen = False
     for name in names:
         try:
             spec = registry.get_spec(name)
         except (KeyError, AttributeError):
             return False
-        if (spec.side_effect_class != ToolSideEffectClass.READ
-                or not {"connector", "account_read"}.issubset(spec.capability_tags)):
+        tags = set(spec.capability_tags)
+        if not tags.intersection({"connector", "account_read", "account_write"}):
+            continue
+        account_source_seen = True
+        read_source = (spec.side_effect_class == ToolSideEffectClass.READ
+            and {"connector", "account_read"}.issubset(tags))
+        approval_scoped_write = (spec.side_effect_class == ToolSideEffectClass.ACCOUNT_WRITE
+            and "account_write" in tags and spec.requires_approval)
+        if not (read_source or approval_scoped_write):
             return False
-    return any(normalized in " ".join(message.split()).casefold()
+    return account_source_seen and any(normalized in " ".join(message.split()).casefold()
                for message in evidence.linked_user_messages)
 
 
@@ -928,6 +953,9 @@ class TurnToolScopeDecision:
     source_artifact_delivery_requested: bool = False
     source_artifact_request_evidence: str = ""
     source_artifact_retrieval_only: bool = False
+    # Runtime-owned format fidelity; scope expansion cannot turn these source
+    # formats into generated replacements. None means not initialized yet.
+    source_artifact_extensions: tuple[str, ...] | None = None
     requested_tool_names: tuple[str, ...] = ()
     required_tool_names: tuple[str, ...] = ()
     requested_artifact_extensions: tuple[str, ...] = ()
@@ -936,6 +964,8 @@ class TurnToolScopeDecision:
     confidence: float = 0.0
     valid: bool = False
     evidence_policy: str = "fresh"
+    research_effort: str = "standard"
+    research_questions: tuple[str, ...] = ()
 
     @property
     def allow_web_tools(self) -> bool:
@@ -987,7 +1017,31 @@ def _planned_output_extensions(registry, required_tool_names, declared_extension
         extensions.update(declared.intersection({".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".tbz2", ".txz"}))
     if "image_generate" in writable:
         extensions.update(declared.intersection({".png", ".jpg", ".jpeg", ".webp", ".svg"}))
+    # A declared authoring-and-rendering plan can produce a final capture.
+    # Keep its requested format here; native same-turn provenance still has
+    # to prove that the capture renders the authored file before delivery.
+    if writable and extensions.intersection({'.html', '.htm'}):
+        for name in planned:
+            try:
+                spec = registry.get_spec(name)
+            except (AttributeError, KeyError):
+                continue
+            if getattr(spec, 'source_artifact_only', False):
+                extensions.update(declared.intersection(getattr(spec, 'source_artifact_extensions', ())))
     return extensions
+
+
+def _source_delivery_formats(registry, names, required, extensions):
+    sources, generated = set(), set()
+    for name in set(names) | set(required):
+        try:
+            spec = registry.get_spec(name)
+        except (KeyError, AttributeError):
+            continue
+        sources.update(getattr(spec, 'source_artifact_extensions', ()))
+        if name in required and not getattr(spec, 'source_artifact_only', False):
+            generated.update(getattr(spec, 'produced_artifact_extensions', ()))
+    return (sources.intersection(extensions) if sources else set(extensions))-generated
 
 
 class ScopedTurnToolRegistry:
@@ -999,11 +1053,17 @@ class ScopedTurnToolRegistry:
         *,
         evidence: TurnToolEvidence,
         tool_scope_decision: TurnToolScopeDecision | None = None,
+        default_read_tool_names: tuple[str, ...] = (),
     ) -> None:
         self._delegate = delegate
         self._evidence = evidence
+        self._default_read_tool_names = frozenset(default_read_tool_names)
         self.turn_tool_scope_decision = tool_scope_decision or TurnToolScopeDecision()
         decision = self.turn_tool_scope_decision
+        if decision.source_artifact_delivery_requested and decision.source_artifact_extensions is None:
+            decision = replace(decision, source_artifact_extensions=tuple(sorted(_source_delivery_formats(
+                delegate, decision.requested_tool_names, decision.required_tool_names, decision.requested_artifact_extensions))))
+            self.turn_tool_scope_decision = decision
         if decision.allowed_scheduler_actions and not decision.scheduler_effect_actions:
             decision = replace(decision, scheduler_effect_actions=decision.allowed_scheduler_actions)
             self.turn_tool_scope_decision = decision
@@ -1020,7 +1080,8 @@ class ScopedTurnToolRegistry:
                 except (AttributeError, KeyError):
                     continue
             if not decision.source_artifact_retrieval_only:
-                source_extensions.difference_update(_planned_output_extensions(delegate, decision.required_tool_names, decision.requested_artifact_extensions))
+                source_extensions.difference_update(_planned_output_extensions(delegate,
+                    (*decision.required_tool_names, *decision.requested_tool_names), decision.requested_artifact_extensions))
             quote = " ".join(decision.source_artifact_request_evidence.split())
             current_text = " ".join(evidence.current_user_message.split())
             capture_requested = decision.source_artifact_delivery_requested and quote and quote in current_text
@@ -1392,6 +1453,11 @@ class ScopedTurnToolRegistry:
             producer_spec = self._delegate.get_spec(tool_name)
         except KeyError:
             producer_spec = None
+        if (producer_spec is not None and self.turn_tool_scope_decision.source_artifact_delivery_requested
+                and not getattr(producer_spec, 'source_artifact_only', False)
+                and set(getattr(producer_spec, 'produced_artifact_extensions', ())).intersection(self.turn_tool_scope_decision.source_artifact_extensions or ())
+                and tool_name not in self.turn_tool_scope_decision.required_tool_names):
+            return False
         if (producer_spec is not None and getattr(producer_spec, "produced_artifact_extensions", ())
                 and producer_spec.side_effect_class is ToolSideEffectClass.WRITE
                 and not producer_spec.source_artifact_only
@@ -1559,6 +1625,10 @@ class ScopedTurnToolRegistry:
             )
         if tool_name in {"market_quote", "weather_forecast", "image_generate"}:
             return tool_name in requested_tool_names
+        if tool_name in {"web_search", "browser_read_pages"} and (
+                tool_name in requested_tool_names or tool_name in self._default_read_tool_names):
+            spec = self._delegate.get_spec(tool_name)
+            return spec.side_effect_class is ToolSideEffectClass.READ and not spec.requires_approval
         if tool_name == "file_read" and self._evidence.slash_prefixed_literal and not self._evidence.has_attachments:
             return False
         try:
@@ -2031,7 +2101,13 @@ class ScopedTurnToolRegistry:
             requested.append("terminal_exec")
         if set(requested).intersection({"file_search", "file_read"}):
             requested.extend(sorted((_CONVERSATION_HISTORY_TOOLS - {"memory_save"}).intersection(available)))
-        if source_delivery_requested and set(capabilities).issubset({"conversation_history", "local_files"}):
+        source_formats = (set(self.turn_tool_scope_decision.source_artifact_extensions or ())
+            if self.turn_tool_scope_decision.source_artifact_delivery_requested else
+            _source_delivery_formats(self._delegate, exact_tool_names, tuple(arguments.get('required_tool_names') or ()), requested_artifact_extensions))
+        new_format_writer = self.turn_tool_scope_decision.source_artifact_delivery_requested and any(spec.name in exact_tool_names and not spec.source_artifact_only
+            and set(spec.produced_artifact_extensions).intersection(set(requested_artifact_extensions)-source_formats)
+            for spec in self._delegate.list_specs()) if source_delivery_requested else False
+        if source_delivery_requested and not new_format_writer and set(capabilities).issubset({"conversation_history", "local_files"}):
             # A typed retrieval plan needs reads, not automatically enabled
             # artifact producers merely because it names a desired extension.
             requested = [name for name in requested
@@ -2109,7 +2185,10 @@ class ScopedTurnToolRegistry:
                 or (
                     tool_name in explicit_required_tool_names
                     and (tool_name in _SCOPE_REQUIRED_TOOL_CANDIDATES
-                         or (tool_name in available and self._requires_required_scope(tool_name)))
+                         or (tool_name in available and (self._requires_required_scope(tool_name)
+                             or (self._delegate.get_spec(tool_name).side_effect_class is ToolSideEffectClass.WRITE
+                                 and not self._delegate.get_spec(tool_name).source_artifact_only
+                                 and self._delegate.get_spec(tool_name).produced_artifact_extensions))))
                 )
             )
             and (tool_name not in _LOCAL_SHELL_TOOLS or not dedicated_artifact_tools
@@ -2135,6 +2214,10 @@ class ScopedTurnToolRegistry:
             if str(name or "").strip()
         }
         web_source_tools = {"web_fetch", "file_download", "browser_navigate", "browser_open", "browser_run_task"}
+        # A browser lifecycle action is not a research request. Selecting its
+        # capability must not invent a navigation requirement.
+        if required.intersection({"browser_close"}):
+            return ()
         if required.intersection(web_source_tools):
             return ()
         for candidate in ("web_fetch", "browser_navigate", "browser_open", "browser_run_task"):
@@ -2165,6 +2248,31 @@ class ScopedTurnToolRegistry:
                 return ScopedTurnToolRegistry(delegate, evidence=self._evidence,
                     tool_scope_decision=self.turn_tool_scope_decision).apply_scope_request(invocation)
         scope_arguments = dict(invocation.arguments)
+        existing_capture = self.turn_tool_scope_decision
+        capture_quote = ' '.join(str(existing_capture.source_artifact_request_evidence or '').split())
+        if (existing_capture.source_artifact_delivery_requested and capture_quote
+                and capture_quote in ' '.join(self._evidence.current_user_message.split())):
+            # Discovery cannot turn an established source-delivery contract
+            # into generation merely by resetting a boolean on the same turn.
+            # Initial mixed source/generated plans retain their named writers;
+            # a new format can still be added without fabricating the source.
+            requested = set(scope_arguments.get('tool_names') or ()) | set(scope_arguments.get('required_tool_names') or ())
+            # Broad discovery can expose helpers; only required named writers
+            # establish a pre-existing mixed generation plan.
+            old_names = set(existing_capture.required_tool_names)
+            specs = self._delegate.list_specs()
+            source_formats = set(existing_capture.source_artifact_extensions or ())
+            incompatible = [spec.name for spec in specs
+                if spec.name in requested-old_names and not getattr(spec,'source_artifact_only',False)
+                and source_formats.intersection(getattr(spec,'produced_artifact_extensions',()))]
+            if incompatible:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, 'failed', {
+                    'reason':'source_artifact_generation_conflict','executed':False,'suppress_activity':True,
+                    'recovery':{'kind':'correct_arguments','retry_tool_name':'request_tool_scope','approval_bypass':False,
+                        'instruction':'Preserve the selected source files/captures. Use the existing source retrieval or capture tools; do not generate replacements.'}},
+                    error='The current request requires original source artifacts, not newly generated replacements.'), self
+            scope_arguments['source_artifact_delivery_requested'] = True
+            scope_arguments['source_artifact_request_evidence'] = existing_capture.source_artifact_request_evidence
         mode = scope_arguments.get("tracking_mode", self.turn_tool_scope_decision.tracking_mode)
         if mode not in {"unspecified", "live", "recurring", "clarify"}:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason":"invalid_tracking_mode"}), self
@@ -2241,7 +2349,7 @@ class ScopedTurnToolRegistry:
         }
         if not self.turn_tool_scope_decision.source_artifact_retrieval_only:
             source_extensions.difference_update(_planned_output_extensions(
-                self._delegate, scope_arguments.get("required_tool_names") or (),
+                self._delegate, requested_names,
                 _validated_artifact_extensions(scope_arguments.get("artifact_extensions"))))
         source_delivery_flag = scope_arguments.get("source_artifact_delivery_requested", self.turn_tool_scope_decision.source_artifact_delivery_requested)
         request_quote = " ".join(str(scope_arguments.get("source_artifact_request_evidence") or self.turn_tool_scope_decision.source_artifact_request_evidence).split())
@@ -2363,7 +2471,8 @@ class ScopedTurnToolRegistry:
             set(scope_arguments.get("tool_names") or ()) == {"browser_screenshot"}
             and self._evidence.has_prior_tool_scope("web")
         )
-        if "web" in capabilities and not scheduler_mutation_scope and not contextual_capture:
+        lifecycle_only = set(scope_arguments.get("tool_names") or ()) == {"browser_close"}
+        if "web" in capabilities and not scheduler_mutation_scope and not contextual_capture and not lifecycle_only:
             required_tool_names = tuple(
                 dict.fromkeys(
                     [
@@ -2375,6 +2484,11 @@ class ScopedTurnToolRegistry:
         if scheduler_mutation_scope:
             artifact_extensions = ()
             embedded_media_extensions = ()
+            # This scope exposes scheduler configuration, not the future job's
+            # producers. Do not turn those hidden helpers into immediate unmet
+            # obligations. Retain genuine unavailable scheduler requirements.
+            required_tool_names = tuple(name for name in required_tool_names
+                if name in tool_names or name in _SCHEDULER_TOOLS)
         elif not self._scope_request_allows_artifact_tools(
             capabilities=capabilities,
             artifact_extensions=artifact_extensions,
@@ -2699,6 +2813,52 @@ class ScopedTurnToolRegistry:
             *(name for name in existing.required_tool_names
               if name not in registered_names and name not in required_tool_names),
         ]))
+        # A revised, explicit production plan can replace an unavailable file
+        # producer. Keep requested formats and all account/action obligations;
+        # actual output bytes still have to satisfy the final delivery contract.
+        unavailable_facts = (invocation.flow_context or {}).get("_runtime_unavailable_artifact_producers", ())
+        runtime_unavailable = tuple(name for name in unavailable_facts if isinstance(name,str)) if isinstance(unavailable_facts,(list,tuple)) else ()
+        embedded_facts = (invocation.flow_context or {}).get('_runtime_verified_embedded_media_replacements', ())
+        verified_embedded = set(name for name in embedded_facts if isinstance(name, str)) if isinstance(embedded_facts, (list, tuple)) else set()
+        final_formats = set(existing.requested_artifact_extensions).union(artifact_extensions)
+        revised_formats = _planned_output_extensions(self._delegate, required_tool_names, final_formats)
+        replacements = []
+        replacement_source_formats = set()
+        for name in required_tool_names:
+            if name in runtime_unavailable:
+                continue
+            try:
+                spec = self._delegate.get_spec(name)
+            except (KeyError, AttributeError):
+                continue
+            if spec.side_effect_class in {ToolSideEffectClass.READ, ToolSideEffectClass.WRITE} and spec.source_artifact_only:
+                replacement_source_formats.update(spec.source_artifact_extensions)
+            if (spec.side_effect_class is ToolSideEffectClass.DANGEROUS_EXEC
+                    or (spec.side_effect_class is ToolSideEffectClass.WRITE
+                        and (set(spec.produced_artifact_extensions).intersection(final_formats)
+                             or name in _LOCAL_FILE_MUTATION_TOOLS))
+                    or (spec.side_effect_class is ToolSideEffectClass.READ and spec.source_artifact_only
+                        and {'.html', '.htm'}.intersection(revised_formats)
+                        and set(spec.source_artifact_extensions).intersection(final_formats, revised_formats))):
+                replacements.append(name)
+        retired_unavailable_producers = []
+        if final_formats and replacements:
+            replaceable = []
+            for name in existing.required_tool_names:
+                if name not in runtime_unavailable or name in required_tool_names:
+                    continue
+                try:
+                    spec = self._delegate.get_spec(name)
+                except (KeyError, AttributeError):
+                    continue
+                if (spec.side_effect_class is ToolSideEffectClass.WRITE
+                        and not spec.source_artifact_only
+                        and (set(spec.produced_artifact_extensions).intersection(final_formats | replacement_source_formats)
+                             or (name in verified_embedded
+                                 and not set(spec.produced_artifact_extensions).intersection(final_formats)))):
+                    replaceable.append(name)
+            retired_unavailable_producers = replaceable
+            superseded_unselected_required = tuple(dict.fromkeys([*superseded_unselected_required,*replaceable]))
         merged_required_tool_names = _filter_scheduler_requested_tool_names_for_action(
             tuple(dict.fromkeys([
                 *(name for name in existing.required_tool_names if name not in superseded_unselected_required),
@@ -2730,6 +2890,9 @@ class ScopedTurnToolRegistry:
             tool_scope_decision=TurnToolScopeDecision(
                 requested_outcome=existing.requested_outcome,
                 evidence_policy=existing.evidence_policy,
+                **_research_scope_values({
+                    'research_effort': invocation.arguments.get('research_effort', existing.research_effort),
+                    'research_questions': invocation.arguments.get('research_questions', existing.research_questions)}),
                 tracking_mode=mode,
                 web_action=web_action,
                 scheduler_action=scheduler_action,
@@ -2751,7 +2914,11 @@ class ScopedTurnToolRegistry:
                 source_artifact_delivery_requested=source_delivery_requested,
                 source_artifact_request_evidence=request_quote if source_delivery_requested else "",
                 source_artifact_retrieval_only=bool(source_delivery_requested
-                    and capabilities.issubset({"conversation_history", "local_files"})),
+                    and capabilities.issubset({"conversation_history", "local_files"})
+                    and not any(spec.name in required_tool_names and spec.produced_artifact_extensions
+                        and not spec.source_artifact_only for spec in self._delegate.list_specs())),
+                source_artifact_extensions=(existing.source_artifact_extensions
+                    if existing.source_artifact_delivery_requested else None),
                 requested_tool_names=merged_requested_tool_names,
                 required_tool_names=merged_required_tool_names,
                 requested_artifact_extensions=tuple(
@@ -2858,12 +3025,28 @@ class ScopedTurnToolRegistry:
             if connector_source_unavailable
             else ()
         )
+        production_guidance = {}
+        if (artifact_extensions and not read_only_source_delivery
+                and set(callable_tool_names).intersection(
+                    _STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS | _LOCAL_SHELL_TOOLS)):
+            # A plain turn starts with the compact delivery contract. A later
+            # typed production scope must still receive shared file guidance.
+            from nullion.reasoning_guidance import ARTIFACT_PRODUCTION_GUIDANCE
+            from nullion.artifacts import artifact_root_for_principal
+            production_guidance["artifact_production_guidance"] = ARTIFACT_PRODUCTION_GUIDANCE
+            production_guidance["artifact_output_root"] = str(artifact_root_for_principal(invocation.principal_id))
+        from nullion.research_budget import current_budget
+        if (budget := current_budget()) is not None:
+            budget.configure(widened, widened.turn_tool_scope_decision)
+            if scope_arguments.get('research_refresh') is True:
+                budget.reads.clear()
         return (
             ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="completed",
                 output={
+                    **production_guidance,
                     "scope_requested": True,
                     "include_local_path_details": (
                         scope_arguments.get("include_local_path_details") is True
@@ -2881,6 +3064,8 @@ class ScopedTurnToolRegistry:
                     "scheduler_effect_actions": list(widened.turn_tool_scope_decision.allowed_scheduler_actions),
                     "requested_outcome": widened.turn_tool_scope_decision.requested_outcome,
                     "evidence_policy": widened.turn_tool_scope_decision.evidence_policy,
+                    "research_effort": widened.turn_tool_scope_decision.research_effort,
+                    "research_questions": list(widened.turn_tool_scope_decision.research_questions),
                     "tracking_mode": widened.turn_tool_scope_decision.tracking_mode,
                     "connector_source_user_requested": widened.turn_tool_scope_decision.connector_source_user_requested,
                     "connector_source_evidence": widened.turn_tool_scope_decision.connector_source_evidence,
@@ -2891,6 +3076,7 @@ class ScopedTurnToolRegistry:
                     "required_tool_names": list(callable_required_tool_names),
                     "requested_required_tool_names": list(merged_required_tool_names),
                     "superseded_unselected_required_tool_names": list(superseded_unselected_required),
+                    "retired_unavailable_artifact_producers": list(retired_unavailable_producers),
                     "explicit_tool_names": sorted(set(existing.requested_tool_names) | explicitly_requested_tools),
                     "unavailable_required_tool_names": list(unavailable_required_tool_names),
                     "unavailable_tools": list(unavailable_tools),
@@ -2973,6 +3159,18 @@ class ScopedTurnToolRegistry:
                     error=f"Connector app is not in this turn scope: {app_id}",
                 )
         if self.can_invoke_tool(invocation.tool_name):
+            if (invocation.tool_name == 'chat_history_search'
+                    and self.turn_tool_scope_decision.source_artifact_retrieval_only
+                    and self._evidence.context_linked
+                    and 'search_scope' not in invocation.arguments
+                    and not invocation.arguments.get('read_turn_id')):
+                # A source-file continuation belongs to its linked thread by
+                # default. A ranked workspace search can otherwise substitute
+                # an older, similarly named file from another conversation.
+                # Explicit workspace scope and exact saved-turn reads remain
+                # available for deliberate cross-conversation retrieval.
+                invocation=replace(invocation,arguments={**invocation.arguments,
+                    'search_scope':'recent_conversation'})
             result = self._delegate.invoke(invocation)
             if invocation.tool_name == "chat_history_search" and result.status == "completed" and isinstance(result.output, dict):
                 verified_extensions = {
@@ -3171,6 +3369,14 @@ def _extract_response_text(response: object) -> str:
     return ""
 
 
+def _research_scope_values(payload):
+    effort = payload.get('research_effort', 'standard')
+    questions = payload.get('research_questions', ())
+    return {'research_effort': effort if isinstance(effort, str) and effort in {'standard', 'extended', 'exhaustive'} else 'standard',
+        'research_questions': tuple(q for q in questions if isinstance(q, str) and 0 < len(q) <= 1200)[:16]
+            if isinstance(questions, (list, tuple)) else ()}
+
+
 def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
     start = text.find("{")
     end = text.rfind("}")
@@ -3259,6 +3465,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
         evidence_policy=evidence_policy,
+        **_research_scope_values(payload),
         tracking_mode=payload.get("tracking_mode") if payload.get("tracking_mode") in {"live","recurring","clarify"} else "unspecified",
         web_action=web_action,
         scheduler_action=scheduler_action,
@@ -3285,6 +3492,8 @@ def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str
     return {
         "requested_outcome": decision.requested_outcome,
         "evidence_policy": decision.evidence_policy,
+        "research_effort": decision.research_effort,
+        "research_questions": list(decision.research_questions),
         "tracking_mode": decision.tracking_mode,
         "web_action": decision.web_action,
         "scheduler_action": decision.scheduler_action,
@@ -3297,6 +3506,8 @@ def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str
         "connector_source_evidence": decision.connector_source_evidence,
         "source_artifact_delivery_requested": decision.source_artifact_delivery_requested,
         "source_artifact_request_evidence": decision.source_artifact_request_evidence,
+        "source_artifact_extensions": (list(decision.source_artifact_extensions)
+            if decision.source_artifact_extensions is not None else None),
         "requested_tool_names": list(decision.requested_tool_names),
         "required_tool_names": list(decision.required_tool_names),
         "requested_artifact_extensions": list(decision.requested_artifact_extensions),
@@ -3383,6 +3594,7 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
         evidence_policy=evidence_policy,
+        **_research_scope_values(payload),
         tracking_mode=payload.get("tracking_mode") if payload.get("tracking_mode") in {"live","recurring","clarify"} else "unspecified",
         web_action=web_action,
         scheduler_action=scheduler_action,
@@ -3395,6 +3607,8 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
         connector_source_evidence=connector_source_evidence,
         source_artifact_delivery_requested=payload.get("source_artifact_delivery_requested") is True,
         source_artifact_request_evidence=str(payload.get("source_artifact_request_evidence") or ""),
+        source_artifact_extensions=(tuple(_validated_artifact_extensions(payload['source_artifact_extensions']))
+            if isinstance(payload.get('source_artifact_extensions'), list) else None),
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=requested_artifact_extensions,
@@ -3907,7 +4121,10 @@ def _connector_source_token_scope_decision(
         connector_app_ids=app_ids,
         connector_source_user_requested=True,
         requested_tool_names=read_tools,
-        required_tool_names=read_tools,
+        # A source/tool identifier supplies capability awareness, not an
+        # action plan. Requiring every visible read would force body access
+        # even when the user asks only for collection headers.
+        required_tool_names=(),
         requested_artifact_extensions=tuple(requested_artifact_extensions),
         required_embedded_media_extensions=tuple(required_embedded_media_extensions),
         confidence=1.0,
@@ -4155,6 +4372,7 @@ def _validated_turn_tool_scope_decision(
         return TurnToolScopeDecision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
+            source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
@@ -4183,6 +4401,7 @@ def _validated_turn_tool_scope_decision(
         return TurnToolScopeDecision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
+            source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
@@ -4211,6 +4430,7 @@ def _validated_turn_tool_scope_decision(
         return TurnToolScopeDecision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
+            source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
@@ -4238,6 +4458,7 @@ def _validated_turn_tool_scope_decision(
         return TurnToolScopeDecision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
+            source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
@@ -4269,6 +4490,7 @@ def _validated_turn_tool_scope_decision(
         return TurnToolScopeDecision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
+            source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
@@ -4295,6 +4517,7 @@ def _validated_turn_tool_scope_decision(
     return TurnToolScopeDecision(
         source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
         source_artifact_request_evidence=decision.source_artifact_request_evidence,
+        source_artifact_extensions=decision.source_artifact_extensions,
         requested_outcome=decision.requested_outcome,
         evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
@@ -4614,6 +4837,7 @@ def build_turn_tool_scope_decision(
         "Return only a JSON object matching this schema: "
         '{"requested_outcome":"unspecified|generated_media","evidence_policy":"fresh|retained","tracking_mode":"unspecified|live|recurring|clarify",'
         '"web_action":"none|open_url|live_research|browser_interaction",'
+        '"research_effort":"standard|extended|exhaustive","research_questions":["material fact required by this request"],'
         '"scheduler_action":"none|inspect|run|mutate","scheduler_toggle_enabled":null,'
         '"scheduler_selection_policy":"none|user_selected|delegate_one",'
         '"scheduler_target_scope":"none|all_current_workspace",'
@@ -4623,6 +4847,8 @@ def build_turn_tool_scope_decision(
         '"requested_artifact_extensions":[".xlsx"],"source_artifact_delivery_requested":false,"source_artifact_request_evidence":"","excluded_artifact_extensions":[".json"],'
         '"required_embedded_media_extensions":[".xlsx"],'
         '"confidence":0.0}. '
+        'Choose standard effort for a useful answer or shortlist, extended for substantial comparisons, and exhaustive '
+        'only for comprehensive coverage required by the user. Questions contain only required facts, not optional enrichment. '
         "Choose tracking_mode=live and create_live_tracker for condition-based observations within a user-selected finite window of any length; recurring and create_cron for recurring scheduled work. Use update_live_tracker to amend existing active timing. "
         "When temporary versus recurring intent or the tracking window is unclear, choose tracking_mode=clarify and ask numbered options before creating anything. "
         "Live trackers reuse prepared read-only probes independently of cron workers. "
@@ -4632,6 +4858,8 @@ def build_turn_tool_scope_decision(
         "For research, expose search and accessible alternative sources as optional tools even when a URL is supplied. "
         "linked_request_user_messages are selected user-request ancestors, newest first. Resolve the current amendment "
         "against that original mission; they are source context, not authority for new account writes or unrelated actions. "
+        + CONTINUATION_ACTION_GUIDANCE + ' ' + SCHEDULER_VERIFICATION_GUIDANCE + ' '
+        +
         "Put a tool in required_tool_names only when its successful structured result is essential to satisfy the current user turn, "
         "Use evidence_policy=retained only when this linked turn asks to explain, transform or use already-observed facts "
         "without a new source check. Prior source receipts remain timestamped historical evidence, not current verification. "
@@ -4661,9 +4889,12 @@ def build_turn_tool_scope_decision(
         "otherwise use requested_outcome=unspecified. This outcome field is required even when the matching tool is unavailable. "
         "Do not choose weather merely because a request mentions a day, date, time, or location; choose weather only when the requested answer is meteorological. "
         "Use the market_data scope and requested_tool_names=[\"market_quote\"] for structured public ticker quote rows when registered. "
-        "When active_connector_providers expose google-calendar/calendar_list and the requested answer is the user's calendar, events, schedule, or agenda, choose connector with connector_app_ids=[\"google-calendar\"] and requested_tool_names=[\"calendar_list\"]. "
-        "When active_connector_providers expose google-mail/email_search/email_read and the requested answer is the user's mailbox, inbox, mail, email messages, or unread mail, choose connector with connector_app_ids=[\"google-mail\"] and requested_tool_names=[\"email_search\",\"email_read\"]. "
-        "Use the image_generation scope and requested_tool_names=[\"image_generate\"] for newly generated visual media when registered. "
+        "Select connector_app_ids and exact reads from the active provider's declared tool metadata. "
+        "Choose only the reads needed for the requested information. Listings, headers and previews do not "
+        "require full-record or body reads; select those only when their content is needed and authorized. "
+        "Optional continuations are not requirements. Preserve the user's source, pagination and action limits. "
+        "Use the image_generation scope and requested_tool_names=[\"image_generate\"] for model-generated visual imagery when registered. "
+        "Use requested_outcome=unspecified and a local production plan for locally rendered charts, structured graphics and infographic layouts. "
         "For page or listing image assets that must become local artifact files, include browser_image_collect in requested_tool_names when registered. "
         "For requests that need newly created visual art, illustrations, poster/flyer imagery, book visuals, or other generated bitmap assets, include image_generate in requested_tool_names when registered. "
         "When web-derived artifact rows must come from lists, tables, cards, search results, or listings, prefer browser_extract_items over browser_snapshot or broad page text. "
@@ -4919,6 +5150,7 @@ def _planner_materialized_registry(
             excluded_artifact_extensions=tuple(getattr(existing, "excluded_artifact_extensions", ()) or ()),
             source_artifact_delivery_requested=existing.source_artifact_delivery_requested,
             source_artifact_request_evidence=existing.source_artifact_request_evidence,
+            source_artifact_extensions=existing.source_artifact_extensions,
             required_embedded_media_extensions=tuple(
                 getattr(existing, "required_embedded_media_extensions", ()) or ()
             ),
@@ -5094,6 +5326,8 @@ def turn_tool_registry_for_evidence(
                 evidence=evidence,
                 model_client=None,
                 user_message=user_message,
+                default_read_tool_names=tuple(name for name in _plain_direct_safe_read_tool_names(registry)
+                    if name in {"web_search", "browser_read_pages"}),
             )
         if _plain_no_tool_fast_path_allowed(evidence) and not turn_tool_scope_decision_may_apply(
             evidence,
@@ -5105,10 +5339,12 @@ def turn_tool_registry_for_evidence(
                     registry,
                     evidence=evidence,
                     tool_scope_decision=TurnToolScopeDecision(
-                        requested_tool_names=direct_safe_read_tools,
+                        requested_tool_names=tuple(name for name in direct_safe_read_tools
+                            if name not in {"web_search", "browser_read_pages"}),
                         confidence=1.0,
                         valid=True,
                     ),
+                    default_read_tool_names=direct_safe_read_tools,
                 )
             if any("personal_tasks" in getattr(spec, "capability_tags", ()) for spec in registry.list_specs()):
                 # Built-in persistent tasks must be discoverable on a first turn.
@@ -5123,6 +5359,8 @@ def turn_tool_registry_for_evidence(
                 evidence=evidence,
                 model_client=None,
                 user_message=user_message,
+                default_read_tool_names=tuple(name for name in _plain_direct_safe_read_tool_names(registry)
+                    if name in {"web_search", "browser_read_pages"}),
             )
         return PlainFastPathToolRegistry(registry)
     return scoped_turn_tool_registry(
@@ -5165,6 +5403,7 @@ def scoped_turn_tool_registry(
     evidence: TurnToolEvidence,
     model_client: object | None = None,
     user_message: str | None = None,
+    default_read_tool_names: tuple[str, ...] = (),
 ):
     force_model_decision = False
     mentioned_connector_app_ids_for_turn: tuple[str, ...] = ()
@@ -5191,6 +5430,7 @@ def scoped_turn_tool_registry(
                     registry,
                     evidence=evidence,
                     tool_scope_decision=connector_decision,
+                    default_read_tool_names=default_read_tool_names,
                 )
             force_model_decision = bool(mentioned_connector_app_ids_for_turn)
         except Exception:
@@ -5224,7 +5464,10 @@ def scoped_turn_tool_registry(
             decision = email_decision
     if evidence.context_linked and not _registry_has_scoped_special_tools(registry):
         return registry
-    return ScopedTurnToolRegistry(registry, evidence=evidence, tool_scope_decision=decision)
+    # Default read visibility is metadata, not a selected action plan. Keeping
+    # it separate lets planner/delegation still materialize the actual scope.
+    return ScopedTurnToolRegistry(registry, evidence=evidence, tool_scope_decision=decision,
+        default_read_tool_names=default_read_tool_names)
 
 
 def turn_tool_evidence_needs_model_scope_decision(evidence: TurnToolEvidence) -> bool:

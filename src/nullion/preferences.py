@@ -441,6 +441,9 @@ def build_profile_prompt(profile: dict[str, str] | None = None) -> str | None:
         parts.append(
             "Default location: Use the Address above as the user's default location for local context, "
             "including weather, nearby places, showtimes, travel origin, and timezone-sensitive lookups "
-            "when the user does not provide another location."
+            "when the user does not provide another location. A destination mentioned in a different task "
+            "does not replace this saved default. Use a location explicitly selected for the current request "
+            "or its linked task when present; otherwise resolve local places using the saved Address before "
+            "asking for a city. Ask only for details still missing after using the profile and current evidence."
         )
     return "User profile:\n" + "\n".join(parts)

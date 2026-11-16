@@ -98,7 +98,7 @@ def test_section_story_appearing_after_start_delivers_exactly_one_real_web_alert
         if phase in (2,3): return use(probe[phase-2]['tool_name'], probe[phase-2]['arguments'])
         if phase == 4: return use('create_live_tracker', {
             'name': '進展の観測', 'stop_after_match':True, 'duration_seconds': 90, 'interval_seconds': 5, 'probe': probe,
-            'matcher': {'kind': 'semantic', 'instruction': '進展の新しい記事。既知の記事を除外。見出しとURLを通知。'}})
+            'matcher': {'kind': 'semantic', 'history_mode': 'records', 'instruction': '進展の新しい記事。既知の記事を除外。見出しとURLを通知。'}})
         return text(fixture_action_acknowledgement(kw) or 'Watching.')
     f.model.create = model
     app = create_app(f.runtime, f.orchestrator, f.registry)

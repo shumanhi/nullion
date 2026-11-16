@@ -58,6 +58,43 @@ def test_only_verified_parent_receipt_availability_wakes_the_scope_model():
         context_linked=True,prior_tool_scopes=('web',),retained_read_available=True))
 
 
+@pytest.mark.parametrize('read_only', [False, True])
+def test_native_composite_observation_survives_action_receipt_enrichment(read_only):
+    from nullion.tools import (ToolInvocation, ToolResult, _with_default_action_receipt,
+        is_completed_read_observation)
+    registry=ToolRegistry()
+    registry.register(ToolSpec('read_child','Read',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,1),lambda inv:None)
+    spec=ToolSpec('composite','Composite',ToolRiskLevel.LOW,ToolSideEffectClass.WRITE,False,1,
+        delegated_tools=('read_child',))
+    registry.register(spec,lambda inv:ToolResult(inv.invocation_id,inv.tool_name,'completed',{'text':'記録 53'},
+        recovered_by=('prior',),response_requirements={'_native_completed_reads':{
+            'tool_names':['read_child'],'read_only':read_only}}))
+    invocation=ToolInvocation('native','composite','operator',{})
+    result=registry.invoke(invocation)
+    enriched=_with_default_action_receipt(spec=spec,invocation=invocation,result=result)
+    assert enriched.response_requirements==result.response_requirements
+    assert enriched.recovered_by==('prior',)
+    assert ('action_receipt' not in enriched.output) is read_only
+    assert is_completed_read_observation(enriched,registry) is read_only
+    from nullion.tools import retained_observation_result
+    retained=retained_observation_result(enriched,invocation_id='linked')
+    assert is_completed_read_observation(retained,registry) is read_only
+    assert is_completed_read_observation(retained_observation_result(retained),registry) is read_only
+    enriched.invocation_id='different'
+    assert not is_completed_read_observation(enriched,registry)
+
+
+@pytest.mark.parametrize('answer', ['No, that source was not opened.',
+    'その情報源は確認していません。', 'No consulté esa fuente.'])
+def test_search_evidence_does_not_replace_a_source_audit_answer(answer):
+    from nullion.response_sanitizer import sanitize_user_visible_reply
+    from nullion.tools import ToolResult
+    result=ToolResult('search','web_search','completed',{'result_kind':'public_search_results',
+        'query':'neutral venue','results':[{'title':'Primary source','url':'https://example.test/primary',
+            'snippet':'The primary source has information about this venue.'}]})
+    assert sanitize_user_visible_reply(user_message='¿Y esta otra fuente?',reply=answer,tool_results=[result])==answer
+
+
 def test_scope_cache_changes_when_verified_parent_evidence_becomes_available():
     from nullion.turn_context_policy import _tool_scope_cache_key
     keys = [_tool_scope_cache_key(user_message='資料を保持。',

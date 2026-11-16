@@ -7,6 +7,8 @@ import asyncio
 import copy
 import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +26,7 @@ RETURN = '225\nNortheast Regional\nDEPARTS\n12:00\np\nARRIVES\n3:25\np\n3h 25m\n
     'Compara trenes de Nueva York a Washington el jueves sobre las 13 y vuelta el domingo al mediodía.',
 ])
 @pytest.mark.parametrize('mode', ['complete', 'complete_same_url', 'step_completed', 'combined', 'bound_combined', 'no_progress'])
-def test_partial_producer_continues_missing_side_without_restarting_or_losing_fields(tmp_path, monkeypatch, prompt, mode):
+def test_partial_producer_continues_missing_side_without_restarting_or_losing_fields(tmp_path, monkeypatch, prompt, mode, request):
     from fastapi.testclient import TestClient
     from nullion import web_app, chat_store
     from nullion.agent_orchestrator import AgentOrchestrator, _COMPLETION_REVIEW_MAX_ATTEMPTS
@@ -36,6 +38,20 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
     monkeypatch.setattr(browser_use_adapter, 'browser_use_available', lambda: True)
     monkeypatch.setattr(browser_use_adapter, 'browser_use_python', lambda: '/external/worker')
     runtime = setup_runtime(tmp_path, monkeypatch); chat_store._store = None
+    class Page(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.end_headers()
+            self.wfile.write(('<html><body><pre>'+RETURN+'</pre></body></html>').encode())
+        def log_message(self,*args): pass
+    source=ThreadingHTTPServer(('127.0.0.1',0),Page)
+    threading.Thread(target=source.serve_forever,daemon=True).start()
+    def cleanup_source(): source.shutdown();source.server_close()
+    request.addfinalizer(cleanup_source)
+    source_url=f'http://localhost:{source.server_port}'
+    monkeypatch.setenv('NULLION_BROWSER_BLOCK_PRIVATE','false')
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND','playwright')
+    monkeypatch.setenv('NULLION_BROWSER_HEADLESS','true')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL',raising=False)
     calls = []
     def external_browser(task, **kwargs):
         calls.append(task.task)
@@ -52,7 +68,7 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
                 for i,row in enumerate(output['observations']): row['captured_at'] = 2.0 if i == len(output['observations'])-1 else 1.0
         if mode == 'complete_same_url':
             output['page_url'] = 'https://example.com/search'
-            output['continuation'] = {'kind': 'alternative_source', 'source_url': output['page_url'], 'tool_names': ['browser_run_task']}
+            output['continuation'] = {'kind': 'alternative_source', 'source_url': output['page_url'], 'tool_names': ['browser_read_pages','browser_run_task']}
         if mode == 'budget' and len(calls) > 1:
             value = f'Additional captured option {len(calls)}'
             output['observations'].append({'value': value, 'quote': value, 'source_url': 'https://example.com/outbound'})
@@ -69,10 +85,17 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
             self.steps += 1
             if self.steps == 1:
                 return tool_response('request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task']})
+            def browser_work(path,task):
+                url=source_url+path
+                response=tool_response('browser_run_task',{'url':url,'task':task,
+                    'execution_kind':'adaptive_interaction','interaction_reason':'Continue the structured delegated comparison from the captured native source'})
+                response['content'].insert(0,{'type':'tool_use','id':'native-'+str(self.steps),'name':'browser_read_pages',
+                    'input':{'pages':[{'url':url,'read_kind':'text'}]}})
+                return response
             if not calls:
-                return tool_response('browser_run_task', {'url': 'https://example.com/outbound', 'task': 'Obtain outbound options'})
+                return browser_work('/outbound','Obtain outbound options')
             if len(calls) < 2 and mode not in {'combined', 'bound_combined'}:
-                return tool_response('browser_run_task', {'url': 'https://example.com/return', 'task': 'Obtain missing return options; preserve outbound findings'})
+                return browser_work('/return','Obtain missing return options; preserve outbound findings')
             answer = '**Northeast Regional 1147** — DEPARTS 12:50 p; ARRIVES 4:12 p; 3h 22m; Coach from $ 155.'
             if mode != 'no_progress':
                 answer += '\n\n**Northeast Regional 225** — DEPARTS 12:00 p; ARRIVES 3:25 p; 3h 25m; Coach from $ 89.'

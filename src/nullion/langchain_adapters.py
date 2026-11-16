@@ -54,29 +54,99 @@ def nullion_tools_as_langchain_tools(
     except Exception as exc:  # pragma: no cover - depends on optional package
         raise RuntimeError("LangChain tool adapter requires langchain-core") from exc
 
-    tool_definitions = _scoped_tool_definitions(tool_registry, allowed_tools=allowed_tools)
+    from nullion import code_mode
+    definitions = _scoped_tool_definitions(tool_registry, allowed_tools=allowed_tools)
     shared_tool_results: list[ToolResult] = []
-    return [
-        StructuredTool.from_function(
-            coroutine=_make_langchain_tool_coroutine(
-                name=str(tool_def.get("name")),
-                fallback_tools=[str(tool) for tool in (tool_def.get("fallback_tools") or []) if isinstance(tool, str)],
-                principal_id=principal_id,
-                cleanup_scope=cleanup_scope,
-                tool_registry=tool_registry,
-                policy_store=policy_store,
-                tool_result_callback=tool_result_callback,
-                prior_tool_results=shared_tool_results,
-                tool_flow_context=tool_flow_context,
-            ),
-            name=str(tool_def.get("name")),
-            description=_enhanced_tool_description(tool_def),
-            args_schema=_normalized_input_schema(tool_def),
-            metadata=_tool_metadata(tool_def),
-        )
-        for tool_def in tool_definitions
-        if isinstance(tool_def.get("name"), str)
-    ]
+    state = {"tool_registry":tool_registry, "messages":[], "principal_id":principal_id,
+             "conversation_id":(tool_flow_context or {}).get("conversation_id",cleanup_scope),
+             "user_message":(tool_flow_context or {}).get("original_user_message", ""),
+             "runtime_store":policy_store,
+             "code_mode_session_id":(tool_flow_context or {}).get("code_mode_session_id")}
+    offered = code_mode.offer_code_mode(definitions, tool_registry, state=state, defer_control_visibility=True)
+    composing = any(d['name'] == code_mode.TOOL_NAME for d in offered)
+    scoped_names = {d['name'] for d in definitions}
+    def fallbacks(definition):
+        candidates = [str(tool) for tool in definition.get('fallback_tools', []) or []]
+        if composing and code_mode._eligible(tool_registry, definition['name']):
+            effect = tool_registry.get_spec(definition['name']).side_effect_class
+            return [tool for tool in candidates if tool in scoped_names and code_mode._eligible(tool_registry, tool)
+                    and tool_registry.get_spec(tool).side_effect_class is effect]
+        return candidates
+    direct = {definition['name']: _make_langchain_tool_coroutine(
+        name=definition['name'], fallback_tools=fallbacks(definition),
+        principal_id=principal_id, cleanup_scope=cleanup_scope, tool_registry=tool_registry,
+        policy_store=policy_store, tool_result_callback=tool_result_callback,
+        prior_tool_results=shared_tool_results, tool_flow_context=tool_flow_context) for definition in definitions}
+
+    async def run_program(_saved_selection=None, **arguments):
+        from nullion.code_mode import execute_async
+        current = {**state, "tool_results":list(shared_tool_results)}
+        current.pop('result', None)
+        async def execute(current, blocks):
+            for block in blocks:
+                if block['name'] not in direct:
+                    raise ValueError('Tool is outside this harness scope')
+                definition = next(d for d in definitions if d['name'] == block['name'])
+                selected = set((_saved_selection['input'] if _saved_selection else arguments).get('tool_names') or ())
+                scoped_call = _make_langchain_tool_coroutine(name=block['name'],
+                    fallback_tools=[tool for tool in fallbacks(definition) if tool in selected],
+                    principal_id=principal_id, cleanup_scope=cleanup_scope, tool_registry=tool_registry,
+                    policy_store=policy_store, tool_result_callback=tool_result_callback,
+                    prior_tool_results=shared_tool_results, tool_flow_context=tool_flow_context)
+                await scoped_call(**block['input'])
+            return {'tool_results':list(shared_tool_results)}
+        selection = _saved_selection or {'type':'tool_use', 'name':code_mode.TOOL_NAME,
+            'id':'lc-program-'+uuid4().hex, 'input':arguments}
+        update = await execute_async(current, [selection], execute=execute)
+        state.update(update)
+        summary = update['tool_results'][-1]
+        shared_tool_results.append(summary)
+        if tool_result_callback is not None:
+            tool_result_callback(summary)
+        from nullion.agent_orchestrator import _tool_result_message_payload
+        payload = _tool_result_message_payload(summary)
+        visuals = update.get('code_mode_visual_reference_blocks') or []
+        return [{'type':'text','text':payload}, *visuals] if visuals else payload
+
+    def native_coroutine(name):
+        async def run(**arguments):
+            denial = code_mode.observation_denial(tool_registry,name,'lc-observation-'+uuid4().hex,shared_tool_results)
+            if denial is not None:
+                shared_tool_results.append(denial)
+                if tool_result_callback is not None: tool_result_callback(denial)
+                return _tool_result_text(denial)
+            return await direct[name](**arguments)
+        if composing:
+            run._nullion_code_mode_visible = lambda: not code_mode.enabled() or code_mode.observation_ready(tool_registry,name,shared_tool_results)
+        return run
+
+    async def resume_program():
+        identity = state.get('code_mode_session_id')
+        if not identity:
+            return
+        from nullion.code_mode_sessions import SessionJournal
+        saved = SessionJournal(state).read(identity)
+        if saved['phase'] != 'approval':
+            raise RuntimeError('Saved Code Mode program is not resumable')
+        suspended = policy_store.get_suspended_turn(saved['approval_id']) if policy_store else None
+        for row in (suspended.pending_tool_calls if suspended else ()) or ():
+            if not any(r.invocation_id==row.get('invocation_id') for r in shared_tool_results):
+                retained = ToolResult(row['invocation_id'], row['tool_name'], row['status'],row['output'])
+                shared_tool_results.append(retained)
+                state.setdefault('invocation_metadata', {})[retained.invocation_id] = {
+                    'tool_use_id':row.get('tool_use_id'), 'arguments':row.get('arguments')}
+                if tool_result_callback is not None:
+                    tool_result_callback(retained)
+        await run_program(_saved_selection=saved['selected'])
+
+    run_program._nullion_code_mode_resume = resume_program
+    run_program._nullion_code_mode_finish = lambda: code_mode.finish_request(state)
+    return [StructuredTool.from_function(
+        coroutine=run_program if definition['name'] == code_mode.TOOL_NAME else native_coroutine(definition['name']),
+        name=definition['name'], description=_enhanced_tool_description(definition),
+        args_schema=_normalized_input_schema(definition), metadata=_tool_metadata(definition))
+        for definition in offered]
+
 
 
 def nullion_client_as_langchain_chat_model(client: Any, *, default_max_tokens: int | None = None) -> Any:
@@ -185,7 +255,7 @@ def _make_langchain_tool_coroutine(
     prior_tool_results: list[ToolResult],
     tool_flow_context: dict[str, Any] | None = None,
 ):
-    async def _run_nullion_tool(**kwargs: Any) -> str:
+    async def _run_direct(**kwargs: Any) -> str | list[dict[str, Any]]:
         invocation = ToolInvocation(
             invocation_id=f"lc-{uuid4().hex[:12]}",
             tool_name=name,
@@ -194,6 +264,8 @@ def _make_langchain_tool_coroutine(
             capsule_id=cleanup_scope,
             flow_context=dict(tool_flow_context) if tool_flow_context is not None else None,
         )
+        from nullion.tools import with_observed_artifact_reference_urls
+        invocation = with_observed_artifact_reference_urls(invocation, prior_tool_results, registry=tool_registry)
         result = artifact_media_plain_replacement_guard_result(invocation, prior_tool_results,
             required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
         if result is None:
@@ -223,16 +295,20 @@ def _make_langchain_tool_coroutine(
                 fallback_result = _with_replayable_artifact_arguments(fallback_result, fallback_invocation.arguments)
                 emitted_results.append(fallback_result)
                 if not _result_allows_fallback(fallback_result):
+                    if fallback_result.status == 'completed':
+                        result.recovered_by = tuple(dict.fromkeys([*result.recovered_by,fallback_result.invocation_id]))
                     result = fallback_result
                     break
+        content = _tool_result_content(result)
         prior_tool_results.extend(emitted_results)
         if tool_result_callback is not None:
             for emitted_result in emitted_results:
                 tool_result_callback(emitted_result)
-        return _tool_result_text(result)
+        return content
 
-    _run_nullion_tool.__name__ = f"nullion_{name}"
-    _run_nullion_tool.__doc__ = f"Run the Nullion {name} tool through Sentinel policy."
+    async def _run_nullion_tool(**kwargs: Any) -> str | list[dict[str, Any]]:
+        return await _run_direct(**kwargs)
+
     return _run_nullion_tool
 
 
@@ -257,7 +333,12 @@ def _invoke_nullion_tool(
     tool_registry: Any,
     policy_store: Any,
 ) -> ToolResult:
-    attempts = max(1, _tool_retry_attempts())
+    from nullion.tools import ToolSideEffectClass
+    try:
+        read = tool_registry.get_spec(invocation.tool_name).side_effect_class is ToolSideEffectClass.READ
+    except (AttributeError, KeyError):
+        read = False
+    attempts = max(1, _tool_retry_attempts()) if read else 1
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -318,6 +399,20 @@ def _tool_result_text(result: ToolResult) -> str:
         return str(output)
 
 
+def _tool_result_content(result: ToolResult) -> str | list[dict[str, Any]]:
+    from nullion.agent_orchestrator import _tool_result_visual_reference_blocks
+    visuals = _tool_result_visual_reference_blocks(result)
+    if visuals:
+        result.output['visual_preview_delivered'] = True
+        return [{'type':'text','text':_tool_result_text(result)}, *visuals]
+    return _tool_result_text(result)
+
+
+def _reference_images(content: Any) -> list[dict[str, Any]]:
+    return [block for block in content if isinstance(block,dict) and block.get('type')=='image'
+        and isinstance(block.get('source'),dict)] if isinstance(content,list) else []
+
+
 async def _call_nullion_model(
     client: Any,
     *,
@@ -329,7 +424,9 @@ async def _call_nullion_model(
     lc_messages, system = _nullion_messages_from_langchain_messages(messages, message_types=message_types)
     create_kwargs: dict[str, Any] = {
         "messages": lc_messages,
-        "tools": [_tool_definition_from_langchain_tool(tool) for tool in tools],
+        "tools": [_tool_definition_from_langchain_tool(tool) for tool in tools
+            if not callable(visible := getattr(getattr(tool, 'coroutine', None), '_nullion_code_mode_visible', None))
+            or visible()],
         "max_tokens": default_max_tokens,
         "system": system,
     }
@@ -338,7 +435,19 @@ async def _call_nullion_model(
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return await asyncio.wait_for(_call_create(create, create_kwargs), timeout=_model_call_timeout_seconds())
+            from nullion.research_budget import prepare_model_request, current_budget
+            budget = current_budget()
+            if budget is not None and budget.exhausted_writer():
+                budget.writer_forced_stop = True
+                return {'content': [{'type': 'text', 'text':
+                    'The research allowance was reached. Completed source evidence was retained; unresolved facts remain unverified.'}],
+                    'stop_reason': 'end_turn'}
+            options = dict(create_kwargs)
+            prepare_model_request(options)
+            timeout = _model_call_timeout_seconds()
+            if budget is not None and budget.active:
+                timeout = min(timeout, budget.writing_remaining() if budget.writing() else budget.remaining())
+            return await asyncio.wait_for(_call_create(create, options), timeout=max(.1, timeout))
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts:
@@ -386,7 +495,8 @@ def _nullion_messages_from_langchain_messages(
                 system_parts.append(text)
             continue
         if isinstance(message, HumanMessage):
-            converted.append({"role": "user", "content": [{"type": "text", "text": _message_text(message.content)}]})
+            converted.append({"role": "user", "content": [
+                {"type": "text", "text": _message_text(message.content)}, *_reference_images(message.content)]})
             continue
         if isinstance(message, ToolMessage):
             converted.append(
@@ -397,7 +507,8 @@ def _nullion_messages_from_langchain_messages(
                             "type": "tool_result",
                             "tool_use_id": str(getattr(message, "tool_call_id", "") or ""),
                             "content": [{"type": "text", "text": _message_text(message.content)}],
-                        }
+                        },
+                        *_reference_images(message.content),
                     ],
                 }
             )

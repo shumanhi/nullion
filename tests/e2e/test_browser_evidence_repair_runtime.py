@@ -1,9 +1,11 @@
 """Real SDK/Chromium/validator/chat/store; only the external model is scripted."""
+from tests.browser_model_protocol import browser_schema_messages
 from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import asyncio
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -65,6 +67,8 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
             extra = '<h2>候補 B</h2><div>11:30</div><div>€</div><div>84</div><div>3h 05m</div>' if failure in {'comparison', 'comparison_document'} else ''
             if failure == 'indexed_controls':
                 extra += ''.join(f'<button aria-label="選択 {i}">選択 {i}</button>' for i in range(20))
+            if failure == 'native_properties':
+                extra += '<div role="checkbox" aria-checked="true" aria-label="絞り込み"></div><label>別の設定<input type="checkbox"></label>'
             self.wfile.write(('<html><body><h1>候補 A</h1><div>10:45</div><div>€</div><div>73</div><div>2h 17m</div>'+extra+'</body></html>').encode())
         def log_message(self, *_): pass
     server = ThreadingHTTPServer(('127.0.0.1', 0), Page)
@@ -105,9 +109,11 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
                         'all_material_requirements_enumerated': True, 'material_requirements': [
                             {'requirement_id': req['requirement_id'], 'satisfied': True, 'draft_covered': True,
                                 'evidence_invocation_ids': [records[i]['invocation_id']]} for i,req in enumerate(review['material_requirement_contract'])]}))
-            schema_messages = [m for m in kwargs['messages'] if isinstance(m.get('content'), str) and m['content'].startswith('Return valid JSON matching this schema: ')]
+            schema_messages = browser_schema_messages(kwargs)
             if schema_messages:
                 self.browser_calls += 1
+                if failure == 'native_properties':
+                    time.sleep(8)  # A repeated done/repair model call must be measurable.
                 if self.browser_calls == 1:
                     invalid = {'label': '比較', 'value': '€73' if failure != 'value' else '€9',
                         'quote': '候補 A 10:45 €73 2h 17m' if failure != 'value' else '候補 A\n10:45\n€\n73\n2h 17m'}
@@ -130,6 +136,16 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
                         observations=[{'label':'候補','value':'候補 A\n10:45\n€\n73\n2h 17m','quote':'候補 A\n10:45\n€\n73\n2h 17m'},
                             {'label':'設定','semantic_role':'interface_control','source_id':page['source_id'],
                              'control_index':control['control_index'],'value':control['label'],'quote':control['label']}]
+                    if failure == 'native_properties':
+                        page = page_feedback(kwargs['messages'])
+                        controls = [next(row for row in page['controls'] if row.get('checked') is checked) for checked in (True, False)]
+                        observations = [
+                            {'label':'候補', 'semantic_role':'entity', 'value':'候補 A\n10:45\n€\n73\n2h 17m',
+                             'quote':'候補 A\n10:45\n€\n73\n2h 17m'},
+                            {'label':'URL', 'semantic_role':'context', 'source_id':page['source_id'],
+                             'value':page['source_url'], 'quote':page['source_url']},
+                            *[{'label':control['label'], 'semantic_role':'interface_control', 'source_id':page['source_id'],
+                               'control_index':control['control_index'], 'control_property':'checked'} for control in controls]]
                     action = {'done': {'data': {'goal_status': 'answered', 'next_action': 'report', 'observations': observations}, 'success': True}}
                 elif self.browser_calls == 2:
                     assert 'needs_evidence_repair' in json.dumps(kwargs['messages'])
@@ -191,10 +207,13 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
                     final += '\n- **候補 B** — 11:30; €84; 3h 05m'
                 if failure == 'absence': final += '\n\nこのページには配達予定日の表示がありません。'
                 return response(final)
-            name, args = ('request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task']}) if self.outer_calls == 1 else (
-                'browser_run_task', {'task': '比較して。候補、時間、価格、所要時間を返して。', 'url': url, 'max_steps': 5})
+            name, args = ('request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_read_pages', 'browser_run_task'], 'required_tool_names': ['browser_run_task']}) if self.outer_calls == 1 else (
+                'browser_run_task', {'task': '比較して。候補、時間、価格、所要時間を返して。', 'url': url, 'max_steps': 5, 'execution_kind': 'adaptive_interaction', 'interaction_reason': 'Exercise capture and repair within the delegated browser session'})
             assert self.outer_calls <= 2, 'The outer graph must receive corrected evidence from the same browser invocation'
-            return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': f'call-{self.outer_calls}', 'name': name, 'input': args}]}
+            return {'stop_reason': 'tool_use', 'content': [
+                *([{'type':'tool_use','id':'native-first','name':'browser_read_pages',
+                    'input':{'pages':[{'url':url,'read_kind':'text'}]}}] if self.outer_calls==2 else []),
+                {'type': 'tool_use', 'id': f'call-{self.outer_calls}', 'name': name, 'input': args}]}
     model = Model(); runtime = bootstrap_persistent_runtime(tmp_path / 'runtime.db'); runtime.model_client = model
     registry = ToolRegistry(); register_browser_tools(registry, policy=BrowserPolicy(), model_client_getter=lambda: model)
     conversation = 'web:different-workspace-repair'
@@ -207,10 +226,16 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
             assert 'Not verified' not in text and "couldn't complete" not in text and not result.json()['artifacts']
             turn = [e for e in runtime.store.list_conversation_events(conversation) if e.get('event_type') == 'conversation.chat_turn'][-1]
             reports = [r['output'] for r in turn['tool_results'] if r['tool_name'] == 'browser_run_task']
-            assert len(reports) == 1 and reports[0]['report_status'] == 'completed', turn
-            assert reports[0]['rejection_counts'] == ({} if failure in {'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls'} else {('value_not_in_quote' if failure == 'value' else 'quote_not_captured'): 1})
-            if failure not in {'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls'}: assert reports[0]['observations'][-1]['quote'] == '候補 A\n10:45\n€\n73\n2h 17m'
-            assert model.browser_calls == (1 if failure in {'value', 'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls'} else 3)
+            assert len(reports) == 1 and reports[0].get('report_status') == 'completed', reports
+            assert reports[0]['rejection_counts'] == ({} if failure in {'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls', 'native_properties'} else {('value_not_in_quote' if failure == 'value' else 'quote_not_captured'): 1})
+            if failure not in {'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls', 'native_properties'}: assert reports[0]['observations'][-1]['quote'] == '候補 A\n10:45\n€\n73\n2h 17m'
+            assert model.browser_calls == (1 if failure in {'value', 'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls', 'native_properties'} else 3)
+            if failure == 'native_properties':
+                assert any(r.get('evidence_kind') == 'captured_source_url' and r['value'] == url for r in reports[0]['observations'])
+                assert any(r.get('control_state', {}).get('observed_property') == 'checked'
+                    and r['control_state']['checked'] is True for r in reports[0]['observations'])
+                assert any(r.get('control_state', {}).get('observed_property') == 'checked'
+                    and r['control_state']['checked'] is False for r in reports[0]['observations'])
             if failure in {'comparison', 'comparison_document'}: assert model.review_calls == 0 and '候補 B' in text and ('84' in text) and ('3h 05m' in text)
             if failure == 'absence': assert model.review_calls == 0 and '配達予定日の表示がありません' in text
             if failure == 'fields': assert model.review_calls == 0 and text.count('- **') == 1
@@ -254,8 +279,7 @@ def test_rejection_at_the_real_sdk_step_limit_stays_bounded_without_parsing_feed
             if protocol_reply is not None: return protocol_reply
             self.calls += 1
             assert self.calls == 1, 'Step exhaustion must remain bounded'
-            schema = json.loads(next(m['content'] for m in kwargs['messages']
-                if isinstance(m.get('content'), str) and m['content'].startswith('Return valid JSON matching this schema: ')).split(': ', 1)[1])
+            schema = json.loads(browser_schema_messages(kwargs)[0]['content'].split(': ', 1)[1])
             payload = {'evaluation_previous_goal': 'Read the page', 'memory': '', 'next_goal': 'Report', 'action': [
                 {'done': {'data': {'goal_status': 'answered', 'next_action': 'report', 'observations': [
                     {'label': '価格', 'value': '$9', 'quote': 'invented quote'}]}, 'success': True}}]}
@@ -282,3 +306,26 @@ def test_explicit_capture_control_index_completes_real_sdk_and_web_without_repai
         tmp_path, monkeypatch, source_summary_model_reply, isolated):
     test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
         tmp_path, monkeypatch, source_summary_model_reply, isolated, 'indexed_controls')
+
+
+def test_native_page_properties_finish_once_through_real_sdk_web_and_telegram(
+        tmp_path, monkeypatch, source_summary_model_reply, record_property):
+    samples = []
+    for index in range(3):
+        root = tmp_path/str(index)
+        root.mkdir()
+        start = time.perf_counter()
+        test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
+            root, monkeypatch, source_summary_model_reply, True, 'native_properties')
+        samples.append(time.perf_counter()-start)
+    assert sum(samples)/len(samples) < 25 and max(samples) < 35, samples
+    record_property('mean_native_property_seconds', sum(samples)/len(samples))
+    record_property('p95_native_property_seconds', max(samples))
+
+
+@pytest.fixture(autouse=True)
+def explicit_independent_sdk_fixture(monkeypatch):
+    # These anonymous-provider fixtures exercise the independent SDK mode.
+    # Managed login preservation has its own real shared-CDP/cookie contract.
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL', raising=False)

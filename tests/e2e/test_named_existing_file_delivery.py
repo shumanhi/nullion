@@ -8,7 +8,7 @@ from urllib.parse import unquote
 import pytest
 
 from tests.e2e.test_scheduled_report_completion import setup_runtime, text_response, tool_response
-from tests.workflow_provider_protocol import workflow_provider_reply
+from tests.workflow_provider_protocol import workflow_provider_reply,is_tool_scope_request
 
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason='Docker product boundary')
 
@@ -51,6 +51,10 @@ def test_existing_file_export_keeps_requested_name_source_edit_and_download_byte
             nonlocal phase
             protocol=workflow_provider_reply(kw)
             if protocol is not None:return protocol
+            if is_tool_scope_request(kw):
+                return text_response(json.dumps({'requested_tool_names':['file_write'],
+                    'required_tool_names':['file_write'],'requested_artifact_extensions':[suffix],
+                    'confidence':1}))
             phase+=1
             if phase==1:return tool_response('request_tool_scope', {'capabilities':['local_files'],
                 'tool_names':['file_write'],'artifact_extensions':[suffix]})

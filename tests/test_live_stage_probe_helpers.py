@@ -40,12 +40,14 @@ def test_repeated_live_prompt_requires_its_own_turn_evidence(prompt, terminal_id
 
 
 @pytest.mark.parametrize('fail', [False, True])
-def test_probe_deduplicates_selected_scenarios_and_stops_paid_work_after_failure(tmp_path, monkeypatch, fail):
+@pytest.mark.parametrize('max_single_ms,expected_timeout',[(None,180),(60000,180),(300000,330)])
+def test_probe_deduplicates_selected_scenarios_and_stops_paid_work_after_failure(tmp_path, monkeypatch, fail,max_single_ms,expected_timeout):
     probe = live_stage_chat_contract_probe
     calls = []
     monkeypatch.setattr(probe, '_get_json', lambda *args, **kwargs: {})
-    monkeypatch.setattr(probe, 'SCENARIOS', {name: Scenario(name, name, None, None) for name in ['a', 'b']})
+    monkeypatch.setattr(probe, 'SCENARIOS', {name: Scenario(name, name, None, max_single_ms) for name in ['a', 'b']})
     def post(url, payload, timeout):
+        assert timeout==expected_timeout
         calls.append(payload)
         if fail:
             raise ConnectionError('External provider unavailable')
@@ -71,7 +73,8 @@ def test_live_scheduler_probes_own_their_jobs_and_never_restore_unchanged_jobs(m
         prompts.append(payload['text'])
         for identifier in created:rows[identifier]['enabled']=True
         if wrong_scope:rows['unrelated']['enabled']=True
-        return {'type':'message','text':'Selected tasks enabled. Current scheduler status confirmed.','artifacts':[]},1
+        text=('Selected tasks enabled: ' if len(prompts)==1 else 'Comprobación nueva, tarea habilitada: ')+', '.join(created)
+        return {'type':'message','text':text,'artifacts':[]},1
     monkeypatch.setattr(probe,'_post_json',post)
     def patch(url,payload,timeout):
         identifier=url.rsplit('/',1)[-1];patched.append(identifier);rows[identifier].update(payload)
@@ -147,6 +150,21 @@ def test_probe_without_receipt_requirement_does_not_wait_for_output(tmp_path):
     assert live_stage_chat_contract_probe._event_tool_output_texts_with_poll(
         tmp_path / "missing.db", "web:plain-turn", timeout_seconds=30,
     ) == []
+
+
+@pytest.mark.parametrize('status',['completed','failed','denied','approval_required'])
+def test_complete_failure_receipt_ends_observation_without_claiming_success(monkeypatch,status):
+    probe=live_stage_chat_contract_probe
+    receipt=json.dumps({'tool_name':'image_generate','status':status,'output':{'http_status_code':402}})
+    monkeypatch.setattr(probe,'_event_tool_output_texts',lambda *a:[receipt])
+    monkeypatch.setattr(probe.time,'sleep',lambda *a:pytest.fail('A full terminal receipt must not wait for a successful status'))
+    outputs=probe._event_tool_output_texts_with_poll(None,'web:fixture',required_output_tools=('image_generate',))
+    scenario=Scenario('visual','',None,None,required_tool_all=('image_generate',))
+    if status=='completed':
+        probe._assert_contract(scenario,response={},elapsed_ms=1,tool_names={'image_generate'},runtime_db_available=True,tool_output_texts=outputs)
+    else:
+        with pytest.raises(AssertionError,match='expected completed results'):
+            probe._assert_contract(scenario,response={},elapsed_ms=1,tool_names={'image_generate'},runtime_db_available=True,tool_output_texts=outputs)
 
 
 def test_live_stage_probe_scans_enough_runtime_rows_for_tool_timings(tmp_path) -> None:
@@ -655,7 +673,7 @@ def test_executive_personal_briefing_scenario_is_cross_domain_and_exactly_packag
         "file_write",
     }.issubset(scenario.required_tool_all)
     assert scenario.required_tool_or_structured_unavailable == ("calendar_list",)
-    assert scenario.required_tool_any == ("browser_navigate", "web_fetch")
+    assert set(scenario.required_tool_any) == {"browser_read_pages", "browser_navigate", "web_fetch"}
     assert scenario.required_artifact_names == (
         "executive_personal_briefing.xlsx",
         "executive_personal_briefing.pdf",
@@ -1095,3 +1113,79 @@ def test_shared_baseline_expiry_remeasures(monkeypatch):
     assert probe.shared_live_baseline(args) == 0
     assert len(calls) == 2
     probe._successful_live_baselines.clear()
+
+
+@pytest.mark.parametrize('day,flight,rental',[('2026-11-15','2026-11-21','2027-06-29'),
+    ('2026-11-21','2026-11-28','2027-06-29'),('2026-06-28','2026-07-04','2026-06-29')])
+def test_live_source_inputs_have_absolute_future_dates_and_complete_parameters(day,flight,rental):
+    from datetime import date
+    probe=live_stage_chat_contract_probe
+    dates=probe._live_source_dates(date.fromisoformat(day))
+    assert dates['flight_date']==flight and dates['rental_start']==rental
+    for name in ('browser_rental_live_records','browser_flight_live_records'):
+        scenario=probe._scenario_for_config(probe.SCENARIOS[name],{},today=date.fromisoformat(day))
+        assert '{' not in scenario.prompt
+        assert (flight if name=='browser_flight_live_records' else rental) in scenario.prompt
+        assert 'browser_read_pages' in scenario.required_tool_any
+    assert probe.SCENARIOS['browser_screenshot_artifact_delivery'].required_tool_any==('browser_screenshot',)
+
+
+@pytest.mark.parametrize('caption',['旅程の手順','Pasos del viaje','Étapes du trajet'])
+@pytest.mark.parametrize('markup',['ol','table','div','flat'])
+def test_html_report_steps_use_structure_instead_of_english_heading_words(caption,markup):
+    if markup=='flat':group='<div>'+''.join('<span>'+caption+str(i)+'</span>' for i in range(6))+'</div>'
+    elif markup=='ol':group='<ol>'+''.join('<li>'+caption+str(i)+'</li>' for i in range(3))+'</ol>'
+    else:
+        row='tr' if markup=='table' else 'div';cell='td' if markup=='table' else 'span'
+        group='<'+markup+'>'+''.join(f'<{row}><{cell}>{i}</{cell}><{cell}>{caption}</{cell}></{row}>' for i in range(3))+'</'+markup+'>'
+    body=(group*3+''.join(f'<a href="https://example.test/{i}">参照</a>' for i in range(3))).encode()
+    assert live_stage_chat_contract_probe._html_step_groups_and_source_links(body)==(3,3)
+    assert live_stage_chat_contract_probe._html_step_groups_and_source_links('<h2>Itinerary</h2><p>Source</p>'.encode())==(0,0)
+
+
+@pytest.mark.parametrize('terminal,seconds',[(None,15),({},15),({'artifacts':[]},15),
+    ({'artifacts':[{'artifact_id':'native-37'}]},45)])
+def test_native_artifact_audit_wait_is_separate_from_plain_chat_latency(terminal,seconds):
+    assert live_stage_chat_contract_probe._native_receipt_wait_seconds(terminal)==seconds
+
+
+@pytest.mark.parametrize('family', ['github_prs', 'browser_not_found_catalog_guard', 'browser_filter_followup',
+    'browser_rental_live_records', 'browser_flight_live_records', 'browser_followup_account_scope_guard',
+    'complex_artifact_pack', 'executive_personal_briefing_pack', 'research_artifact_email_followup_pack'])
+@pytest.mark.parametrize('status', ['completed', 'failed'])
+def test_source_contract_accepts_verified_batch_reads_without_accepting_failed_reads(family, status):
+    probe = live_stage_chat_contract_probe
+    scenario = Scenario(family, '資料', None, None, required_tool_any=probe.SCENARIOS[family].required_tool_any)
+    arguments = dict(response={'text':'資料'}, elapsed_ms=10, tool_names={'browser_read_pages'},
+        runtime_db_available=True, tool_output_texts=[json.dumps({'tool_name':'browser_read_pages',
+            'status':status, 'output':{'pages':[{'url':'https://source.example.test', 'text':'Verified source'}]}})])
+    if status == 'failed':
+        with pytest.raises(AssertionError): probe._assert_contract(scenario, **arguments)
+    else:
+        probe._assert_contract(scenario, **arguments)
+
+
+def test_message_probe_waits_for_a_deferred_checkpoint(monkeypatch):
+    probe = live_stage_chat_contract_probe
+    rows = iter([
+        {'turn_id': 'owned', 'evidence_kind': 'deferred_runtime_checkpoint', 'tool_results': []},
+        {'turn_id': 'owned', 'tool_results': [{'tool_name': 'list_crons', 'status': 'completed'}]}])
+    monkeypatch.setattr(probe, '_chat_turn_for_user_message', lambda *args: next(rows))
+    monkeypatch.setattr(probe, '_message_received_for_user_message', lambda *args: None)
+    sleeps = []
+    monkeypatch.setattr(probe.time, 'sleep', sleeps.append)
+    assert probe._tool_names_for_user_message_with_poll(None, 'owned', '状態',
+        required_tool_any=('list_crons',)) == {'list_crons'}
+    assert sleeps == [0.2]
+
+
+@pytest.mark.parametrize('prompt',['https://example.test/event','次の情報','Información adicional'])
+def test_live_probe_correlates_terminal_to_exact_outgoing_submission(prompt):
+    from tests.e2e.test_live_stage_web_matrix import _terminal_for_submission
+    frames=[{'type':'_submitted','text':prompt,'turn_id':'new','conversation_id':'c'},
+        {'type':'done','turn_id':'old','text':'Previous image reply','conversation_id':'c'}]
+    assert _terminal_for_submission(frames,prompt,'c') is None
+    result={'type':'done','turn_id':'new','text':'Requested reply','conversation_id':'c'}
+    frames.append(result)
+    assert _terminal_for_submission(frames,prompt,'c')==result
+    assert _terminal_for_submission(frames,prompt,'other') is None

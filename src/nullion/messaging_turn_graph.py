@@ -1877,13 +1877,8 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
     )
     marker = split_tool_approval_marker(text)
     approval_id = marker.approval_id if marker is not None else None
-    if approval_id and _pending_runtime_approval_exists(runtime, approval_id):
-        return PlatformChatResponse(
-            text=text,
-            suspended_for_approval=True,
-            approval_id=approval_id,
-        )
-    if marker is not None:
+    suspended_for_approval = bool(approval_id and _pending_runtime_approval_exists(runtime, approval_id))
+    if marker is not None and not suspended_for_approval:
         text = str(marker.remainder or "").strip() or ORPHAN_APPROVAL_REQUEST_REPLY
     if str(text or "").strip() == ORPHAN_APPROVAL_REQUEST_REPLY:
         recovered_approval_id = _latest_pending_runtime_approval_for_turn(
@@ -1893,17 +1888,20 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
             chat_id=request.chat_id,
         )
         if recovered_approval_id:
-            return PlatformChatResponse(
-                text=f"Tool approval requested: {recovered_approval_id}",
-                suspended_for_approval=True,
-                approval_id=recovered_approval_id,
-            )
+            approval_id = recovered_approval_id
+            suspended_for_approval = True
+            text = f"Tool approval requested: {recovered_approval_id}"
     from nullion.messaging_adapters import delivery_contract_for_turn, prepare_reply_for_platform_delivery
+
+    # A numeric task-target selection executes its stored request. Admission
+    # already validated that binding; the UI's number is not the request text
+    # used by the producer's current-turn artifact/history receipts.
+    evidence_request_text = getattr(request.turn_dispatch_decision, "resolved_message", None) or request.text
 
     stored_reply, stored_artifact_paths, stored_tool_results, raw_stored_artifact_paths = _latest_stored_turn_delivery_evidence(
         runtime,
         evidence_conversation_id,
-        request_text=request.text,
+        request_text=evidence_request_text,
         turn_id=request.turn_id,
     )
     if (
@@ -1922,7 +1920,7 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
                 _latest_stored_turn_delivery_evidence(
                     runtime,
                     evidence_conversation_id,
-                    request_text=request.text,
+                    request_text=evidence_request_text,
                     turn_id=request.turn_id,
                 )
             )
@@ -2177,8 +2175,26 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
     failure_notice = artifact_terminal_failure_reply(stored_tool_results, user_message=request.text)
     if not attachment_paths and failure_notice:
         response_text = failure_notice
+    if suspended_for_approval:
+        # This request's verified native pause owns terminal delivery. File
+        # preparation and caption cleanup must not replace its control marker:
+        # messaging clients use it to render the actionable approval card.
+        response_text = text
+    # The stored canonical answer intentionally excludes activity. Restore the
+    # settings-backed shared presentation after all caption/receipt selection,
+    # rather than letting that selection silently discard /verbose details.
+    if (isinstance(response_text, str) and not suspended_for_approval
+            and not delivery_metadata.get("reply_already_sent")):
+        from nullion.chat_operator import activity_trace_enabled_for_chat
+        from nullion.run_activity import append_activity_trace_to_reply
+        from nullion.chat_text import render_user_message
+        response_text = render_user_message(append_activity_trace_to_reply(response_text or "", tool_results=stored_tool_results,
+            enabled=request.append_activity_trace and activity_trace_enabled_for_chat(
+                runtime, chat_id=request.chat_id or request.conversation_id)))
     return PlatformChatResponse(
         text=response_text,
+        suspended_for_approval=suspended_for_approval,
+        approval_id=approval_id if suspended_for_approval else None,
         artifact_paths=attachment_paths,
         artifact_candidate_paths=artifact_candidate_paths,
         reply_already_sent=bool(delivery_metadata.get("reply_already_sent", False)),
@@ -2241,7 +2257,11 @@ def _handle_text_message_accepts_kw(handler: object, name: str) -> bool:
 def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     ingress = state["ingress"]
     service = state["service"]
-    handler = service.handle_text_message
+    # Preserve the shared response's files, receipts and delivery ownership.
+    # The text-only compatibility method intentionally discards those fields.
+    handler = getattr(service, 'handle_text_request', None)
+    if not callable(handler):
+        handler = service.handle_text_message
 
     kwargs = {
         "text": ingress.text,
@@ -2306,7 +2326,12 @@ def _finalize_reply_node(state: MessagingTurnState) -> dict[str, object]:
     adapters.save_messaging_chat_history(ingress, reply)
     if runtime is not None:
         try:
-            runtime.checkpoint(force=True)
+            if marker is not None or fallbacks:
+                # Approval/control transitions retain their synchronous commit.
+                runtime.checkpoint(force=True)
+            else:
+                from nullion.runtime_checkpoints import checkpoint_request_completion
+                checkpoint_request_completion(runtime, conversation_id=ingress.operator_chat_id)
         except Exception:
             logger.debug("Unable to checkpoint messaging turn graph final state", exc_info=True)
     raw_reply_already_sent = bool(state.get("raw_reply_already_sent"))

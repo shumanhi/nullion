@@ -28,6 +28,22 @@ def test_resume_discards_only_quality_authority_and_keeps_native_receipts():
     assert without_quality_review(current)==current
 
 
+def test_removing_quality_state_preserves_only_owned_inspection_descriptors():
+    from nullion.workflow_reasoning import remember_review_inspections, inspect_review_evidence, retained_review_inspections
+    result = ToolResult('owned', 'opaque_read', 'completed', {'body':'Captured value 17.'})
+    cache = {'rows':['obsolete verdict'], 'approved':True}
+    windows = inspect_review_evidence([{'invocation_id':'owned','json_pointer':'/body'}],
+        results=[result], references={}, visible_ids={'owned'})
+    remember_review_inspections(cache, windows, results=[result], references={})
+    cache['retained_inspection_windows'][0]['content'] = 'forged copied fact'
+    state = without_quality_review({'completion_requirement_contract_cache':cache})
+    retained = state['completion_requirement_contract_cache']
+    assert set(retained) == {'retained_inspection_windows'}
+    assert 'forged' not in str(retained) and state['outcome_review_cache'] == {}
+    assert retained_review_inspections(retained, results=[result])[0]['content'] == 'Captured value 17.'
+    assert without_quality_review(state) == state
+
+
 def test_compatibility_result_preserves_missing_file_failure_and_valid_outputs():
     result=SimpleNamespace(outcome_review_receipt='obsolete', completion_review_handoff='obsolete',
         response_presentation={'outcome_review_role':'helper','native_failure':'file_missing'},
@@ -116,6 +132,25 @@ def test_requested_source_delivery_remains_selected_after_native_promotion():
     assert source_delivery_contract(state,[row]) == ((),())
 
 
+@pytest.mark.parametrize('extension', ['.png','.pdf','.csv','.html','.zip','.xlsx'])
+def test_explicit_source_delivery_uses_native_format_when_scope_omits_extension(extension):
+    scope = SimpleNamespace(valid=True, source_artifact_delivery_requested=True,
+        source_artifact_request_evidence='これを送って', requested_tool_names=('record_download',),
+        required_tool_names=(), requested_artifact_extensions=(), excluded_artifact_extensions=())
+    state = {'tool_registry':SimpleNamespace(turn_tool_scope_decision=scope),'user_message':'これを送って'}
+    row = ToolResult('download','record_download','completed',{'artifact_descriptors':[
+        {'path':'/artifacts/current'+extension,'role':'source','extension':extension}]})
+    contract, formats = source_delivery_contract(state,[row])
+    assert contract and formats == (extension,)
+    other = ToolResult('helper','browser_screenshot','completed',{'artifact_descriptors':[
+        {'path':'/artifacts/internal.png','role':'source'}]})
+    assert source_delivery_contract(state,[other,row]) == (contract,formats)
+    scope.excluded_artifact_extensions = (extension,)
+    assert source_delivery_contract(state,[row]) == ((),())
+    scope.excluded_artifact_extensions = (); scope.source_artifact_request_evidence = 'another request'
+    assert source_delivery_contract(state,[row]) == ((),())
+
+
 def test_current_readonly_scope_supersedes_stale_delivery_hint():
     from nullion.agent_orchestrator import _turn_has_artifact_delivery_contract, _required_attachment_extensions_from_turn_state
     state={'tool_registry':SimpleNamespace(_evidence=SimpleNamespace(requested_extensions=('.pdf',))),
@@ -190,3 +225,28 @@ def test_missing_media_caption_cannot_hide_native_failure(tmp_path, findings):
     assert 'MEDIA:' not in result.reply and '資料を添付しました。' not in result.reply
     assert result.reply.endswith('The requested file is not available for delivery.')
     if findings: assert findings.strip() in result.reply
+
+
+@pytest.mark.parametrize('variant',['authored','external','unwritten','reversed','replaced','failed','unselected','retrieval'])
+def test_authored_html_render_is_delivery_but_source_capture_is_not(tmp_path,variant):
+    from nullion.tools import ToolRegistry,ToolSpec,ToolSideEffectClass,ToolRiskLevel
+    registry=ToolRegistry()
+    for name,effect,source in [('page_write',ToolSideEffectClass.WRITE,False),('page_capture',ToolSideEffectClass.READ,True)]:
+        registry.register(ToolSpec(name,name,ToolRiskLevel.LOW,effect,False,10,
+            source_artifact_only=source,source_artifact_extensions=('.png',) if source else ()),lambda _:None)
+    registry.turn_tool_scope_decision=SimpleNamespace(valid=True,source_artifact_delivery_requested=False,
+        requested_tool_names=() if variant=='unselected' else ('page_capture',),required_tool_names=(),
+        requested_artifact_extensions=('.png',),source_artifact_retrieval_only=variant=='retrieval')
+    source=tmp_path/'素材.html';source.write_text('<h1>37</h1>')
+    capture=ToolResult('capture','page_capture','failed' if variant=='failed' else 'completed',{
+        'page_url':'https://example.com' if variant=='external' else source.as_uri(),
+        'artifact_descriptors':[{'path':str(tmp_path/'画像.png'),'role':'source'}]})
+    writer=ToolResult('write','page_write','completed',{'artifact_path':str(source)})
+    rows=[writer,capture]
+    if variant=='unwritten':rows=[capture]
+    if variant=='reversed':rows.reverse()
+    if variant=='replaced':rows.append(ToolResult('new','page_write','completed',{'artifact_path':str(source)}))
+    contract,formats=source_delivery_contract({'tool_registry':registry},rows)
+    if variant=='authored':
+        assert contract[0]['eligible_evidence_tool_names']==('page_capture',) and formats==('.png',)
+    else:assert (contract,formats)==((),())

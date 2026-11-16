@@ -73,14 +73,16 @@ def test_update_api_is_observation_only_until_protected_post(environment,tmp_pat
         assert conn.execute('SELECT status FROM update_operations').fetchone()==('completed',)
 
 
-def test_real_update_browser_uses_one_post_then_observes(environment,tmp_path,monkeypatch):
+def test_real_update_panel_uses_one_post_then_observes(environment,tmp_path,monkeypatch):
     from test_web_surface_contracts import _UvicornThread,_free_port,_open_page
     home,runtime=environment;_local_release(tmp_path,monkeypatch)
     with _UvicornThread(_app(runtime),_free_port()) as server:
         playwright,browser,page,errors=_open_page(server.base_url)
         requests=[];page.on('request',lambda req:requests.append((req.method,req.url)))
         try:
-            page.locator('#update-btn').click()
+            # Release visibility has separate UI coverage. This case exercises
+            # the update panel even when the installed release is current.
+            page.evaluate('openUpdate()')
             page.get_by_role('button',name='Check for updates',exact=True).click()
             expect(page.locator('#update-done-title')).to_have_text('Already up to date',timeout=15000)
             posts=[url for method,url in requests if method=='POST' and url.endswith('/api/update')]

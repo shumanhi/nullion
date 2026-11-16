@@ -237,6 +237,7 @@ def live_fixture(tmp_path, monkeypatch):
                 condition = (
                     {
                         "kind": "semantic",
+                        "history_mode": "records",
                         "instruction": "Alert only once the requested slot is actually available and include the slot label.",
                     }
                     if self.semantic
@@ -1116,7 +1117,7 @@ def test_two_expiries_require_reply_anchor_and_select_exact_tracker(live_fixture
 
 
 @pytest.mark.parametrize("option,expected", [("1","active again until"),("4","stay stopped")])
-def test_telegram_expiry_choice_runs_real_handler_once(live_fixture, monkeypatch, option, expected):
+def test_telegram_expiry_choice_runs_real_handler_once(live_fixture, monkeypatch, option, expected, record_property):
     import asyncio
     from datetime import timedelta
     from fastapi.testclient import TestClient
@@ -1165,10 +1166,22 @@ def test_telegram_expiry_choice_runs_real_handler_once(live_fixture, monkeypatch
         service=telegram_app.ChatOperatorService(runtime=f.runtime,settings=settings,
             bot_token=settings.telegram.bot_token,operator_chat_id="123",model_client=f.model,agent_orchestrator=f.orchestrator)
         update=SimpleNamespace(update_id=502,message=message)
+        samples=[]
         async def deliver():
-            await service.on_message(update,SimpleNamespace(bot=None))
-            await service.on_message(update,SimpleNamespace(bot=None))
+            for _ in range(2):
+                started=time.monotonic()
+                task=asyncio.create_task(service.on_message(update,SimpleNamespace(bot=None)))
+                done,_=await asyncio.wait({task},timeout=2)
+                if not done:
+                    task.cancel()
+                    await asyncio.wait({task},timeout=2)
+                assert done, 'The completed numeric action did not finish its typing keepalive'
+                await task
+                samples.append(time.monotonic()-started)
         asyncio.run(deliver())
+        record_property('telegram_choice_average_seconds',sum(samples)/len(samples))
+        record_property('telegram_choice_max_seconds',max(samples))
+        assert sum(samples)/len(samples)<1 and max(samples)<2
         assert len([s for s in wire if expected in s])==1,wire
         assert len(store.list("workspace_admin"))==1
         assert store.get(job["id"])["state"]==("active" if option=="1" else "stopped")
@@ -1441,7 +1454,7 @@ def test_real_browser_connection_failure_pauses_with_specific_repair_notice(live
             'name':'Browser connection watch','duration_seconds':90,'interval_seconds':5,
             'conversation_id':'web:browser-health',
             'probe':[{'tool_name':'browser_navigate','arguments':{'url':'https://example.com'}}],
-            'matcher':{'kind':'semantic','instruction':'観測'},
+            'matcher':{'kind':'semantic','instruction':'観測','history_mode':'snapshot'},
         })
         assert response.status_code==200,response.json()
         wait_for(lambda: client.get('/api/live-trackers').json()['trackers'][0]['state']=='blocked',timeout=35)
@@ -1910,7 +1923,7 @@ def test_browser_setup_repairs_scope_large_read_and_condition_then_delivers_new_
         phase+=1
         blocks=[b for m in kw['messages'] for b in (m.get('content') if isinstance(m.get('content'),list) else []) if isinstance(b,dict) and b.get('type')=='tool_result']
         latest='\n'.join(c.get('text','') for b in blocks[-1:] for c in b.get('content',[]) if isinstance(c,dict))
-        if phase==1:return use('request_tool_scope',{'tracking_mode':'live','capabilities':['live_tracking','web'],
+        if phase==1:return use('request_tool_scope',{'tracking_mode':'live','capabilities':['live_tracking','web'],'research_effort':'extended',
             'tool_names':['browser_navigate','browser_extract_items','browser_extract_text','create_live_tracker'],
             'required_tool_names':['create_live_tracker']})
         if phase==2:return use('browser_navigate',{'url':url})
@@ -2051,7 +2064,7 @@ def test_semantic_new_article_history_survives_edits_and_worker_restart(live_fix
         response=original(**kw)
         for block in response.get('content',[]):
             if block.get('name')=='create_live_tracker':block['input']['matcher']={'kind':'semantic',
-                'instruction':'Alert only for a newly appearing article URL after the baseline; ignore known URLs and headline edits.'}
+                'instruction':'Alert only for a newly appearing article URL after the baseline; ignore known URLs and headline edits.','history_mode':'records'}
         return response
     f.model.create=provider;cid='web:new-article-history';restarted=None
     try:

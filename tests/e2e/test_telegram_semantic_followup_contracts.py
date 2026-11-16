@@ -151,7 +151,7 @@ def test_telegram_completed_context_and_overlapping_semantic_followup(tmp_path, 
     else:
         assert any(mid == 3 and "bicycle" in text for mid, text in sent)
         assert all(mid != 3 or text != "Got it — I’ll continue from the current request." for mid, text in sent)
-    assert any(mid == 2 and text == "⌛ On it! Feel free to send other tasks — I can handle multiple at once." for mid, text in sent)
+    assert sum(mid == 2 and "listing is available" in text for mid, text in sent) == 1
     loaded = load_runtime_store(tmp_path / "runtime.db")
     child = loaded.get_conversation_turn("telegram-update:3")
     assert child.parent_turn_id == ("telegram-update:2" if relationship == "follow_up" else None)
@@ -216,4 +216,4 @@ def test_web_numeric_followup_does_not_revive_old_scheduler_scope(tmp_path, monk
     assert len(model.foreground) == 2
     choice = runtime.store.get_conversation_turn("choice")
     assert choice.parent_turn_id == "current"
-    assert choice.disposition_reason == "dispatch:numbered_option_reply"
+    assert choice.disposition_reason in {"dispatch:numbered_option_reply", "dispatch:numbered_conversation_choice"}

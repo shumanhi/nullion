@@ -6490,7 +6490,8 @@ def test_websocket_chat_streams_tool_activity_before_final_reply(tmp_path, monke
             })
 
             saw_live_tool_activity = False
-            for _ in range(20):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
                 event = websocket.receive_json()
                 assert event["type"] != "chunk"
                 if (
@@ -6499,6 +6500,8 @@ def test_websocket_chat_streams_tool_activity_before_final_reply(tmp_path, monke
                     and "web_fetch" in event.get("detail", "")
                 ):
                     saw_live_tool_activity = True
+                    break
+                if event["type"] in {"response", "error"}:
                     break
 
             assert saw_live_tool_activity

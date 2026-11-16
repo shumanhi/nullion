@@ -15,13 +15,31 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1', reason='co
 from tests.source_answer_fixture import source_presentation_response
 
 
+@pytest.fixture
+def public_source_pages(monkeypatch):
+    """Real native prereads; only the delegated external provider is simulated."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND','playwright')
+    monkeypatch.setenv('NULLION_BROWSER_HEADLESS','true')
+    monkeypatch.setenv('NULLION_BROWSER_BLOCK_PRIVATE','false')
+    class Site(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.end_headers()
+            self.wfile.write(b'<html><main><h1>Current availability</h1><p>Opening time: 19:30.</p></main></html>')
+        def log_message(self,*args):pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Site)
+    threading.Thread(target=server.serve_forever,daemon=True).start()
+    try:yield f'http://localhost:{server.server_port}'
+    finally:server.shutdown();server.server_close()
+
+
 @pytest.mark.parametrize('prompt,requested,alternative,partial,recorded', [
     ('Find current opening times. No screenshots or other attachments are requested.', False, False, False, False),
     ('今の営業時間を教えて', False, True, True, False),
     ('Check availability and send a screenshot', True, False, True, False),
     ('近くの場所を比較してください', False, False, True, True),
 ])
-def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, monkeypatch, prompt, requested, alternative, partial, recorded, source_summary_model_reply):
+def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, monkeypatch, prompt, requested, alternative, partial, recorded, source_summary_model_reply, public_source_pages):
     from fastapi.testclient import TestClient
     from PIL import Image
     from nullion import web_app
@@ -65,8 +83,11 @@ def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, mo
             if self.calls==1:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'scope','name':'request_tool_scope','input':{'capabilities':['web'],'tool_names':['browser_run_task'],'required_tool_names':['browser_run_task'],'artifact_extensions':['.png'], 'source_artifact_delivery_requested':requested, 'source_artifact_request_evidence':prompt if requested else ''}}]}
             if self.calls==2 or alternative and self.calls==3:
-                target='https://second.example/' if self.calls==3 else 'https://first.example/'
-                return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(self.calls),'name':'browser_run_task','input':{'task':prompt,'url':target}}]}
+                target=public_source_pages+('/second' if self.calls==3 else '/first')
+                reads=[{'type':'tool_use','id':'native-read','name':'browser_read_pages','input':{
+                    'independent_pages':True,'pages':[{'url':public_source_pages+path,'read_kind':'text'}
+                        for path in (('/first','/second') if alternative else ('/first',))]}}] if self.calls==2 else []
+                return {'stop_reason':'tool_use','content':[*reads,{'type':'tool_use','id':str(self.calls),'name':'browser_run_task','input':{'task':prompt,'url':target,'execution_kind':'adaptive_interaction','interaction_reason':'Exercise the delegated evidence and delivery contract after the native read'}}]}
             if recorded:
                 value='- **Riverfront Park** — Hudson Ave. [Source 1](https://example.com/places)\n\n- **The Peekskill Museum** — 124 Union Ave; (914) 736-0473. [Source 1](https://example.com/places)'
             else: value='Current opening time: 19:30.'
@@ -166,7 +187,7 @@ def test_long_telegram_code_preserves_literal_content_in_every_delivered_chunk(t
 
 
 @pytest.mark.parametrize('editable', [True, False])
-def test_streamed_telegram_final_reply_has_a_real_delivery_receipt(tmp_path, monkeypatch, editable):
+def test_completed_telegram_reply_skips_preview_and_has_a_real_delivery_receipt(tmp_path, monkeypatch, editable):
     from nullion.telegram_app import _deliver_reply, ChatStreamingMode
     monkeypatch.setenv('NULLION_DATA_DIR', str(tmp_path))
     wire=[]
@@ -183,8 +204,7 @@ def test_streamed_telegram_final_reply_has_a_real_delivery_receipt(tmp_path, mon
     reply='This is a complete readable report. ' * 12
     asyncio.run(_deliver_reply(Message(), reply, principal_id='telegram:100',
                               streaming_mode=ChatStreamingMode.MESSAGE_EDITS, request_id='streamed-final'))
-    assert len(wire)>1
-    assert wire[-1][1]==reply.strip() if editable else ''.join(text for _,text in wire)==reply.strip()
+    assert wire == [('send', reply.strip())], 'Completed text must not be replayed as synthetic deltas'
     receipts=[json.loads(line) for line in (tmp_path/'delivery_receipts.jsonl').read_text().splitlines()]
     assert len(receipts)==1 and receipts[0]['status']=='succeeded'
     assert receipts[0]['message_id']==str(101 if editable else len(wire)+100)
@@ -282,7 +302,7 @@ def test_plain_chat_with_browser_installed_stays_on_fast_path(tmp_path, monkeypa
     assert max(elapsed) < 1, elapsed
 
 
-def test_validated_scope_clears_stale_capture_requirement_in_real_turn(tmp_path, monkeypatch, source_summary_model_reply):
+def test_validated_scope_clears_stale_capture_requirement_in_real_turn(tmp_path, monkeypatch, source_summary_model_reply, public_source_pages):
     from PIL import Image
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.plugins.browser_plugin import register_browser_tools, browser_use_worker
@@ -312,7 +332,10 @@ def test_validated_scope_clears_stale_capture_requirement_in_real_turn(tmp_path,
                 name, args = 'request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_run_task'],
                     'required_tool_names': ['browser_run_task'], 'artifact_extensions': [], 'source_artifact_delivery_requested': False}
             elif self.calls == 2:
-                name, args = 'browser_run_task', {'task': '予約時間', 'url': 'https://example.com/'}
+                url = public_source_pages+'/'
+                return {'stop_reason':'tool_use','content':[
+                    {'type':'tool_use','id':'native-read','name':'browser_read_pages','input':{'pages':[{'url':url,'read_kind':'text'}]}},
+                    {'type':'tool_use','id':str(self.calls),'name':'browser_run_task','input':{'task':'予約時間','url':url,'execution_kind':'adaptive_interaction','interaction_reason':'Inspect the captured booking controls'}}]}
             else:
                 return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': '19:30'}]}
             return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(self.calls), 'name': name, 'input': args}]}

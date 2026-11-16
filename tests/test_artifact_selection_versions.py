@@ -99,3 +99,22 @@ def test_nonlocal_write_tools_cannot_enter_artifact_edit_recovery(tmp_path, effe
         'review_decision':'revise','retryable':True,'recovery':plan_revision_recovery('opaque')})
     state = {'tool_registry':registry,'tool_results':rows,'tool_flow_context':{'required_artifact_extensions':['.html']}}
     assert not _retained_artifact_reproposal_paths(state, ToolInvocation('rejected','opaque','p',{'path':str(path)}), result, rows)
+
+
+@pytest.mark.parametrize('kind',['current','mapping','continuation','input','changed','symlink','valid'])
+def test_native_table_repair_requires_current_stable_write(tmp_path,kind):
+    from nullion.agent_orchestrator import _verified_delimited_artifact_repairs
+    path=tmp_path/'table.csv'
+    path.write_text('Name,Value\nRecord,12\n' if kind=='valid' else 'METADATA\nName,Value\nRecord,12\n')
+    if kind=='symlink':
+        link=tmp_path/'link.csv';link.symlink_to(path);path=link
+    signature=(path.stat().st_size,path.stat().st_mtime_ns)
+    row={'invocation_id':'continuation:old' if kind=='continuation' else 'writer',
+        'tool_name':'file_read' if kind=='input' else 'file_write','status':'completed',
+        'output':{'artifact_path':str(path)}}
+    if kind=='changed':path.write_text(path.read_text()+'Changed,1\n')
+    result=row if kind=='mapping' else ToolResult(**row)
+    state={'tool_results':[result],'artifact_selection_signatures':{str(path):signature}}
+    repairs=_verified_delimited_artifact_repairs(state,[str(path)])
+    assert bool(repairs)==(kind in {'current','mapping'})
+    if repairs:assert repairs[0]['path']==str(path)

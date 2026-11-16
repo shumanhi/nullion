@@ -32,8 +32,8 @@ def test_status_creation_is_serialized_across_event_loops(text):
     assert not errors and not thread.is_alive()
     assert calls == [('send', text), ('edit', 7)]
 
-@pytest.mark.parametrize('requested', [(), ('.pdf',), ('.png',)])
-def test_browser_evidence_role_comes_from_typed_delivery_contract(tmp_path, monkeypatch, requested):
+@pytest.mark.parametrize('requested,deliver_source', [((),False), (('.pdf',),False), (('.png',),False), (('.png',),True)])
+def test_browser_evidence_role_comes_from_typed_delivery_contract(tmp_path, monkeypatch, requested, deliver_source):
     from nullion.plugins.browser_plugin import browser_use_worker
     path=tmp_path/'arbitrary-name.png';path.write_bytes(b'png')
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_python', lambda: '/worker/python')
@@ -41,10 +41,11 @@ def test_browser_evidence_role_comes_from_typed_delivery_contract(tmp_path, monk
         'result_kind':'source_observations', 'report_status':'completed', 'artifact_paths':[str(path)],
         'observations':[], 'unknowns':[]})
     result=browser_task_handler(lambda: object(), BrowserPolicy())(ToolInvocation('i','browser_run_task','different-user',
-        {'task':'調べて', 'url':'https://example.net'}, flow_context={'requested_artifact_extensions':requested}))
+        {'task':'調べて', 'url':'https://example.net'}, flow_context={'requested_artifact_extensions':requested,
+            'source_artifact_delivery_requested':deliver_source}))
     assert result.status == 'completed'
     delivered=_artifact_paths_from_tool_result(result)
-    if '.png' in requested:
+    if '.png' in requested and deliver_source:
         assert len(delivered)==1
         assert Path(delivered[0]).read_bytes()==path.read_bytes()
         assert Path(delivered[0]).parent.name=='artifacts'

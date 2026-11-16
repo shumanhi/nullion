@@ -272,10 +272,6 @@ _SERVER_STARTED_AT = datetime.now(UTC).isoformat()
 _WEB_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
 _WEB_STABLE_CONTEXT_CACHE: dict[tuple[object, ...], tuple[dict[str, object], ...]] = {}
 _WEB_STABLE_CONTEXT_CACHE_LOCK = threading.RLock()
-_WEB_CHECKPOINT_LOCK = threading.RLock()
-_WEB_CHECKPOINT_INFLIGHT: dict[int, object] = {}
-_WEB_CHECKPOINT_DIRTY: set[int] = set()
-_WEB_CHECKPOINT_FORCE: set[int] = set()
 _WEB_TURN_SLOW_LOG_MS = 1200.0
 _WEB_AUTO_HISTORY_CONTEXT_LIMIT = 8
 _WEB_AUTO_HISTORY_CONTEXT_MIN_SCORE = 2
@@ -3055,6 +3051,9 @@ _HTML = r"""<!DOCTYPE html>
   }
   .logs-empty { color: var(--muted); padding: 24px 16px; }
   .msg.bot .bubble.thinking { color: var(--muted); font-style: italic; }
+  .msg.bot .bubble.status-bubble.request-progress-bubble {
+    font-size: 12px; line-height: 1.4; font-style: normal; padding: 8px 12px;
+  }
   .msg.bot .bubble.typing-bubble {
     display: inline-flex; align-items: center; gap: 9px;
     min-width: 108px; color: var(--muted); font-style: normal;
@@ -7934,6 +7933,13 @@ function setBotStatus(text, turnId = null) {
   return bubble;
 }
 
+function setBotProgress(text, turnId = null) {
+  const bubble = turnId ? (_botTurnBubbles.get(turnId) || findBotBubbleByTurnId(turnId)) : botMsgEl;
+  // Progress may update a provisional status, never erase producer text.
+  if (bubble && bubble.dataset.rawText) return;
+  if (text) setBotStatus(text, turnId).classList.add('request-progress-bubble');
+}
+
 // ── WebSocket chat ────────────────────────────────────────────────────────────
 
 function _websocketReconnectDelayMs() {
@@ -7996,6 +8002,8 @@ async function connect() {
         addThinkingBlock(data.text || '', data.turn_id || null);
       } else if (data.type === 'activity') {
         updateRunActivity(data);
+      } else if (data.type === 'progress') {
+        if (!data.turn_id || !_finishedTurnIds.has(data.turn_id)) setBotProgress(data.text || '', data.turn_id || null);
       } else if (data.type === 'task_status') {
         if (data.conversation_id && data.conversation_id !== conversationId) return;
         const showTaskActivity = activityEnabledForTaskStatus(data);
@@ -8312,7 +8320,7 @@ async function sendMessage() {
   resetRunActivity(turnId);
   if (plannerRequested && activityTraceEnabled) _activityForcedTurnIds.add(turnId);
   beginTurnUi(turnId, displayText);
-  showBotTyping('Thinking', turnId);
+  setBotProgress(window.__NULLION_REQUEST_ACK__ || 'Thinking', turnId);
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ text, attachments: outgoingAttachments, conversation_id: conversationId, activity_trace: activityTraceEnabled, show_thinking: thinkingDisplayEnabled, stream: chatStreamingEnabled, turn_id: turnId }));
     return;
@@ -8321,7 +8329,24 @@ async function sendMessage() {
 }
 
 async function sendHttpMessage(text, turnId = null, attachments = []) {
-  showBotTyping('Thinking', turnId);
+  setBotProgress(window.__NULLION_REQUEST_ACK__ || 'Thinking', turnId);
+  let progressClosed = false;
+  const progressConversation = conversationId;
+  async function pollProgress() {
+    if (progressClosed || !turnId) return;
+    try {
+      const params = new URLSearchParams({turn_id: turnId, conversation_id: progressConversation});
+      const response = await fetch('/api/chat/progress?' + params, {cache: 'no-store'});
+      if (response.ok) {
+        const progress = await response.json();
+        if (!progressClosed && progress.active && progress.text && !_finishedTurnIds.has(turnId)) {
+          setBotProgress(progress.text, turnId);
+        }
+      }
+    } catch (_) { /* Progress transport cannot fail or resubmit the request. */ }
+    if (!progressClosed) setTimeout(pollProgress, 1000);
+  }
+  setTimeout(pollProgress, 250);
   try {
     const r = await fetch('/api/chat', {
       method: 'POST',
@@ -8362,6 +8387,8 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
     finishTurnUi();
     setStatus(false, 'Offline');
     scheduleWebsocketReconnect('Offline');
+  } finally {
+    progressClosed = true;
   }
 }
 
@@ -9048,6 +9075,7 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
     </div>`;
   messages.appendChild(div);
   ensureBubbleTimestamp(div.querySelector('.bubble'));
+  addArtifactLinks(div.querySelector('.bubble'), display.artifacts || []);
   scrollMessagesToBottom();
 }
 
@@ -15502,6 +15530,8 @@ async function checkForUpdates() {
     if (v.has_update) {
       btn.textContent = `Update (${v.latest})`;
       btn.style.display = 'flex';
+    } else {
+      btn.style.display = 'none';
     }
   } catch(e) { /* silent */ }
 }
@@ -19772,6 +19802,9 @@ def _hydrate_chat_history_media(
     hydrated: list[dict[str, Any]] = []
     for message in messages:
         item = dict(message)
+        if str(item.get("role") or "").lower() == "bot":
+            from nullion.chat_text import render_user_message
+            item["text"] = render_user_message(str(item.get("text") or ""))
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         artifacts = _chat_media_payloads_from_metadata(runtime, metadata, "artifacts", principal_id=principal_id)
         attachments = _chat_media_payloads_from_metadata(runtime, metadata, "attachments", principal_id=principal_id)
@@ -21329,8 +21362,16 @@ def create_app(runtime, orchestrator, registry):
     globals()["WebSocket"] = WebSocket
 
     app = FastAPI(title="Nulliøn Web UI")
+    async def _drain_runtime_checkpoints():
+        from nullion.runtime_checkpoints import wait_runtime_checkpoints
+        await asyncio.to_thread(wait_runtime_checkpoints, runtime, timeout=5)
+    app.router.on_shutdown.append(_drain_runtime_checkpoints)
     from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker
     web_turn_tracker = AsyncTurnDispatchTracker()
+    # Transport snapshots only: execution and wording still come from the
+    # shared request callback. HTTP clients can observe the same progress as WS.
+    http_progress = {}
+    http_progress_lock = threading.Lock()
     try:
         if registry is not None:
             runtime.active_tool_registry = registry
@@ -22294,6 +22335,7 @@ def create_app(runtime, orchestrator, registry):
         delivery_channel: str,
         delivery_target: str,
         delivered_text: str,
+        browser_recovery_choices=(),
     ) -> None:
         try:
             store = runtime.store
@@ -22304,6 +22346,7 @@ def create_app(runtime, orchestrator, registry):
                 delivery_channel=delivery_channel,
                 delivery_target=delivery_target,
                 delivered_text=delivered_text,
+                browser_recovery_choices=browser_recovery_choices,
             )
             from nullion.cron_delivery import checkpoint_cron_delivery_records
             if event is not None:
@@ -22579,7 +22622,8 @@ def create_app(runtime, orchestrator, registry):
                         logger.warning("Could not save tracker notification history", exc_info=True)
                 _record_cron_delivery_event("cron.tracker_status.sent", job, channel, target, conv_id, notification_kind=kind)
                 try:
-                    runtime.checkpoint(force=True)
+                    from nullion.runtime_checkpoints import checkpoint_request_completion
+                    checkpoint_request_completion(runtime, conversation_id=conv_id)
                 except Exception:
                     logger.warning("Could not checkpoint tracker notification receipt", exc_info=True)
             return delivered
@@ -23398,10 +23442,13 @@ def create_app(runtime, orchestrator, registry):
     @app.get("/", response_class=HTMLResponse)
     async def index():
         from nullion.preferences import time_presentation_context
+        from nullion.chat_text import WORKING_ACK_SUMMARY, UserMessage, render_user_message
+        acknowledgement = render_user_message(UserMessage(summary=WORKING_ACK_SUMMARY.removesuffix('.'), kind='update'))
         bootstrap = (
             "<script>"
             f"window.__NULLION_CSRF_TOKEN__ = {json.dumps(csrf_token)};"
             f"window.__NULLION_SLASH_COMMANDS__ = {json.dumps(operator_command_suggestions())};"
+            f"window.__NULLION_REQUEST_ACK__ = {json.dumps(acknowledgement)};"
             f"window.__NULLION_TIME_PRESENTATION__ = {json.dumps(time_presentation_context())};"
             "</script>"
         )
@@ -27822,41 +27869,10 @@ def create_app(runtime, orchestrator, registry):
 
     @app.get("/api/version")
     async def get_version():
-        """Check current version and whether an update is available (git)."""
-        import subprocess
-        repo_root = Path(__file__).resolve().parents[2]
-        try:
-            current = subprocess.check_output(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=str(repo_root),
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
-        except Exception:
-            current = "unknown"
-
-        has_update = False
-        remote_hash = ""
-        try:
-            subprocess.check_call(
-                ["git", "fetch", "--quiet"],
-                cwd=str(repo_root),
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-            remote_hash = subprocess.check_output(
-                ["git", "rev-parse", "--short", "origin/main"],
-                cwd=str(repo_root),
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
-            has_update = bool(remote_hash and remote_hash != current)
-        except Exception:
-            pass
-
-        return JSONResponse({
-            "current": current,
-            "latest":  remote_hash or current,
-            "has_update": has_update,
-        })
+        """Use the same cached release target as messaging and /update."""
+        from dataclasses import asdict
+        from nullion.update_notifications import check_available_update
+        return JSONResponse(asdict(await asyncio.to_thread(check_available_update, runtime)))
 
     @app.post("/api/reject/{approval_id}")
     async def reject(approval_id: str):
@@ -27871,11 +27887,20 @@ def create_app(runtime, orchestrator, registry):
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
+    @app.get('/api/chat/progress')
+    async def chat_http_progress(turn_id: str, conversation_id: str):
+        with http_progress_lock:
+            entry = http_progress.get((conversation_id, turn_id))
+            return JSONResponse({'type':'progress', 'turn_id':turn_id,
+                'conversation_id':conversation_id, 'active':entry is not None,
+                'text':entry['text'] if entry is not None and entry['owner'].publication_gate.can_publish() else ''})
+
     @app.post("/api/chat")
     async def chat_http(request: Request):
         """HTTP chat fallback for environments where WebSocket upgrades fail."""
         conv_id = "web:0"
         registration = None
+        progress_key = None
         try:
             try:
                 payload = await request.json()
@@ -27925,7 +27950,19 @@ def create_app(runtime, orchestrator, registry):
                         user_text, attachments=attachments,
                     ),
                 )
+                progress_key = (conv_id, payload['turn_id'])
+                with http_progress_lock:
+                    http_progress.setdefault(progress_key, {'owner':registration, 'text':''})
                 await registration.wait_for_dependencies()
+
+            def http_activity(event):
+                if event.get('status_kind') != 'request_progress' or progress_key is None:
+                    return
+                if registration is not None and not registration.publication_gate.can_publish():
+                    return
+                with http_progress_lock:
+                    if progress_key in http_progress and http_progress[progress_key]['owner'] is registration:
+                        http_progress[progress_key]['text'] = event['text']
 
             def _shared_platform_chat_turn(*, allow_mini_agents: bool = False):
                 return _run_shared_web_platform_chat_turn(
@@ -27936,6 +27973,7 @@ def create_app(runtime, orchestrator, registry):
                     request_payload=payload,
                     turn_dispatch_decision=registration.decision if registration is not None else None,
                     cancellation_checker=registration.is_cancelled if registration is not None else None,
+                    activity_callback=http_activity,
                 )
 
             def _http_platform_chat_message_payload(result: object) -> dict[str, object]:
@@ -27959,7 +27997,8 @@ def create_app(runtime, orchestrator, registry):
                     return JSONResponse({"type": "message", "text": "", "superseded": True, "artifacts": []})
                 if result.suspended_for_approval:
                     return JSONResponse(_web_approval_required_payload(
-                        {"approval_id": result.approval_id or "", "is_web_request": True},
+                        {"approval_id": result.approval_id or "", "is_web_request": True,
+                        "artifacts": _shared_web_platform_chat_artifacts(result, conversation_id=conv_id, user_text=user_text)},
                         default_tool_name="tool",
                         runtime=runtime, turn_id=payload.get("turn_id"),
                     ))
@@ -27970,7 +28009,8 @@ def create_app(runtime, orchestrator, registry):
                 return JSONResponse({"type": "message", "text": "", "superseded": True, "artifacts": []})
             if result.suspended_for_approval:
                 return JSONResponse(_web_approval_required_payload(
-                    {"approval_id": result.approval_id or "", "is_web_request": True},
+                    {"approval_id": result.approval_id or "", "is_web_request": True,
+                        "artifacts": _shared_web_platform_chat_artifacts(result, conversation_id=conv_id, user_text=user_text)},
                     default_tool_name="tool",
                     runtime=runtime, turn_id=payload.get("turn_id"),
                 ))
@@ -27989,6 +28029,10 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"type": "error", "text": f"Error: {_short_error_text(exc)}"}, status_code=500)
 
         finally:
+            if progress_key is not None:
+                with http_progress_lock:
+                    if http_progress.get(progress_key, {}).get('owner') is registration:
+                        http_progress.pop(progress_key, None)
             if registration is not None:
                 await registration.finish()
 
@@ -28014,7 +28058,7 @@ def create_app(runtime, orchestrator, registry):
         async def send_websocket_event(event: dict[str, Any]) -> None:
             registration = turn_registrations.get(str(event.get("turn_id") or ""))
             if registration is not None and event.get("type") in {
-                "chunk", "done", "thinking", "approval_required", "task_status", "error",
+                "chunk", "done", "thinking", "approval_required", "task_status", "error", "progress",
             }:
                 if not await registration.publication_gate.wait():
                     turn_id = registration.turn_id
@@ -28099,7 +28143,6 @@ def create_app(runtime, orchestrator, registry):
             from nullion.chat_streaming import (
                 WEB_CHAT_CAPABILITIES,
                 ChatStreamingMode,
-                iter_chat_text_chunks,
                 select_chat_streaming_mode,
             )
             stream_requested = payload.get("stream", payload.get("streaming", None))
@@ -28115,13 +28158,9 @@ def create_app(runtime, orchestrator, registry):
                 return event
 
             async def send_reply_text(reply_text: str) -> None:
-                if web_streaming_mode is ChatStreamingMode.CHUNKS:
-                    for index, chunk in enumerate(iter_chat_text_chunks(reply_text)):
-                        await send_websocket_event(turn_payload({"type": "chunk", "text": chunk}))
-                        if index % 8 == 0:
-                            await asyncio.sleep(0.02)
-                else:
-                    await send_websocket_event(turn_payload({"type": "chunk", "text": reply_text}))
+                # Producer deltas already stream while inference is running.
+                # Completed/fallback text must appear without an artificial reveal.
+                await send_websocket_event(turn_payload({"type": "chunk", "text": reply_text}))
 
             def websocket_activity_events(event: dict[str, str]) -> list[dict[str, str]]:
                 events = [event]
@@ -28148,6 +28187,10 @@ def create_app(runtime, orchestrator, registry):
                     await send_websocket_event(turn_payload({"type": "thinking", "text": str(text).strip()}))
 
             def emit_activity_event(event: dict[str, str]) -> None:
+                if event.get('status_kind') == 'request_progress':
+                    asyncio.run_coroutine_threadsafe(send_websocket_event(turn_payload({
+                        'type': 'progress', 'text': event['text']})), loop)
+                    return
                 if not activity_trace_enabled:
                     return
                 try:
@@ -28583,9 +28626,15 @@ def _web_approval_required_payload(
                     token = dict(suspended.resume_token or {})
                     token["conversation_turn_id"] = turn_id
                     store.add_suspended_turn(replace(suspended, resume_token=token))
-                    checkpoint = getattr(runtime, "checkpoint", None)
-                    if callable(checkpoint):
-                        checkpoint()
+                    from nullion.runtime import PersistentRuntime
+                    if isinstance(runtime, PersistentRuntime):
+                        from nullion.runtime_persistence import checkpoint_pending_approvals
+                        checkpoint_pending_approvals(store, runtime.checkpoint_path, [approval_id])
+                        _schedule_web_checkpoint(runtime)
+                    else:
+                        checkpoint = getattr(runtime, "checkpoint", None)
+                        if callable(checkpoint):
+                            checkpoint()
         except Exception:
             approval = None
         if approval is not None:
@@ -28611,6 +28660,7 @@ def _web_approval_required_payload(
             visible_text = "Nullion paused before continuing. Review the approval card to continue or deny the action."
     return {
         "type": "approval_required",
+        **({"artifacts": list(result["artifacts"])} if result.get("artifacts") else {}),
         **({"turn_id": turn_id} if turn_id else {}),
         "text": visible_text,
         "approval_id": approval_id,
@@ -30131,6 +30181,7 @@ def _web_ambiguity_classifier(
             decision = route_turn_dispatch_with_context(
                 text,
                 active_turn_ids=("recent-branch",),
+                target_context_selected=True,
                 active_turn_texts=(active_turn_text,),
                 model_client=model_client,
             )
@@ -30259,6 +30310,10 @@ def _compact_web_tool_output_for_context(
     if tool_name == "request_tool_scope" and isinstance(redacted, dict):
         from nullion.source_selection import compact_scope_evidence
         return compact_scope_evidence(redacted, original_chars=len(encoded))
+    from nullion.source_context_projection import compact_native_page_history
+    native_pages=compact_native_page_history(redacted,max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if native_pages is not None:
+        return native_pages
     from nullion.source_selection import compact_source_identity_evidence
     identity_evidence = compact_source_identity_evidence(redacted, encoded=encoded,
         max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
@@ -30726,67 +30781,8 @@ def _feature_enabled(name: str, *, default: bool = True) -> bool:
 
 
 def _schedule_web_checkpoint(runtime, *, force: bool = False) -> None:
-    if runtime is None:
-        return
-    runtime_id = id(runtime)
-
-    with _WEB_CHECKPOINT_LOCK:
-        if force:
-            _WEB_CHECKPOINT_FORCE.add(runtime_id)
-        if runtime_id in _WEB_CHECKPOINT_INFLIGHT:
-            _WEB_CHECKPOINT_DIRTY.add(runtime_id)
-            return
-        owner = object()
-        _WEB_CHECKPOINT_INFLIGHT[runtime_id] = owner
-
-    def _retire() -> None:
-        # Caller holds the lock. A new writer may already own this runtime
-        # when the previous thread reaches its finally block.
-        if _WEB_CHECKPOINT_INFLIGHT.get(runtime_id) is owner:
-            _WEB_CHECKPOINT_INFLIGHT.pop(runtime_id, None)
-            _WEB_CHECKPOINT_DIRTY.discard(runtime_id)
-            _WEB_CHECKPOINT_FORCE.discard(runtime_id)
-
-    def _run() -> None:
-        try:
-            while True:
-                with _WEB_CHECKPOINT_LOCK:
-                    requested_force = runtime_id in _WEB_CHECKPOINT_FORCE
-                    _WEB_CHECKPOINT_FORCE.discard(runtime_id)
-                    # Requests already queued are covered by this pass. Only
-                    # requests arriving during the save need another pass.
-                    _WEB_CHECKPOINT_DIRTY.discard(runtime_id)
-                try:
-                    checkpoint_kwargs: dict[str, object] = {}
-                    if requested_force:
-                        try:
-                            checkpoint_signature = inspect.signature(runtime.checkpoint)
-                            if "force" in checkpoint_signature.parameters or any(
-                                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                                for parameter in checkpoint_signature.parameters.values()
-                            ):
-                                checkpoint_kwargs["force"] = True
-                        except (TypeError, ValueError):
-                            checkpoint_kwargs["force"] = True
-                    runtime.checkpoint(**checkpoint_kwargs)
-                except Exception:
-                    logger.debug("Unable to run web checkpoint", exc_info=True)
-                with _WEB_CHECKPOINT_LOCK:
-                    if runtime_id in _WEB_CHECKPOINT_DIRTY:
-                        _WEB_CHECKPOINT_DIRTY.remove(runtime_id)
-                        continue
-                    _retire()
-                    return
-        finally:
-            with _WEB_CHECKPOINT_LOCK:
-                _retire()
-
-    try:
-        threading.Thread(target=_run, daemon=True).start()
-    except BaseException:
-        with _WEB_CHECKPOINT_LOCK:
-            _retire()
-        raise
+    from nullion.runtime_checkpoints import schedule_runtime_checkpoint
+    schedule_runtime_checkpoint(runtime, force=force)
 
 
 def _smart_cleanup_enabled() -> bool:

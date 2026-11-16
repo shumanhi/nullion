@@ -65,7 +65,7 @@ def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tr
     def create_tracker():
         return use('create_live_tracker', {'name': 'Selected new records', 'stop_after_match':False, 'interval_seconds': 900,
             'duration_seconds': 14400, 'source_refresh': 'navigate', 'probe': state.probe,
-            'matcher': {'kind': 'semantic', 'instruction': 'Notify on newly appearing record URLs after the baseline; ignore existing records.'}})
+            'matcher': {'kind': 'semantic', 'history_mode': 'records', 'instruction': 'Notify on newly appearing record URLs after the baseline; ignore existing records.'}})
     def provider(**kw):
         system = kw.get('system', '')
         if 'Workflow action preflight.' in system:

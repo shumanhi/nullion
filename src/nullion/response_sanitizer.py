@@ -192,6 +192,17 @@ def sanitize_user_visible_reply(
     """Keep the producer's source-summary provenance separate from final copy."""
     if tool_results is not None:
         tool_results = list(tool_results)
+    if tool_results:
+        from nullion.chat_text import render_tool_user_choice
+        latest = tool_results[-1]
+        output = latest.get('output') if isinstance(latest, Mapping) else getattr(latest, 'output', None)
+        if choice := render_tool_user_choice(output):
+            if presentation_metadata is not None:
+                presentation_metadata.update(kind='clarification', needs_input=True)
+            # Earlier source records cannot replace an unresolved current tool
+            # question. Apply the same path/style sanitation without selecting
+            # another answer from those earlier records.
+            return _sanitize_reply_style(_sanitize_local_paths(choice))
     from nullion.request_delivery_requirements import reviewed_action_reply_matches
     defer_action_receipts = defer_action_receipts or reviewed_action_reply_matches(tool_results, user_message, reply)
     path_token = _LOCAL_PATH_DETAIL_EVIDENCE.set(_requested_source_local_paths(tool_results))
@@ -248,7 +259,9 @@ def _sanitize_user_visible_reply(
     raw = _sanitize_account_tool_transport_details(raw, results, user_message=user_message)
     raw = _sanitize_internal_tool_state_phrasing(raw, results, user_message=user_message)
     raw = _sanitize_account_tool_body_leak(raw, results)
-    raw = _sanitize_account_tool_family_drift(raw, results, user_message=user_message)
+    # A paraphrase need not repeat a sender/subject verbatim. Matching another
+    # source's display label cannot choose which part of a multi-source answer
+    # survives; the primary owns that synthesis. Raw-body protection stays above.
     if account_detour_reply := _account_read_reply_over_invalid_attachment_detour(raw, results):
         return _sanitize_reply_style(
             _sanitize_local_paths(account_detour_reply),
@@ -1565,6 +1578,20 @@ def _action_receipt_reply_over_drift(text: str, results: list[ToolResult]) -> st
 
 
 def _artifact_completion_reply_over_drift(text: str, results: list[ToolResult], *, user_message: str | None = None) -> str | None:
+    if any(result.status == 'completed' and isinstance(result.output, Mapping)
+            and isinstance(result.output.get('action_receipt'), Mapping)
+            and result.output['action_receipt'].get('type') == 'action_receipt'
+            for result in results):
+        # A verified account/action receipt is the outcome; preparing its file
+        # is supporting work. Keep that outcome through caption normalization.
+        return None
+    if any(not result.recovered_by and isinstance(result.output, Mapping)
+            and (result.output.get('reason') == 'approval_required' or result.output.get('requires_approval') is True)
+            and result.status in {'denied', 'approval_required', 'requires_approval', 'suspended'}
+            for result in results):
+        # A completed file is supporting work while an action awaits consent.
+        # It cannot turn the request's approval prompt into a success receipt.
+        return None
     from nullion.artifact_lifecycle import artifact_terminal_failure_reply
     if notice := artifact_terminal_failure_reply(results, user_message=user_message):
         return notice
@@ -4251,7 +4278,7 @@ def _structured_tool_evidence_sections(
             items = _structured_evidence_items_from_mapping(result.output)
             lines = _summary_to_bullet_lines(summary)
             if lines:
-                sections.append(("Files I found", lines, items or [result.output]))
+                sections.append(("File search", lines, items or [result.output]))
             continue
         generic_items = _structured_evidence_items_from_mapping(result.output)
         if not generic_items:
@@ -5065,6 +5092,11 @@ def _web_search_reply_over_ignored_results(
     *,
     user_message: str | None,
 ) -> str | None:
+    # Search observations are context, not a requirement to repeat snippets.
+    # The primary may answer a follow-up about a different source or explain a
+    # limitation. Content overlap cannot determine whether that answer is valid.
+    if text.strip() and not is_raw_tool_payload_reply(reply=text, tool_results=results):
+        return None
     if _has_completed_deliverable_artifact_result(results):
         return None
     if _browser_recovery_should_preserve_model_reply(text, results):
@@ -8165,34 +8197,6 @@ def _sanitize_account_tool_transport_details(
     return cleaned
 
 
-def _sanitize_account_tool_family_drift(
-    text: str,
-    results: list[ToolResult],
-    *,
-    user_message: str | None = None,
-) -> str:
-    primary_family = _primary_account_tool_family(results)
-    if primary_family is None:
-        return text
-    families = {
-        family
-        for result in results
-        if (family := _account_tool_family(result.tool_name)) is not None
-        and result.status == "completed"
-        and isinstance(result.output, dict)
-    }
-    if len(families) < 2:
-        return text
-    if _reply_mentions_account_family_evidence(text, results, primary_family):
-        return text
-    for family in families:
-        if family == primary_family:
-            continue
-        if _reply_mentions_account_family_evidence(text, results, family):
-            return _account_tool_summary(results, user_message=user_message) or text
-    return text
-
-
 def _account_tool_reply_over_ungrounded_result(
     text: str,
     results: list[ToolResult],
@@ -9582,6 +9586,10 @@ def _file_search_payload_summary(results: list[ToolResult]) -> str | None:
             if name and name not in safe_names:
                 safe_names.append(name)
         if not safe_names:
+            pattern = output.get("pattern")
+            if isinstance(pattern, str) and pattern.strip():
+                label = json.dumps(pattern.strip()[:300], ensure_ascii=False)
+                return f"No matching files found for {label} in the searched locations."
             return "I searched the available files but did not find a matching file, so I could not prove the answer from files."
         shown = ", ".join(f"`{name}`" for name in safe_names[:5])
         extra = len(safe_names) - 5

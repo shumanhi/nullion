@@ -16,3 +16,5 @@ SRC_ROOT = APP_ROOT / "src"
 if SRC_ROOT.exists():
     sys.path.insert(0, str(SRC_ROOT))
     sys.path.insert(0, str(APP_ROOT))
+
+pytest_plugins = ['scripts.pytest_test_timings']

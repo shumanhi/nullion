@@ -63,6 +63,7 @@ def test_comparison_finishes_useful_scope_but_checks_material_challengers(tmp_pa
     class Provider:
         reviews = 0
         plans = 0
+        scope_declared = False
 
         def create(self, **kw):
             system = kw.get('system') or ''
@@ -120,6 +121,11 @@ def test_comparison_finishes_useful_scope_but_checks_material_challengers(tmp_pa
                     'material_requirements': [{'requirement_id': row['requirement_id'], 'satisfied': True, 'draft_covered': True,
                         'evidence_invocation_ids': [benchmark if row['evidence_subject_id'] == 'benchmark' else choice]}
                         for row in packet['material_requirement_contract']], 'search_coverage': assessment})
+            if mode == 'exhaustive' and not self.scope_declared:
+                self.scope_declared = True
+                return tool_response('request_tool_scope', {'capabilities':['web'],
+                    'tool_names':['opaque_discover','opaque_read'], 'research_effort':'exhaustive',
+                    'research_questions':['Compare all declared candidate sources']})
             if not discoveries and mode!='finite':
                 return tool_response('opaque_discover', {'query':'候補','limit':len(sources)} if native_search else {})
             for url in sources[:2]:
@@ -184,7 +190,7 @@ def test_comparison_finishes_useful_scope_but_checks_material_challengers(tmp_pa
             conversation_history=[], tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store, max_iterations=25)
     assert len(discoveries) == (0 if mode == 'finite' else 1) and provider.plans == 0
     assert 'Other relevant sources remain unchecked' not in result.final_text
-    assert '75 cents/g' in result.final_text
+    assert '75 cents/g' in result.final_text, [(r.tool_name, r.status, r.output, r.error) for r in getattr(result, 'tool_results', ()) if r.status != 'completed']
     events = runtime.store.list_recent_conversation_events(cid, event_type='conversation.completion_review')
     if mode == 'blocked':
         assert reads == sources[:3]

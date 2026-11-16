@@ -43,6 +43,7 @@ from nullion.platform_activity import (
 )
 from nullion.chat_operator import activity_trace_enabled_for_chat
 from nullion.session_stop import stop_session_async, stop_session_reply
+from nullion.chat_streaming import LatestTextUpdateQueue
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.users import load_user_registry, resolve_messaging_user
@@ -217,6 +218,7 @@ class _DiscordTextDeltaStreamer:
         self._parts: list[str] = []
         self._last_update_at = 0.0
         self._last_text = ""
+        self._updates = LatestTextUpdateQueue(loop, self._publish_draft)
 
     @property
     def text(self) -> str:
@@ -268,12 +270,16 @@ class _DiscordTextDeltaStreamer:
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
             return
         self._last_update_at = now
-        try:
-            asyncio.run_coroutine_threadsafe(self._send_or_edit(text), self._loop).result(timeout=2)
-        except Exception:
-            logger.debug("Discord text streaming update failed", exc_info=True)
+        self._updates.submit(text)
+
+    async def _publish_draft(self, text: str) -> None:
+        await self._send_or_edit(text)
 
     async def finish(self, final_text: str | None) -> bool:
+        try:
+            await self._updates.drain()
+        except Exception:
+            logger.warning("Draft update failed before finalization", exc_info=True)
         text = str(final_text or "")
         if not text or self._message is None:
             return False
@@ -621,8 +627,15 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
     delivery_channel = SimpleNamespace(send=turn_registration.publication_gate.guard(
         message.channel.send, withdraw=withdraw_sent))
 
-    def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
-        del event
+    from nullion.request_progress import RequestProgressDelivery
+    async def send_progress(text):
+        return await delivery_channel.send(sanitize_external_inline_markup(text))
+    async def remove_progress(sent):
+        await sent.delete()
+    progress_delivery = RequestProgressDelivery(loop=asyncio.get_running_loop(),
+        send=send_progress, edit=_edit_discord_message, remove=remove_progress,
+        can_publish=turn_registration.publication_gate.can_publish,
+        on_published=lambda fact: _mark_timing('progress_'+fact['operation']+'_'+fact['phase_id']))
 
     try:
         await turn_registration.wait_for_dependencies()
@@ -635,8 +648,9 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                 turn_dispatch_decision=turn_registration.decision,
                 cancellation_checker=turn_registration.is_cancelled,
                 text_delta_callback=text_streamer.emit,
-                activity_callback=emit_working_ack_for_tool_activity,
+                activity_callback=progress_delivery.emit,
             )
+            await progress_delivery.freeze()
             reply = turn_result.reply
         _mark_timing("handler_completed")
         if await turn_registration.is_superseded():
@@ -658,6 +672,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
             target_id=_optional_message_text(getattr(message.channel, "id", None)),
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
+            artifact_paths=getattr(turn_result, 'artifact_paths', ()),
             request_id=ingress.request_id,
             message_id=ingress.message_id,
             reply_already_sent=reply_already_sent,
@@ -673,7 +688,26 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         _mark_timing("delivery_complete")
         _log_turn_timing(turn_outcome)
     finally:
+        await progress_delivery.finish()
         await turn_registration.finish()
+
+
+async def send_discord_update_notice(client, target: str, text: str) -> bool:
+    kind, _, identity = target.partition(':')
+    if kind == 'channel':
+        recipient = client.get_channel(int(identity)) or await client.fetch_channel(int(identity))
+    elif kind == 'user':
+        recipient = client.get_user(int(identity)) or await client.fetch_user(int(identity))
+    else:
+        raise ValueError('Unknown Discord update recipient')
+    await _send_discord_chunks_with_plain_fallback(recipient, text, limit=1900)
+    return True
+
+
+def discord_update_notice_target(settings):
+    channel = str(os.environ.get('NULLION_DISCORD_OPERATOR_CHANNEL_ID') or '').strip()
+    user = str(settings.discord.operator_user_id or '').strip()
+    return 'channel:' + channel if channel else ('user:' + user if user else '')
 
 
 async def run_discord_app(
@@ -709,6 +743,14 @@ async def run_discord_app(
     class NullionDiscordClient(discord.Client):
         async def on_ready(self) -> None:
             logger.info("Nullion Discord adapter connected as %s", self.user)
+            if not hasattr(self, '_nullion_update_task'):
+                from nullion.update_notifications import run_update_notification_loop
+
+                async def _send_update(target, text):
+                    return await send_discord_update_notice(self, target, text)
+
+                self._nullion_update_task = asyncio.create_task(run_update_notification_loop(
+                    service.runtime, channel='discord', target=lambda: discord_update_notice_target(settings), send=_send_update))
             if not hasattr(self, "_nullion_delivery_recovery_task") and hasattr(service.agent_orchestrator, "run_delivery_recovery"):
                 self._nullion_delivery_recovery_task = asyncio.create_task(
                     service.agent_orchestrator.run_delivery_recovery(service.runtime, surface="discord"))
@@ -810,6 +852,10 @@ async def run_discord_app(
             "Discord Developer Portal > your application > Bot > Privileged Gateway Intents, then restart Discord."
         ) from exc
     finally:
+        update_task = getattr(client, '_nullion_update_task', None)
+        if update_task is not None:
+            update_task.cancel()
+            await asyncio.gather(update_task, return_exceptions=True)
         recovery = getattr(client, "_nullion_delivery_recovery_task", None)
         if recovery is not None:
             recovery.cancel()

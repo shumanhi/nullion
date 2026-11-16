@@ -150,6 +150,23 @@ def test_uninitialized_capture_fails_before_creating_deliverable(tmp_path, monke
     assert not list(tmp_path.rglob("*.png"))
 
 
+def test_rendered_document_can_be_captured_without_external_navigation(tmp_path,monkeypatch):
+    from nullion.plugins.browser_plugin.browser_tools import BrowserTools
+    from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy
+    from nullion.plugins.browser_plugin.browser_session import BrowserSessionPool,BrowserScreenshotResult
+    from nullion.tools import ToolInvocation
+    class Backend:
+        async def screenshot(self,session_id,mode):
+            return BrowserScreenshotResult(data=b'png',mode=mode,requested_mode=mode,
+                page_url='about:blank',has_document_content=True)
+    monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT',str(tmp_path))
+    result=BrowserTools(Backend(),BrowserSessionPool(),BrowserPolicy()).browser_screenshot(
+        ToolInvocation('rendered','browser_screenshot','operator',{}))
+    assert result.status=='completed',result
+    assert result.output['has_document_content'] is True
+    assert list(tmp_path.rglob('*.png'))
+
+
 @pytest.mark.parametrize("extra", ["browser_screenshot", "browser_wait_for", "email_send"])
 def test_url_fast_path_preserves_required_work(extra):
     from dataclasses import replace

@@ -19,8 +19,8 @@ class StructuredDispatchModel:
         relationship: str,
         confidence: float = 0.9,
         effect: str | None = None,
-        target_index: int | None = None,
-        target_is_explicit: bool | None = None,
+        target_index: int | None = 0,
+        target_is_explicit: bool | None = True,
         work_ack_recommended: bool = False,
     ) -> None:
         self.relationship = relationship
@@ -89,7 +89,7 @@ def test_turn_dispatch_waits_only_on_model_structured_follow_up():
 
 
 def test_turn_dispatch_does_not_attach_generic_compact_reply_without_structured_evidence():
-    model = StructuredDispatchModel(relationship="follow_up")
+    model = StructuredDispatchModel(relationship="follow_up", target_is_explicit=False)
 
     decision = route_turn_dispatch_with_context(
         "d'accord",
@@ -101,7 +101,8 @@ def test_turn_dispatch_does_not_attach_generic_compact_reply_without_structured_
 
     assert decision.policy is TurnDispatchPolicy.PARALLEL
     assert decision.dependency_turn_ids == ()
-    assert decision.reason == "no_structured_dispatch_decision"
+    assert decision.reason == "ambiguous_dispatch_target"
+    assert decision.clarification_targets
     assert len(model.calls) == 1
 
 
@@ -153,7 +154,7 @@ def test_plain_followup_rejects_missing_or_malformed_structured_target(target, e
     assert decision.policy is TurnDispatchPolicy.PARALLEL
 
 
-def test_turn_dispatch_single_active_structured_evidence_falls_back_to_active_turn():
+def test_turn_dispatch_missing_model_decision_asks_instead_of_guessing_single_target():
     class EmptyStructuredDispatchModel:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
@@ -172,13 +173,14 @@ def test_turn_dispatch_single_active_structured_evidence_falls_back_to_active_tu
         model_client=model,
     )
 
-    assert decision.policy is TurnDispatchPolicy.WAIT_FOR_ACTIVE
-    assert decision.dependency_turn_ids == ("turn-1",)
-    assert decision.reason == "structured_active_followup_evidence"
+    assert decision.policy is TurnDispatchPolicy.PARALLEL
+    assert decision.dependency_turn_ids == ()
+    assert decision.reason == "ambiguous_dispatch_target"
+    assert decision.clarification_targets
     assert len(model.calls) == 1
 
 
-def test_turn_dispatch_active_request_structured_evidence_enables_compact_followup():
+def test_turn_dispatch_existing_artifact_does_not_resolve_unanchored_message():
     class EmptyStructuredDispatchModel:
         def create(self, **_kwargs):
             return {"content": [{"type": "text", "text": ""}]}
@@ -191,9 +193,10 @@ def test_turn_dispatch_active_request_structured_evidence_enables_compact_follow
         model_client=EmptyStructuredDispatchModel(),
     )
 
-    assert decision.policy is TurnDispatchPolicy.WAIT_FOR_ACTIVE
-    assert decision.dependency_turn_ids == ("turn-1",)
-    assert decision.reason == "structured_active_followup_evidence"
+    assert decision.policy is TurnDispatchPolicy.PARALLEL
+    assert decision.dependency_turn_ids == ()
+    assert decision.reason == "ambiguous_dispatch_target"
+    assert decision.clarification_targets
 
 
 def test_turn_dispatch_targets_model_selected_active_turn_among_parallel_requests():
@@ -230,8 +233,8 @@ def test_turn_dispatch_can_target_later_parallel_request_without_latest_assumpti
     assert decision.reason == "model_structured_follow_up"
 
 
-def test_turn_dispatch_fails_open_when_parallel_follow_up_has_no_structured_target():
-    model = StructuredDispatchModel(relationship="follow_up")
+def test_turn_dispatch_asks_when_parallel_follow_up_has_no_structured_target():
+    model = StructuredDispatchModel(relationship="follow_up", target_index=None, target_is_explicit=False)
 
     decision = route_turn_dispatch_with_context(
         "¿Eso requiere atención ahora?",
@@ -242,7 +245,8 @@ def test_turn_dispatch_fails_open_when_parallel_follow_up_has_no_structured_targ
 
     assert decision.policy is TurnDispatchPolicy.PARALLEL
     assert decision.dependency_turn_ids == ()
-    assert decision.reason == "no_structured_dispatch_decision"
+    assert decision.reason == "ambiguous_dispatch_target"
+    assert decision.clarification_targets
 
 
 def test_turn_dispatch_fails_open_when_model_targets_unlisted_active_index():
@@ -257,7 +261,8 @@ def test_turn_dispatch_fails_open_when_model_targets_unlisted_active_index():
 
     assert decision.policy is TurnDispatchPolicy.PARALLEL
     assert decision.dependency_turn_ids == ()
-    assert decision.reason == "no_structured_dispatch_decision"
+    assert decision.reason == "ambiguous_dispatch_target"
+    assert decision.clarification_targets
 
 
 def test_turn_dispatch_marks_model_structured_revision():

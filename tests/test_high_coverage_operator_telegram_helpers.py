@@ -156,7 +156,7 @@ def test_plain_no_tool_direct_model_reply_uses_compact_no_tool_prompt() -> None:
     assert calls
     assert calls[0]["tools"] == []
     assert "Chat delivery contract (message-only turn)" in calls[0]["system"]
-    assert "explicitly asks for a no-tool response" in calls[0]["system"]
+    assert "Honor explicit no-tool requests without calling or requesting tools" in calls[0]["system"]
     assert "No tools are available for this first-pass reply" in calls[0]["system"]
     assert "Structured capability inventory:" in calls[0]["system"]
     assert "<tool_request>" in calls[0]["system"]
@@ -3813,7 +3813,7 @@ def test_render_chat_turn_delivers_sanitized_browser_evidence_over_cron_receipt_
     assert "OLRP payment portal" in reply
     assert "Tenant Login: https://kmrm.appfolio.com/connect/users/sign_in" in reply
     assert "Live-search blocker" not in reply
-    assert streamed and "".join(streamed) == str(reply)
+    assert not streamed, "Buffered completed answers use final delivery, not a synthetic draft"
     events = list(
         runtime.store.list_recent_conversation_events(
             "telegram:123",
@@ -5923,7 +5923,9 @@ def test_compact_unstructured_followup_guard_is_prompt_agnostic() -> None:
 
     assert guard is not None
     assert "structured target evidence" in guard
-    assert "Ask one brief clarification" in guard
+    assert "only if required details remain unresolved" in guard
+    assert "saved user profile/defaults" in guard
+    assert "do not ask the user to repeat known profile information" in guard
     assert "Can you pick five" not in guard
 
 
@@ -12240,10 +12242,8 @@ def test_scoped_safe_read_direct_weather_uses_structured_arguments(tmp_path: Pat
         user_message="weather request in a non-English phrasing",
     )
 
-    assert result is not None
-    assert calls == [{"location_text": "10024, New York", "forecast_days": 1, "timezone": "America/New_York", "include_hourly": False}]
-    assert [tool.tool_name for tool in result.tool_results] == ["weather_forecast"]
-    assert "72°F" in result.final_text
+    assert result is None, "The primary producer must interpret weather dates and requested fields"
+    assert not calls, "Do not fetch once in a shortcut and again in the producer"
 
 
 @pytest.mark.parametrize('prompt_text', ['Give me ten current headlines.', 'Dame diez noticias actuales.', '最新のニュースを十件教えて。'])
@@ -12848,7 +12848,7 @@ def test_model_tool_request_weather_recovery_invokes_direct_read_without_retry_m
     assert {definition["name"] for definition in retry_registry.list_tool_definitions()} == {"weather_forecast"}
 
 
-def test_no_tool_scope_retry_invokes_safe_read_directly_without_second_model(monkeypatch, tmp_path: Path) -> None:
+def test_no_tool_scope_retry_keeps_weather_interpretation_with_primary(monkeypatch, tmp_path: Path) -> None:
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
     registry = ToolRegistry()
     registry.register(
@@ -12924,8 +12924,12 @@ def test_no_tool_scope_retry_invokes_safe_read_directly_without_second_model(mon
                 ]
             }
 
-    def forbidden_second_model(_history, _registry):  # noqa: ANN001
-        raise AssertionError("no-tool recovery should invoke the safe read tool directly")
+    def primary_answer(_history, selected_registry):
+        result = chat_operator.invoke_tool_with_boundary_policy(runtime.store,
+            chat_operator.ToolInvocation("primary-weather", "weather_forecast", "workspace_admin",
+                {"location_text":"10024, New York", "forecast_days":1}), registry=selected_registry)
+        return SimpleNamespace(final_text="The current temperature is 74°F.", tool_results=[result],
+            artifacts=[], suspended_for_approval=False)
 
     initial_result = SimpleNamespace(
         tool_results=[],
@@ -12943,7 +12947,7 @@ def test_no_tool_scope_retry_invokes_safe_read_directly_without_second_model(mon
         principal_id="workspace_admin",
         user_message="weather",
         evidence=TurnToolEvidence(),
-        run_turn=forbidden_second_model,
+        run_turn=primary_answer,
     )
 
     assert retried is True
@@ -15781,7 +15785,7 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
     async def monitor_noop():
         return None
 
-    async def register_commands_noop(bot):
+    async def register_commands_noop(bot, **kwargs):
         return False
 
     async def send_message_noop(*args, **kwargs):
@@ -15912,7 +15916,7 @@ def test_telegram_refresh_busy_ack_and_registration_helpers(tmp_path, monkeypatc
         def __init__(self) -> None:
             self.commands = None
 
-        async def set_my_commands(self, commands):
+        async def set_my_commands(self, commands, **kwargs):
             self.commands = commands
 
     bot = Bot()
@@ -16352,8 +16356,8 @@ async def test_telegram_delivery_download_streamer_and_service_helpers(tmp_path,
     message = Message()
     await telegram_app._reply_text_in_chunks(message, "one two three four", do_quote=True)
     assert message.replies[-1][1]["do_quote"] is True
-    streamed = await telegram_app._reply_text_with_streaming_edits(message, "x" * 250, do_quote=False)
-    assert streamed.message_id == 44
+    await telegram_app._deliver_reply(message, "x" * 250, streaming_mode=telegram_app.ChatStreamingMode.MESSAGE_EDITS)
+    assert message.replies[-1][0] == "x" * 250 and not message.edits
 
     attachment = tmp_path / "artifact.txt"
     attachment.write_text("artifact", encoding="utf-8")
@@ -16385,10 +16389,6 @@ async def test_telegram_delivery_download_streamer_and_service_helpers(tmp_path,
     assert "<code>x &lt; y</code>" in message.replies[-1][0]
     assert message.replies[-1][1]["parse_mode"] == "HTML"
 
-    async def fail_streaming_edits(*args, **kwargs):
-        raise RuntimeError("streaming failed")
-
-    monkeypatch.setattr(telegram_app, "_reply_text_with_streaming_edits", fail_streaming_edits)
     await telegram_app._deliver_reply(
         message,
         "fallback after streaming failure",
@@ -16633,7 +16633,8 @@ async def test_telegram_delivery_download_streamer_and_service_helpers(tmp_path,
     assert telegram_app._telegram_tool_event_should_emit_working_ack({"id": "phase-check-attachments", "label": "Checking attachments"}) is False
     activity_runtime = SimpleNamespace(
         store=SimpleNamespace(
-            list_conversation_events=lambda conversation_id: [
+            get_conversation_session_setting=lambda conversation_id, setting: True,
+            list_recent_conversation_events=lambda conversation_id, **kwargs: [
                 {"event_type": "conversation.session_settings", "activity_trace_enabled": True}
             ]
         )
@@ -17120,6 +17121,7 @@ async def test_telegram_streamed_plain_reply_edits_preview_without_duplicate_ter
     )
     primary_deliveries: list[str] = []
     receipts: list[dict[str, object]] = []
+    typing_active = asyncio.Event()
 
     class Message:
         text = "hello"
@@ -17141,6 +17143,9 @@ async def test_telegram_streamed_plain_reply_edits_preview_without_duplicate_ter
             return SimpleNamespace(message_id=91, edit_text=self.edit_text)
 
         async def edit_text(self, text, **kwargs):  # noqa: ANN001, ANN003
+            assert typing_active.is_set(), "Typing stopped before the final edit"
+            await asyncio.sleep(.02)
+            assert typing_active.is_set(), "Typing stopped while the edit acknowledgement was pending"
             self.edits.append(str(text))
             self.edit_kwargs.append(dict(kwargs))
 
@@ -17148,10 +17153,11 @@ async def test_telegram_streamed_plain_reply_edits_preview_without_duplicate_ter
         return []
 
     async def no_typing(message, runtime, text):  # noqa: ANN001, ANN003
-        return None
-
-    async def stop_typing(task):  # noqa: ANN001
-        return None
+        typing_active.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            typing_active.clear()
 
     async def capture_primary_delivery(message, reply, **kwargs):  # noqa: ANN001, ANN003
         primary_deliveries.append(str(reply))
@@ -17166,7 +17172,6 @@ async def test_telegram_streamed_plain_reply_edits_preview_without_duplicate_ter
     message = Message()
     monkeypatch.setattr(telegram_app, "_download_telegram_attachments", no_download)
     monkeypatch.setattr(telegram_app, "_run_typing_keepalive", no_typing)
-    monkeypatch.setattr(telegram_app, "_stop_typing_keepalive", stop_typing)
     monkeypatch.setattr(telegram_app, "_deliver_reply", capture_primary_delivery)
     monkeypatch.setattr(telegram_app, "_record_telegram_delivery_receipt", capture_receipt)
     monkeypatch.setattr(telegram_app, "_call_handle_update_with_activity", streamed_handler)
@@ -17177,6 +17182,7 @@ async def test_telegram_streamed_plain_reply_edits_preview_without_duplicate_ter
     assert message.edits == ["Hi Himan — how can I help?"]
     assert message.edit_kwargs == [{}]
     assert primary_deliveries == []
+    assert not typing_active.is_set()
     assert len(receipts) == 1
     assert receipts[0]["transport_ok"] is True
     assert receipts[0]["delivered_message"].message_id == 91
@@ -17331,6 +17337,7 @@ async def test_telegram_streamed_final_records_receipt_before_slow_activity_fini
         settings=settings,
     )
     receipt_recorded = asyncio.Event()
+    typing_stopped = asyncio.Event()
     allow_activity_finish = asyncio.Event()
 
     class Message:
@@ -17371,7 +17378,7 @@ async def test_telegram_streamed_final_records_receipt_before_slow_activity_fini
         return None
 
     async def stop_typing(task):  # noqa: ANN001
-        return None
+        typing_stopped.set()
 
     def streamed_handler(service, update, **kwargs):  # noqa: ANN001, ANN003
         kwargs["text_delta_callback"]("Final answer")
@@ -17393,7 +17400,8 @@ async def test_telegram_streamed_final_records_receipt_before_slow_activity_fini
         svc.on_message(SimpleNamespace(update_id=46, message=message), SimpleNamespace(bot=None))
     )
     await asyncio.wait_for(receipt_recorded.wait(), timeout=1)
-    assert not task.done()
+    await asyncio.wait_for(typing_stopped.wait(), timeout=.25)
+    assert not task.done(), "Status cleanup can remain pending after visible delivery and typing have finished"
     allow_activity_finish.set()
     await task
 
@@ -17627,7 +17635,12 @@ async def test_telegram_on_message_caches_handler_checkpoint_signature(tmp_path,
 
     await svc.on_message(SimpleNamespace(update_id=99, message=Message()), SimpleNamespace(bot=None))
 
-    assert telegram_app._CHECKPOINT_FILE_SIGNATURES[str(runtime.checkpoint_path)] == telegram_app._checkpoint_file_signature(runtime.checkpoint_path)
+    from nullion.runtime_checkpoints import _CHECKPOINT_INFLIGHT
+    import time
+    deadline = time.monotonic() + 5
+    while id(runtime) in _CHECKPOINT_INFLIGHT:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(.01)
     load_calls = {"count": 0}
 
     def count_load(path):  # noqa: ANN001
@@ -17637,6 +17650,7 @@ async def test_telegram_on_message_caches_handler_checkpoint_signature(tmp_path,
     monkeypatch.setattr(telegram_app, "load_runtime_store", count_load)
     assert telegram_app._refresh_runtime_from_checkpoint(runtime) is False
     assert load_calls["count"] == 0
+    assert telegram_app._CHECKPOINT_FILE_SIGNATURES[str(runtime.checkpoint_path)] == telegram_app._checkpoint_file_signature(runtime.checkpoint_path)
 
 
 @pytest.mark.asyncio
@@ -18012,7 +18026,7 @@ async def test_telegram_inflight_plain_turn_does_not_send_working_ack_without_to
 
 
 @pytest.mark.asyncio
-async def test_telegram_sends_quoted_working_ack_for_foreground_tool_use_signal(
+async def test_telegram_fast_tool_turn_needs_no_separate_working_ack(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -18083,12 +18097,7 @@ async def test_telegram_sends_quoted_working_ack_for_foreground_tool_use_signal(
     await svc.on_message(SimpleNamespace(update_id=99, message=message), SimpleNamespace(bot=None))
     await asyncio.sleep(0)
 
-    assert message.replies == [
-        (
-            telegram_app.WORKING_ACK_TEXT,
-            {"do_quote": True},
-        )
-    ]
+    assert message.replies == []
     assert [delivery["reply"] for delivery in deliveries] == ["Calendar checked"]
 
 
@@ -19089,6 +19098,7 @@ async def test_telegram_deferred_manual_cron_shows_running_status_and_suppresses
 def test_telegram_registered_run_cron_returns_deferred_receipt_with_running_status(
     tmp_path: Path,
     monkeypatch,
+    request,
 ) -> None:
     from nullion import crons, telegram_entrypoint
 
@@ -19110,6 +19120,16 @@ def test_telegram_registered_run_cron_returns_deferred_receipt_with_running_stat
         delivery_target="999",
     )
     crons.save_crons([job])
+
+    def finish_owned_background_delivery():
+        # The initial status receipt is not the terminal delivery. Keep this
+        # test's provider and environment patches until its own worker exits.
+        prefix = "nullion-telegram-manual-cron"
+        for worker in threading.enumerate():
+            if worker.name.startswith(prefix) and worker.name.endswith(job.id):
+                worker.join(timeout=5)
+                assert not worker.is_alive(), worker.name
+    request.addfinalizer(finish_owned_background_delivery)
 
     registry = ToolRegistry()
     completed = threading.Event()

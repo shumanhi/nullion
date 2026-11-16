@@ -1,4 +1,5 @@
 """Actual SDK actions must expose extracted DOM values to the next model step."""
+from tests.browser_model_protocol import browser_schema_messages
 from tests.workflow_provider_protocol import workflow_provider_reply
 import json, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,7 @@ def test_real_sdk_extraction_values_reach_next_step_without_a_repeated_query(tmp
     worker = os.environ.get("NULLION_BROWSER_USE_TEST_PYTHON", "/tmp/nullion-browser-sdk/bin/python")
     if not __import__("pathlib").Path(worker).is_file(): pytest.skip("Installed SDK worker required")
     for key, value in {"NULLION_HOME":str(tmp_path), "NULLION_BROWSER_BLOCK_PRIVATE":"false", "NULLION_BROWSER_HEADLESS":"true", "NULLION_BROWSER_USE_SANDBOX":"false", "ANONYMIZED_TELEMETRY":"false"}.items(): monkeypatch.setenv(key, value)
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
     monkeypatch.delenv("NULLION_BROWSER_USE_CDP_URL", raising=False)
     from playwright.sync_api import sync_playwright
     with sync_playwright() as playwright:
@@ -31,7 +33,7 @@ def test_real_sdk_extraction_values_reach_next_step_without_a_repeated_query(tmp
             protocol_reply = workflow_provider_reply(kwargs, completion=True)
             if protocol_reply is not None: return protocol_reply
             self.calls += 1
-            schema_message = next(m["content"] for m in kwargs["messages"] if isinstance(m.get("content"), str) and m["content"].startswith("Return valid JSON matching this schema: "))
+            schema_message = browser_schema_messages(kwargs)[0]['content']
             schema = json.loads(schema_message.split(": ", 1)[1])
             if self.calls == 1:
                 action = {"find_elements":{"selector":"img", "attributes":["data-evidence"], "max_results":5, "include_text":False}}
@@ -52,3 +54,11 @@ def test_real_sdk_extraction_values_reach_next_step_without_a_repeated_query(tmp
         assert "find_elements" in result["execution_audit"]["action_names"]
         assert time.monotonic()-started < 35
     finally: server.shutdown(); server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def explicit_independent_sdk_fixture(monkeypatch):
+    # These anonymous-provider fixtures exercise the independent SDK mode.
+    # Managed login preservation has its own real shared-CDP/cookie contract.
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL', raising=False)

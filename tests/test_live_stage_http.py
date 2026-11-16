@@ -52,3 +52,26 @@ def test_probe_status_get_recovers_against_real_read_only_http_server():
         assert _get_json(f'http://127.0.0.1:{server.server_port}/api/status',timeout=5)=={'status':'ok'}
         assert calls==[('GET','/api/status')]*2
     finally:server.shutdown();server.server_close();thread.join(timeout=2)
+
+
+def test_one_stalled_read_cannot_consume_the_whole_recovery_budget():
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    calls=[]
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            if len(calls)==1:time.sleep(2.5)
+            self.send_response(200);self.end_headers()
+            try:self.wfile.write(b'{"verified":true}')
+            except BrokenPipeError:pass
+        def log_message(self,*args):pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    try:
+        started=time.monotonic()
+        result=read_json(Request(f'http://127.0.0.1:{server.server_port}/evidence'),timeout=15,retry_seconds=8)
+        assert result=={'verified':True} and calls==['/evidence','/evidence']
+        assert time.monotonic()-started<3.2
+    finally:server.shutdown();server.server_close();thread.join(timeout=2)

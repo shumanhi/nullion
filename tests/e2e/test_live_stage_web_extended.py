@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from tests.e2e.test_live_stage_web_matrix import catalogue,live_web,_submit
+from tests.e2e.live_primary_assertions import record_primary_boundary
 
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reason='Opt-in real stage Web acceptance')
 
@@ -34,6 +35,7 @@ def test_live_web_only_final_document_survives_delivery_and_reload(live_web):
     expect(page.locator('#messages a[download]').filter(has_text=final)).to_have_count(1,timeout=15000)
     assert page.locator('#messages a[download]').filter(has_text=draft).count()==0
     assert elapsed<180000 and not errors,(elapsed,errors)
+    record_primary_boundary(live_web,'primary-final-docx')
 
 
 def test_live_web_missing_public_fact_is_explained_once_without_losing_findings(live_web):
@@ -67,6 +69,7 @@ def test_live_web_compact_pdf_summary_keeps_heading_and_bullets_together(live_we
                                          'Prioritize Apollo', 'Review Voyager next week')), text
     assert sum(row['tool_name'] == 'pdf_create' and row['status'] == 'completed' for row in turn['tool_results']) == 1
     assert elapsed < 120000, elapsed
+    record_primary_boundary(live_web,'primary-pdf-report')
 
 
 def test_live_web_dashboard_polling_during_generation_keeps_final_file_and_history(live_web):
@@ -84,6 +87,7 @@ def test_live_web_dashboard_polling_during_generation_keeps_final_file_and_histo
     history=catalogue._get_json(live_web[-1]+'/api/chat/history/'+live_web[4]+'?turn_ids='+quote(json.dumps([turn['turn_id']])),timeout=30)
     assert len(history['terminal_replies'])==1 and len(history['terminal_replies'][0]['artifacts'])==1,history
     assert elapsed<120000,elapsed
+    record_primary_boundary(live_web,'primary-csv-status-polling')
 
 
 def test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input(live_web):
@@ -92,11 +96,15 @@ def test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input(liv
     filename='stage_identity_'+uuid4().hex[:10]+'.csv'
     made,created,_=_submit(live_web,'Create '+filename+' with the exact CSV content Name,Value followed by Cedar,37. Attach that CSV only.',timeout=120)
     assert len(made['artifacts'])==1,made
+    original_bytes,_=catalogue._artifact_bytes(base,made['artifacts'][0],timeout=30)
     response,turn,_=_submit(live_web,'Search the workspace for '+filename+' and tell me its exact filename only. Do not attach, rewrite, copy or create any files.',timeout=120)
     assert filename in response['text'] and not response['artifacts'],response
     assert any(r['tool_name']=='file_search' and r['status']=='completed' for r in turn.get('tool_results',[])),turn
     assert not any(r['tool_name'] in {'file_write','file_patch','pdf_create','document_create'} for r in turn.get('tool_results',[])),turn
+    preserved_bytes,_=catalogue._artifact_bytes(base,made['artifacts'][0],timeout=30)
+    assert preserved_bytes==original_bytes,'A filename-only lookup invalidated or changed the original download'
     assert not errors
+    record_primary_boundary(live_web,'primary-file-lookup-followup',expected_turns=2)
 
 
 @pytest.mark.parametrize('language',['en','es','ja'])
@@ -112,9 +120,12 @@ def test_live_web_account_read_waits_for_explicit_source_choice(live_web,languag
     out=Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])/('account-read-choice-'+language);out.mkdir(parents=True,exist_ok=True)
     (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
     names={row['tool_name'] for row in turn['tool_results']}
-    assert 'request_tool_scope' in names,names
     assert not names.intersection({'email_search','email_read','email_attachment_read','calendar_list','connector_request'}),turn
     scopes=[r['output'] for r in turn['tool_results'] if r['tool_name']=='request_tool_scope' and r['status']=='completed']
-    assert scopes[-1]['source_selection_required'] is True,scopes[-1]
+    # Asking the numbered source question immediately is the valid fast path.
+    # Discovery is optional; if selected, it must retain the explicit choice.
+    if scopes:
+        assert scopes[-1]['source_selection_required'] is True,scopes[-1]
     assert len(re.findall(r'^\s*\d+[.)]\s+',response['text'],flags=re.M))>=2,response
     assert not response['artifacts'] and elapsed<90000 and not live_web[2],result
+    record_primary_boundary(live_web,'primary-native-source-consent-'+language)

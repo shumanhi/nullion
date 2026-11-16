@@ -29,6 +29,19 @@ def test_http_browser_request_cancellation_releases_worker_and_preserves_other_t
     executable, marker = fake_sdk_worker(tmp_path)
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_available', lambda:True)
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_python', lambda:str(executable))
+    # The native read-first boundary must finish before the worker under test
+    # starts. Substitute only its external browser engine; no host browser or
+    # network is needed to prove process cancellation and request ownership.
+    class Browser:
+        BACKEND_NAME = 'playwright'
+        async def navigate(self, session, url): return url
+        async def extract_text(self, session, selector): return 'Public source requires interaction.'
+        async def run_js(self, session, script):
+            if script == '() => location.href': return 'https://example.com'
+            return {'url':'https://example.com', 'links':[]}
+        async def close_session(self, session): pass
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.setattr('nullion.plugins.browser_plugin.backends.playwright_backend.PlaywrightBackend', Browser)
     class Provider:
         def create(self, **kw):
             protocol_reply = workflow_provider_reply(kw, completion=True)
@@ -40,7 +53,8 @@ def test_http_browser_request_cancellation_releases_worker_and_preserves_other_t
             if not names:
                 return {"stop_reason":"end_turn","content":[{"type":"text","text":json.dumps({"confidence":1})}]}
             name = "browser_run_task" if "browser_run_task" in names else "request_tool_scope"
-            arguments = ({"task":"Read the public page", "url":"https://example.com", "max_steps":2}
+            arguments = ({"task":"Read the public page", "url":"https://example.com", "max_steps":2,
+                "execution_kind":"adaptive_interaction", "interaction_reason":"Exercise cancellation of the delegated worker after native preflight"}
                 if name == "browser_run_task" else {"capabilities":["web"],
                     "tool_names":["browser_run_task"],"required_tool_names":["browser_run_task"]})
             return {"stop_reason":"tool_use","content":[{"type":"tool_use","id":name,"name":name,"input":arguments}]}

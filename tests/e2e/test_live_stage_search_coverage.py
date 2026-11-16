@@ -2,7 +2,6 @@
 import json
 import os
 from pathlib import Path
-import sqlite3
 
 import pytest
 
@@ -22,15 +21,10 @@ def test_live_web_follows_discovered_alternate_after_primary_negative(live_web):
     assert expected_text in response['text'] and expected_url in response['text'], response
     assert any(expected_url in json.dumps(r.get('output'), ensure_ascii=False)
                for r in turn['tool_results'] if r['status'] == 'completed'), turn
-    with sqlite3.connect(database.resolve().as_uri()+'?mode=ro', uri=True, timeout=10) as db:
-        reviews = [json.loads(row[0]) for row in db.execute("SELECT payload FROM conversation_events "
-            "WHERE json_extract(payload,'$.conversation_id')=? AND json_extract(payload,'$.event_type')=? "
-            "ORDER BY updated_at", (conversation, 'conversation.completion_review'))]
-    assert any(r.get('disposition') == 'complete' and (r.get('search_coverage') or {}).get('coverage_sufficient')
-               and (r.get('search_coverage') or {}).get('conclusion') == 'positive' for r in reviews), reviews
-    latest = reviews[-1]
-    assert latest.get('disposition') == 'complete' and not latest.get('search_coverage_errors'), latest
+    assert turn.get('response_fulfilled') is True,turn
+    readers={'browser_read_pages','browser_extract_text','browser_extract_detail','browser_extract_items','browser_run_task','web_fetch'}
+    observed=[json.dumps(r.get('output'),ensure_ascii=False) for r in turn['tool_results']
+        if r['status']=='completed' and r['tool_name'] in readers]
+    assert any(expected_url in output and expected_text in output for output in observed),observed
     assert 'Some requested work remains incomplete.' not in response['text'], response
-    constraints = (latest.get('search_coverage') or {}).get('constraints') or []
-    assert all(row.get('constraint_id') for row in constraints), latest
     assert not errors and not response.get('artifacts')

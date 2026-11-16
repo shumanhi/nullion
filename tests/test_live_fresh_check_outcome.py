@@ -15,14 +15,16 @@ def test_fresh_check_probe_requires_its_own_completed_turn(tmp_path,monkeypatch,
         if url.endswith('/api/crons'):
             jobs['abc12345']={**payload,'id':'abc12345'}
             return {'ok':True,'job':jobs['abc12345']},1
+        is_followup=bool(cid)
         if not cid:cid.append(payload['conversation_id']);jobs['abc12345']['enabled']=True
-        if payload['text']=='Do a fresh check':
+        if is_followup:
             with sqlite3.connect(db) as conn:
                 conn.execute('INSERT INTO conversation_events VALUES (?,?)',(json.dumps({
                     'conversation_id':cid[0],'event_type':'conversation.chat_turn','user_message':payload['text'],
                     'created_at':'2028-01-01T00:00:00+00:00','response_fulfilled':fulfilled,
-                    'assistant_reply':'Task is enabled.','tool_results':[{'tool_name':'list_crons','status':'completed'}]}),'2028-01-01'))
-        return {'text':'Task is enabled.','artifacts':[]},1
+                    'assistant_reply':'La tarea abc12345 está habilitada.','tool_results':[{'tool_name':'list_crons','status':'completed',
+                        'output':{'crons':[{**jobs['abc12345'],'has_last_result':False}]}}]}),'2028-01-01'))
+        return {'text':'Task abc12345 is enabled.','artifacts':[]},1
     monkeypatch.setattr(probe,'_post_json',post)
     monkeypatch.setattr(probe,'_event_tool_names_with_poll',lambda *args,**kw:{'toggle_cron'})
     monkeypatch.setattr(probe,'_tool_names_for_user_message_with_poll',lambda *args,**kw:{'list_crons'})

@@ -26,6 +26,9 @@ from uuid import uuid4
 from weakref import WeakKeyDictionary
 
 from nullion.source_selection import pending_source_selection
+from nullion.code_mode import request_session_scope
+from nullion.request_resources import current_request_resource_scope, request_resource_scope
+from nullion.research_budget import research_scope
 
 from nullion.agent_turn_limits import (
     AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
@@ -116,6 +119,7 @@ from nullion.latency_phases import (
     PHASE_BUILD_CONTEXT,
     PHASE_CHECK_ATTACHMENTS,
     PHASE_CHECK_TASK_STATE,
+    PHASE_LOAD_MEMORY,
     PHASE_PREPARE_ARTIFACTS,
     PHASE_RUN_TOOLS,
     PHASE_SAVE_CONVERSATION,
@@ -1839,6 +1843,9 @@ def _turn_tool_scope_requires_special_tools(tool_registry: object) -> bool:
 
 
 _COMPACT_DELIVERY_CONTRACT_TOOL_NAMES = frozenset({
+    "chat_history_search",
+    "memory_search",
+    "browser_read_pages",
     "browser_assert_page_state",
     "browser_click_element",
     "browser_click_id",
@@ -1889,7 +1896,19 @@ def _turn_tool_scope_uses_compact_delivery_contract(tool_registry: object) -> bo
     }
     if not requested:
         return True
-    return requested.issubset(_COMPACT_DELIVERY_CONTRACT_TOOL_NAMES)
+    # Registered native reads do not require the artifact/action delivery
+    # contract merely because they are available on a cold first turn. Rich
+    # connector, scheduler, skill and artifact scopes were excluded above.
+    for name in requested.difference(_COMPACT_DELIVERY_CONTRACT_TOOL_NAMES):
+        try:
+            spec = tool_registry.get_spec(name)
+        except (AttributeError, KeyError, TypeError):
+            return False
+        if (getattr(getattr(spec, "side_effect_class", None), "value", None) != "read"
+                or getattr(spec, "requires_approval", False)
+                or getattr(spec, "produced_artifact_extensions", ())):
+            return False
+    return True
 
 
 def _orchestrator_with_interactive_fast_profile(orchestrator, *, enabled: bool, tool_registry: object):
@@ -1930,13 +1949,17 @@ def _handle_verbose_command(message: str) -> str | None:
 
 def _session_activity_trace_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
-    get_session_setting = getattr(runtime.store, "get_conversation_session_setting", None)
+    store = getattr(runtime, "store", None)
+    get_session_setting = getattr(store, "get_conversation_session_setting", None)
     if callable(get_session_setting):
         value = get_session_setting(conversation_id, "activity_trace_enabled")
         # The indexed getter also represents an unset setting. Do not scan
         # copied conversation history on every ordinary delivery.
         return value if isinstance(value, bool) else None
-    events = runtime.store.list_conversation_events(conversation_id)
+    list_events = getattr(store, "list_conversation_events", None)
+    if not callable(list_events):
+        return None
+    events = list_events(conversation_id)
     for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
             continue
@@ -1981,7 +2004,14 @@ def set_activity_trace_enabled_for_chat(runtime: PersistentRuntime, *, chat_id: 
             "activity_trace_enabled": enabled,
         }
     )
-    runtime.checkpoint()
+    _checkpoint_chat_settings(runtime, chat_id)
+
+
+def _checkpoint_chat_settings(runtime, chat_id):
+    if isinstance(runtime, PersistentRuntime):
+        runtime.checkpoint_conversation_events(conversation_id=_conversation_id_for_chat(chat_id))
+    else:
+        runtime.checkpoint()
 
 
 def set_verbose_mode_for_chat(runtime: PersistentRuntime | None, *, chat_id: str | None, mode: str) -> None:
@@ -2000,8 +2030,7 @@ def _session_chat_streaming_setting(runtime: PersistentRuntime, *, chat_id: str 
     get_session_setting = getattr(runtime.store, "get_conversation_session_setting", None)
     if callable(get_session_setting):
         value = get_session_setting(conversation_id, "chat_streaming_enabled")
-        if isinstance(value, bool):
-            return value
+        return value if isinstance(value, bool) else None
     events = runtime.store.list_conversation_events(conversation_id)
     for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
@@ -2017,8 +2046,7 @@ def _session_thinking_display_setting(runtime: PersistentRuntime, *, chat_id: st
     get_session_setting = getattr(runtime.store, "get_conversation_session_setting", None)
     if callable(get_session_setting):
         value = get_session_setting(conversation_id, "thinking_display_enabled")
-        if isinstance(value, bool):
-            return value
+        return value if isinstance(value, bool) else None
     events = runtime.store.list_conversation_events(conversation_id)
     for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
@@ -2048,7 +2076,7 @@ def set_thinking_display_enabled_for_chat(runtime: PersistentRuntime, *, chat_id
             "thinking_display_enabled": enabled,
         }
     )
-    runtime.checkpoint()
+    _checkpoint_chat_settings(runtime, chat_id)
 
 
 def chat_streaming_enabled_for_chat(runtime: PersistentRuntime, *, chat_id: str | None) -> bool:
@@ -2075,7 +2103,7 @@ def set_chat_streaming_enabled_for_chat(runtime: PersistentRuntime, *, chat_id: 
             "chat_streaming_enabled": enabled,
         }
     )
-    runtime.checkpoint()
+    _checkpoint_chat_settings(runtime, chat_id)
 
 
 def _handle_verbose_command_for_chat(runtime: PersistentRuntime | None, message: str, *, chat_id: str | None) -> str | None:
@@ -2322,9 +2350,15 @@ def _approved_pending_tool_invocation_from_suspended_turn(
 
 
 def approved_read_needs_continuation(runtime, suspended_turn, *, tool_registry, orchestrator) -> bool:
-    """An approved read supplies evidence; the resumed agent still owes an answer."""
+    """Resume reads and saved programs through the shared request executor."""
     if not callable(getattr(orchestrator, "resume_turn", None)):
         return False
+    from nullion.code_mode_sessions import checkpoint_reference
+    identity = checkpoint_reference(suspended_turn.pending_tool_calls)
+    if identity:
+        # A saved program must own the continuation even when its pending call
+        # is a write. Native execution checks the approved action again.
+        return True
     invocation = _approved_pending_tool_invocation_from_suspended_turn(runtime, suspended_turn)
     if invocation is None:
         return False
@@ -3645,12 +3679,19 @@ def _broadcast_new_workspace_approvals(
     approval_id: str | None = None,
 ) -> None:
     try:
-        if any(
-            _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
-            and approval.approval_id not in before_ids
-            for approval in runtime.store.list_approval_requests()
-        ):
-            runtime.checkpoint()
+        pending_ids = [
+            approval.approval_id for approval in runtime.store.list_approval_requests()
+            if _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
+            and (approval.approval_id not in before_ids or approval.approval_id == approval_id)
+        ]
+        if pending_ids:
+            if isinstance(runtime, PersistentRuntime):
+                from nullion.runtime_persistence import checkpoint_pending_approvals
+                from nullion.runtime_checkpoints import schedule_runtime_checkpoint
+                checkpoint_pending_approvals(runtime.store, runtime.checkpoint_path, pending_ids)
+                schedule_runtime_checkpoint(runtime)
+            else:
+                runtime.checkpoint()
         from nullion.workspace_notifications import broadcast_new_pending_approvals, broadcast_pending_approval
 
         broadcast_pending_approval(runtime, approval_id, settings=settings)
@@ -3706,7 +3747,11 @@ def _memory_context_for_chat(
 
         entries = select_memory_entries_for_prompt(entries, **({"query": query} if query else {}))
         if reinforce and reinforce_memory_entries(runtime.store, entries):
-            runtime.checkpoint()
+            if isinstance(runtime, PersistentRuntime):
+                from nullion.runtime_checkpoints import schedule_runtime_checkpoint
+                schedule_runtime_checkpoint(runtime)
+            else:
+                runtime.checkpoint()
     except Exception:
         logger.debug("Unable to select chat memory entries", exc_info=True)
     return format_memory_context(entries)
@@ -4583,7 +4628,9 @@ def _conversation_context_boundary_prompt(result) -> str | None:
         "active task-frame state, an automatic saved-chat lookup candidate, or an unambiguous name/id "
         "supplied by the user. If saved-chat candidates are present, use the newest structured candidate "
         "that resolves the current reference instead of asking the user to repeat details. If the referent "
-        "is not determined by runtime evidence, ask a brief clarification instead of choosing a previous topic."
+        "is not determined by runtime evidence, ask a brief clarification instead of choosing a previous topic. "
+        "This task boundary does not erase saved user profile or preferences. Use those defaults for the "
+        "current request; a location from an unrelated task does not override the saved default location."
     )
 
 
@@ -4605,8 +4652,9 @@ def _compact_unstructured_followup_guard_prompt(
         "evidence such as an attachment, URL, file extension, slash/operator command, approval/action state, "
         "artifact descriptor, task/frame state, numbered-option reply, or direct platform reply anchor. "
         "Do not choose an older artifact, scheduled task, account object, branch, file, or prior topic from "
-        "history just because it is recent. Ask one brief clarification question to identify the target or set "
-        "the user wants to use."
+        "history just because it is recent. First resolve the current request using its named target and "
+        "saved user profile/defaults. A short message can be a complete new request. Ask a brief clarification "
+        "only if required details remain unresolved; do not ask the user to repeat known profile information."
     )
 
 
@@ -8570,6 +8618,11 @@ def _run_scoped_safe_read_tool_directly(
     tool_name = _single_scoped_safe_direct_read_tool(registry)
     if not tool_name:
         return None
+    if model_client is not None and tool_name in {"weather_forecast", "market_quote"}:
+        # A scope hint authorizes a read, not a current-value-only answer.
+        # Keep date/range/field selection with the primary producer. The native
+        # fallback remains available when no model can compose the result.
+        return None
     default_arguments = _direct_safe_read_tool_default_arguments(tool_name)
     arguments = (
         _filter_direct_safe_read_arguments(tool_name, direct_arguments)
@@ -9150,6 +9203,14 @@ def _turn_result_schema_followup_tool_names(result: object) -> tuple[str, ...]:
                     _scan(child, depth=depth + 1)
 
     for tool_result in list(getattr(result, "tool_results", None) or []):
+        # The composed receipt repeats native diagnostics, including possible
+        # repair capabilities. Those are not new user obligations. Inspect the
+        # original native receipts once, preserving their exact ownership.
+        if _tool_result_name(tool_result) == "code_mode":
+            continue
+        recovered_by = tool_result.get("recovered_by") if isinstance(tool_result, dict) else getattr(tool_result, "recovered_by", ())
+        if recovered_by:
+            continue
         output = (
             tool_result.get("output")
             if isinstance(tool_result, dict)
@@ -10019,15 +10080,9 @@ def _direct_browser_page_read_after_open(
 
 
 def _turn_result_has_completed_tool(result: object, tool_names: Iterable[str]) -> bool:
+    from nullion.tools import completed_runtime_tool_names
     allowed = {str(name or "").strip() for name in tool_names if str(name or "").strip()}
-    if not allowed:
-        return False
-    for tool_result in list(getattr(result, "tool_results", None) or []):
-        if _tool_result_name(tool_result) not in allowed:
-            continue
-        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
-            return True
-    return False
+    return bool(allowed.intersection(completed_runtime_tool_names(getattr(result, "tool_results", ()))))
 
 
 def _turn_result_has_textual_or_verified_browser_evidence(result: object) -> bool:
@@ -13492,6 +13547,7 @@ def _registry_with_request_retry_evidence(registry, *, result, conversation_id, 
         invocation_metadata=dict(getattr(result, "invocation_metadata", {}) or {}),
         completion_review_handoff=getattr(result, 'completion_review_handoff', None),
         prepared_answer=getattr(result, 'prepared_answer', None),
+        code_mode_session_id=getattr(result, 'code_mode_session_id', None),
         retained_read_context=retained_context,
     ))
 
@@ -13546,15 +13602,21 @@ def _registry_with_inflight_revision_evidence(
                 spec = base_registry.get_spec(name)
             except (KeyError, ValueError):
                 continue
-            if spec.side_effect_class is not ToolSideEffectClass.READ:
+            from nullion.tools import is_completed_read_observation, retained_observation_result
+            observed = ToolResult(receipt.get('invocation_id') or '', name, 'completed',
+                receipt.get('output') or {}, response_requirements=receipt.get('response_requirements'))
+            if not is_completed_read_observation(observed, base_registry):
                 continue
             invocation_id=f"continuation:{parent_id}:{index}"
-            results.append(ToolResult(
-                invocation_id=invocation_id, tool_name=name,
-                status="completed", output=deepcopy(receipt.get("output")),
-            ))
-            provenance[invocation_id]={'parent_turn_id':parent_id,'observed_at':event.get('created_at'),
-                'original_invocation_id':receipt.get('invocation_id')}
+            inherited = retained_observation_result(observed, invocation_id=invocation_id)
+            origin = (inherited.response_requirements or {}).get('_retained_observation')
+            if not isinstance(origin, dict):
+                origin = {'parent_turn_id':parent_id,'observed_at':event.get('created_at'),
+                    'original_invocation_id':receipt.get('invocation_id')}
+            inherited.response_requirements = {**(inherited.response_requirements or {}),
+                '_retained_observation':deepcopy(origin)}
+            results.append(inherited)
+            provenance[invocation_id]=deepcopy(origin)
     if not results:
         return registry
     return _RevisionContinuationRegistry(registry, TurnContinuationEvidence(
@@ -13580,7 +13642,10 @@ def _selected_parent_has_read_receipts(runtime, conversation_id, parent_id, regi
                     or row.get('tool_name') in {'request_tool_scope',CHAT_HISTORY_SEARCH_TOOL_NAME}):
                 continue
             try:
-                if registry.get_spec(row.get('tool_name')).side_effect_class == ToolSideEffectClass.READ:
+                from nullion.tools import is_completed_read_observation
+                observed = ToolResult(row.get('invocation_id') or '', row.get('tool_name'), 'completed',
+                    row.get('output') or {}, response_requirements=row.get('response_requirements'))
+                if is_completed_read_observation(observed, registry):
                     return True
             except (KeyError,TypeError):
                 continue
@@ -14253,6 +14318,7 @@ def _chat_ambiguity_classifier(
             decision = route_turn_dispatch_with_context(
                 text,
                 active_turn_ids=("active-branch",),
+                target_context_selected=True,
                 active_turn_texts=(active_turn_text,),
                 model_client=model_client,
             )
@@ -15009,14 +15075,15 @@ def _admin_local_app_targets_prompt(*, principal_id: str | None = None) -> str |
 
 
 def _compact_message_only_delivery_contract_prompt() -> str:
+    from nullion.reasoning_guidance import COMPACT_COMPARISON_GUIDANCE, SOURCE_LINK_GUIDANCE
     return (
         "Chat delivery contract (message-only turn):\n"
-        "- Reply directly in user-facing chat text. Answer the user's actual question first.\n"
-        "- Prefer compact prose or tight short-line summaries; use bullets only when they improve scanning.\n"
-        "- Keep internal tool names, raw payloads, files, paths, and implementation details out unless the user asked for them.\n"
-        "- If the current user explicitly asks for a no-tool response, do not call or request tools; answer directly within that constraint.\n"
-        "- If you ask the user to choose from options, include exactly one numbered choice list so numeric replies map clearly.\n"
-        "- Never answer only 'Done', 'OK', or 'Completed'. Include the requested answer or concrete result."
+        "- Answer the user's actual question first, in chat.\n"
+        "- Omit internal tools, payloads and paths unless requested.\n"
+        "- Honor explicit no-tool requests without calling or requesting tools.\n"
+        "- Use exactly one numbered choice list accepting numeric replies.\n"
+        "- Never answer only acknowledgements; give the result.\n"
+        + COMPACT_COMPARISON_GUIDANCE + '\n' + SOURCE_LINK_GUIDANCE
     )
 
 
@@ -15026,8 +15093,9 @@ def _chat_delivery_contract_prompt(
     principal_id: str | None = None,
     compact_message_only: bool = False,
 ) -> str:
+    from nullion.reasoning_guidance import ARTIFACT_PRODUCTION_GUIDANCE, INPUT_RESOLUTION_GUIDANCE, CONTINUATION_ACTION_GUIDANCE
     if compact_message_only:
-        return _compact_message_only_delivery_contract_prompt()
+        return _compact_message_only_delivery_contract_prompt() + '\n' + CONTINUATION_ACTION_GUIDANCE
     admin_local_app_targets_text = _admin_local_app_targets_prompt(principal_id=principal_id)
     cache_key = (
         _chat_runtime_cache_identity(runtime),
@@ -15055,7 +15123,10 @@ def _chat_delivery_contract_prompt(
         workspace_registry_text = None
     caps_text = (
         "Chat delivery contract:\n"
-        f"- When the user asks you to send, attach, upload, or deliver a file, write it with file_write under this workspace artifact directory only: {artifact_root}\n"
+        f"- Save requested files under this workspace artifact directory: {artifact_root}\n"
+        f"{ARTIFACT_PRODUCTION_GUIDANCE}"
+        f"- {INPUT_RESOLUTION_GUIDANCE}\n"
+        f"- {CONTINUATION_ACTION_GUIDANCE}\n"
         f"- Legacy artifact directory still supported for older turns: {legacy_artifact_root}\n"
         "- For an exact PDF page-count request, set expected_page_count on pdf_create/pdf_edit. A layout overflow requires repairing the layout, not dropping requested content.\n"
         "- Treat artifact creation, inspection, and delivery as separate steps. Reuse successful producer inspection receipts; do not download local files to inspect them. Finish with MEDIA:<exact path> for each final requested file only. Drafts and superseded versions must not be attached.\n"
@@ -15112,6 +15183,8 @@ def _chat_delivery_contract_prompt(
         "- If a tool result has status denied or error, treat it as failed and ask for the needed approval or report the failure."
         )
         )
+    from nullion.reasoning_guidance import COMPARISON_GUIDANCE, SOURCE_LINK_GUIDANCE
+    caps_text += '\n' + COMPARISON_GUIDANCE + '\n' + SOURCE_LINK_GUIDANCE
     _chat_stable_context_cache_set(cache_key, caps_text, db_path=_chat_runtime_cache_db_path(runtime))
     return caps_text
 
@@ -15337,7 +15410,7 @@ def _chat_capability_inventory_prompt(
     discovery_registry = getattr(runtime, "active_tool_registry", None) or tool_registry
     active_connector_context = active_connector_provider_context_snapshot(allow_runtime_load=False)
     cache_key = (
-        "direct_scope_routes_v7_shared_source_read_guidance",
+        "direct_scope_routes_v10_bounded_research",
         _chat_runtime_cache_identity(runtime),
         _chat_tool_registry_signature(tool_registry),
         _chat_tool_registry_signature(discovery_registry),
@@ -16031,7 +16104,10 @@ def _has_local_discovery_tool_results(
     )
 
 
-_LOCAL_DISCOVERY_SUMMARY_TOOLS = frozenset({"file_search", "file_read", "workspace_summary", "request_tool_scope"})
+# Code Mode is orchestration: its native receipts remain separate results.
+# Counting the wrapper as a substantive action changes filename lookups into
+# attachment delivery even when their validated scope explicitly forbids it.
+_LOCAL_DISCOVERY_SUMMARY_TOOLS = frozenset({"file_search", "file_read", "workspace_summary", "request_tool_scope", "code_mode"})
 
 
 def _completed_tools_are_only_local_discovery(
@@ -16059,7 +16135,7 @@ def _local_discovery_only_has_file_identities(tool_results) -> bool:
             continue
         name = _tool_result_name(result)
         output = _tool_result_output(result)
-        if name == "request_tool_scope":
+        if name in {"request_tool_scope", "code_mode"}:
             continue
         if name == "file_search" and output.get("search_contents", False) is False:
             details = output.get("match_details") or []
@@ -16962,6 +17038,10 @@ def _should_force_checkpoint_after_chat_turn(
 
 def _checkpoint_conversation_events_after_chat_turn(runtime: PersistentRuntime,
                                                    conversation_id: str | None = None) -> None:
+    if isinstance(runtime, PersistentRuntime):
+        from nullion.runtime_receipts import checkpoint_runtime_receipts
+        checkpoint_runtime_receipts(runtime, conversation_id=conversation_id)
+        return
     checkpoint_events = getattr(runtime, "checkpoint_conversation_events", None)
     if callable(checkpoint_events):
         if isinstance(runtime, PersistentRuntime):
@@ -16977,10 +17057,12 @@ def _should_checkpoint_conversation_events_after_chat_turn(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
     artifact_count: int,
     suspended_for_approval: bool,
+    turn_dispatch_decision: object | None = None,
 ) -> bool:
     # Completed tool work must be recallable after a process restart. Keep
     # plain no-tool chat on its existing deferred checkpoint path.
-    return bool(tool_results) or _should_force_checkpoint_after_chat_turn(
+    return (getattr(turn_dispatch_decision, "reason", None) == "numbered_dispatch_choice"
+        or bool(tool_results)) or _should_force_checkpoint_after_chat_turn(
         tool_results=tool_results,
         artifact_count=artifact_count,
         suspended_for_approval=suspended_for_approval,
@@ -20034,18 +20116,41 @@ def _preferred_current_turn_source_media_paths(
     return (preferred_path,)
 
 
+def _current_artifact_producers(tool_results):
+    # A successful repair at the same path replaces its earlier producer
+    # receipt. Retain independent sibling files and ignore inspection reads.
+    producers = []; seen_paths = set()
+    for result in reversed(tool_results or ()):
+        if (_tool_result_name(result) not in {*_MEDIA_EMBEDDABLE_ARTIFACT_TOOLS, "file_write"}
+                or normalize_tool_status(getattr(result, "status", None)) != "completed"):
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        identities = set()
+        for path in _output_artifact_paths(output):
+            try:
+                identities.add(str(Path(path).expanduser().resolve()))
+            except (OSError, RuntimeError):
+                identities.add(str(Path(path).expanduser()))
+        if identities and identities.issubset(seen_paths):
+            continue
+        producers.append(result); seen_paths.update(identities)
+    return list(reversed(producers))
+
+
 def _completed_artifact_extensions_without_embedded_media(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
     *,
     required_image_paths: tuple[str, ...] = (),
+    allowed_plain_paths: Iterable[str] = (),
 ) -> set[str]:
     missing_media: set[str] = set()
+    allowed_plain_identities = {identity for path in allowed_plain_paths for identity in _path_identity_variants(path)}
     required_image_identities = {
         identity
         for path in required_image_paths
         for identity in _path_identity_variants(path)
     }
-    for result in tool_results or ():
+    for result in _current_artifact_producers(tool_results):
         tool_extension = _MEDIA_EMBEDDABLE_ARTIFACT_TOOLS.get(str(getattr(result, "tool_name", "") or ""))
         output = result.output if isinstance(result.output, dict) else {}
         extension = tool_extension
@@ -20064,6 +20169,12 @@ def _completed_artifact_extensions_without_embedded_media(
             for key in ("artifact_paths", "artifacts")
         )
         if not has_artifact:
+            continue
+        # The shared delivery contract can select a plain sibling beside an
+        # illustrated file of the same format. It is not a failed replacement.
+        if (allowed_plain_identities and not _output_embedded_media_paths(output)
+                and any(_path_matches_identity_set(Path(path), allowed_plain_identities)
+                        for path in _output_artifact_paths(output))):
             continue
         embedded_images: list[str] = []
         for key in ("embedded_images", "source_image_paths", "image_paths"):
@@ -20113,13 +20224,7 @@ def _completed_artifact_paths_without_current_media(
         for identity in _path_identity_variants(path)
     }
     missing_paths: set[str] = set()
-    for result in tool_results or ():
-        if normalize_tool_status(getattr(result, "status", None)) != "completed":
-            continue
-        if str(getattr(result, "tool_name", "") or "") not in _MEDIA_EMBEDDABLE_ARTIFACT_TOOLS and str(
-            getattr(result, "tool_name", "") or ""
-        ) != "file_write":
-            continue
+    for result in _current_artifact_producers(tool_results):
         output = result.output if isinstance(result.output, dict) else {}
         artifact_paths: list[str] = []
         for key in ("path", "artifact_path"):
@@ -20255,8 +20360,15 @@ def _missing_required_attachment_extensions_for_repair(
         tool_results=tool_results,
     )
     current_turn_media_paths = _preferred_current_turn_source_media_paths(tool_results)
+    from nullion.artifact_lifecycle import delivery_manifest
+    from nullion.response_fulfillment_contract import artifact_valid_plain_media_siblings
+    selected_paths = delivery_manifest(tool_results) or tuple(
+        path for path in artifact_paths or () if Path(path).suffix.lower() in required)
+    allowed_plain_paths = artifact_valid_plain_media_siblings(tool_results, selected_paths,
+        required_extensions=required)
     if media_required:
-        missing_embedded_media_extensions = _completed_artifact_extensions_without_embedded_media(tool_results)
+        missing_embedded_media_extensions = _completed_artifact_extensions_without_embedded_media(
+            tool_results, allowed_plain_paths=allowed_plain_paths)
         existing_with_embedded_media.difference_update(
             extension
             for extension in missing_embedded_media_extensions
@@ -20269,6 +20381,7 @@ def _missing_required_attachment_extensions_for_repair(
         missing_current_media_extensions = _completed_artifact_extensions_without_embedded_media(
             tool_results,
             required_image_paths=current_turn_media_paths,
+            allowed_plain_paths=allowed_plain_paths,
         )
         existing.difference_update(extension for extension in missing_current_media_extensions if extension in required)
         for extension in missing_current_media_extensions:
@@ -21926,6 +22039,8 @@ def _remember_chat_turn(
         tool_results=tool_results,
         source="agent",
     )
+    from nullion.chat_text import render_user_message
+    assistant_reply = render_user_message(assistant_reply)
     try:
         from nullion.connections import workspace_id_for_principal
 
@@ -22074,6 +22189,10 @@ def _compact_tool_output_for_context(
     user_message: str | None = None,
 ) -> object:
     redacted = redact_value(output)
+    if tool_name == "code_mode":
+        from nullion.code_mode import compact_output
+        from nullion.agent_orchestrator import _model_tool_result_max_chars
+        return compact_output(redacted, max_chars=_model_tool_result_max_chars())
     if tool_name == "chat_history_search" and isinstance(redacted, dict):
         from nullion.conversation_history_tools import compact_history_search_output
         return compact_history_search_output(redacted, max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
@@ -22216,6 +22335,10 @@ def _compact_tool_output_for_context(
     if tool_name == "request_tool_scope" and isinstance(redacted, dict):
         from nullion.source_selection import compact_scope_evidence
         return compact_scope_evidence(redacted, original_chars=len(encoded))
+    from nullion.source_context_projection import compact_native_page_history
+    native_pages=compact_native_page_history(redacted,max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if native_pages is not None:
+        return native_pages
     from nullion.source_selection import compact_source_identity_evidence
     identity_evidence = compact_source_identity_evidence(redacted, encoded=encoded,
         max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
@@ -22932,7 +23055,8 @@ def _latest_chat_turn_artifact_tool_results(
     if not isinstance(conversation_id, str) or not conversation_id.strip():
         return ()
     try:
-        events = runtime.store.list_conversation_events(conversation_id)
+        events = runtime.store.list_recent_conversation_events(
+            conversation_id, event_type="conversation.chat_turn", limit=16)
     except Exception:
         logger.debug("Could not read conversation events for last-mile artifact fulfillment", exc_info=True)
         return ()
@@ -23354,6 +23478,9 @@ def _auto_accept_proposal(
         logger.debug("Builder auto-accept failed (non-fatal)", exc_info=True)
 
 
+@research_scope
+@request_resource_scope
+@request_session_scope
 def _render_chat_turn(
     runtime: PersistentRuntime,
     *,
@@ -23384,6 +23511,9 @@ def _render_chat_turn(
     timing_started_at = time.perf_counter()
     timing_last_at = timing_started_at
     timing_marks: list[dict[str, object]] = []
+    if activity_callback is not None:
+        from nullion.request_progress import RequestProgress
+        activity_callback = RequestProgress(activity_callback).emit
     phase_tracker = PhaseActivityTracker(
         activity_callback=activity_callback,
         surface="messaging",
@@ -23466,6 +23596,26 @@ def _render_chat_turn(
     principal_id = _principal_id_for_chat(chat_id, settings)
     approval_ids_before = _pending_approval_ids(runtime)
     conversation_id = _conversation_id_for_chat(chat_id)
+
+    # A target clarification is a UI decision, not a new execution of the
+    # ambiguous request. Keep every candidate untouched until a numeric choice
+    # has been bound and validated by the shared admission tracker.
+    from nullion.turn_dispatch_choices import dispatch_choice_question
+    dispatch_question = dispatch_choice_question(turn_dispatch_decision) if turn_dispatch_decision is not None else None
+    if dispatch_question is not None:
+        recorded = runtime.process_conversation_message(
+            conversation_id=conversation_id, chat_id=chat_id, user_message=prompt,
+            request_id=request_id, message_id=message_id, turn_id=turn_id,
+            dispatch_disposition=ConversationTurnDisposition.INDEPENDENT,
+            dispatch_dependency_turn_ids=(), dispatch_reason="dispatch_target_clarification", checkpoint=False)
+        _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt,
+            assistant_reply=dispatch_question, conversation_turn_id=recorded.turn.turn_id)
+        _checkpoint_conversation_events_after_chat_turn(runtime, conversation_id)
+        _finish_latency("dispatch_target_clarification")
+        return dispatch_question
+    resolved_message = getattr(turn_dispatch_decision, "resolved_message", None)
+    if resolved_message is not None:
+        prompt = resolved_message
 
     # A delivered expiry notice carries the identity of this numbered UI action.
     from nullion.live_tracking_choices import expiry_choice_reply
@@ -23647,6 +23797,7 @@ def _render_chat_turn(
                 "dispatch_dependency_turn_ids": (numbered_option_parent_turn_id,),
                 "dispatch_reason": "numbered_option_reply",
             }
+    phase_tracker.emit(PHASE_CHECK_TASK_STATE, "running")
     conversation_result = runtime.process_conversation_message(
         conversation_id=conversation_id,
         chat_id=chat_id,
@@ -23742,6 +23893,7 @@ def _render_chat_turn(
     if numbered_option_context:
         conversation_context = "\n\n".join(part for part in (conversation_context, numbered_option_context) if part)
     _mark_timing("conversation_context")
+    phase_tracker.emit(PHASE_LOAD_MEMORY, "running")
     memory_context = _memory_context_for_chat(
         runtime,
         chat_id=chat_id,
@@ -23782,11 +23934,14 @@ def _render_chat_turn(
         [attachment.name for attachment in normalized_attachments] + unavailable_chat_attachment_names(attachments or [])
     )
     prompt_attachment_format_candidate = _has_attachment_format_candidate(effective_prompt)
+    filename_reference_present = bool(_requested_output_filenames_from_texts(effective_prompt))
     allow_attachment_model_planning = (
         planner_requested
         or attachment_context_present
         or prompt_attachment_format_candidate
-    )
+    ) and not filename_reference_present and not callable(getattr(agent_orchestrator, "review_turn_result", None))
+    # The primary selects output/media requirements through its typed scope.
+    # Separate format/media classifiers before that decision add model trips.
     requested_attachment_extensions = _requested_attachment_extensions(
         effective_prompt,
         model_client=model_client if allow_attachment_model_planning else None,
@@ -23839,6 +23994,13 @@ def _render_chat_turn(
     else:
         planned_embedded_media_extensions = ()
         scope_requested_extensions = ()
+    if filename_reference_present:
+        # A concrete source/output name supplies file identity, not an action
+        # or delivery requirement. The primary's structured scope selects
+        # creation, conversion or delivery when the current request needs it.
+        requested_attachment_extensions = ()
+        planned_embedded_media_extensions = ()
+        scope_requested_extensions = ()
     source_attachment_paths = _source_attachment_paths(normalized_attachments)
     existing_named_artifact_paths = _existing_named_workspace_artifact_paths(
         runtime,
@@ -23874,8 +24036,7 @@ def _render_chat_turn(
     prior_tool_scopes = _recent_tool_scopes_for_context(
         runtime, conversation_id, anchor_turn_id=conversation_result.turn.parent_turn_id)
     retained_read_available = bool(
-        set(prior_tool_scopes).intersection({'web','connector'})
-        and _selected_parent_has_read_receipts(runtime,conversation_id,conversation_result.turn.parent_turn_id,
+        _selected_parent_has_read_receipts(runtime,conversation_id,conversation_result.turn.parent_turn_id,
             runtime.active_tool_registry))
     turn_tool_evidence = build_turn_tool_evidence(
         user_message=effective_prompt,
@@ -23941,10 +24102,11 @@ def _render_chat_turn(
     tool_scope_user_message = "\n\n".join(
         part for part in (effective_prompt, reply_context_prompt) if part
     )
-    mentions_current_cron_reference = _user_turn_mentions_current_cron_reference(
-        tool_scope_user_message,
-        principal_id=principal_id,
-    )
+    # Explicit reply state can select a job. Ordinary requests let the primary
+    # scope scheduler tools when needed, without scanning all jobs for names.
+    mentions_current_cron_reference = bool(quoted_cron_name) if callable(
+        getattr(agent_orchestrator, "review_turn_result", None)
+    ) else _user_turn_mentions_current_cron_reference(tool_scope_user_message, principal_id=principal_id)
     fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
         user_message=tool_scope_user_message,
@@ -24025,7 +24187,8 @@ def _render_chat_turn(
             runtime, prompt=effective_prompt, principal_id=principal_id, require_all=False)
     artifact_reference_followup = bool(
         (scope_requested_extensions or prompt_attachment_format_candidate)
-        and (turn_is_context_linked(conversation_result) or bool(existing_source_reference_paths))
+        and (turn_is_context_linked(conversation_result) or bool(existing_source_reference_paths)
+             or filename_reference_present)
         and not attachment_context_present
         and not planner_requested
     )
@@ -24151,6 +24314,8 @@ def _render_chat_turn(
             allow_dedicated_artifact_tools=existing_named_artifact_action == "use_tools",
         )
         if existing_file_decision is not None:
+            existing_file_decision = replace(existing_file_decision, required_tool_names=(),
+                requested_artifact_extensions=())
             active_decision = getattr(active_turn_tool_registry, "turn_tool_scope_decision", None)
             existing_file_decision = _merge_active_artifact_contract_into_scope_decision(
                 existing_file_decision,
@@ -24162,10 +24327,9 @@ def _render_chat_turn(
                 tool_scope_decision=existing_file_decision,
             )
     elif _requested_output_filenames(effective_prompt) and not artifact_reference_followup:
-        # A concrete filename is structured file evidence but does not by
-        # itself say whether the user wants discovery or creation. Make both
-        # the read tools and exact suffix producer visible so the agent can
-        # resolve that distinction semantically in one turn.
+        # A filename identifies a possible source, not an output requirement.
+        # Let the primary producer select creation through structured scope;
+        # never force a replacement artifact after an unsuccessful lookup.
         named_file_decision = _local_file_reference_scope_decision_from_message(
             effective_prompt,
             registry=base_tool_registry,
@@ -24176,7 +24340,8 @@ def _render_chat_turn(
             active_turn_tool_registry = ScopedTurnToolRegistry(
                 base_tool_registry,
                 evidence=turn_tool_evidence,
-                tool_scope_decision=replace(named_file_decision, required_tool_names=()),
+                tool_scope_decision=replace(named_file_decision, required_tool_names=(),
+                    requested_artifact_extensions=()),
             )
     if planned_embedded_media_extensions:
         existing_decision = getattr(active_turn_tool_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
@@ -24232,6 +24397,13 @@ def _render_chat_turn(
         requires_new_artifact_content=turn_tool_evidence.existing_named_artifact_requires_new_content,
     )
     turn_tool_flow_context = dict(turn_tool_flow_context or {})
+    from nullion.plugins.browser_plugin.browser_config import selected_browser_recovery
+    browser_selection = selected_browser_recovery(runtime.store, reply=prompt,
+        conversation_id=conversation_id, parent_turn_id=(conversation_result.turn.parent_turn_id
+            or (reply_dependency_turn_ids[0] if len(reply_dependency_turn_ids)==1 else None)),
+        principal_id=principal_id)
+    if browser_selection:
+        turn_tool_flow_context['browser_mode_selection'] = browser_selection
     if selected_request:
         turn_tool_flow_context["selected_request_context"] = selected_request
     if pending_request:
@@ -24266,7 +24438,7 @@ def _render_chat_turn(
         active_turn_tool_registry, runtime=runtime, conversation_id=conversation_id,
         principal_id=principal_id, decision=turn_dispatch_decision, base_registry=base_tool_registry,
         conversation_result=conversation_result)
-    if conversation_result.turn.parent_turn_id and set(prior_tool_scopes).intersection({'web','connector'}):
+    if conversation_result.turn.parent_turn_id and (retained_read_available or set(prior_tool_scopes).intersection({'web','connector'})):
         observation_scope = getattr(active_turn_tool_registry, 'turn_tool_scope_decision', None)
         observation_continuation = getattr(active_turn_tool_registry, 'turn_continuation_evidence', None)
         runtime.store.add_conversation_event({
@@ -24290,10 +24462,12 @@ def _render_chat_turn(
                 if key in {"platform", "reply_to_message_id", "reply_to_turn_id", "reply_to_from_bot", "reply_to_text", "reply_to_has_attachment"}
             }
         }
+    from nullion.request_lineage import execution_request
     turn_tool_flow_context.update(
-        user_request=prompt,
+        current_user_request=prompt,
+        user_request=execution_request(turn_tool_flow_context, prompt),
         browser_session_scope=conversation_result.turn.turn_id,
-        browser_session_owner=f"conversation:{conversation_id}",
+        browser_session_owner=current_request_resource_scope(),
     )
     agent_orchestrator = _orchestrator_with_interactive_fast_profile(
         agent_orchestrator,
@@ -24793,11 +24967,10 @@ def _render_chat_turn(
                 ],
             })
             _mark_timing("context_delivery_contract")
-            plain_no_user_tool_fast_path = _tool_registry_has_only_context_discovery_tools(active_turn_tool_registry)
+            plain_no_user_tool_fast_path = _turn_tool_scope_uses_compact_delivery_contract(active_turn_tool_registry)
             _capability_inventory = (
                 _compact_tool_scope_awareness_prompt(runtime.active_tool_registry or base_tool_registry)
-                if _tool_registry_has_only_context_discovery_tools(
-                    active_turn_tool_registry, include_context_operations=True)
+                if plain_no_user_tool_fast_path
                 else _chat_capability_inventory_prompt(runtime, tool_registry=active_turn_tool_registry)
             )
             if _capability_inventory:
@@ -25193,6 +25366,9 @@ def _render_chat_turn(
             def _safe_text_delta_callback(delta: str) -> None:
                 if not delta or (cancellation_checker is not None and cancellation_checker()):
                     return
+                if not streamed_text_parts and activity_callback is not None:
+                    activity_callback({'id':'request-progress','label':'Progress',
+                        'status_kind':'request_progress','status':'done','text':''})
                 turn_latency.mark("first_text_delta", once=True)
                 streamed_text_parts.append(delta)
                 if text_delta_callback is not None:
@@ -26601,6 +26777,7 @@ def _render_chat_turn(
                 )
                 _finish_latency(suppressed_outcome, tool_count=len(activity_tool_results))
                 if _should_checkpoint_conversation_events_after_chat_turn(
+                    turn_dispatch_decision=turn_dispatch_decision,
                     tool_results=activity_tool_results,
                     artifact_count=suppressed_artifact_count,
                     suspended_for_approval=_turn_is_suspended,
@@ -26646,15 +26823,8 @@ def _render_chat_turn(
                 enabled=thinking_display_enabled_for_chat(runtime, chat_id=chat_id),
             )
             current_artifact_count = _current_turn_artifact_count(reply, locals().get("turn_result", None))
-            if (
-                text_delta_callback is not None
-                and not streamed_text_parts
-                and not _turn_is_suspended
-                and not handled_by_mini_agents
-                and current_artifact_count == 0
-                and str(visible_reply or "").strip()
-            ):
-                _safe_text_delta_callback(str(visible_reply))
+            # Only actual producer deltas establish stream ownership. Buffered
+            # answers retain the shared final presentation/delivery boundary.
             if streamed_text_parts and "".join(streamed_text_parts) == visible_reply:
                 visible_reply = StreamedChatReply(visible_reply)
             if handled_by_mini_agents and mini_agent_dispatch_group_id:
@@ -26670,18 +26840,18 @@ def _render_chat_turn(
             )
             phase_tracker.emit(PHASE_SAVE_CONVERSATION, "running")
             turn_latency.mark("save_start", once=True)
-            if not _turn_is_suspended:
-                _remember_chat_turn(
-                    runtime,
-                    chat_id=chat_id,
-                    user_message=prompt,
-                    assistant_reply=reply,
-                    conversation_turn_id=conversation_result.turn.turn_id,
-                    tool_results=activity_tool_results,
-                    artifact_paths=locals().get("turn_result", SimpleNamespace(artifacts=[])).artifacts,
-                    response_presentation=getattr(locals().get("turn_result"), "response_presentation", None),
-                    response_fulfilled=getattr(locals().get('turn_result'), 'response_fulfilled', None),
-                )
+            # Approval pauses the action, not completed files or draft provenance.
+            _remember_chat_turn(
+                runtime,
+                chat_id=chat_id,
+                user_message=prompt,
+                assistant_reply=reply,
+                conversation_turn_id=conversation_result.turn.turn_id,
+                tool_results=activity_tool_results,
+                artifact_paths=locals().get("turn_result", SimpleNamespace(artifacts=[])).artifacts,
+                response_presentation=getattr(locals().get("turn_result"), "response_presentation", None),
+                response_fulfilled=False if _turn_is_suspended else getattr(locals().get('turn_result'), 'response_fulfilled', None),
+            )
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
             if not _turn_is_suspended and not deferred_scheduler_receipt_reply:
                 _schedule_chat_turn_memory_capture(
@@ -26726,7 +26896,8 @@ def _render_chat_turn(
                 tool_count=len(activity_tool_results),
                 artifact_count=current_artifact_count,
             )
-            if _should_checkpoint_conversation_events_after_chat_turn(
+            if defer_checkpoint or _should_checkpoint_conversation_events_after_chat_turn(
+                turn_dispatch_decision=turn_dispatch_decision,
                 tool_results=activity_tool_results,
                 artifact_count=current_artifact_count,
                 suspended_for_approval=_turn_is_suspended,
@@ -27257,7 +27428,11 @@ def handle_chat_operator_message(
         )
         return reply
 
-    if _normalize_command_head(message) == "/stop":
+    if _normalize_command_head(message) == "/help":
+        from nullion.operator_commands import operator_command_reference
+        parts = message.strip().split()
+        reply = operator_command_reference(platform=channel_name, full=len(parts)>1 and parts[1].lower()=='commands')
+    elif _normalize_command_head(message) == "/stop":
         if not is_stop_command_text(message):
             reply = "Usage: /stop"
         else:

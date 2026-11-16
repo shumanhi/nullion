@@ -12683,17 +12683,10 @@ def test_browser_answer_preservation_does_not_treat_search_query_words_as_result
     assert reply == sanitize_user_visible_reply(user_message=None, reply=draft_reply, tool_results=[])
 
 
-def test_sanitizer_replaces_web_search_non_answer_that_name_drops_sources() -> None:
+def test_sanitizer_recovers_an_empty_reply_from_search_snippets() -> None:
     reply = sanitize_user_visible_reply(
         user_message="Can u find car rental from Spring Ma for a week? From jun 27 to July 4th, no electric car",
-        reply=(
-            "Yes — I can help you look for a non-electric car rental in Springfield, MA for June 27 to July 4.\n\n"
-            "I’m at the point where I can open the search, but I can’t reliably read the live results from the "
-            "browser in this turn. If you want, I can still help in one of these ways:\n\n"
-            "1. I can give you the exact search links/filters to use on Hertz, Enterprise, Avis, Budget, and Kayak.\n"
-            "2. You can send me a rental site link or screenshots, and I’ll help compare the options.\n"
-            "3. I can build a short checklist of the best pickup locations around Springfield, MA."
-        ),
+        reply="",
         tool_results=[
             ToolResult(
                 "search",
@@ -12787,10 +12780,10 @@ def test_browser_answer_preservation_uses_browser_blocker_instead_of_search_lead
     assert reply == sanitize_user_visible_reply(user_message=None, reply=draft_reply, tool_results=[])
 
 
-def test_sanitizer_groups_structured_search_values_by_result_symbol() -> None:
+def test_sanitizer_groups_structured_search_values_for_an_empty_reply() -> None:
     reply = sanitize_user_visible_reply(
         user_message="Give current market prices.",
-        reply="I found search rows.",
+        reply="",
         tool_results=[
             ToolResult(
                 "search-crml",
@@ -14810,7 +14803,7 @@ def test_sanitizer_prefers_primary_account_tool_when_internal_reply_mentions_wro
 
 
 @pytest.mark.usefixtures('expressive_account_presentation')
-def test_sanitizer_prevents_later_account_tool_from_overwriting_primary_result() -> None:
+def test_sanitizer_keeps_combined_account_answer_in_either_read_order() -> None:
     calendar = ToolResult(
         "calendar",
         "calendar_list",
@@ -14841,22 +14834,14 @@ def test_sanitizer_prevents_later_account_tool_from_overwriting_primary_result()
         },
     )
 
-    sanitized = sanitize_user_visible_reply(
-        user_message="cechk my calender",
-        reply=(
-            "**Latest unread email**\n"
-            "- **From:** St. Jude Children's Research Hospital\n"
-            "- **Subject:** *Example, your weekly update and patient spotlight on Jeritza*\n\n"
-            "If you want, I can also open it and summarize the message for you."
-        ),
-        tool_results=[calendar, email],
-        source="agent",
-    )
-
-    assert sanitized == (
-        "📅 I checked your calendar. Found 1 event:\n"
-        "- 2026-05-17 14:00 - 2026-05-17 15:00: Lunch with Nathan"
-    )
+    reply = ('Lunch with Nathan is scheduled from 14:00 to 15:00 on 2026-05-17. '
+        'The unread message is a weekly charity newsletter featuring a patient story.')
+    for results in ([calendar, email], [email, calendar]):
+        metadata = {}
+        sanitized = sanitize_user_visible_reply(user_message='両方の結果を要約してください。',
+            reply=reply, tool_results=results, source='agent', presentation_metadata=metadata)
+        assert reply in sanitized
+        assert metadata.get('fulfillment_satisfied') is not False
 
 
 @pytest.mark.usefixtures('expressive_account_presentation')

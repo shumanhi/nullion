@@ -196,7 +196,7 @@ def test_docker_harnesses_copy_worktrees_without_host_git_metadata() -> None:
     linux = (ROOT / 'scripts/installer-docker-linux.sh').read_text()
     assert '.:/inputs/suite:ro' in compose
     assert ':/inputs/app:ro' in compose
-    assert 'cp -a /inputs/app/. /tmp/nullion-src/' in runner
+    assert "tar -C /inputs/app --exclude='./.e2e-artifacts' -cf - . | tar -C /tmp/nullion-src -xf -" in runner
     assert 'rm -rf /tmp/nullion-src/.git' in runner
     assert 'rm -rf /tmp/nullion-work/nullion-src/.git' in linux
 

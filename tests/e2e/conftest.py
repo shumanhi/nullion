@@ -7,6 +7,53 @@ from pathlib import Path
 import pytest
 
 
+def pytest_runtest_logreport(report):
+    """Persist each completed live case before a later long workflow starts."""
+    if os.environ.get('NULLION_LIVE_STAGE_E2E')!='1' or '/test_live_stage' not in report.nodeid:
+        return
+    root=os.environ.get('NULLION_LIVE_EVIDENCE_DIR')
+    if not root or (report.when!='call' and not report.failed and not report.skipped):
+        return
+    import json
+    import time
+    row={'nodeid':report.nodeid,'phase':report.when,'outcome':report.outcome,
+        'duration_seconds':report.duration,'recorded_at':time.time()}
+    if report.failed:
+        row['failure']=str(report.longrepr)[:3500]
+        row['scenario_failures']=[]
+        for line in report.capstdout.splitlines():
+            try:message=json.loads(line)
+            except ValueError:continue
+            if isinstance(message,dict) and message.get('event')=='scenario_failure':
+                row['scenario_failures'].append({key:str(message.get(key,''))[:2500]
+                    for key in ('scenario','failure','exception_type')})
+    target=Path(root);target.mkdir(parents=True,exist_ok=True)
+    with (target/'case-results.jsonl').open('a') as handle:
+        handle.write(json.dumps(row,ensure_ascii=False)+'\n')
+
+
+@pytest.fixture(autouse=True)
+def pause_live_stage_between_cases(request):
+    """An operator can pause the owned runner before its next paid request."""
+    if os.environ.get('NULLION_LIVE_STAGE_E2E')!='1' or not request.node.path.name.startswith('test_live_stage'):
+        yield
+        return
+    import json
+    import time
+    root=os.environ.get('NULLION_LIVE_STAGE_ARTIFACT_ROOT')
+    if not root:
+        yield
+        return
+    root=Path(root)
+    pause=root/'.pause-before-next-case'
+    state=root/'.live-runner-state.json'
+    state.write_text(json.dumps({'phase':'boundary','next_case':request.node.nodeid}))
+    while pause.exists():time.sleep(.25)
+    state.write_text(json.dumps({'phase':'running','case':request.node.nodeid,'started_at':time.time()}))
+    try:yield
+    finally:state.write_text(json.dumps({'phase':'boundary','completed_case':request.node.nodeid,'finished_at':time.time()}))
+
+
 @pytest.fixture(scope='session')
 def live_stage_provider_guard():
     from scripts.live_stage_provider_guard import process_provider_guard
@@ -179,3 +226,27 @@ def source_summary_model_reply():
         else: return None
         return {'stop_reason':'end_turn','content':[{'type':'text','text':json.dumps(decision)}]}
     return reply
+
+
+@pytest.fixture
+def native_browser_source(monkeypatch):
+    """Real local HTTP pages for scripted SDK providers' native read prerequisite."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    servers=[]
+    monkeypatch.setenv('NULLION_BROWSER_BLOCK_PRIVATE','false')
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND','playwright')
+    monkeypatch.setenv('NULLION_BROWSER_HEADLESS','true')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL',raising=False)
+    def serve(body):
+        payload=body.encode('utf-8')
+        class Page(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.end_headers()
+                self.wfile.write(payload)
+            def log_message(self,*args):pass
+        server=ThreadingHTTPServer(('127.0.0.1',0),Page);servers.append(server)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        return f'http://localhost:{server.server_port}/'
+    yield serve
+    for server in servers:
+        server.shutdown();server.server_close()

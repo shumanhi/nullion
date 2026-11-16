@@ -131,7 +131,8 @@ def test_browser_text_reaches_chat_without_revalidation(tmp_path, monkeypatch, r
                             if mode == 'items_dense':
                                 payloads = [part['text'] for message in kwargs['messages'] for block in message.get('content', [])
                                             if isinstance(block, dict) and block.get('type') == 'tool_result'
-                                            for part in block.get('content', []) if isinstance(part, dict) and '"item_count"' in str(part.get('text', ''))]
+                                            for part in block.get('content', []) if isinstance(part, dict) and any(key in str(part.get('text', ''))
+                                                for key in ('"item_count"', '"collection_views"'))]
                                 assert len(payloads) == 1
                                 # Model latency grows with input. Simulate that
                                 # external cost; complete record delivery stays real.

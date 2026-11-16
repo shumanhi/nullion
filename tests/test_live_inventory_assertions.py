@@ -27,3 +27,11 @@ def test_concise_labels_preserve_unique_numbered_inventory_identity(names):
 ])
 def test_missing_ambiguous_wrong_or_duplicate_inventory_rows_fail(reply,names):
     with pytest.raises(AssertionError):assert_numbered_inventory_identities(reply,_inventory(names))
+
+
+@pytest.mark.parametrize('name',['Stock report release check','株式レポート','Informe bursátil'])
+def test_exact_identity_accepts_typographic_dash_substitution(name):
+    inventory={'inventory_index':[{'selection_index':1,'name':name+' - web - 2026-10-02'}]}
+    assert_numbered_inventory_identities('1. '+name+' — Web — 2026-10-02',inventory)
+    with pytest.raises(AssertionError):
+        assert_numbered_inventory_identities('1. Unrelated — web — 2026-10-02',inventory)

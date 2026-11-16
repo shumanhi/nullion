@@ -7,7 +7,7 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker real route and SQLite')
 
 @pytest.mark.parametrize('prompt',['Compare these two departures.','Compara estas dos salidas.','この二つの出発便を比較してください。'])
-def test_distinct_departures_with_one_carrier_are_delivered_once_each(tmp_path,monkeypatch,prompt):
+def test_distinct_departures_with_one_carrier_are_delivered_once_each(tmp_path,monkeypatch,prompt,native_browser_source):
     from datetime import UTC,datetime
     from fastapi.testclient import TestClient
     from nullion import web_app,chat_store
@@ -23,6 +23,8 @@ def test_distinct_departures_with_one_carrier_are_delivered_once_each(tmp_path,m
     monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'none.env'));monkeypatch.setenv('NULLION_MEMORY_ENABLED','0')
     monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off');chat_store._store=None
     source=records();calls=[]
+    from html import escape
+    url=native_browser_source('<html><body><pre>'+escape(json.dumps(source[0].output,ensure_ascii=False))+'</pre></body></html>')
     def capture(*args,**kwargs):calls.append(1);return source[0].output
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_available',lambda:True)
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_python',lambda:'/external/python')
@@ -56,9 +58,14 @@ def test_distinct_departures_with_one_carrier_are_delivered_once_each(tmp_path,m
                 return tool('present_source_answer',selection(context=json.loads(raw)))
             if not names:return text('{}')
             self.step+=1
-            if self.step==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_run_task'],
+            if self.step==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_read_pages','browser_run_task'],
                 'required_tool_names':['browser_run_task']})
-            if self.step==2:return tool('browser_run_task',{'task':prompt,'url':'https://travel.example/results'})
+            if self.step==2:
+                response=tool('browser_run_task',{'task':prompt,'url':url,'execution_kind':'adaptive_interaction',
+                'interaction_reason':'Exercise the delegated source-evidence contract after the native read'})
+                response['content'].insert(0,{'type':'tool_use','id':'native-first','name':'browser_read_pages',
+                    'input':{'pages':[{'url':url,'read_kind':'text'}]}})
+                return response
             assert self.step==3
             return text('**American** — 7:14 AM–10:29 AM\n\n**American** — 9:05 AM–12:16 PM')
     model=Provider();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model

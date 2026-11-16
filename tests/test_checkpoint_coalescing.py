@@ -1,4 +1,5 @@
 """Checkpoint no-ops and coalesced writes preserve persistence intent."""
+from nullion import runtime_checkpoints
 from types import SimpleNamespace
 import threading
 
@@ -79,7 +80,7 @@ def test_background_checkpoint_preserves_force_only_for_the_requested_pass(monke
     web_app._schedule_web_checkpoint(runtime,force=initial)
     queued.pop(0)()
     assert calls==expected
-    assert id(runtime) not in web_app._WEB_CHECKPOINT_INFLIGHT
+    assert id(runtime) not in runtime_checkpoints._CHECKPOINT_INFLIGHT
 
 
 def test_retiring_writer_cannot_clear_a_new_writers_pending_state(monkeypatch):
@@ -93,16 +94,16 @@ def test_retiring_writer_cannot_clear_a_new_writers_pending_state(monkeypatch):
         def __exit__(self,*exc):
             nonlocal restarted
             lock.release()
-            if calls and not restarted and id(runtime) not in web_app._WEB_CHECKPOINT_INFLIGHT:
+            if calls and not restarted and id(runtime) not in runtime_checkpoints._CHECKPOINT_INFLIGHT:
                 restarted=True;web_app._schedule_web_checkpoint(runtime,force=True)
     monkeypatch.setattr(web_app.threading,'Thread',Thread)
-    monkeypatch.setattr(web_app,'_WEB_CHECKPOINT_LOCK',Gate())
+    monkeypatch.setattr(runtime_checkpoints,'_CHECKPOINT_LOCK',Gate())
     runtime=SimpleNamespace(checkpoint=lambda *,force=False:calls.append(force))
     web_app._schedule_web_checkpoint(runtime)
     queued.pop(0)()
-    assert queued and id(runtime) in web_app._WEB_CHECKPOINT_INFLIGHT
+    assert queued and id(runtime) in runtime_checkpoints._CHECKPOINT_INFLIGHT
     queued.pop(0)()
-    assert calls==[False,True] and id(runtime) not in web_app._WEB_CHECKPOINT_INFLIGHT
+    assert calls==[False,True] and id(runtime) not in runtime_checkpoints._CHECKPOINT_INFLIGHT
 
 
 def test_requests_queued_before_worker_starts_share_one_forced_pass(monkeypatch):
@@ -125,7 +126,7 @@ def test_requests_queued_before_worker_starts_share_one_forced_pass(monkeypatch)
     assert len(queued) == 1
     queued.pop()()
     assert calls == [True]
-    assert id(runtime) not in web_app._WEB_CHECKPOINT_INFLIGHT
+    assert id(runtime) not in runtime_checkpoints._CHECKPOINT_INFLIGHT
 
 
 def test_failed_worker_start_does_not_poison_later_checkpoint_requests(monkeypatch):
@@ -136,6 +137,6 @@ def test_failed_worker_start_does_not_poison_later_checkpoint_requests(monkeypat
     monkeypatch.setattr(web_app.threading,'Thread',FailedThread)
     runtime=SimpleNamespace(checkpoint=lambda **kw:None)
     with pytest.raises(RuntimeError):web_app._schedule_web_checkpoint(runtime,force=True)
-    assert id(runtime) not in web_app._WEB_CHECKPOINT_INFLIGHT
-    assert id(runtime) not in web_app._WEB_CHECKPOINT_FORCE
-    assert id(runtime) not in web_app._WEB_CHECKPOINT_DIRTY
+    assert id(runtime) not in runtime_checkpoints._CHECKPOINT_INFLIGHT
+    assert id(runtime) not in runtime_checkpoints._CHECKPOINT_FORCE
+    assert id(runtime) not in runtime_checkpoints._CHECKPOINT_DIRTY
