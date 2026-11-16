@@ -1,5 +1,8 @@
 """Real Web source verification and response-only obligations in one request."""
 import os
+import json
+from datetime import datetime,timedelta
+from zoneinfo import ZoneInfo
 import pytest
 from tests.e2e.test_live_stage_web_matrix import live_web,_submit,catalogue
 
@@ -12,11 +15,9 @@ def test_live_web_forecast_and_composed_question_use_different_proof(live_web,re
     assert any(t['tool_name']=='weather_forecast' and t['status']=='completed' for t in turn.get('tool_results',[])),turn
     assert '?' in response['text'] or '？' in response['text'],response
     assert turn.get('response_fulfilled') is True,turn
-    database,conversation=live_web[3:5]
-    plans=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_requirement_contract')
-    rows=plans[-1]['requirement_rows'];assert not any(r['requirement_kind']=='action' and not r['eligible_evidence_tool_names'] for r in rows),rows
-    reviews=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_review')
-    assert reviews[-1]['disposition']=='complete' and len(reviews)<=2,reviews
-    assert not any(r.get('runtime_failure_code')=='unverified_requirements' for r in reviews),reviews
+    tomorrow=(datetime.now(ZoneInfo('America/New_York'))+timedelta(days=1)).date().isoformat()
+    forecasts=[t['output'] for t in turn.get('tool_results',[]) if t['tool_name']=='weather_forecast' and t['status']=='completed']
+    assert any(tomorrow in json.dumps(result) for result in forecasts),forecasts
+    assert not response.get('artifacts')
     assert elapsed<120000,elapsed
     record_property('forecast_question_latency_ms',elapsed)

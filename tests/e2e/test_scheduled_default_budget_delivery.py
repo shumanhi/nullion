@@ -1,5 +1,6 @@
-"""A legitimate larger scheduled run finishes beyond the old 64-call cutoff."""
+"""Local-record work can exceed the old 64-call cutoff, independently of research limits."""
 import os
+import json
 
 import pytest
 
@@ -26,13 +27,16 @@ def test_default_finishes_useful_work_past_old_limit_without_budget_prompt(tmp_p
     monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE', 'off')
     runtime = setup_runtime(tmp_path, monkeypatch)
     reads = []
+    records = tmp_path/'selected-records.json'
+    records.write_text(json.dumps({str(index): 7 for index in range(70)}))
     registry = ToolRegistry()
     def read(invocation):
         value = invocation.arguments['record']
         reads.append(value)
+        observed = json.loads(records.read_text())[str(value)]
         return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
-            {'text': f'Selected record {value}: value 7.'})
-    registry.register(ToolSpec('browser_extract_text', 'Read a selected record', ToolRiskLevel.LOW,
+            {'text': f'Selected record {value}: value {observed}.'})
+    registry.register(ToolSpec('opaque_record_read', 'Read one selected local JSON record', ToolRiskLevel.LOW,
         ToolSideEffectClass.READ, False, 2, input_schema={'type': 'object',
             'properties': {'record': {'type': 'integer'}}, 'required': ['record']}), read)
     class Provider:
@@ -45,7 +49,7 @@ def test_default_finishes_useful_work_past_old_limit_without_budget_prompt(tmp_p
                 return protocol
             self.producer_calls += 1
             if len(reads) < 70:
-                return tool_response('browser_extract_text', {'record': len(reads)})
+                return tool_response('opaque_record_read', {'record': len(reads)})
             return text_response('Checked all 70 selected records. Total: 490. All requested checks are complete.')
     provider = Provider()
     deliveries, send = telegram_boundary(monkeypatch)

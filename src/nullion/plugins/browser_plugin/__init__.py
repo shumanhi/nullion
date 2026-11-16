@@ -9,7 +9,7 @@ Or via environment:
 
 Backend selection (NULLION_BROWSER_BACKEND):
     auto        — default: attach to existing Chrome if running, otherwise
-                  auto-launch Chrome/Brave/Edge, fall back to Playwright headless
+                  auto-launch Chrome/Brave/Edge; reconnect before offering headless recovery
     cdp         — attach to already-running Chrome (--remote-debugging-port=9222)
     playwright  — always use Playwright headless Chromium
 """
@@ -41,9 +41,19 @@ def _make_spec(
     observation_inline_setup_tools: tuple[str, ...] = (),
     context_argument_bindings: tuple[tuple[str, str], ...] = (),
     discovery_parameters: tuple[str, ...] = (),
+    delegated_tools: tuple[str, ...] = (),
+    independent_batch: tuple[str, str] | tuple[()] = (),
+    batch_item_required_fields: tuple[str, ...] = (),
+    independent_batch_validator=None,
+    code_mode_allowed: bool | None = None,
+    code_mode_observation_tools: tuple[str, ...] = (),
+    code_mode_ui_interaction: bool = False,
 ) -> ToolSpec:
     return ToolSpec(
         name=name,
+        code_mode_allowed=code_mode_allowed,
+        code_mode_observation_tools=code_mode_observation_tools,
+        code_mode_ui_interaction=code_mode_ui_interaction,
         description=description,
         risk_level=risk,
         side_effect_class=side_effect,
@@ -59,6 +69,10 @@ def _make_spec(
         observation_inline_setup_tools=observation_inline_setup_tools,
         context_argument_bindings=context_argument_bindings,
         discovery_parameters=discovery_parameters,
+        delegated_tools=delegated_tools,
+        independent_batch=independent_batch,
+        batch_item_required_fields=batch_item_required_fields,
+        independent_batch_validator=independent_batch_validator,
     )
 
 
@@ -113,38 +127,92 @@ def register_browser_tools(
         from nullion.plugins.browser_plugin.backends.auto_backend import AutoBackend
         backend = AutoBackend()
 
+    from nullion.plugins.browser_plugin.backends.session_recovery import SessionRecoveryBackend
+    backend = SessionRecoveryBackend(backend)
     pool = BrowserSessionPool()
     effective_policy = policy or get_default_policy()
     tools = BrowserTools(backend=backend, pool=pool, policy=effective_policy)
     registry.mark_plugin_installed("browser_plugin")
     registry.register_cleanup_hook(tools.close_tracked_sessions)
+    from nullion.plugins.browser_plugin.browser_reads import PageReadBatch, can_batch_read_plan
+    registry.register(
+        _make_spec(
+            "browser_read_pages",
+            "Read rendered pages in the configured real browser without an inner AI loop. "
+            "Prefer this for known URLs and source comparisons: navigation, observed readiness conditions "
+            "and structured item/detail or text extraction run together. Omit url for a single read of "
+            "the current task tab. Multiple URLs require independent_pages=true: at most two independent "
+            "read-only tabs run together, sharing the configured profile/login and leaving the user's tab intact. "
+            "Do not batch pages that change shared search/account state or depend on each other's actions. "
+            "For independent URLs, prefer one pages batch; independent_pages=true also allows the runtime "
+            "to combine adjacent independent read calls without another model round. "
+            "Use observed readiness selectors/text for dynamic results. A read without a readiness criterion "
+            "is an observation, not proof that filters were applied or results are absent. If a page needs "
+            "interaction, inspect the returned data and request native controls or browser_run_task then. "
+            "Keep the original user requirements; do not invent mandatory counts or extra research fields. "
+            "Once the requested evidence is sufficient, compose the answer rather than starting optional exploration. "
+            "Text reads include document_title, visible headings, links and coverage. A complete heading_coverage with zero "
+            "headings verifies their absence in that DOM scope; distinguish the document title from a visible heading "
+            "instead of repeatedly waiting for a heading that is absent. "
+            "Returns exact source URLs, structured records, coverage and per-page failures. No screenshots or files.",
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.READ,
+            timeout=45,
+            capability_tags=("web",),
+            delegated_tools=("browser_navigate", "browser_wait_for", "browser_extract_text", "browser_extract_items", "browser_extract_detail"),
+            continuation_tools=("browser_snapshot", "browser_navigate", "browser_extract_text", "browser_run_task"),
+            context_argument_bindings=(("session_id", "browser_session_id"),),
+            independent_batch=("pages", "independent_pages"),
+            batch_item_required_fields=("url",),
+            independent_batch_validator=lambda arguments, principal_id: can_batch_read_plan(
+                tools, arguments, principal_id),
+            code_mode_allowed=True,
+            input_schema=PageReadBatch.model_json_schema(),
+        ),
+        tools.browser_read_pages,
+    )
     from nullion.plugins.browser_plugin.browser_use_adapter import browser_use_available, browser_task_handler
     if model_client_getter is not None and browser_use_available():
         registry.register(
             _make_spec(
                 "browser_run_task",
-                "Delegate dynamic multi-step forms and result comparisons to Browser Use. For simple public text, use lightweight readers. Request browser_run_task in both tool_names and required_tool_names to delegate. Select this tool by exact name in both tool_names and required_tool_names through request_tool_scope only when delegating a full visual workflow. An optional tool_names entry does not launch or expose this several-minute worker; ordinary web research retains lightweight readers. If a dynamic workflow needs delegation later, request its exact required scope then. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. Its isolated browser session is not shared with low-level browser tools. Scope only this tool for a visual navigation task with screenshots; do not require a separate capture tool. Reuses the configured model. Prefer this for dynamic multi-step forms and result comparisons from the start. Do not duplicate the same form workflow with a long low-level tool sequence before delegating it. For long pages, use captured-text query search to locate required rows. A verified no-result condition within the user's exact constraints is an outcome; do not broaden to different locations or constraints without permission. For readable public pages, use navigation and structured extraction directly; do not start a full visual worker just to read ordinary text or collect image URLs. When a visual workflow genuinely needs multiple sources, use one coherent multi-page objective rather than separate full workers for each source. Stop when the requested observations are captured and avoid optional detail exploration. Delegate only outcomes needed for the original user objective; do not make extra detail or a preferred intermediate source mandatory. For open-ended research, choose accessible, substantiated candidates before deep exploration; replace a blocked optional candidate instead of exhausting full workers on it. Preserve subjects and sources explicitly required by the user. Does not book or purchase. May take several minutes.",
+                "Delegate adaptive browser interaction and dynamic multi-step forms to Browser Use. Prefer lightweight readers such as browser_read_pages, web_fetch and web_search for known URLs and public-page research. Request browser_run_task in both tool_names and required_tool_names to delegate. Select this tool by exact name in both tool_names and required_tool_names through request_tool_scope only when delegating a full visual workflow. An optional tool_names entry does not launch or expose this several-minute worker; ordinary web research retains lightweight readers. If a dynamic workflow needs delegation later, request its exact required scope then. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. In Auto/CDP mode it uses the configured managed browser and its existing login. If this controller cannot attach, continue with ordinary browser tools on that same session; never replace it with a fresh browser. Explicit Playwright mode uses separate workspace-owned browser state and cannot borrow a managed-browser login. For an explicitly requested visual navigation task with screenshots, scope this tool; do not require a separate capture tool. Reuses the configured model. Use browser_read_pages first for readable pages and comparisons of known URLs. Delegate when captured page state establishes that adaptive interaction is needed; do not turn every comparison into a full visual workflow. Do not duplicate the same form workflow with a long low-level tool sequence before delegating it. For long pages, use captured-text query search to locate required rows. A verified no-result condition within the user's exact constraints is an outcome; do not broaden to different locations or constraints without permission. For readable public pages, use navigation and structured extraction directly; do not start a full visual worker just to read ordinary text or collect image URLs. When a visual workflow genuinely needs multiple sources, use one coherent multi-page objective rather than separate full workers for each source. Stop when the requested observations are captured and avoid optional detail exploration. Delegate only outcomes needed for the original user objective; do not make extra detail or a preferred intermediate source mandatory. For open-ended research, choose accessible, substantiated candidates before deep exploration; replace a blocked optional candidate instead of exhausting full workers on it. Preserve subjects and sources explicitly required by the user. Does not book or purchase. May take several minutes.",
                 risk=ToolRiskLevel.MEDIUM, side_effect=ToolSideEffectClass.WRITE, timeout=650,
                 continuation_tools=("browser_run_task", "web_search", "web_fetch"),
                 source_artifact_extensions=(".png",),
+                delegated_tools=("browser_navigate", "browser_wait_for", "browser_extract_text", "browser_extract_items", "browser_extract_detail"),
                 discovery_parameters=("max_steps",),
                 capability_tags=("source_step_context", "explicit_scope_only", "required_scope_only"),
+                # The native handler performs its own request-bound read
+                # preflight before adaptive interaction. An outer Code Mode
+                # prerequisite would reject the call before that read can run.
                 input_schema={"type": "object", "properties": {
                     "task": {"type": "string", "description": "Structured browser objective with constraints and expected observations"},
                     "url": {"type": "string", "description": "HTTP/HTTPS target page"},
-                    "max_steps": {"type": "integer", "minimum": 1, "maximum": 30}},
+                    "max_steps": {"type": "integer", "minimum": 1, "maximum": 30},
+                    "read_urls": {"type":"array","maxItems":6,"uniqueItems":True,"items":{"type":"string"},
+                        "description":"For a read objective involving multiple sources, include every required source URL here. These pages must be independent; dependent navigation needs separate calls."},
+                    "independent_pages": {"type":"boolean","default":False,
+                        "description":"True only when the listed read_urls can be read independently; required for multiple sources in one read invocation."},
+                    "execution_kind": {"type":"string","enum":["read","adaptive_interaction"],"default":"read",
+                        "description":"Use read for research and public pages. Adaptive interaction starts a nested browser agent only for a remaining interactive or visual requirement established by page evidence."},
+                    "interaction_reason": {"type":"string","minLength":1,"maxLength":1000,
+                        "description":"Required for adaptive_interaction. Identify the observed control, visual state or native access failure and the requested interaction it requires; more research alone is not sufficient."}},
                     "required": ["task", "url"], "additionalProperties": False},
-            ), browser_task_handler(model_client_getter, effective_policy),
+            ), browser_task_handler(model_client_getter, effective_policy, mode_getter=tools.session_browser_mode,
+                                    read_preflight=tools.browser_task_read_preflight),
         )
 
     registry.register(
         _make_spec(
             "browser_open",
-            "Open or focus the configured agent browser session without navigating away from the current page.",
+            "Open or focus the configured browser; omit mode normally. Headless recovery requires a verified user selection. Retry its configured connection first. If recovery_options are returned, ask numbered choices and wait for the user. Public-page work may need no login, while account work may require restoring the configured session. The headless choice applies only to this task, preserves other tasks and the configured browser, and does not inherit its login.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
-            timeout=10,
-            input_schema=_object_schema({}),
+            timeout=20,
+            input_schema=_object_schema({"mode": {"type": "string", "enum": ["configured", "headless"], "description": "Omit normally. Explicit headless recovery requires the user to choose it first; do not assume every task needs login."},
+                "retention_request_evidence": {"type":"string","minLength":1,"maxLength":2000,"description":"Required for keep_open=true: quote the current user's explicit request to leave the browser open for handoff or follow-up. Tool names in a research instruction do not establish a handoff request."},
+                "keep_open": {"type": "boolean", "default": False, "description": "True only when the user explicitly wants the browser context left open for follow-up. Retains this conversation's session until browser_close, /stop or shutdown. Ordinary research tabs close when the request finishes."}}),
         ),
         tools.browser_open,
     )
@@ -171,12 +239,15 @@ def register_browser_tools(
                 "browser_screenshot",
                 "browser_image_collect",
             ),
+            code_mode_allowed=True,
             input_schema=_object_schema(
                 {
                     "url": {
                         "type": "string",
                         "description": "HTTP/HTTPS URL, or a local HTML file path/file URL inside this workspace.",
-                    }
+                    },
+                    "retention_request_evidence": {"type":"string","minLength":1,"maxLength":2000,"description":"Required for keep_open=true: quote the current user's explicit request to leave this page open for handoff or follow-up."},
+                    "keep_open": {"type": "boolean", "default": False, "description": "True only for an explicit request to leave this page open for follow-up; preserves its state for this conversation until browser_close, /stop or shutdown. Omit for ordinary research."}
                 },
                 required=["url"],
             ),
@@ -191,6 +262,8 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout=15,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     "selector": {
@@ -211,6 +284,8 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout=15,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(_BROWSER_TARGET_PROPERTIES),
         ),
         tools.browser_click_element,
@@ -222,6 +297,8 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.WRITE,
             timeout=10,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     "selector": {"type": "string", "description": "CSS selector for the input or editable element."},
@@ -239,6 +316,8 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.WRITE,
             timeout=15,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     **{key: value for key, value in _BROWSER_TARGET_PROPERTIES.items() if key != "text"},
@@ -252,7 +331,10 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_snapshot",
-            "Inspect the current page and return visible interactive elements with stable element_id values for reliable follow-up actions.",
+            "Inspect the current page and return visible interactive elements with stable element_id values for reliable follow-up actions. "
+            "A link to a destination is not evidence that the destination is open. Follow observed links and verify the destination URL "
+            "and actual controls before claiming a requested form or control is ready. If elements are omitted, inspect retained evidence "
+            "or use browser_find rather than assuming the missing controls exist or are absent.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
@@ -265,6 +347,7 @@ def register_browser_tools(
                 "browser_wait_for",
                 "browser_assert_page_state",
             ),
+            code_mode_allowed=True,
             input_schema=_object_schema(
                 {
                     "max_elements": {
@@ -299,6 +382,7 @@ def register_browser_tools(
             observation_repair_parameters=("selector",),
             context_argument_bindings=(("session_id", "browser_session_id"),),
             continuation_tools=("browser_extract_detail", "browser_run_js", "browser_image_collect"),
+            code_mode_allowed=True,
             input_schema=_object_schema(
                 {
                     "fields": {
@@ -329,14 +413,17 @@ def register_browser_tools(
         _make_spec(
             "browser_extract_detail",
             (
-                "Read one authoritative detail record from the current rendered DOM with Nullion's fixed "
-                "typed extractor. Use this for a selected product, booking, venue, event, or other detail page; "
+                "Read one authoritative record and current control counts. For form/navigation work, inspect "
+                "browser_snapshot and follow observed links to actual controls; mentions alone do not establish the target state. "
+                "Use the fixed typed DOM extractor for a selected product, booking, venue, event, or other detail page; "
                 "do not use browser_run_js output as verified record evidence."
             ),
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
-            continuation_tools=("browser_assert_page_state", "browser_image_collect", "browser_screenshot"),
+            continuation_tools=("browser_assert_page_state", "browser_snapshot", "browser_find", "browser_navigate",
+                "browser_click_element", "browser_click_id", "browser_image_collect", "browser_screenshot"),
+            code_mode_allowed=True,
             input_schema=_object_schema(
                 {
                     "selector": {
@@ -359,6 +446,8 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout=10,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     "element_id": {
@@ -378,6 +467,8 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.WRITE,
             timeout=10,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     "element_id": {
@@ -403,6 +494,8 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout=15,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     "element_id": {
@@ -427,7 +520,11 @@ def register_browser_tools(
         _make_spec(
             "browser_extract_text",
             (
-                "Extract visible text from the page or a specific element (CSS selector). "
+                "Extract visible text and a bounded index of exact visible links from the page or a CSS region. "
+                "For candidate recommendations, comparisons and ordering/booking links, prefer browser_read_pages "
+                "or browser_extract_items/detail so record boundaries and hrefs stay together. Use observed direct "
+                "links in the answer. Discovery labels do not establish specific items, prices or inventory; read "
+                "the relevant detail before claiming those facts. "
                 "Check the observed page against the requested inputs and constraints. A loaded URL or generic "
                 "landing page does not prove a search was submitted or filters applied. When matching records are "
                 "missing, inspect interactive elements and complete the form or use another available source. "
@@ -447,6 +544,7 @@ def register_browser_tools(
                 "browser_assert_page_state", "browser_extract_items", "browser_extract_detail",
                 "browser_run_js", "browser_image_collect", "browser_screenshot",
             ),
+            code_mode_allowed=True,
             input_schema=_object_schema(
                 {
                     "selector": {
@@ -465,7 +563,7 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_screenshot",
-            "Capture the browser page as a PNG artifact and return its path. "
+            "Capture a web page or populated local document as PNG. about:blank is valid after rendering content; untouched empty tabs need content or navigation first. Return the artifact path. "
             "Defaults to auto mode. Use viewport for ordinary chat screenshots; use full_page only when "
             "the user explicitly asks for the whole page.",
             risk=ToolRiskLevel.LOW,
@@ -492,6 +590,8 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=5,
+            code_mode_allowed=True,
+            code_mode_ui_interaction=True,
             input_schema=_object_schema(
                 {
                     "direction": {
@@ -546,7 +646,8 @@ def register_browser_tools(
         _make_spec(
             "browser_assert_page_state",
             (
-                "Verify that the current rendered page, or an optional CSS-scoped region, contains required state "
+                "Verify actual destination text and control counts. A link or mention of a form is not the opened form; "
+                "inspect its observed controls before claiming completion. Verify that the page or a CSS region contains required state "
                 "and omits forbidden state before reporting a browser task complete. Use a scope selector when "
                 "unrelated navigation, recommendations, or sidebars may contain forbidden text. An unverified "
                 "result is evidence to inspect another structured page surface, not proof that the task is blocked."
@@ -619,6 +720,7 @@ def register_browser_tools(
             # inspect and manipulate local app state without a second approval.
             requires_approval=False,
             timeout=15,
+            code_mode_observation_tools=("browser_read_pages", "browser_navigate", "browser_snapshot", "browser_extract_text"),
             input_schema=_object_schema(
                 {
                     "script": {
@@ -634,7 +736,7 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_close",
-            "Close the browser session.",
+            "Close only the selected browser session, not every tab or window. A closed_count of zero means no selected session was open. Never claim all browser tabs are closed from this single-session receipt.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.WRITE,
             timeout=5,
@@ -646,3 +748,9 @@ def register_browser_tools(
     # sampling. This callback only projects the adapter's retained observations.
     for name in ('browser_click_id', 'browser_type_id', 'browser_select_combobox', 'browser_click_element'):
         registry.get_spec(name).action_review_context = tools.action_review_context
+    # Independent page batches are request snapshots. Native UI navigation and
+    # controls invalidate them; live reads otherwise keep their fresh behavior.
+    registry.get_spec('browser_read_pages').same_request_read_cache = True
+    registry.get_spec('browser_read_pages').read_cache_context_keys = ('browser_session_scope', 'browser_session_id')
+    for name in ('browser_open', 'browser_navigate', 'browser_run_js', 'browser_scroll'):
+        registry.get_spec(name).invalidates_read_cache = True

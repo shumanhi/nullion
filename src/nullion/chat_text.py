@@ -11,6 +11,9 @@ import re
 import json
 from dataclasses import dataclass
 
+WORKING_ACK_SUMMARY = "On it! Feel free to send other tasks — I can handle multiple at once."
+WORKING_ACK_TEXT = "⌛ " + WORKING_ACK_SUMMARY
+
 
 @dataclass(frozen=True)
 class ReplySection:
@@ -363,6 +366,19 @@ def _presentation_preferences(preferences=None):
     return presentation_policy(load_preferences())
 
 
+def render_tool_user_choice(output):
+    """Render the existing typed tool pause through the shared message contract."""
+    if not isinstance(output, dict) or output.get('result_kind') != 'user_choice_required' or output.get('requires_user_choice') is not True:
+        return None
+    question, options = output.get('user_question'), output.get('recovery_options')
+    if not isinstance(question, str) or not question.strip() or not isinstance(options, list) or not 2 <= len(options) <= 8:
+        return None
+    if any(not isinstance(row, dict) or row.get('number') != index or not isinstance(row.get('label'), str)
+           or not row['label'].strip() for index, row in enumerate(options, 1)):
+        return None
+    return render_user_message(UserMessage(paragraphs=(question,), choices=tuple(row['label'] for row in options)))
+
+
 def render_user_message(message: UserMessage | str, *, preferences=None) -> str:
     """Render one message shape using the shared preferences, without model IO."""
     if isinstance(message, str):
@@ -487,7 +503,7 @@ def presentation_prefix(message_kind, *, preferences=None) -> str:
 def apply_presentation_preferences(text: str, *, preferences=None, message_kind=None) -> str:
     """Shared final style boundary. Never rewrite facts or make another model call."""
     from nullion.redaction import redact_text
-    text = redact_text(text)
+    text = make_markdown_tables_chat_readable(redact_text(text))
     prefs = _presentation_preferences(preferences)
     if getattr(prefs, 'markdown_style', 'light') == 'plain':
         def plain_prose(value):

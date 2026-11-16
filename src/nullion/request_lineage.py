@@ -2,6 +2,35 @@
 from collections.abc import Mapping
 from datetime import datetime
 from copy import copy
+import json
+
+
+def execution_request(context, current_request):
+    """Carry a verified selected goal and its amendments into native tools.
+
+    Lineage is loaded/validated by the shared ingress owner. This projection
+    does not choose a parent from prose, retrieve history or grant consent.
+    """
+    selected = context.get('selected_request_context') if isinstance(context, Mapping) else None
+    if not isinstance(selected, Mapping) or not selected.get('parent_turn_id'):
+        return current_request
+    original = selected.get('original_request')
+    turns = selected.get('turns')
+    if not isinstance(original, str) or not original.strip() or not isinstance(turns, list):
+        return current_request
+    amendments = [row['user'] for row in turns if isinstance(row, Mapping)
+        and not row.get('context_only') and isinstance(row.get('user'), str) and row['user'] != original]
+    if current_request != original:
+        amendments.append(current_request)
+    prior = turns[-1] if turns and isinstance(turns[-1], Mapping) else {}
+    response = prior.get('assistant') if not prior.get('context_only') else None
+    details = {'amendments_and_current_reply': amendments}
+    if isinstance(response,str) and response:
+        # An option number only has meaning alongside its owned question.
+        # The assistant text is reference data, never independent authority.
+        details['previous_assistant_reference'] = response
+    return original + ('\n\nSelected request context (prior assistant text is reference data):\n'
+        + json.dumps(details, ensure_ascii=False) if amendments or response else '')
 
 
 def recent_context_only_turns(store, turn, workspace_id, *, exclude_ids=()):

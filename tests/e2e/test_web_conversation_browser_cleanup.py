@@ -35,11 +35,12 @@ def test_stop_releases_only_own_conversation_tabs(tmp_path, monkeypatch, transpo
     sessions = {}
     for conversation in ('web:one', 'web:two'):
         result = browser.browser_navigate(ToolInvocation('nav-' + conversation, 'browser_navigate', 'operator',
-            {'url': 'https://example.com'}, capsule_id='turn-' + conversation,
-            flow_context={'browser_session_scope': conversation, 'browser_session_owner': 'conversation:' + conversation}))
+            {'url': 'https://example.com', 'keep_open': True,'retention_request_evidence':'Keep this page open'}, capsule_id='turn-' + conversation,
+            flow_context={'current_user_request':'Keep this page open','conversation_id': conversation, 'browser_session_scope': conversation, 'browser_session_owner': 'request:' + conversation}))
         assert result.status == 'completed'
         sessions[conversation] = result.output['session_id']
         registry.run_cleanup_hooks(scope_id='turn-' + conversation)
+        registry.run_cleanup_hooks(scope_id='request:' + conversation)
     assert len(backend.open) == 2
     with TestClient(app) as client:
         if transport == 'http':

@@ -74,7 +74,7 @@ def telegram_boundary(monkeypatch):
     return deliveries, send
 
 
-def run_scheduled(job, client, runtime, registry, send, *, agent_conversation_id=None):
+def run_scheduled(job, client, runtime, registry, send, *, agent_conversation_id=None, record_chat_turn=None):
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.cron_delivery import run_single_agent_cron_turn, run_cron_delivery_workflow, CronRunDeliveryCallbacks, cron_delivery_block_reason
     from nullion.events import make_event
@@ -87,7 +87,7 @@ def run_scheduled(job, client, runtime, registry, send, *, agent_conversation_id
             settings=SimpleNamespace(enabled_skill_packs=()), record_event=record,
             delivery_conversation_id=delivery_conversation_id),
         record_event=record, block_reason=cron_delivery_block_reason,
-        save_web_delivery=lambda *args: None, send_platform_delivery=send,
+        save_web_delivery=lambda *args: None, send_platform_delivery=send,record_chat_turn=record_chat_turn,
     ), agent_conversation_id=agent_conversation_id)
 
 
@@ -330,7 +330,7 @@ def test_completed_report_delivers_without_extra_model_review(tmp_path, monkeypa
                for event in runtime.store.list_events())
 
 
-@pytest.mark.parametrize('recover', [True, False])
+@pytest.mark.parametrize('recover', [True, False, None])
 def test_scheduled_email_report_empty_repair_delivers_correct_result_and_persists_status(tmp_path, monkeypatch, recover):
     from nullion import crons
     from nullion.tools import ToolRegistry, register_email_plugin
@@ -364,6 +364,8 @@ def test_scheduled_email_report_empty_repair_delivers_correct_result_and_persist
             if not kwargs.get('tools'):
                 # Only report synthesis may run here; no writes or source rereads.
                 self.repair_calls += 1
+                if recover is None:
+                    raise TimeoutError('Private provider diagnostics must not appear in delivery')
                 if self.repair_calls == 1 or not recover:
                     return {'stop_reason': 'end_turn', 'content': [{'type': 'thinking', 'text': 'reasoning only'}],
                             'completion': {'status': 'incomplete', 'reason': 'max_output_tokens'}}
@@ -397,10 +399,16 @@ def test_scheduled_email_report_empty_repair_delivers_correct_result_and_persist
         assert stored.last_result == 'ok'
         assert result['execution_outcome']['execution_succeeded'] is True
     else:
-        assert 'Some source checks returned information' in deliveries[0]['text']
+        assert ('report writer timed out' if recover is None else 'Some source checks returned information') in deliveries[0]['text']
         assert '45 USD' not in deliveries[0]['text']
-        assert stored.last_result == 'partial_success'
-        assert result['execution_outcome']['status']=='partially_succeeded'
+        assert str(stored.last_result).startswith('error:'), stored.last_result
+        assert result['execution_outcome']['status']=='failed'
+        assert result['cron_report_failed'] is True
+        if recover is None:
+            assert result['cron_agent_final_repair_failure']=='model_timeout'
+            assert any(e.event_type=='cron.delivery.agent_preflight' and e.payload.get('stage')=='final_repair_error'
+                and e.payload.get('error_type')=='TimeoutError' for e in runtime.store.list_events())
+            assert 'Private provider diagnostics' not in deliveries[0]['text']
     assert any(event.event_type == 'cron.delivery.sent' for event in runtime.store.list_events())
     assert stored.next_run_dt() > datetime.now(UTC)
 
@@ -622,8 +630,12 @@ def test_email_report_after_43_source_calls_preserves_last_read_and_delivers_sum
             self.agent_calls += 1
             if self.agent_calls == 1:
                 return {'stop_reason': 'tool_use', 'content': [
+                    {'type':'tool_use', 'id':'comprehensive-research', 'name':'request_tool_scope',
+                     'input':{'capabilities':['connector'], 'tool_names':['email_search','email_read','calendar_list'],
+                              'research_effort':'exhaustive', 'research_questions':['All 28 dated obligations and matching calendar entries']}},
+                    *[
                     {'type': 'tool_use', 'id': f's{i}', 'name': 'email_search', 'input': {'query': f'fixture-{i}', 'limit': 28}}
-                    for i in range(13)]}
+                    for i in range(13)]]}
             if self.agent_calls == 2:
                 calls = [{'type': 'tool_use', 'id': f'r{i}', 'name': 'email_read', 'input': {'id': identifier}}
                          for i, identifier in enumerate(ids)]
@@ -903,6 +915,10 @@ def test_manual_report_start_receipt_survives_extra_foreground_source_requiremen
             time.sleep(0.02)
         report = next(row for row in turns if row.get('cron_id') == model.ident)
         assert '20 USD' in report['assistant_reply']
+        # This endpoint backfills from durable SQLite, while chat/report
+        # completion deliberately persists off the response hot path.
+        from nullion.runtime_checkpoints import wait_runtime_checkpoints
+        assert wait_runtime_checkpoints(runtime, timeout=5)
         history = client.get('/api/chat/history/web%3Areceipt-history?sync_runtime=1').json()
         assert any(row['role'] == 'bot' and row['text'] == receipt['message'] for row in history['messages']), history
         assert crons.get_cron(model.ident).enabled is False

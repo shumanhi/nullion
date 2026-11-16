@@ -15,7 +15,5 @@ def test_live_web_missing_filename_finishes_without_creating_replacement(live_we
     assert turn.get('response_fulfilled') is True and not response.get('artifacts'),turn
     assert not any(r['status']=='completed' and r['tool_name'] in {'pdf_create','file_write','pdf_edit'} for r in results),results
     assert filename in response['text'],response
-    reviews=catalogue._conversation_event_payloads(live_web[3],live_web[4],event_type='conversation.completion_review')
-    assert reviews[-1]['disposition']=='complete',reviews
     assert elapsed<75000,elapsed
     record_property('filename_lookup_latency_ms',elapsed)

@@ -8,6 +8,28 @@ from nullion.request_lineage import recent_context_only_turns
 from nullion.conversation_runtime import ConversationTurnDisposition as D
 
 
+@pytest.mark.parametrize('reply',['1','２','٣'])
+def test_execution_goal_keeps_selected_request_amendments_and_current_choice(reply):
+    from nullion.request_lineage import execution_request
+    selected={'parent_turn_id':'owned-parent','original_request':'EWR → LAX, 2031-04-08, 18:00',
+        'turns':[{'user':'unrelated fact','context_only':True},
+                 {'user':'EWR → LAX, 2031-04-08, 18:00'},
+                 {'user':'DTLA, 1 room','assistant':'1. LAX + DTLA\n2. 別の空港'}]}
+    goal=execution_request({'selected_request_context':selected},reply)
+    assert selected['original_request'] in goal and 'DTLA, 1 room' in goal and reply in goal
+    assert 'unrelated fact' not in goal
+    assert 'LAX + DTLA' in goal
+    assert execution_request({},reply)==reply
+    assert execution_request({'selected_request_context':{**selected,'original_request':None}},reply)==reply
+
+
+def test_execution_goal_does_not_resurrect_replaced_request():
+    from nullion.request_lineage import execution_request
+    selected={'parent_turn_id':'owned','original_request':'Use the revised dates only.', 'goal_replaced':True,
+        'turns':[{'user':'Use old dates.','context_only':True}]}
+    assert 'old dates' not in execution_request({'selected_request_context':selected},'1')
+
+
 def fixture():
     rows=[{'conversation_id':'web:a','workspace_id':'workspace-a','turn_id':'root',
         'parent_turn_id':None,'user_message':'出演者とプロの身長を調べて。','assistant_reply':'対象は？\n1. 出演者\n2. 両方'},
@@ -108,3 +130,15 @@ def test_recovery_references_are_post_reset_owned_bounded_and_never_goals():
     assert len(context[-1]['assistant']) == 4000
     store.list_recent_conversation_events_after_reset = lambda *a, **kw: []
     assert recent_context_only_turns(store, turn, 'workspace-a') == []
+
+
+@pytest.mark.parametrize('original',['出演者の音楽を調べて','Investiga la música de estos artistas','Research these artists and their music'])
+def test_completion_review_uses_same_verified_goal_as_native_execution(original):
+    from nullion.agent_orchestrator import _completion_review_original_request
+    from nullion.request_lineage import execution_request
+    context={'selected_request_context':{'parent_turn_id':'owned','original_request':original,
+        'turns':[{'user':original,'assistant':'1. Provide the source URL.'}]}}
+    state={'user_message':'https://source.example/event','tool_flow_context':context}
+    assert _completion_review_original_request(state)==execution_request(context,state['user_message'])
+    assert original in _completion_review_original_request(state)
+    assert _completion_review_original_request({'user_message':'new','tool_flow_context':{'user_request':original}})=='new'

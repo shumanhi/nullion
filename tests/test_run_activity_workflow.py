@@ -35,6 +35,29 @@ from nullion.task_status_format import compact_task_status_subject
 from nullion.tools import ToolResult
 
 
+@pytest.mark.parametrize("runtime", [object(), SimpleNamespace(store=object())])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_activity_setting_without_session_store_uses_global_default(runtime, enabled, monkeypatch) -> None:
+    from nullion.chat_operator import activity_trace_enabled_for_chat
+
+    monkeypatch.setenv("NULLION_ACTIVITY_TRACE_ENABLED", "1" if enabled else "0")
+    assert activity_trace_enabled_for_chat(runtime, chat_id="opaque-771") is enabled
+
+
+def test_indexed_activity_setting_does_not_scan_history_when_unset(monkeypatch) -> None:
+    from nullion.chat_operator import activity_trace_enabled_for_chat
+
+    def reject_history(*args, **kwargs):
+        raise AssertionError("ordinary delivery must not scan conversation history")
+
+    runtime = SimpleNamespace(store=SimpleNamespace(
+        get_conversation_session_setting=lambda *args: None,
+        list_conversation_events=reject_history,
+    ))
+    monkeypatch.setenv("NULLION_ACTIVITY_TRACE_ENABLED", "0")
+    assert not activity_trace_enabled_for_chat(runtime, chat_id="opaque-771")
+
+
 def test_operator_verbose_command_uses_activity_on_off(monkeypatch) -> None:
     from nullion.operator_commands import (
         handle_operator_command,
@@ -1151,3 +1174,14 @@ def test_activity_never_delivers_tool_payloads_or_internal_errors(tool_name, pri
         assert "secret.pdf" not in rendered
         # Full evidence is preserved for diagnosis; only the display is narrowed.
         assert result.output == output and result.error == error
+
+
+def test_reapplying_shared_activity_does_not_duplicate_or_expose_payload():
+    from nullion.tools import ToolResult
+    from nullion.run_activity import append_activity_trace_to_reply
+    result=ToolResult('source','list_crons','completed',{'jobs':[{'task':'PRIVATE request prose',
+        'path':'/private/internal.json','connector_payload':'PRIVATE account state'}]})
+    first=append_activity_trace_to_reply('完了しました。',tool_results=[result],enabled=True)
+    second=append_activity_trace_to_reply(first,tool_results=[result],enabled=True)
+    assert first==second and 'list_crons' in first
+    assert 'PRIVATE' not in first and '/private/' not in first and 'connector_payload' not in first

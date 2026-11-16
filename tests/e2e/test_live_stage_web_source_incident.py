@@ -68,7 +68,8 @@ def test_live_image_question_followed_by_event_link(live_web,tmp_path):
             attachment=str(tmp_path/'owned-lineup.png');image.save(attachment)
         page.locator('#file-input').set_input_files(attachment)
         expect(page.locator('#attachments-bar')).to_contain_text(Path(attachment).name)
-        page.locator('#user-input').fill('Find about these DJs that are playing here tonight')
+        image_prompt='Find about these DJs that are playing here tonight'
+        page.locator('#user-input').fill(image_prompt)
         page.locator('#user-input').press('Enter')
         expect(page.locator('#attachments-bar')).to_be_hidden(timeout=15000)
         # Supply the event URL during the original image question, as in the
@@ -80,7 +81,21 @@ def test_live_image_question_followed_by_event_link(live_web,tmp_path):
         assert 'focused answer' not in reply and len(reply)>250,reply
         assert not any(name in reply.casefold() for name in ['bambounou','dennis free','matiachetti']),reply
         assert 'http' in reply and not response['artifacts'] and not errors
-        _assert_artist_sources(reply)
+        owned={f['turn_id'] for f in frames if f.get('type')=='_submitted'
+            and f.get('text') in {image_prompt,'https://ra.co/events/2556108'}
+            and f.get('conversation_id')==conversation}
+        assert len(owned)==2,owned
+        delivered={f['turn_id']:f for f in frames if f.get('type')=='done' and f.get('turn_id') in owned}
+        assert set(delivered)==owned,delivered
+        combined='\n\n'.join(f['text'] for f in delivered.values())
+        _assert_artist_sources(combined)
+        # Facts already delivered for the owned image need not be repeated in
+        # a subsequent date correction. Both replies must remain visible.
+        for identity in owned:
+            bubble=page.locator('.msg.bot .bubble[data-turn-id='+json.dumps(identity)+']')
+            expect(bubble).to_be_visible()
+        assert not any(f.get('artifacts') for f in delivered.values()),delivered
+        result['delivered_turn_ids']=sorted(owned)
         result['status']='passed'
     except BaseException as exc:
         result.update(status='failed',error=str(exc));raise
@@ -107,8 +122,19 @@ def test_live_structured_source_record_comparison_keeps_relationships(live_web):
         for value in ['51.77','53.74','22','20']:assert value in reply,reply
         assert 'https://books.toscrape.com' in reply and 'focused answer' not in reply,reply
         assert not response['artifacts'] and not errors
-        assert sum(row['tool_name']=='browser_run_task' for row in turn['tool_results'])==1,turn['tool_results']
-        assert any(row.get('output',{}).get('result_kind')=='source_observations' for row in turn['tool_results'])
+        worker_calls=[row for row in turn['tool_results'] if row['tool_name']=='browser_run_task']
+        assert sum(row['status']=='completed' for row in worker_calls)==1,worker_calls
+        rejected=[row for row in worker_calls if row['status']!='completed']
+        assert len(rejected)<=1 and all(row.get('output',{}).get('executed') is False for row in rejected),worker_calls
+        native=[row['output'] for row in worker_calls if row['status']=='completed'
+            and row.get('output',{}).get('result_kind')=='browser_page_collection']
+        if native:
+            assert native[0]['requested_pages']==native[0]['completed_pages']==2,native
+            from tests.e2e.live_public_followup_assertions import assert_public_followup_outcome
+            proof=assert_public_followup_outcome(response=response,turns=[turn],reviews=[])
+            assert {first,second}.issubset({r['url'] for r in proof['observed_sources']}),proof
+        else:
+            assert any(row.get('output',{}).get('result_kind')=='source_observations' for row in turn['tool_results'])
         result['status']='passed'
     except BaseException as exc:
         result.update(status='failed',error=str(exc));raise

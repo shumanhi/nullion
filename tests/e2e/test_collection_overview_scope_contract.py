@@ -7,7 +7,10 @@ import time
 import pytest
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason='container E2E only')
 
-@pytest.mark.parametrize('prompt,detail', [('Check my email',False),('Revisa mi bandeja',False),('受信箱を確認して',False),('Open the second message',True)])
+@pytest.mark.parametrize('prompt,detail', [('Check my email',False),('Revisa mi bandeja',False),('受信箱を確認して',False),
+    ('Use email_search for message headers only. Do not read bodies.',False),
+    ('Usa email_search, solo encabezados; no leas los cuerpos.',False),
+    ('email_search で件名だけ。本文は読まないで。',False),('Open the second message',True)])
 @pytest.mark.parametrize('has_more', [False, True])
 def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path, monkeypatch, prompt, detail, has_more):
     from fastapi.testclient import TestClient
@@ -19,6 +22,8 @@ def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path,
     monkeypatch.setattr(turn_context_policy,'_active_connector_provider_context',lambda:[{
         'provider_id':'custom_connector_provider','display_name':'Example connector',
         'active_app_ids':['google-mail'],'structured_tools':['email_search','email_read']}])
+    monkeypatch.setattr(turn_context_policy,'cached_active_connector_app_id_providers',lambda **kw: ({
+        'active_app_ids':['google-mail'],'structured_tools':['email_search','email_read']},))
     calls=[];registry=ToolRegistry()
     def external_mail(inv):
         calls.append(inv.tool_name)

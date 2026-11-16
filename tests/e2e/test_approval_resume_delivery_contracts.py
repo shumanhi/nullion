@@ -13,11 +13,17 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='con
 
 
 def setup_terminal(tmp_path,monkeypatch,backend):
+    from nullion import chat_store
     from nullion.runtime import bootstrap_persistent_runtime
     from nullion.tools import create_core_tool_registry
     from nullion.approvals import create_permission_grant
     from nullion.policy import OPERATOR_PERMISSION_PRINCIPAL
     monkeypatch.setenv('NULLION_TERMINAL_ENABLED','1')
+    monkeypatch.setenv('NULLION_HOME', str(tmp_path/'home'))
+    monkeypatch.setenv('NULLION_DATA_DIR', str(tmp_path/'data'))
+    monkeypatch.setenv('NULLION_ENV_FILE', str(tmp_path/'missing.env'))
+    monkeypatch.setenv('NULLION_MEMORY_ENABLED', 'false')
+    chat_store._store = None
     monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off')
     monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT',str(tmp_path/'storage'))
     runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db')

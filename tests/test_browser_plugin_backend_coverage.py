@@ -2467,7 +2467,7 @@ async def test_auto_backend_selection_and_delegation(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_backend_falls_back_to_chromium_with_notice_when_cdp_browser_unavailable(monkeypatch) -> None:
+async def test_auto_backend_preserves_visible_mode_when_cdp_browser_unavailable(monkeypatch) -> None:
     fallback = CompleteBackend()
     fresh = auto_backend.AutoBackend()
 
@@ -2477,14 +2477,14 @@ async def test_auto_backend_falls_back_to_chromium_with_notice_when_cdp_browser_
     monkeypatch.setattr(auto_backend, "_find_chrome", lambda: None)
     monkeypatch.setattr(fresh, "_make_playwright", lambda: fallback)
 
-    assert await fresh._ensure_backend() is fallback
-    assert fresh.connection_notice()
-    assert "Could not connect to the shared browser through CDP" in fresh.connection_notice()
-    assert await fresh.navigate("s", "https://example.com") == "navigated:https://example.com"
+    with pytest.raises(ConnectionError, match="saved profile has been preserved"):
+        await fresh._ensure_backend()
+    assert not fallback.calls
+    assert fresh._backend is None
 
 
 @pytest.mark.asyncio
-async def test_auto_backend_falls_back_to_chromium_with_notice_when_browser_launch_fails(monkeypatch) -> None:
+async def test_auto_backend_preserves_visible_mode_when_browser_launch_fails(monkeypatch) -> None:
     fallback = CompleteBackend()
     fresh = auto_backend.AutoBackend()
 
@@ -2495,12 +2495,13 @@ async def test_auto_backend_falls_back_to_chromium_with_notice_when_browser_laun
     monkeypatch.setattr(auto_backend, "_launch_chrome", lambda path: (_ for _ in ()).throw(RuntimeError("launch failed")))
     monkeypatch.setattr(fresh, "_make_playwright", lambda: fallback)
 
-    assert await fresh._ensure_backend() is fallback
-    assert fresh.connection_notice()
-    assert await fresh.open("s") == "opened:s"
+    with pytest.raises(ConnectionError, match="saved profile has been preserved"):
+        await fresh._ensure_backend()
+    assert not fallback.calls
+    assert fresh._backend is None
 
 
-def test_browser_tools_surface_auto_cdp_fallback_notice(monkeypatch) -> None:
+def test_browser_tools_report_visible_browser_failure_without_replacement(monkeypatch) -> None:
     fallback = CompleteBackend()
     backend = auto_backend.AutoBackend()
 
@@ -2513,12 +2514,10 @@ def test_browser_tools_surface_auto_cdp_fallback_notice(monkeypatch) -> None:
     tools = BrowserTools(backend=backend, pool=BrowserSessionPool(), policy=BrowserPolicy())
     result = tools.browser_navigate(inv("browser_navigate", {"url": "https://example.com"}))
 
-    assert result.status == "completed"
-    assert result.output["browser_connection_notice"].startswith(
-        "Could not connect to the shared browser through CDP"
-    )
-    assert result.output["used_shared_authenticated_browser"] is False
-    assert ("navigate", result.output["session_id"], "https://example.com") in fallback.calls
+    assert result.status == "failed"
+    assert "visible agent browser is unavailable" in result.error
+    assert not fallback.calls
+    assert backend._backend is None
 
 
 def test_auto_backend_browser_preference_uses_exact_browser_order(monkeypatch) -> None:
@@ -2700,6 +2699,8 @@ async def test_playwright_backend_page_methods_and_shutdown() -> None:
     page = Page()
     backend = playwright_backend.PlaywrightBackend.__new__(playwright_backend.PlaywrightBackend)
     backend._pages = {"s": page}
+    backend._contexts = {"s": page.context}
+    backend._context_roots = {"s": "s"}
     backend._browser = SimpleNamespace(close=lambda: asyncio.sleep(0))
     playwright = AsyncContext()
     backend._playwright = playwright
@@ -7695,3 +7696,13 @@ def test_native_combobox_does_not_use_an_unrelated_label(monkeypatch):
     finally:
         _run(backend.close_session("wrong-label"))
         _run(backend.shutdown())
+
+
+@pytest.mark.parametrize('module',[cdp_backend,playwright_backend])
+@pytest.mark.parametrize('label',['意見フォーム','Enviar comentarios','Avis au responsable'])
+def test_semantic_role_with_text_keeps_the_supplied_target_name(module,label):
+    from types import SimpleNamespace
+    calls=[]
+    page=SimpleNamespace(get_by_role=lambda role,**kw:calls.append((role,kw)) or 'selected')
+    assert module._base_locator_for_target(page,{'role':'link','text':label})=='selected'
+    assert calls==[('link',{'name':label})]

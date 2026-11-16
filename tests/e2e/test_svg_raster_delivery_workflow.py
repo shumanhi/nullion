@@ -36,11 +36,11 @@ def test_svg_conversion_preserves_pixels_and_invalidates_only_its_own_cache(tmp_
     assert changed!=first and changed.is_file() and companion.read_bytes()==before
     source.write_text(SVG.replace('#ff0000','#00ffff'))
     digest=hashlib.sha256(b'svg-chromium-v1:'+source.read_bytes()).hexdigest()[:20]
-    cache=source.with_name(f'.{source.stem}.rendered-{digest}.png')
+    cache=first.parent/f'{source.stem}-{digest}.png'
     cache.symlink_to(companion)
     assert _embeddable_image_path(source)==source
     assert companion.read_bytes()==before and cache.is_symlink()
-    assert not list(tmp_path.glob('*.tmp.png'))
+    assert not list(first.parent.glob('*.tmp.png'))
 
 
 def test_svg_conversion_is_inert_and_does_not_fetch_external_resources(tmp_path):

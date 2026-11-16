@@ -14,6 +14,18 @@ from nullion.config import DiscordSettings, NullionSettings, SlackSettings, Tele
 from nullion.reminders import ReminderRecord
 
 
+@pytest.mark.parametrize('surface', ['web','telegram','slack','discord'])
+def test_shared_presentation_preserves_a_disabled_chat_no_response(monkeypatch,surface):
+    from nullion import chat_operator,messaging_turn_graph
+    monkeypatch.setattr(chat_operator,'handle_chat_operator_message',lambda *args,**kw: None)
+    monkeypatch.setattr(chat_operator,'activity_trace_enabled_for_chat',
+        lambda *args,**kw: (_ for _ in ()).throw(AssertionError('No reply needs no activity rendering')))
+    response=messaging_turn_graph.run_platform_chat_request(object(),
+        messaging_turn_graph.PlatformChatRequest(platform=surface,text='確認37',chat_id='opaque-37'))
+    assert response.text is None
+    assert not response.artifact_paths
+
+
 def test_messaging_roots_and_allowed_roots_use_data_dir(tmp_path, monkeypatch) -> None:
     from nullion import messaging_adapters as adapters
 

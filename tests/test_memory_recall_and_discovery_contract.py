@@ -152,6 +152,71 @@ def test_memory_snapshot_cache_avoids_repeated_decryption_and_full_runtime_load(
     assert seen==['user_facts']
 
 
+def test_memory_refresh_resolves_one_key_for_all_rows_and_checks_new_revision(tmp_path,monkeypatch):
+    import sqlite3
+    from cryptography.fernet import Fernet
+    from nullion import runtime_persistence as persistence
+    from nullion.memory import memory_entries_for_owner
+    path=tmp_path/'runtime.db';runtime=bootstrap_persistent_runtime(path)
+    for index in range(50):
+        remember_text_fact(runtime.store,owner='workspace:alpha' if index<49 else 'workspace:beta',
+            key='項目'+str(index),value='観測'+str(index),source='structured')
+    runtime.checkpoint(force=True)
+    old_cipher=persistence._runtime_memory_cipher_for(path)
+    rotated=Fernet(Fernet.generate_key())
+    calls=[]
+    def load_key(target):
+        calls.append(target)
+        return old_cipher if len(calls)==1 else rotated
+    monkeypatch.setattr(persistence,'_runtime_memory_cipher_for',load_key)
+    persistence._MEMORY_READ_CACHE.pop(str(path.resolve()),None)
+    first=memory_entries_for_owner(runtime.store,'workspace:alpha',checkpoint_path=path)
+    assert len(first)==49 and len(calls)==1
+    assert len(memory_entries_for_owner(runtime.store,'workspace:beta',checkpoint_path=path))==1
+    assert len(calls)==1
+    # Re-encrypted committed data must resolve the current key on its next
+    # snapshot; no process-wide cipher/key cache may retain the old key.
+    with sqlite3.connect(path) as connection:
+        rows=connection.execute('select collection,item_key,payload from memory').fetchall()
+        for collection,identity,payload in rows:
+            raw=old_cipher.decrypt(payload.removeprefix(persistence._ENCRYPTED_RUNTIME_MEMORY_PREFIX).encode())
+            sealed=persistence._ENCRYPTED_RUNTIME_MEMORY_PREFIX+rotated.encrypt(raw).decode()
+            connection.execute('update memory set payload=?,updated_at=? where collection=? and item_key=?',
+                (sealed,'2031-04-08T00:00:00+00:00',collection,identity))
+    assert [e.value for e in memory_entries_for_owner(runtime.store,'workspace:alpha',checkpoint_path=path)] == [e.value for e in first]
+    assert len(calls)==2
+
+
+def test_corrupt_memory_refresh_never_publishes_a_partially_verified_snapshot(tmp_path,monkeypatch):
+    import sqlite3
+    from nullion import runtime_persistence as persistence
+    path=tmp_path/'runtime.db';runtime=bootstrap_persistent_runtime(path)
+    for index in range(3):
+        remember_text_fact(runtime.store,owner='workspace:alpha',key='記録'+str(index),value='確認',source='structured')
+    runtime.checkpoint(force=True)
+    assert len(persistence.read_persisted_memory_entries(path))==3
+    with sqlite3.connect(path) as connection:
+        identity=connection.execute('select item_key from memory limit 1').fetchone()[0]
+        connection.execute('update memory set payload=?,updated_at=? where item_key=?',
+            (persistence._ENCRYPTED_RUNTIME_MEMORY_PREFIX+'corrupted','2031-04-08T00:00:00+00:00',identity))
+    for _ in range(2):
+        with pytest.raises(ValueError,match='Persisted memory could not be verified'):
+            persistence.read_persisted_memory_entries(path)
+
+
+def test_unencrypted_snapshot_row_is_rejected_before_key_storage_access(tmp_path,monkeypatch):
+    import sqlite3
+    from nullion import runtime_persistence as persistence
+    path=tmp_path/'runtime.db';runtime=bootstrap_persistent_runtime(path)
+    remember_text_fact(runtime.store,owner='workspace:alpha',key='記録',value='確認',source='structured')
+    runtime.checkpoint(force=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute("update memory set payload='{}',updated_at='2031-04-08T00:00:00+00:00'")
+    monkeypatch.setattr(persistence,'_runtime_memory_cipher_for',lambda path:pytest.fail('Malformed plaintext must not access/create key material'))
+    with pytest.raises(ValueError,match='Persisted memory could not be verified'):
+        persistence.read_persisted_memory_entries(path)
+
+
 def test_transient_checkpoint_lock_keeps_verified_memory_and_refreshes_after_unlock(tmp_path):
     import sqlite3
     from nullion.memory import memory_entries_for_owner

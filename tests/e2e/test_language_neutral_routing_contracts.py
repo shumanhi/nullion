@@ -55,6 +55,8 @@ class _StructuredDispatchModel:
                                 "effect": self.effect,
                                 "confidence": self.confidence,
                                 "target_index": self.target_index,
+                                "target_is_explicit": self.relationship == "follow_up",
+                                "plausible_target_indexes": [],
                             }
                         ),
                     }
@@ -1047,7 +1049,15 @@ def test_active_dispatch_tracker_selects_structured_target_without_latest_assump
             assert second.decision.dependency_turn_ids == ()
             assert follow.decision.disposition is ConversationTurnDisposition.CONTINUE
             assert follow.decision.dependency_turn_ids == ("turn-cron",)
-            assert follow.dependency_tasks == (second_task,)
+            assert len(follow.dependency_tasks) == 1
+            completion = follow.dependency_tasks[0]
+            assert not completion.done()
+            # The public dependency is a completion signal, so cancelling a
+            # waiter cannot cancel the selected active adapter task.
+            assert completion is not first_task and completion is not second_task
+            await tracker.finish("telegram:active-middle-e2e", "turn-cron")
+            assert completion.done() and not completion.cancelled()
+            assert not first_task.done() and not second_task.done()
         finally:
             await tracker.finish("telegram:active-middle-e2e", "turn-follow-up")
             await tracker.finish("telegram:active-middle-e2e", "turn-cron")

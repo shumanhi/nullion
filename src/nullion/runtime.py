@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+import threading
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from functools import lru_cache
@@ -278,6 +279,8 @@ class PersistentRuntime:
     live_tool_registry: ToolRegistry | None = None
     model_client: Any | None = None
     scheduled_budget_runner: Any | None = None
+    _checkpoint_lock: Any = field(default_factory=threading.RLock, init=False, repr=False)
+    _reminder_mutation_lock: Any = field(default_factory=threading.RLock, init=False, repr=False)
 
     @property
     def active_tool_registry(self) -> ToolRegistry | None:
@@ -302,6 +305,10 @@ class PersistentRuntime:
         self.live_tool_registry = value
 
     def checkpoint(self, *, force: bool = False) -> Path:
+        with self._checkpoint_lock:
+            return self._checkpoint(force=force)
+
+    def _checkpoint(self, *, force: bool = False) -> Path:
         measure_sqlite = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
         started_at = perf_counter()
         payload = None if force else build_runtime_store_payload(self.store)
@@ -428,9 +435,65 @@ class PersistentRuntime:
         return scheduled_task
 
     def schedule_reminder(self, *, chat_id: str, text: str, due_at: datetime):
-        scheduled_task = schedule_reminder(self.store, chat_id=chat_id, text=text, due_at=due_at)
-        self.checkpoint()
+        scheduled_task, reminder = _new_reminder_records(chat_id=chat_id, text=text, due_at=due_at)
+        self.commit_reminder_change(scheduled_task.task_id, task=scheduled_task,
+            reminder=reminder, previous_reminder=None)
         return scheduled_task
+
+    def commit_reminder_change(self, task_id, *, task, reminder, previous_reminder):
+        """Publish a reminder change in memory only after its durable commit."""
+        from nullion.runtime_persistence import commit_runtime_reminder
+        with self._reminder_mutation_lock:
+            if self.store.get_reminder(task_id) != previous_reminder:
+                raise ValueError("The reminder changed; refresh its current state and retry")
+            previous_task = self.store.get_scheduled_task(task_id)
+            sqlite_target = Path(self.checkpoint_path).suffix.lower() in {'.db', '.sqlite', '.sqlite3'}
+            if sqlite_target:
+                commit_runtime_reminder(self.checkpoint_path, task_id=task_id, task=task,
+                    reminder=reminder, previous_reminder=previous_reminder)
+            def apply(current_task, current_reminder):
+                if current_task is None:
+                    self.store.scheduled_tasks.pop(task_id, None)
+                else:
+                    self.store.add_scheduled_task(current_task)
+                if current_reminder is None:
+                    self.store.remove_reminder(task_id)
+                else:
+                    self.store.add_reminder(current_reminder)
+            apply(task, reminder)
+            if not sqlite_target:
+                try:
+                    self.checkpoint(force=True)
+                except Exception:
+                    apply(previous_task, previous_reminder)
+                    raise
+
+    def refresh_reminders(self):
+        """Explicit inventory reads and delivery workers see other processes' commits."""
+        from nullion.runtime_persistence import read_runtime_reminders
+        if (Path(self.checkpoint_path).suffix.lower() not in {'.db', '.sqlite', '.sqlite3'}
+                or not Path(self.checkpoint_path).exists()):
+            return
+        with self._reminder_mutation_lock:
+            current = read_runtime_reminders(self.checkpoint_path)
+            if current is None:
+                return
+            reminders, tasks, native_ids = current
+            for task_id in set(self.store.reminders).union(native_ids).difference(reminders):
+                self.store.remove_reminder(task_id)
+                self.store.scheduled_tasks.pop(task_id, None)
+            for task_id, reminder in reminders.items():
+                self.store.add_reminder(reminder)
+                if task_id in tasks:
+                    self.store.add_scheduled_task(tasks[task_id])
+
+    def cancel_reminder(self, task_id: str) -> bool:
+        self.refresh_reminders()
+        reminder = self.store.get_reminder(task_id)
+        if reminder is None:
+            return False
+        self.commit_reminder_change(task_id, task=None, reminder=None, previous_reminder=reminder)
+        return True
 
     def report_health_issue(
         self,
@@ -4103,6 +4166,13 @@ def schedule_reminder(
     text: str,
     due_at: datetime,
 ):
+    task, reminder = _new_reminder_records(chat_id=chat_id, text=text, due_at=due_at)
+    store.add_scheduled_task(task)
+    store.add_reminder(reminder)
+    return task
+
+
+def _new_reminder_records(*, chat_id: str, text: str, due_at: datetime):
     normalized_due_at = normalize_reminder_due_at(due_at)
     task = ScheduledTask(
         task_id=_next_runtime_id("task"),
@@ -4113,16 +4183,13 @@ def schedule_reminder(
         last_run_at=None,
         failure_count=0,
     )
-    store.add_scheduled_task(task)
-    store.add_reminder(
-        ReminderRecord(
+    reminder = ReminderRecord(
             task_id=task.task_id,
             chat_id=chat_id,
             text=text,
             due_at=normalized_due_at,
         )
-    )
-    return task
+    return task, reminder
 
 
 

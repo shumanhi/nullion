@@ -110,3 +110,8 @@ def test_generated_pdf_keeps_media_proof_after_native_read(tmp_path,monkeypatch,
     assert not reviews
     turns=restored.store.list_recent_conversation_events('web:read-after-write',event_type='conversation.chat_turn')
     assert turns[-1]['response_fulfilled'] is True, turns[-1]
+    # Count synthetic fallback receipts as well as native producer calls: an
+    # unused image-only replacement is still incorrect work after inspection.
+    pdf_results = [r for r in turns[-1].get('tool_results', []) if r['tool_name'] == 'pdf_create']
+    assert len(pdf_results) == (2 if plain_sibling else 1)
+    assert not any(r.get('output', {}).get('last_mile_materialized') for r in pdf_results)

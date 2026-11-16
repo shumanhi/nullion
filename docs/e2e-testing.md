@@ -1,4 +1,195 @@
+`test_compacted_artifact_evidence_integrity.py` drives the real Web route, native
+file read, retained-evidence inspection, file generation and artifact download.
+Required facts are placed in the middle of a large source; English and Japanese
+requests must inspect exact retained bytes and deliver those facts in the HTML
+without fetching the source again. `test_context_compaction_integrity.py` covers
+repeated projections, exact handles, source ownership, failed/successful producer
+attempts, image inputs, source samples and delegated fallback omission metadata.
+
+`test_browser_required_input_handoff.py` drives real Web chat, SQLite, the native
+page read and the isolated Browser Use SDK against a controlled HTTP form. Only
+the external model is scripted. Current page-grounded prerequisites must reach
+the common numbered reply without extra browser decisions or invented results;
+English and Japanese cases share the same path. Unit coverage rejects stale
+controls, foreign sources, unsupported quotations and stale final captures.
+
+`test_personal_task_target_clarification.py` also covers a single unrelated pending
+record: the intended target title and persisted identity must agree before a
+write. A mismatch returns a shared numbered question without changing revision.
+
 # Testing
+
+`test_reminder_persistence_latency.py` runs create/update/delete through the real
+chat route while a simulated slow snapshot holds the runtime and snapshot-file
+locks. Each result must have its action receipt and durable reminder/task pair
+before the snapshot is released. Multiple requests and language variants measure
+average and maximum latency, and the later snapshot must not restore a deletion.
+`test_reminder_incremental_persistence.py` covers aborted pair writes, stale
+revisions, cross-process inventory and delivery, rescheduling, delivery rollback,
+operator/button cancellation and scoped display-setting commits.
+
+`test_personal_task_target_clarification.py` replays an attempted completion with
+no task identity through Web and Telegram's shared runtime. It requires a
+numbered clarification, no invented task, and numeric follow-ups which either
+leave the list unchanged or explicitly create the completed item. Unit tests
+also preserve revision-bound corrections, concrete created/updated receipts and
+fresh SQLite initialization without a runtime snapshot.
+
+`test_alternative_artifact_method_delivery.py` creates PNG and PDF outputs through
+the real scope, producer and SQLite pipeline, then verifies Web download and
+Telegram multipart bytes. An earlier unavailable text producer remains in the
+scope receipt but must not cause a false failure after the requested format is
+produced. English and Japanese requests use the same decisions.
+`test_alternative_artifact_completion.py` keeps missing files, additional formats
+and counts, task-frame obligations, account actions, consent and source-only
+tools authoritative. The shared production prompt covers measured text wrapping
+and actual rendered-image inspection; these instructions are not a visual-quality
+certificate. Progress tests require the generic final preparation label for
+both text and attachments.
+
+`test_private_tool_progress.py` verifies one updating Web UI card across real
+history search and exact-read operations, with multilingual requests, private
+output suppression and a deliberately slow unfiltered-history dependency. It
+also measures representative plain turns to protect the fast path.
+`test_meaningful_request_progress.py` covers history and online research across
+WebSocket, HTTP, Telegram SDK, Slack and Discord delivery. The overlapping-source
+regression in `test_overlapping_evidence_retention.py` keeps previously inspected
+middle facts visible after repeated overlapping windows, without repeating the
+external read. Runtime source ownership and unchanged fingerprints remain real.
+
+`test_research_recovery_and_compact_comparison.py` exercises the real Web API
+and Telegram SDK, runtime, source recovery, exact retained inspections and final
+delivery with Spanish and Japanese requests. External source/inference fixtures
+simulate an unavailable route and a usable alternative with large records.
+Unrelated plain requests retain one primary call and measured mean/max latency.
+`test_source_context_projection.py` verifies bounded views, all-row previews,
+explicit omissions and unchanged full evidence, including composite readers.
+The opt-in Web UI checks in `test_live_stage_web_batched_research.py` also cover
+arithmetic without tool calls and live availability recovery with a usable
+source link, captured date/party-size evidence and no booking. They record
+elapsed time and model-context sizes. SDK delivery checks do not establish
+real Telegram app acceptance; that still requires an inbound user message.
+
+`test_shared_turn_latency.py` holds a real runtime database writer lock while
+three multilingual Telegram SDK requests finish through incremental receipt
+queues and the shared snapshot coordinator. It verifies handler mean/max latency,
+one delivered answer per input and restored history/deduplication after release.
+Its Web API probe checks compact initial context, retained profile information
+and exactly one primary model call per ordinary request with optional capabilities
+installed. `test_browser_page_reads.py` exercises explicit native batches, adjacent
+independent model calls and dependent calls through the real API/SQLite/browser;
+only independent reads overlap and all successful/failed source receipts survive.
+
+`test_source_audit_followup.py` exercises real Web and Telegram request/delivery
+boundaries with selected search and composite-read receipts. A question about a
+different source must preserve the primary answer instead of becoming a generic
+snippet warning. Successive quoted follow-ups retain observation provenance and
+do not re-execute the source read. Adapter and registry checks reject write or
+unregistered operations as read-only proof.
+
+`test_browser_read_context_reuse.py` replays the real chat API and Chromium
+through Playwright and Auto adapters. A native preflight establishes a source
+cookie, then independent reads must reuse it without repeating slow session
+setup. Three multilingual requests verify findings, links, native receipts and
+mean/max latency. Unit cases cover sibling/parent cleanup order, unrelated-task
+isolation and context inheritance through configured and headless recovery.
+
+`test_telegram_history_mirror_latency.py` holds a real encrypted chat-history
+SQLite database under an exclusive writer while the real Telegram SDK publishes
+three multilingual replies. It bounds mean/max delivery latency, verifies typing
+continues through delayed HTTP acknowledgements and checks history eventually
+persists. This isolates the secondary history mirror from canonical runtime
+state and proves that a busy mirror cannot stall the user-facing event loop.
+
+`test_ingress_feedback_and_history_contention.py` replays real Telegram SDK
+ingress with completed greeting/ticket requests and slow post-delivery cleanup.
+The screenshot follow-up must retain the ticket context without a historical
+target menu. Repeated multilingual quick turns inject slow concurrent admission
+and assert first typing average/max latency bounds without extra progress
+messages. A real HTTP chat request runs under a held runtime file lock: its
+prepared clarification remains visible and the history is subsequently durable.
+Unit coverage also holds an actual SQLite writer, validates coalesced receipts
+across runtime reloads, and checks dependency cancellation and early completion.
+
+`test_meaningful_request_progress.py` drives the real shared runtime through
+Web UI, Telegram SDK HTTP, Slack ingress and Discord ingress. With verbose off,
+slow external inference must leave completed source counts visible before the
+answer, use one editable messaging notice, clean it up and deliver one final
+answer with persisted tool evidence. Telegram also injects an actual HTTP
+typing failure and requires a later successful refresh. Unit checks cover
+coalescing, fast-turn suppression, slow/failing status transport, cancellation,
+shared formatting and connection-pool reuse. No live Slack/Discord account is
+used; those SDK boundaries are simulated.
+
+`test_research_artifact_handoff.py` exercises real Chromium research, scoped
+producer selection, native image creation, SQLite and final Web download or
+Telegram SDK multipart delivery. Generated-image requests must retain their
+format and receive the artifact deadline before generation; research captures
+must stay internal. Interrupted production must preserve its native timeout
+through the final delivery boundary. Unit coverage repeats the format-retention
+contract for image, PDF, HTML and spreadsheet formats and for interruptions with
+and without earlier tool results. The Telegram HTTP provider is simulated;
+live Telegram acceptance still requires a real user-sent request.
+
+`test_browser_page_reads.py` runs multilingual real chat/SQLite requests against
+Chromium with an existing cookie and user tab. Independent reads must overlap,
+retain exact links/rows, close only batch tabs and finish without an inner SDK
+model loop. A missing region preserves the other page's findings. Repeated
+requests record average/max latency bounds and fail if the slow inner-model
+dependency enters the path. Unit contracts cover explicit independence, URL
+validation, headless context leases, projection and non-forgeable READ receipts.
+`test_live_stage_web_batched_research.py` is an opt-in real-provider Web UI probe:
+plain-turn latency, live rendered research, native tool/usage evidence and an
+adjacent weather request. Its evidence records actual latency, model calls and
+available usage; a controlled fixture result alone does not establish live speed.
+
+`test_shared_client_research_policy.py` replays the same controlled model
+decisions through the real Web UI and Telegram ingress/SDK HTTP boundary in
+three languages. An initial adaptive-browser selection must return a native
+read, exact source links and the shared login without starting its inner model.
+Both surfaces check persisted task outcomes and repeated latency bounds. The
+same replay also starts independent search/page batches directly, repeats them
+across saved-history turns, checks the two-query concurrency ceiling, and keeps
+the slow adaptive dependency out of the fast path. Permissions are real and
+explicitly granted in the isolated fixture; only provider/network endpoints are
+simulated. Unit contracts preserve partial evidence on timeout/cancellation and
+all source identities and exact long URLs during context compaction. The
+Telegram transport is simulated here; real user-sent stage Telegram requests
+remain necessary for live acceptance. The opt-in Web probe also repeats the
+reported news request and records full visible-answer latency.
+
+`test_responsive_delivery.py` measures Telegram's actual SDK/HTTP delivery with
+a slow simulated external API: four multilingual runs must keep token callbacks
+unblocked, coalesce obsolete edits, preserve one message and render the complete
+final formatting. A completed answer must use one send. The same file drives
+the Web UI repeatedly with a slow external-model fixture and requires an early
+wait state followed by the full readable result within average/max limits.
+`test_latest_text_updates.py` covers the corresponding Telegram/Slack/Discord
+queue ordering and in-flight-send ownership. The existing Browser Use runtime
+contract exercises the real isolated SDK, browser, WebSocket activity and SQLite
+with scripted provider replies; it checks fresh evidence, no duplicate decision
+captures, progress before the final result and measured latency. These controlled
+checks do not establish production provider or Telegram app latency.
+
+`test_weather_period_answer.py` sends real sequential chat requests and uses the
+native forecast adapter with an external provider fixture. English, Japanese and
+Spanish follow-ups must return the next day's distinct forecast, preserve the
+location and keep the primary answer round even when a direct-read hint is set.
+An adjacent market-volume question must retain the requested field rather than
+being replaced with a price-only summary. `test_probe_completion_ownership.py`
+also verifies that reading an observation cannot silently finish a tracker setup.
+Browser runtime coverage exercises text-only decisions and a structured request
+for visual context, retaining actual PNG evidence in both modes.
+
+`test_shared_browser_login_handoff.py` launches a real persistent Chromium
+session with an existing synthetic login cookie. External CDP fixtures simulate
+capacity and a stalled browser-control socket. Real chat ingress, isolated SDK
+startup, scope recovery, native browser tools and SQLite must recover on that
+same cookie; the user's tab must stay open and the protected page must be read
+without a replacement browser. This is a controlled session-preservation check,
+not proof of a human signing into a real account. SDK runtime fixtures explicitly
+select independent Playwright mode, and verify cookie persistence across worker
+processes. Native schema requests and text-JSON compatibility are both covered.
 
 The primary agent owns the answer; there is no independent AI quality gate.
 `test_producer_only_completion.py` exercises Web API, Telegram upload bytes,
@@ -11,6 +202,24 @@ answers remain visible. `test_producer_completion.py` covers legacy paused-state
 migration without changing historical data or dropping native media receipts.
 Live stage Web UI and real inbound Telegram validation remain separate acceptance
 steps; deterministic Docker coverage is not a claim that either was exercised.
+
+`test_dispatch_target_clarification.py` runs concurrent requests through the
+real HTTP route and SQLite: a vague English, Spanish or Japanese amendment must
+ask for its target without cancelling or withholding another request. A numeric
+answer executes the stored amendment for the selected recent request and is
+durable. Unit coverage also checks reset, cancelled targets, other conversations
+and replies, invalid choices, and the no-scan lookup used by ordinary ingress.
+
+`test_generated_artifact_email_approval.py` creates an actual PNG with the shell
+producer, stages its declared output, and prepares a native email approval.
+Telegram multipart bytes and its Send email button, HTTP downloads, and the
+rendered Web draft/attachment are checked. English and Japanese requests must
+show the complete draft and the selected attachment without reaching the email
+transport before confirmation. The Web UI also approves one synthetic message
+and checks the fake mail transport's exact subject and MIME attachment bytes, plus the visible sent receipt.
+Multi-step clarification variants retain the complete original request. This
+is combined generation/approval coverage; email read-only live
+cases do not establish that an attachment-and-send workflow works.
 
 Tests live alongside the implementation in `tests/`, with real product workflow
 coverage in `tests/e2e/`. A fresh clone contains the complete released suite.
@@ -692,12 +901,15 @@ file version, compaction, formatting and transport tests remain. Existing
 partial answers stay visible even when another connector needs reconnection;
 native outcome state still records that blocker.
 
-`test_live_stage_web_producer_completion.py` covers real stage Web PDF download
-and native account-source consent with no independent quality-review events.
-`test_live_stage_web_producer_generation.py` extends this to final DOCX selection,
-a complete twenty-row XLSX, CSV generation during dashboard polling, an existing
-file lookup follow-up, multilingual plain-turn latency, read-only scheduler
-inventory and weather. These opt-in tests use the real configured provider and
+The canonical Web workflows in `test_live_stage_web_extended.py` and
+`test_live_stage_web_followups.py` also check primary ownership, exact history
+counts and the absence of independent quality-review events. They cover PDF
+download, account-source consent in three languages, final DOCX selection, CSV
+generation during dashboard polling, existing-file lookup and multilingual chat
+latency without collected wrappers repeating the same workflows.
+`test_live_stage_web_producer_generation.py` retains the distinct twenty-row
+XLSX, read-only scheduler inventory, weather and image workflows.
+These opt-in tests use the real configured provider and
 browser UI, retain SQLite evidence, and inspect actual downloaded file bytes.
 They do not establish Telegram app coverage; that requires the unlocked native
 app and a real inbound user-message path.
@@ -708,3 +920,47 @@ a real user message, checks one terminal attachment after caption revisions and
 runtime synchronization, and reloads the page. Unit cases exercise both arrival
 orders, concurrent independent store connections, separate message parts and
 identical replies belonging to different requests or conversations.
+
+The isolated worker runtime contract also runs three independent processes against
+a local cookie-protected fixture: the second receives the first run's cookie,
+then signs out; the third must not resurrect it. Saved state files must remain
+private. This is separate from the managed-browser handoff tests, which reuse
+a running browser and never export or replace its profile.
+
+`test_browser_recovery_choice.py` exercises real chat/SQLite and an actual Chromium
+public-page read after a numeric headless choice. The failed reconnect must stop
+for user input without visiting the site, and another task belonging to the same
+user must retain its configured-browser behavior. Connection failures do not
+imply that all public research requires authentication.
+
+Bounded-comparison acceptance verifies the requested item facts and direct item
+links, requires reading only a strict subset of the discovered catalogue, and
+records a 90-second request bound. It does not impose a universal four-page
+research cap. The scheduler enable-follow-up fixture explicitly asks for a fresh
+configuration inspection without running or modifying the task.
+
+Detail-read regressions preserve visible item links through the real browser,
+chat and SQLite boundaries. They cover single/dependent/parallel read plans,
+multiple languages, hidden links, malformed URLs, non-web actions and tab cleanup.
+
+## Live stage categories and overlap
+
+The [live stage catalogue](testing/live-stage-test-catalog.md) groups the stage
+tests by workflow and separates live workflows, saved-result replays, local
+harness checks and aggregate entry points. The reviewed assignments are saved
+in `tests/e2e/live_stage_catalog.json`.
+
+Use `python3 scripts/live_stage_test_catalog.py --category browser --selectors`
+to inspect a category, or `--set smoke --selectors` for the eight-case smoke
+selection. These commands never run tests or contact stage. The catalogue also
+records API/Web scenario overlap and canonical replacements for retired wrappers.
+Extra ownership assertions now run inside the canonical workflows. The redundant
+aggregate pytest entry is removed; individual API scenarios and the standalone
+probe CLI remain available. Collected tests should reuse assertion helpers rather
+than call another collected test.
+
+[Per-test runtime history](testing/test-performance.md) is captured automatically
+for ordinary pytest, Docker unit/E2E and live-stage Web runs. It retains each
+attempt and its outcome, so later runs can compare medians and observed p95
+without replacing failed or slower results. Use
+`python3 scripts/test_performance.py --lane stage` to inspect stage timings.

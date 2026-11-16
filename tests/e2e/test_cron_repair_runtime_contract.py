@@ -550,10 +550,12 @@ def test_email_triage_recovers_mixed_source_refs_and_delivers_report(tmp_path, m
     assert invoked==['email_search','email_read','calendar_list'],[(r.tool_name,r.output) for r in outcome['tool_results']]
     assert outcome['cron_delivery_status']=='sent',outcome
     assert outcome['response_fulfilled'] is complete_report,outcome
-    assert bool(outcome.get('cron_report_partial')) is not complete_report,outcome
+    # Invalid writer output delivers a failure notice, not a partial report.
+    assert not outcome.get('cron_report_partial'),outcome
     assert len(repairs)==(1 if complete_report else 2)
     if not complete_report:
         assert outcome['response_fulfilled'] is False
+        assert outcome.get('cron_report_failed') is True
         assert all('Partial report' not in text and 'November 7' not in text for text,_ in wire)
         assert not outcome.get('cron_completion_continuations')
     assert any('November 7' in text and 'scan is incomplete' in text and options.get('parse_mode')=='HTML' for text,options in wire) is complete_report
@@ -677,12 +679,18 @@ def test_long_account_report_recovery_keeps_calendar_checks_and_delivers_once(tm
                     'report': 'Checked 24 renewal messages dated October 26. Renewal is November 7; an existing calendar event was verified. No duplicate created.'}))
             self.step += 1
             if self.step == 1:
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(i),
-                    'name': 'email_read', 'input': {'id': str(i)}} for i in range(24)]}
+                return {'stop_reason': 'tool_use', 'content': [{'type':'tool_use', 'id':'scope',
+                    'name':'request_tool_scope', 'input':{'capabilities':['connector'],
+                        'tool_names':['email_read','calendar_list'], 'research_effort':'extended',
+                        'research_questions':['All 24 renewal records and their matching calendar entries']}},
+                    *[{'type': 'tool_use', 'id': str(i),
+                    'name': 'email_read', 'input': {'id': str(i)}} for i in range(24)]]}
             if self.step == 2:
                 return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'calendar',
                     'name': 'calendar_list', 'input': {'start': '2026-11-06T00:00:00-05:00', 'end': '2026-11-08T00:00:00-05:00'}}]}
-            return text_response('I checked your email.\nFrom: billing@example.test\nPreview: Renewal notice.\nDate: October 26.')
+            # A typed provider interruption invokes the report recovery path;
+            # English header words in an answer are not a routing signal.
+            raise TimeoutError('Report generation interrupted after the completed source checks')
     provider = Provider()
     result = run_single_agent_cron_turn(CronJob(id='long-report', name='更新', schedule='0 * * * *',
         task='Read selected renewal records, verify existing calendar events, and report without duplicates.'),

@@ -616,6 +616,7 @@ def _build_runtime_service_from_settings(
         delivery_channel: str,
         delivery_target: str,
         delivered_text: str,
+        browser_recovery_choices=(),
     ) -> None:
         try:
             from nullion.cron_delivery import record_cron_delivery_chat_turn
@@ -628,6 +629,7 @@ def _build_runtime_service_from_settings(
                 delivery_channel=delivery_channel,
                 delivery_target=delivery_target,
                 delivered_text=delivered_text,
+                browser_recovery_choices=browser_recovery_choices,
             )
             from nullion.cron_delivery import checkpoint_cron_delivery_records
             if event is not None:

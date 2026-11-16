@@ -41,7 +41,7 @@ def test_pdf_argument_error_survives_focused_history_compaction(tmp_path):
     assert error.status == 'failed'
     assert tool_repair_kind(error) == 'correct_arguments'
     schema = _default_input_schema_for_tool('pdf_create')
-    assert {row['required'][0] for row in schema['anyOf']} == {'text_pages', 'html_pages', 'image_paths', 'screenshot_paths'}
+    assert {row['required'][0] for row in schema['anyOf']} == {'text_pages', 'html_pages', 'image_paths', 'screenshot_paths', 'card_pages'}
     compact = _compact_focused_artifact_source_history([], state={'tool_flow_context': {'requires_artifact_delivery': True}}, tool_results=[error], model_tool_registry=registry('pdf_create'))
     packet = json.dumps(compact)
     assert error.error in packet

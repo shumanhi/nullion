@@ -16,7 +16,8 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
 @pytest.mark.parametrize('condition,label', [('Notify when the vote total changes; ignore the clock.', 'Votes='),
     ('時刻の表示を無視し、票数の合計が変わったら通知してください。', '票数=')])
 @pytest.mark.parametrize('preview_selector', ['body', 'a'])
-def test_incomplete_preview_is_repaired_before_tracker_admission_and_changes_alert_after_restart(tmp_path, monkeypatch, condition, label, preview_selector):
+@pytest.mark.parametrize('execution_layer',['off','on'])
+def test_incomplete_preview_is_repaired_before_tracker_admission_and_changes_alert_after_restart(tmp_path, monkeypatch, condition, label, preview_selector, execution_layer):
     from fastapi.testclient import TestClient
     from nullion import web_app
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -40,7 +41,13 @@ def test_incomplete_preview_is_repaired_before_tracker_admission_and_changes_ale
     monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright');monkeypatch.setenv('NULLION_BROWSER_BLOCK_PRIVATE', 'false')
     monkeypatch.setenv('NULLION_ENV_FILE', str(tmp_path/'none.env'));monkeypatch.setenv('NULLION_MEMORY_ENABLED', 'false')
     runtime = setup_runtime(tmp_path, monkeypatch);registry = ToolRegistry();register_browser_tools(registry)
+    monkeypatch.setenv('NULLION_CODE_MODE',execution_layer)
     phase = 0; evaluations = []
+    def native(name,args):
+        if execution_layer=='off':return tool_response(name,args)
+        result=tool_response('code_mode',{'tool_names':[name],'code':"call_tool("+repr(name)+", "+repr(args)+")"})
+        result['content'][0]['id']='program-'+str(phase)
+        return result
     class Provider:
         def create(self, **kw):
             nonlocal phase
@@ -56,15 +63,17 @@ def test_incomplete_preview_is_repaired_before_tracker_admission_and_changes_ale
             phase += 1
             if phase == 1:return tool_response('request_tool_scope', {'capabilities':['web','scheduler'],
                 'tool_names':['browser_navigate','browser_find','browser_extract_text','create_live_tracker']})
-            if phase == 2:return tool_response('browser_navigate', {'url':url})
-            if phase == 3:return tool_response('browser_find', {'selector':preview_selector})
-            if phase == 5:return tool_response('browser_extract_text', {'selector':'#results', 'ready_text':label})
-            if phase in (4, 6):
-                return tool_response('create_live_tracker', {'name':'票数の変化', 'stop_after_match':True,'duration_seconds':3600,
+            if phase == 2:return native('browser_navigate', {'url':url})
+            if phase == 3:return native('browser_find', {'selector':preview_selector})
+            if phase == 5 or execution_layer=='on' and phase==7:
+                return native('browser_extract_text',{'selector':'#results',**({'ready_text':label} if execution_layer=='off' or phase==7 else {})})
+            if phase in ((4,6,8) if execution_layer=='on' else (4,6)):
+                return native('create_live_tracker', {'name':'票数の変化', 'stop_after_match':True,'duration_seconds':3600,
                     'interval_seconds':5, 'source_refresh':'navigate', 'probe':[{
-                        'tool_name':'browser_find' if phase == 4 else 'browser_extract_text',
-                        'arguments':({'selector':preview_selector} if phase == 4 else
-                            {'selector':'#results', 'ready_text':label})}],
+                        'tool_name':('code_mode' if execution_layer=='on' else 'browser_find') if phase==4 else 'browser_extract_text',
+                        'arguments':({'code':'read()'} if execution_layer=='on' and phase==4 else
+                            {'selector':preview_selector} if phase==4 else
+                            {'selector':'#results',**({'ready_text':label} if execution_layer=='off' or phase==8 else {})})}],
                     'matcher':{'kind':'semantic','history_mode':'snapshot','instruction':condition}})
             return text_response('The tracker is monitoring changes. The initial result is its baseline.')
     provider = Provider();register_live_tracker_tools(registry, model_client_getter=lambda:provider)
@@ -79,8 +88,16 @@ def test_incomplete_preview_is_repaired_before_tracker_admission_and_changes_ale
             job = jobs[0];assert job['comparison_snapshot']['outputs'][0]['text'].endswith(label+'10; Clock=1')
             turns = [r for r in runtime.store.list_conversation_events('web:comparison') if r.get('event_type') == 'conversation.chat_turn']
             attempts = [r for r in turns[-1]['tool_results'] if r['tool_name'] == 'create_live_tracker']
-            assert [r['status'] for r in attempts] == ['failed','completed']
-            assert attempts[0]['output']['validation']['code'] == 'incomplete_observation'
+            assert [r['status'] for r in attempts] == (['failed','failed','completed'] if execution_layer=='on' else ['failed','completed'])
+            if execution_layer=='on':
+                constraints=attempts[0]['output']['recovery']['argument_constraints']
+                assert 'browser_extract_text' in constraints['repeatable_native_read_tools']
+                assert 'code_mode' not in constraints['repeatable_native_read_tools']
+                assert attempts[1]['output']['validation']['code']=='source_readiness_unverified'
+                repair=attempts[1]['output']['recovery']['argument_constraints']['repairable_preparations']
+                assert any(p['probe']['tool_name']=='browser_extract_text' and p['supported_parameters']==['ready_selector','ready_text'] for p in repair)
+            else:
+                assert attempts[0]['output']['validation']['code']=='incomplete_observation'
             assert len(evaluations) == 1, 'The invalid preview must not consume an evaluator call'
             # Recreate the worker between checks: persisted snapshot and portable
             # source setup must survive the creator's transient browser scope.

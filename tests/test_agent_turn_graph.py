@@ -1050,7 +1050,10 @@ def test_agent_turn_graph_emits_foreground_ack_when_model_selects_tool() -> None
     )
 
     assert result.final_text == "done"
-    assert events == [{"id": "foreground-working-ack", "label": "Preparing work", "status": "running"}]
+    assert events[0] == {"id": "foreground-working-ack", "label": "Preparing work", "status": "running"}
+    operations = [e['operation_progress'] for e in events if e.get('status_kind') == 'operation_progress']
+    assert [e['status'] for e in operations] == ['running', 'completed']
+    assert operations[0]['id'] == operations[1]['id']
     assert [(item.tool_name, item.status) for item in activity] == [
         ("calendar_search", "running"),
         ("calendar_search", "completed"),
@@ -1556,8 +1559,10 @@ def test_agent_turn_graph_recovers_browser_image_collection_from_rendered_dom() 
         },
     )
     assert result.tool_results[-1].output["rendered_recovery"]["source"] == "browser_rendered_dom"
-    tool_result_text = client.second_messages[-1]["content"][0]["content"][0]["text"]
-    assert "rendered_recovery" in tool_result_text
+    tool_result_texts = [block["content"][0]["text"]
+        for message in client.second_messages for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"]
+    assert any("rendered_recovery" in text for text in tool_result_texts)
     assert "/tmp/rendered-product.png" in result.artifacts
 
 
@@ -5573,8 +5578,8 @@ def test_agent_turn_graph_retries_focused_artifact_producer_timeout(tmp_path: Pa
     )
 
     assert len(client.calls) == 4
-    assert {tool["name"] for tool in client.calls[1]["tools"]} == {"file_write"}
-    assert {tool["name"] for tool in client.calls[2]["tools"]} == {"file_write"}
+    assert {tool["name"] for tool in client.calls[1]["tools"]} == {"file_write", "inspect_retained_evidence"}
+    assert {tool["name"] for tool in client.calls[2]["tools"]} == {"file_write", "inspect_retained_evidence"}
     assert report_path.exists()
     assert result.artifact_delivery_satisfied is True
     assert result.model_timed_out is False

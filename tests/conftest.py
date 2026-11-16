@@ -51,6 +51,7 @@ def _close_test_timers(monkeypatch, _isolate_nullion_data_dir):
     # Timers resolve patched functions when they fire. They must finish or
     # be cancelled while their originating test's patches are still active.
     timers = []
+    snapshots = []
     timer_type = threading.Timer
     original_start = threading.Thread.start
 
@@ -58,6 +59,8 @@ def _close_test_timers(monkeypatch, _isolate_nullion_data_dir):
         result = original_start(thread, *args, **kwargs)
         if isinstance(thread, timer_type):
             timers.append(thread)
+        if getattr(thread, 'name', '') == 'runtime-checkpoint':
+            snapshots.append(thread)
         return result
 
     monkeypatch.setattr(threading.Thread, "start", start)
@@ -66,6 +69,9 @@ def _close_test_timers(monkeypatch, _isolate_nullion_data_dir):
         timer.cancel()
         timer.join(timeout=3)
         assert not timer.is_alive(), "Test timer did not stop before restoring patches"
+    for worker in snapshots:
+        worker.join(timeout=5)
+        assert not worker.is_alive(), 'Snapshot worker outlived its originating test patches'
 
 
 @pytest.fixture(autouse=True)

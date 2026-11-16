@@ -102,6 +102,7 @@ def compact_scope_evidence(output: Mapping[str, object], *, original_chars: int)
         'capabilities', 'available_tools', 'unavailable_tools', 'explicit_tool_names',
         'required_tool_names', 'requested_required_tool_names', 'unavailable_required_tool_names',
         'artifact_extensions', 'required_artifact_extensions', 'excluded_artifact_extensions',
+        'artifact_production_guidance', 'artifact_output_root',
         'embedded_media_artifact_extensions', 'connector_app_ids', 'scheduler_action',
         'scheduler_effect_actions', 'scheduler_target_scope', 'scheduler_selection_policy',
         'scheduler_toggle_enabled', 'tracking_mode', 'requested_outcome', 'scope_requested',

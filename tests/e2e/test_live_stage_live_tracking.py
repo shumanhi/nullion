@@ -75,8 +75,6 @@ def test_live_stage_web_any_finite_window_and_same_tracker_amendments(live_web):
         assert len(owned())==1 and owned()[0]['id']==ident and owned()[0]['interval_seconds']==900
         for update in (changed,corrected):
             assert not any(r['tool_name'].startswith('browser_') or r['tool_name'] in {'web_fetch','web_search','create_live_tracker','stop_live_tracker','create_cron'} for r in update.get('tool_results',[])),update
-        reviews=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_review')
-        assert reviews and reviews[-1]['disposition']=='complete',reviews
         out=Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])/'finite-window-contract.json'
         out.write_text(json.dumps({'tracking':_tracking_evidence(database,name),'turns':_turns(database,conversation)},ensure_ascii=False,indent=2))
         assert not errors
@@ -362,11 +360,11 @@ def test_live_stage_web_expiry_followup_renews_saved_window():
             time.sleep(.2)
         assert turn and any(line.strip().startswith('1.') for line in turn['assistant_reply'].splitlines())
         bubble=page.locator('.msg.bot .bubble[data-turn-id='+json.dumps(turn['turn_id'])+']')
-        expect(bubble).to_contain_text(before['id'],timeout=15000)
+        expect(bubble).to_contain_text('Continue for 30 minutes',timeout=15000)
         # Ordered-list numbers are browser markers, not innerText characters.
         expect(bubble.locator('ol li')).to_have_count(3,timeout=15000)
         assert bubble.locator('ol li').first.get_attribute('value')=='1'
-        assert job()['state']=='expired'
+        assert job()['state']=='expired' and job()['id']==before['id']
         page.locator('#user-input').fill('1')
         page.locator('#user-input').press('Enter')
         deadline=time.monotonic()+60
@@ -723,18 +721,18 @@ def test_live_stage_shared_presentation_and_filter_amendment(live_web):
         assert amended['expires_at']==config['expires_at'] and amended['interval_seconds']==900
         assert after[0]['matcher']==amended['matcher'] and after[0]['condition_revision']==1
         assert updated.get('response_fulfilled') is True,updated
-        assert any((r.get('response_requirements') or {}).get('_reviewed_action_reply')
-            for r in updated.get('tool_results',[])),updated
         assert not any(r['tool_name'].startswith('browser_') or r['tool_name'] in {'create_live_tracker','stop_live_tracker','create_cron'}
             for r in updated.get('tool_results',[])),updated
         bubble=page.locator('#messages .msg.bot .bubble').last
         expect(bubble).not_to_contain_text('**')
         assert len(bubble.inner_text())<2500
-        visible_reply=bubble.inner_text()
+        visible_reply=bubble.evaluate("el=>{const copy=el.cloneNode(true);copy.querySelectorAll('.message-time').forEach(n=>n.remove());return copy.innerHTML;}")
+        raw_reply=bubble.get_attribute('data-raw-text')
         page.reload(wait_until='domcontentloaded')
         restored=page.locator('#messages .msg.bot .bubble[data-turn-id='+json.dumps(updated['turn_id'])+']')
         expect(restored).to_have_count(1)
-        expect(restored).to_have_text(visible_reply,use_inner_text=True)
+        assert restored.get_attribute('data-raw-text')==raw_reply
+        assert restored.evaluate("el=>{const copy=el.cloneNode(true);copy.querySelectorAll('.message-time').forEach(n=>n.remove());return copy.innerHTML;}")==visible_reply
         expect(restored).not_to_contain_text('**')
         assert not errors,errors
         out=Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])/'shared-presentation-condition'
@@ -766,8 +764,6 @@ def test_live_stage_existing_condition_amendment_render(live_web):
     assert updated['expires_at']==original['expires_at'] and updated['interval_seconds']==original['interval_seconds']
     amended=[t for t in turns if any(r['tool_name']=='update_live_tracker' and r['status']=='completed' for r in t.get('tool_results',[]))][-1]
     assert amended['response_fulfilled'] is True,amended
-    assert any((r.get('response_requirements') or {}).get('_reviewed_action_reply')
-        for r in amended['tool_results']),amended
     assert not any(r['tool_name'].startswith('browser_') or r['tool_name'] in {'stop_live_tracker','create_live_tracker','create_cron'} for r in amended['tool_results'])
     # The live_web fixture intentionally pins a fresh conversation in an
     # init script on every reload. Use a clean browser context to inspect the

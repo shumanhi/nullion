@@ -17,14 +17,21 @@ from uuid import uuid4
 _MIN_HTML_ARTIFACT_BYTES = 64
 
 
+def _selected_delivery_receipt(result, requirement_contract):
+    def field(value, key, default=None):
+        return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+    return any(field(row, 'requirement_kind')=='deliverable' and field(row, 'delivery_required', True)
+        and field(result, 'tool_name') in field(row, 'eligible_evidence_tool_names', ())
+        and (not field(row, 'eligible_evidence_invocation_ids', ())
+             or field(result, 'invocation_id') in field(row, 'eligible_evidence_invocation_ids'))
+        for row in requirement_contract)
+
+
 def demote_unrequested_source_artifacts(tool_results, *, source_only_tool_names,
                                        requirement_contract, required_extensions) -> list[str]:
     """A scope hint cannot make an evidence-only tool's files user outputs."""
     def field(value, key, default=None):
         return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
-    eligible = {name for row in requirement_contract
-                if field(row, "requirement_kind") == "deliverable" and field(row, "delivery_required", True)
-                for name in field(row, "eligible_evidence_tool_names", ())}
     formats = set(normalize_artifact_extensions(required_extensions))
     demoted = []
     for result in tool_results or ():
@@ -36,7 +43,8 @@ def demote_unrequested_source_artifacts(tool_results, *, source_only_tool_names,
             if not isinstance(descriptor, dict) or descriptor.get("role") != "deliverable":
                 continue
             path = descriptor.get("path")
-            if isinstance(path, str) and (name not in eligible or artifact_format_extension(path) not in formats):
+            if isinstance(path, str) and (not _selected_delivery_receipt(result, requirement_contract)
+                    or artifact_format_extension(path) not in formats):
                 descriptor["role"] = ARTIFACT_ROLE_SOURCE
                 demoted.append(path)
     return list(dict.fromkeys(demoted))
@@ -65,7 +73,7 @@ def requested_source_artifact_candidates(tool_results, *, artifact_roots, requir
     for result in tool_results or ():
         if normalize_tool_status(field(result, "status")) != "completed":
             continue
-        if promote and field(result, "tool_name") not in eligible:
+        if promote and not _selected_delivery_receipt(result, requirement_contract):
             continue
         output = field(result, "output")
         if not isinstance(output, dict):
@@ -129,14 +137,17 @@ def register_selected_existing_source_artifacts(*, reply: str, user_message: str
     results = list(tool_results or ())
     scopes = [output(item) for item in results if field(item, "tool_name") == "request_tool_scope"
               and normalize_tool_status(field(item, "status")) == "completed"]
-    if source_scope_decision is not None:
+    if source_scope_decision is not None and getattr(source_scope_decision, 'valid', True):
         scopes.append({"source_artifact_delivery_requested": getattr(source_scope_decision, "source_artifact_delivery_requested", False),
                        "source_artifact_request_evidence": getattr(source_scope_decision, "source_artifact_request_evidence", ""),
                        "required_tool_names": getattr(source_scope_decision, "required_tool_names", ())})
     user_text = " ".join(str(user_message or "").split())
+    current_scopes = scopes[-1:]
+    if current_scopes and current_scopes[-1].get('source_artifact_delivery_requested') is False:
+        return []
     declared_delivery = any(scope.get("source_artifact_delivery_requested") is True
                and (quote := " ".join(str(scope.get("source_artifact_request_evidence") or "").split()))
-               and quote in user_text for scope in scopes)
+               and quote in user_text for scope in current_scopes)
     history_paths = history_artifact_reference_paths(results)
     if not declared_delivery and not history_paths:
         return []
@@ -149,7 +160,18 @@ def register_selected_existing_source_artifacts(*, reply: str, user_message: str
              and normalize_tool_status(field(item, "status")) == "completed"]
     histories = [item for item in results if field(item, "tool_name") == "chat_history_search"
                  and normalize_tool_status(field(item, "status")) == "completed"]
-    if not selected or not (reads or histories):
+    searches = [item for item in results if field(item, "tool_name") == "file_search"
+                and normalize_tool_status(field(item, "status")) == "completed"]
+    if declared_delivery:
+        # An exact filename in the authorized request plus one native lookup
+        # identity selects an existing file. It needs no rewrite, content read,
+        # or model-generated MEDIA directive. Ambiguous identities stay pending.
+        requested = list(dict.fromkeys(path for item in searches
+            for path in output(item).get('matches', ()) if isinstance(path, str)
+            and text_references_file_path(user_message, path)))
+        if len(requested) == 1:
+            selected = (Path(requested[0]),)
+    if not selected or not (reads or histories or searches):
         return []
     roots = tuple(artifact_roots)
     verified = []
@@ -161,6 +183,10 @@ def register_selected_existing_source_artifacts(*, reply: str, user_message: str
             if matching is None:
                 matching = next((item for item in histories if any(
                     Path(value).expanduser().resolve() == resolved for value in history_artifact_reference_paths([item]))), None)
+            if matching is None and declared_delivery:
+                matching = next((item for item in searches if any(
+                    isinstance(value, str) and Path(value).expanduser().resolve() == resolved
+                    for value in output(item).get('matches', ()))), None)
             descriptor = next((value for root in roots if (value := artifact_descriptor_for_path(resolved, artifact_root=root)) is not None), None)
         except (OSError, RuntimeError, ValueError):
             return []

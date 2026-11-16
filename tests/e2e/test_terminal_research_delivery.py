@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
 
 @pytest.mark.parametrize('prompt', ['Check the claims in this source.', 'この資料の主張を検証して。', 'Verifica las afirmaciones de esta fuente.'])
 @pytest.mark.parametrize('mode', ['terminal_partial', 'terminal_empty', 'review_timeout', 'alternative_method', 'explicit_continuation'])
-def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(tmp_path, monkeypatch, prompt, mode):
+def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(tmp_path, monkeypatch, prompt, mode, native_browser_source):
     from fastapi.testclient import TestClient
     from nullion import web_app, chat_store
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -27,6 +27,9 @@ def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(
     monkeypatch.setattr(browser_use_adapter, 'browser_use_available', lambda: True)
     monkeypatch.setattr(browser_use_adapter, 'browser_use_python', lambda: '/external/worker')
     runtime = setup_runtime(tmp_path, monkeypatch); chat_store._store = None
+    url=native_browser_source('<html><body>Controlled source'
+        '<button onclick="document.getElementById(\'claim\').hidden=false">Inspect details</button>'
+        '<p id="claim" hidden>Recorded statement: 42</p></body></html>')
     calls = []; alternatives = []
     def remote_browser(task, **kw):
         calls.append(task.url)
@@ -114,13 +117,22 @@ def test_terminal_research_returns_findings_and_specific_blocker_without_repeat(
             self.steps += 1
             if self.steps == 1:
                 return tool_response('request_tool_scope', {'capabilities': ['web'],
-                    'tool_names': ['browser_run_task', 'secondary_reader'], 'required_tool_names': ['browser_run_task']})
+                    'tool_names': ['browser_read_pages','browser_run_task', 'secondary_reader'], 'required_tool_names': ['browser_run_task']})
+            def browser_work(target):
+                # This contract exercises terminal outcomes from the adaptive
+                # worker, not the read-only path's native-read fast handoff.
+                result=tool_response('browser_run_task',{'url':target,'task':prompt,
+                    'execution_kind':'adaptive_interaction',
+                    'interaction_reason':'Inspect the native source\'s observed Inspect details control to expose its claim.'})
+                result['content'].insert(0,{'type':'tool_use','id':'native-'+str(self.steps),'name':'browser_read_pages',
+                    'input':{'pages':[{'url':target,'read_kind':'text'}]}})
+                return result
             if self.steps == 2:
-                return tool_response('browser_run_task', {'url': 'https://example.com/source', 'task': prompt})
+                return browser_work(url+'source')
             if mode == 'alternative_method' and not alternatives:
                 return tool_response('secondary_reader', {})
             if mode == 'explicit_continuation' and len(calls) == 1:
-                return tool_response('browser_run_task', {'url': 'https://example.net/source', 'task': prompt})
+                return browser_work(url+'alternative')
             answer = '' if mode == 'terminal_empty' else 'Recorded statement: 42.'
             if mode == 'alternative_method': answer += ' Independent record: 39.'
             elif mode != 'explicit_continuation': answer += ' Login blocked access; the statement has not been independently verified.'

@@ -47,6 +47,23 @@ def test_style_changes_do_not_modify_code_links_or_literal_artifact_metadata():
     assert apply_presentation_preferences(result,preferences=Preferences(emoji_level='none',markdown_style='plain'))==result
 
 
+@pytest.mark.parametrize('headers',[('商品','価格','在庫'),('Producto','Precio','Stock'),('المنتج','السعر','المخزون')])
+def test_table_structure_is_shared_and_idempotent_before_storage_or_transport(headers):
+    from nullion.messaging_adapters import prepare_reply_for_platform_delivery
+    from nullion.telegram_formatting import format_telegram_text,telegram_html_to_plain
+    table='| '+' | '.join(headers)+' |\n|---|---|---|\n| Maple | $34 | 4 |\n| Birch | $48 | 7 |'
+    literal='```text\n| Keep | Literal |\n|---|---|\n| 1 | 2 |\n```'
+    authored=table+'\n\n'+literal
+    canonical=render_user_message(authored)
+    assert '|---|---|---|' not in canonical and literal in canonical
+    assert render_user_message(canonical)==canonical
+    assert prepare_reply_for_platform_delivery(authored,allow_attachments=False).text==canonical
+    formatted,_=format_telegram_text(authored)
+    visible=telegram_html_to_plain(formatted)
+    for value in (*headers,'Maple','$34','4','Birch','$48','7'):
+        assert value in canonical and value in visible
+
+
 def test_invalid_preference_values_fall_back_consistently_in_prompt_and_renderer():
     prefs=SimpleNamespace(emoji_level=[],markdown_style='unknown',response_structure=None)
     assert presentation_policy(prefs).emoji_level=='none'

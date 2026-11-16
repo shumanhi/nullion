@@ -7,6 +7,41 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+DOCUMENT_CONTENT_SCRIPT = "Boolean(document.body && (document.body.childElementCount || document.body.textContent.trim() || (document.body.getAttribute('style') || '').trim() || document.styleSheets.length))"
+
+
+async def goto_with_settled_failure(page, url):
+    """Observe the error document's commit before allowing another navigation.
+
+    Chromium can reject goto before its native error redirect commits. Starting
+    a fallback immediately lets that redirect abort the next successful URL.
+    Register before goto so an early DOM event cannot be missed. No retries,
+    new tabs, fixed sleeps or changes to the browser profile are involved.
+    """
+    loaded = asyncio.get_running_loop().create_future()
+    def completed(*_):
+        if not loaded.done():
+            loaded.set_result(None)
+    on = getattr(page, 'on', None)
+    remove = getattr(page, 'remove_listener', None)
+    observing = callable(on) and callable(remove)
+    if observing:
+        on('domcontentloaded', completed)
+    try:
+        return await page.goto(url, wait_until='domcontentloaded', timeout=30_000)
+    except Exception:
+        if observing:
+            try:
+                await asyncio.wait_for(loaded, timeout=1)
+            except TimeoutError:
+                pass  # Aborted/download navigations may have no error document.
+        raise
+    finally:
+        if observing:
+            remove('domcontentloaded', completed)
+        if not loaded.done():
+            loaded.cancel()
+
 
 @dataclass(frozen=True)
 class BrowserScreenshotResult:
@@ -20,6 +55,7 @@ class BrowserScreenshotResult:
     document_width: int | None = None
     document_height: int | None = None
     is_clipped: bool = False
+    has_document_content: bool | None = None
 
 
 def auto_screenshot_uses_full_page(current_url: str | None, exceeds_viewport: bool) -> bool:

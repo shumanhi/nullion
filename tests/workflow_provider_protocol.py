@@ -52,6 +52,13 @@ def workflow_provider_reply(kwargs, *, completion=True, reasoned=False, action=F
     system = str(kwargs.get('system') or '')
     def reply(value):
         return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': json.dumps(value)}]}
+    from nullion.builder_reflector import _REFLECTION_SYSTEM_PROMPT
+    messages = kwargs.get('messages') or []
+    if (messages and messages[0].get('role') == 'system'
+            and messages[0].get('content') == [{'type':'text','text':_REFLECTION_SYSTEM_PROMPT}]):
+        # Background skill induction shares the provider, but is not a turn of
+        # the scripted foreground producer. Keep it on its own exact protocol.
+        return reply({'should_propose':False})
     if 'Workflow action preflight.' in system:
         return reply({'decision': 'proceed', 'issues': []})
     if not completion:

@@ -31,7 +31,7 @@ def test_live_web_negotiated_output_keeps_goal_and_delivers_generated_png(live_w
     final, final_turn, final_ms = _submit(live_web, '1', timeout=900)
     artifacts = final.get('artifacts') or []
     assert len(artifacts) == 1, final
-    content = probe._artifact_bytes(base, artifacts[0], timeout=30)
+    content, _ = probe._artifact_bytes(base, artifacts[0], timeout=30)
     assert content.startswith(b'\x89PNG\r\n\x1a\n'), artifacts
     import io
     from PIL import Image
@@ -39,7 +39,7 @@ def test_live_web_negotiated_output_keeps_goal_and_delivers_generated_png(live_w
         assert image.width >= 100 and image.height >= 100
     results = final_turn.get('tool_results') or []
     assert any(row.get('status') == 'completed' and row.get('tool_name') in
-        {'image_generate','terminal_exec','local_exec'} for row in results), results
+        {'image_render','image_generate','terminal_exec','local_exec'} for row in results), results
     assert final_turn.get('parent_turn_id') == second_turn['turn_id'], final_turn
     assert second_turn.get('parent_turn_id') == first_turn['turn_id'], second_turn
     assert not errors

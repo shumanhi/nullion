@@ -140,6 +140,7 @@ def _git(*args: str, cwd: Path | None = None) -> tuple[int, str]:
         cwd=cwd,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     return result.returncode, (result.stdout + result.stderr).strip()
 

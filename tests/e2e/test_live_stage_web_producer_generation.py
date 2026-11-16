@@ -6,17 +6,10 @@ from uuid import uuid4
 import pytest
 
 from tests.e2e.test_live_stage_web_matrix import live_web, _submit, catalogue
-from tests.e2e.test_live_stage_web_producer_completion import _record_primary_boundary
+from tests.e2e.live_primary_assertions import record_primary_boundary
 
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E') != '1',
     reason='Explicit real-provider stage Web acceptance only')
-
-
-def test_live_web_primary_docx_selects_only_final_version(live_web):
-    from tests.e2e.test_live_stage_web_extended import (
-        test_live_web_only_final_document_survives_delivery_and_reload as replay)
-    replay(live_web)
-    _record_primary_boundary(live_web, 'primary-final-docx')
 
 
 def test_live_web_primary_xlsx_has_all_twenty_rows(live_web):
@@ -43,28 +36,7 @@ def test_live_web_primary_xlsx_has_all_twenty_rows(live_web):
     assert any(row['status'] == 'completed' and row['tool_name'] in
         {'spreadsheet_create', 'terminal_exec', 'local_exec'} for row in turn['tool_results']), turn
     assert elapsed < 240000
-    _record_primary_boundary(live_web, 'primary-twenty-row-xlsx')
-
-
-def test_live_web_primary_csv_survives_dashboard_polling(live_web):
-    from tests.e2e.test_live_stage_web_extended import (
-        test_live_web_dashboard_polling_during_generation_keeps_final_file_and_history as replay)
-    replay(live_web)
-    _record_primary_boundary(live_web, 'primary-csv-status-polling')
-
-
-def test_live_web_primary_file_lookup_followup_does_not_regenerate(live_web):
-    from tests.e2e.test_live_stage_web_extended import (
-        test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input as replay)
-    replay(live_web)
-    _record_primary_boundary(live_web, 'primary-file-lookup-followup', expected_turns=2)
-
-
-def test_live_web_primary_plain_chat_stays_fast_in_three_languages(live_web):
-    from tests.e2e.test_live_stage_web_followups import (
-        test_live_web_plain_turn_latency_across_languages as replay)
-    replay(live_web)
-    _record_primary_boundary(live_web, 'primary-multilingual-chat', expected_turns=3, allow_deferred=True)
+    record_primary_boundary(live_web, 'primary-twenty-row-xlsx')
 
 
 def test_live_web_primary_inventory_does_not_start_scheduled_work(live_web):
@@ -77,7 +49,7 @@ def test_live_web_primary_inventory_does_not_start_scheduled_work(live_web):
     assert not any(row['tool_name'] in {'run_cron', 'create_cron', 'update_cron', 'delete_cron', 'toggle_cron'}
         for row in turn['tool_results']), turn
     assert elapsed < 90000
-    _record_primary_boundary(live_web, 'primary-scheduler-inventory')
+    record_primary_boundary(live_web, 'primary-scheduler-inventory')
 
 
 def test_live_web_primary_weather_delivers_current_tool_result(live_web):
@@ -88,7 +60,7 @@ def test_live_web_primary_weather_delivers_current_tool_result(live_web):
     results = [row for row in turn['tool_results'] if row['tool_name'] == 'weather_forecast']
     assert results and any(row['status'] == 'completed' for row in results), turn
     assert elapsed < 90000
-    _record_primary_boundary(live_web, 'primary-weather')
+    record_primary_boundary(live_web, 'primary-weather')
 
 
 def test_live_web_primary_image_bytes_and_followup_keep_selected_subject(live_web, tmp_path):
@@ -110,4 +82,4 @@ def test_live_web_primary_image_bytes_and_followup_keep_selected_subject(live_we
     assert not response['artifacts'], response
     # Direct vision/plain replies may defer runtime import; the live history
     # boundary still requires exactly two persisted user and terminal replies.
-    _record_primary_boundary(live_web, 'primary-selected-image-followup', expected_turns=2, allow_deferred=True)
+    record_primary_boundary(live_web, 'primary-selected-image-followup', expected_turns=2, allow_deferred=True)

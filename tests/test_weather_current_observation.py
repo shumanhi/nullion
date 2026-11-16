@@ -21,3 +21,25 @@ def test_current_conditions_are_labeled_independently(current, expected):
     assert result.output['current'].get('time') == current.get('time')
     assert result.output['daily'][0]['summary'] == 'overcast'
     assert 'summary' not in current, 'Adapter must not mutate the provider payload'
+
+
+@pytest.mark.parametrize('address,label', [
+    ({'house_number':'12','road':'Long Street','city':'Harbor City','state':'North Region','country':'Example'}, 'Harbor City, North Region'),
+    ({'village':'港村','state':'北地方'}, '港村, 北地方'),
+])
+def test_weather_uses_structured_locality_label_without_street_address(address, label):
+    from nullion.tools import _resolve_nominatim_weather_location
+    result = _resolve_nominatim_weather_location('precise saved location', json_get=lambda *args:
+        [{'lat':'41','lon':'-90','display_name':'12 Long Street, internal administrative hierarchy', 'address':address}])
+    assert result['name'] == label
+    assert result['latitude'] == 41 and result['longitude'] == -90
+
+
+def test_no_model_weather_fallback_preserves_every_dated_forecast():
+    from nullion.tools import ToolResult
+    from nullion.agent_orchestrator import _weather_forecast_completion_text
+    result = ToolResult('x','weather_forecast','completed',{'current':{'temperature_2m':40},'daily':[
+        {'date':'2027-04-15','temperature_max_f':47}, {'date':'2027-04-16','temperature_max_f':69}]})
+    text = _weather_forecast_completion_text(result)
+    assert 'Apr 15' in text and 'Apr 16' in text and '69°F' in text
+    assert 'Today:' not in text

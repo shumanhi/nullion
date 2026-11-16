@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import io
 import json
+import logging
 import os
 import re
 import threading
@@ -23,6 +24,8 @@ from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, Browser
 from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserScreenshotResult, BrowserSessionPool
 from nullion.tools import ToolInvocation, ToolResult, tool_execution_remaining_seconds
 from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+logger = logging.getLogger(__name__)
 
 BROWSER_ITEM_FIELDS = ("title", "url", "canonical_url", "compact_text", "link_text", "section_heading",
                        "image_url", "image_alt", "image_width", "image_height", "price_text",
@@ -48,7 +51,10 @@ def _fail(invocation: ToolInvocation, message: str, output: dict[str, Any] | Non
     )
 
 
-def _browser_failure_output(exc: BaseException) -> dict[str, str]:
+def _browser_failure_output(exc: BaseException) -> dict[str, object]:
+    from nullion.plugins.browser_plugin.backends.session_recovery import BrowserRecoveryRequired
+    if isinstance(exc, BrowserRecoveryRequired):
+        return exc.recovery_output()
     # Preserve native transport facts for callers without parsing error prose.
     cause = getattr(exc, "reason", exc)
     timeout = isinstance(cause, TimeoutError)
@@ -2776,6 +2782,13 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
   if (description) record.description = description;
   if (bullets.length) record.bullets = bullets;
   if (details) record.details = details;
+  const anchors = [...(root.matches('a[href]') ? [root] : []), ...root.querySelectorAll('a[href]')]
+    .filter(node => visible(node) && ['http:', 'https:'].includes(node.protocol));
+  record.links = anchors.slice(0, 200).map(node => ({{
+    text: compact(node.innerText || node.getAttribute('aria-label'), 500), url: node.href,
+  }}));
+  record.link_coverage = {{scope_found: true, observed_count: anchors.length,
+    returned_count: record.links.length, truncated: anchors.length > record.links.length}};
   return {{
     ok: Boolean(title && location.href),
     selector: rootSelector || null,
@@ -3896,11 +3909,10 @@ def _browser_assert_page_state_script(
     return markers;
   }};
   const assertionLocalizedOwnerCache = new Map();
+  let assertionLocalizedOwnersIndexed = false;
   const localizedCurrencyMarkerOwners = (targetMarker) => {{
-    if (assertionLocalizedOwnerCache.has(targetMarker)) {{
-      return assertionLocalizedOwnerCache.get(targetMarker);
-    }}
-    const owners = new Set();
+    if (assertionLocalizedOwnersIndexed) return assertionLocalizedOwnerCache.get(targetMarker) || new Set();
+    assertionLocalizedOwnersIndexed = true;
     for (const code of assertionCurrencyCodes) {{
       for (const locale of assertionCurrencyLocales(code)) {{
         for (const currencyDisplay of ['symbol', 'narrowSymbol', 'name']) {{
@@ -3927,15 +3939,17 @@ def _browser_assert_page_state_script(
             if (/\\p{{Script=Han}}/u.test(terminalRun) && characters.length > 1) {{
               candidates.add(markerIdentity(characters[characters.length - 1]));
             }}
-            if (candidates.has(targetMarker)) owners.add(code);
+            for (const marker of candidates) {{
+              if (!assertionLocalizedOwnerCache.has(marker)) assertionLocalizedOwnerCache.set(marker, new Set());
+              assertionLocalizedOwnerCache.get(marker).add(code);
+            }}
           }} catch (_error) {{
             // Ignore unsupported locale/currency combinations.
           }}
         }}
       }}
     }}
-    assertionLocalizedOwnerCache.set(targetMarker, owners);
-    return owners;
+    return assertionLocalizedOwnerCache.get(targetMarker) || new Set();
   }};
   const currencyMarkersCompatible = (leftMarker, rightMarker) => {{
     if (leftMarker === rightMarker) return true;
@@ -3957,8 +3971,10 @@ def _browser_assert_page_state_script(
       && assertionRegionCurrencies.has(code)
     );
   }};
+  const semanticIdentityCache = new Map();
   const semanticIdentities = (value) => {{
     const raw = unicodeText(value);
+    if (semanticIdentityCache.has(raw)) return semanticIdentityCache.get(raw);
     const percents = new Set();
     const markers = new Set();
     const percentAfter = new RegExp('(' + amountPattern + ')\\\\s*[%٪]', 'gu');
@@ -4013,7 +4029,9 @@ def _browser_assert_page_state_script(
       if (beforeMarker) markers.add(beforeMarker + ':' + amount);
       if (afterMarker) markers.add(afterMarker + ':' + amount);
     }}
-    return {{percents, markers}};
+    const result = {{percents, markers}};
+    semanticIdentityCache.set(raw, result);
+    return result;
   }};
   const semanticCompatible = (expected, candidate) => {{
     const wanted = semanticIdentities(expected);
@@ -4218,6 +4236,10 @@ def _browser_assert_page_state_script(
     forbidden_found: forbiddenFound,
     selector: args.selector || null,
     candidate_count: candidates.length,
+    page_controls: {{
+      form_count: scopeRoot.querySelectorAll('form, [role="form"]').length + (scopeRoot.matches('form, [role="form"]') ? 1 : 0),
+      editable_control_count: Array.from(scopeRoot.querySelectorAll('input:not([type="hidden"]), textarea, select, [contenteditable="true"]')).filter(visible).length,
+    }},
     candidates: candidates.slice(0, 20).map(compactPreview)
   }};
 }})()
@@ -4297,6 +4319,17 @@ def _workspace_html_preview_url(raw_url: str, *, principal_id: str | None) -> st
     return None
 
 
+_PAGE_CONTROL_STATE_SCRIPT = """() => ({
+  url: location.href,
+  page_controls: {
+    form_count: document.querySelectorAll('form, [role="form"]').length,
+    editable_control_count: Array.from(document.querySelectorAll(
+      'input:not([type="hidden"]), textarea, select, [contenteditable="true"]'
+    )).filter(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden').length
+  }
+})"""
+
+
 def _principal_allows_private_host_navigation(principal_id: str | None) -> bool:
     try:
         from nullion.connections import principal_has_admin_access
@@ -4325,6 +4358,8 @@ def _serialized_browser_operation(method):
             if not acquired:
                 return _fail(invocation, "Browser operation timed out waiting for the session.",
                              {"reason": "handler_timeout", "session_id": session_id})
+            if method.__name__ != 'browser_read_pages':
+                self._read_first_policy.invalidate_reads(invocation)
             result = method(self, invocation, *args, **kwargs)
             if (result.status == "completed" and isinstance(result.output, dict)
                     and method.__name__ in {"browser_run_js", "browser_extract_text", "browser_extract_items", "browser_extract_detail"}):
@@ -4333,7 +4368,21 @@ def _serialized_browser_operation(method):
                 remaining = tool_execution_remaining_seconds()
                 if remaining is None or remaining > 0.25:
                     try:
-                        document_url = _run(self._backend.run_js(session_id, "() => location.href"), timeout_seconds=1)
+                        if method.__name__ == "browser_extract_text":
+                            from nullion.plugins.browser_plugin.browser_reads import text_links_script
+                            references = _run(self._backend.run_js(session_id, text_links_script(invocation.arguments.get("selector"))), timeout_seconds=1)
+                            document_url = references.get("url") if isinstance(references, dict) else references
+                            if isinstance(references, dict) and isinstance(references.get("links"), list):
+                                result.output.update(links=references["links"], link_coverage=references.get("link_coverage"))
+                        elif method.__name__ == 'browser_extract_detail':
+                            state = _run(self._backend.run_js(session_id, _PAGE_CONTROL_STATE_SCRIPT), timeout_seconds=1)
+                            document_url = state.get('url') if isinstance(state, dict) else state
+                            controls = state.get('page_controls') if isinstance(state, dict) else None
+                            if isinstance(controls, dict) and all(type(controls.get(key)) is int and controls[key]>=0
+                                    for key in ('form_count', 'editable_control_count')):
+                                result.output['page_controls'] = controls
+                        else:
+                            document_url = _run(self._backend.run_js(session_id, "() => location.href"), timeout_seconds=1)
                         if isinstance(document_url, str):
                             preview_url = _workspace_html_preview_url(document_url, principal_id=invocation.principal_id)
                             if preview_url is not None:
@@ -4341,6 +4390,7 @@ def _serialized_browser_operation(method):
                                 result.output["source_document_path"] = url2pathname(urlparse(preview_url).path)
                             elif urlparse(document_url).scheme in {"http", "https"}:
                                 result.output["page_url"] = document_url
+                                self._read_first_policy.remember(invocation, document_url)
                                 if method.__name__ == "browser_extract_text" and isinstance(result.output.get("text"), str):
                                     result.output['observation_setup'] = [{'tool_name': 'browser_navigate',
                                         'arguments': {'url': document_url}}]
@@ -4381,11 +4431,14 @@ class BrowserTools:
         self._backend = backend
         self._pool = pool
         self._policy = policy
+        from nullion.plugins.browser_plugin.browser_reads import BrowserReadFirstPolicy
+        self._read_first_policy = BrowserReadFirstPolicy()
         self._cleanup_lock = threading.Lock()
         self._sessions_by_scope: dict[str, set[str]] = {}
         self._active_session_lock = threading.Lock()
         self._active_sessions_by_principal: dict[str, tuple[str, float]] = {}
         self._issued_sessions_by_scope: dict[str, set[str]] = {}
+        self._recovery_sessions_by_scope: dict[str, str] = {}
         self._element_snapshot_lock = threading.Lock()
         self._element_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
         self._page_assertion_lock = threading.Lock()
@@ -4396,12 +4449,39 @@ class BrowserTools:
         )
         self._resolved_session_local = threading.local()
 
+    def session_browser_mode(self, invocation):
+        mode_getter = getattr(self._backend, "mode_for_session", None)
+        return mode_getter(self._session_id(invocation)) if callable(mode_getter) else "configured"
+
+    def browser_task_read_preflight(self, invocation):
+        from nullion.plugins.browser_plugin.browser_reads import browser_task_read_preflight
+        return browser_task_read_preflight(self, invocation)
+
+    def _headless_mode_authorized(self, invocation):
+        configured = getattr(self._backend, '_configured', self._backend)
+        if getattr(configured, 'BACKEND_NAME', None) == 'playwright' and getattr(configured, '_headless', False) is True:
+            return True  # The deployment itself explicitly uses headless.
+        context = invocation.flow_context or {}
+        choice = context.get('browser_mode_selection') or {}
+        return (choice.get('mode') == 'headless' and choice.get('principal_id') == invocation.principal_id
+            and bool(choice.get('source_turn_id')) and bool(choice.get('source_invocation_id')))
+
     def _session_id(self, invocation: ToolInvocation) -> str:
         resolved = getattr(self._resolved_session_local, "by_invocation", None)
         if isinstance(resolved, dict):
             cached_session_id = resolved.get(id(invocation))
             if isinstance(cached_session_id, str) and cached_session_id:
                 return cached_session_id
+        recovery_scope = self._active_session_key(invocation)
+        with self._active_session_lock:
+            if (invocation.tool_name == "browser_open" and invocation.arguments.get("mode") == "headless"
+                    and self._headless_mode_authorized(invocation)):
+                # Even an explicit shared/UI session id must not move another
+                # task into this request's newly selected headless browser.
+                self._recovery_sessions_by_scope[recovery_scope] = self._scoped_model_session_id(invocation, "headless-recovery")
+            recovery_session = self._recovery_sessions_by_scope.get(recovery_scope)
+        if recovery_session:
+            return recovery_session
         raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
         bound_session_id = str(context.get("browser_session_id") or "").strip()
@@ -4489,6 +4569,24 @@ class BrowserTools:
             if owner:
                 self._sessions_by_scope.setdefault(owner, set()).add(session_id)
 
+    def _retain_requested_context(self, invocation: ToolInvocation, session_id: str) -> dict[str, object]:
+        # This runtime-owned conversation identity cannot come from model args.
+        # A durable owner prevents request cleanup from destroying explicitly
+        # retained UI state; the existing conversation-stop/close paths release it.
+        if invocation.arguments.get("keep_open") is not True:
+            return {}
+        context = invocation.flow_context or {}
+        quote = " ".join(str(invocation.arguments.get("retention_request_evidence") or "").split())
+        request = " ".join(str(context.get("current_user_request") or "").split())
+        if not quote or not request or quote not in request:
+            return {"browser_context_retained": False, "retention_reason": "explicit_request_evidence_required"}
+        conversation_id = context.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return {"browser_context_retained": False, "retention_reason": "conversation_identity_required"}
+        with self._cleanup_lock:
+            self._sessions_by_scope.setdefault("conversation:" + conversation_id, set()).add(session_id)
+        return {"browser_context_retained": True}
+
     def _active_session_keys(self, invocation: ToolInvocation) -> tuple[str, ...]:
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
         browser_scope = str(context.get("browser_session_scope") or "").strip()
@@ -4545,6 +4643,9 @@ class BrowserTools:
             for scope in empty_scopes:
                 self._sessions_by_scope.pop(scope, None)
         with self._active_session_lock:
+            for key, value in tuple(self._recovery_sessions_by_scope.items()):
+                if value == session_id:
+                    self._recovery_sessions_by_scope.pop(key, None)
             for key in list(self._issued_sessions_by_scope):
                 self._issued_sessions_by_scope[key].discard(session_id)
                 if not self._issued_sessions_by_scope[key]:
@@ -4960,13 +5061,14 @@ class BrowserTools:
         error: object,
     ) -> dict[str, object]:
         output: dict[str, object] = {
+            **(_browser_failure_output(error) if isinstance(error, BaseException) else {}),
             "reason": _browser_failure_reason(error),
             "message": _compact_failure_message(error),
             "session_id": session_id,
             "target": dict(target),
             "text_length": len(str(text or "")),
         }
-        candidates = self._visible_editable_field_candidates(session_id)
+        candidates = [] if output.get("requires_user_choice") else self._visible_editable_field_candidates(session_id)
         if candidates:
             output["visible_editable_fields"] = candidates
         return output
@@ -4993,6 +5095,7 @@ class BrowserTools:
         return target
 
     def close_tracked_sessions(self, scope_id: str | None = None) -> None:
+        self._read_first_policy.clear(scope_id)
         if scope_id is None:
             with self._page_assertion_lock:
                 self._page_assertion_contracts.clear()
@@ -5023,9 +5126,17 @@ class BrowserTools:
                     ):
                         continue
                 try:
-                    _run(self._backend.close_session(session_id))
+                    try:
+                        _run(self._backend.close_session(session_id), timeout_seconds=5)
+                    except Exception:
+                        _run(self._backend.close_session(session_id), timeout_seconds=5)
                 except Exception:
-                    pass
+                    # Keep the exact lease so a later cleanup can retry it.
+                    # A failed close must not erase ownership of a live tab.
+                    with self._cleanup_lock:
+                        self._sessions_by_scope.setdefault(str(scope_id or "pending-cleanup"), set()).add(session_id)
+                    logger.warning("Browser session cleanup failed for %s", session_id, exc_info=True)
+                    continue
                 with self._cleanup_lock:
                     if any(
                         session_id in scoped_session_ids
@@ -5037,7 +5148,18 @@ class BrowserTools:
     # ── Tools ─────────────────────────────────────────────────────────────────
 
     @_serialized_browser_operation
+    def browser_read_pages(self, invocation: ToolInvocation) -> ToolResult:
+        from nullion.plugins.browser_plugin.browser_reads import read_pages
+        return read_pages(self, invocation)
+
+    @_serialized_browser_operation
     def browser_open(self, invocation: ToolInvocation) -> ToolResult:
+        if invocation.arguments.get('mode') == 'headless' and not self._headless_mode_authorized(invocation):
+            return _fail(invocation, 'Use the configured browser. Headless mode requires a verified user selection.', {
+                'reason':'invalid_tool_arguments','executed':False,
+                'recovery':{'kind':'correct_arguments','retry_tool_name':'browser_open',
+                    'argument_constraints':{'mode':{'enum':['configured']}},
+                    'instruction':'Open the configured browser. Do not change browser mode without a native user selection.'}})
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         self._forget_page_assertion_contract(
@@ -5045,18 +5167,17 @@ class BrowserTools:
             scope_id=self._page_assertion_scope_id(invocation),
         )
         try:
+            mode = invocation.arguments.get("mode")
+            if mode is not None:
+                selector = getattr(self._backend, "select_mode", None)
+                if selector is None:
+                    raise ValueError("This browser backend does not support task-local mode selection")
+                _run(selector(session_id, mode))
             result = _run(self._backend.open(session_id))
-            # Explicitly opening a page transfers a lease to its caller. Turn
-            # cleanup must not close the page the user was asked to keep open.
-            # Navigation-only worker sessions still follow capsule cleanup.
-            context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
-            owner = str(context.get("browser_session_owner") or invocation.principal_id or "").strip()
-            if owner:
-                with self._cleanup_lock:
-                    self._sessions_by_scope.setdefault(owner, set()).add(session_id)
-            return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
+            retained = self._retain_requested_context(invocation, session_id)
+            return _ok(invocation, {"result": result, "session_id": session_id, "browser_mode": self.session_browser_mode(invocation), **retained, **self._connection_notice_output()})
         except Exception as e:
-            return _fail(invocation, f"Open failed: {e}")
+            return _fail(invocation, f"Open failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_navigate(self, invocation: ToolInvocation) -> ToolResult:
@@ -5084,9 +5205,19 @@ class BrowserTools:
             result = _run(self._backend.navigate(session_id, navigate_url))
             return _ok(invocation, {"result": result, "session_id": session_id,
                 "result_kind": "browser_navigation", "page_url": str(navigate_url),
-                **self._connection_notice_output()})
+                "state_verification": {"navigation_completed": True, "controls_verified": False},
+                "next_step": "This receipt confirms navigation only. Inspect the loaded page and follow observed links "
+                    "until the requested destination controls are verified before claiming a form or control is open. "
+                    "Do not type or submit without authorization.",
+                **self._retain_requested_context(invocation, session_id), **self._connection_notice_output()})
         except Exception as e:
-            return _fail(invocation, f"Navigation failed: {e}", _browser_failure_output(e))
+            failure = _browser_failure_output(e)
+            if failure.get('failure_reason') in {'source_error','source_timeout'}:
+                # Policy was checked above and an actual source navigation was
+                # attempted. A failed read can justify another controller;
+                # don't make that controller repeat the same lightweight read.
+                self._read_first_policy.remember(invocation, str(url))
+            return _fail(invocation, f"Navigation failed: {e}", failure)
 
     @_serialized_browser_operation
     def browser_click(self, invocation: ToolInvocation) -> ToolResult:
@@ -5100,7 +5231,7 @@ class BrowserTools:
             output: dict[str, object] = {"clicked": selector, "session_id": session_id}
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Click failed: {e}")
+            return _fail(invocation, f"Click failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_click_element(self, invocation: ToolInvocation) -> ToolResult:
@@ -5129,7 +5260,7 @@ class BrowserTools:
             output: dict[str, object] = {"clicked": target, "session_id": session_id}
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Click failed: {e}")
+            return _fail(invocation, f"Click failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_type(self, invocation: ToolInvocation) -> ToolResult:
@@ -5143,7 +5274,7 @@ class BrowserTools:
             _run(self._backend.type_text(session_id, str(selector), str(text)))
             return _ok(invocation, {"typed": len(str(text)), "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Type failed: {e}")
+            return _fail(invocation, f"Type failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_type_field(self, invocation: ToolInvocation) -> ToolResult:
@@ -5185,9 +5316,15 @@ class BrowserTools:
             if not isinstance(result, dict):
                 return _fail(invocation, "Snapshot returned an invalid result.")
             self._remember_element_snapshot(session_id, result)
-            return _ok(invocation, {"snapshot": result, "session_id": session_id})
+            # This URL is returned by our fixed snapshot script, alongside the
+            # actual captured controls. It is already a native page observation.
+            page_url = result.get("url")
+            if isinstance(page_url,str) and urlparse(page_url).scheme in {"http","https"}:
+                self._read_first_policy.remember(invocation,page_url)
+            return _ok(invocation, {"snapshot": result, "session_id": session_id,
+                **({"page_url":page_url} if isinstance(page_url,str) else {})})
         except Exception as e:
-            return _fail(invocation, f"Snapshot failed: {e}")
+            return _fail(invocation, f"Snapshot failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_extract_items(self, invocation: ToolInvocation) -> ToolResult:
@@ -5259,6 +5396,7 @@ class BrowserTools:
                    if isinstance(page["url"], str) and page["url"].startswith(("https://", "http://")) else {}),
                 "source_record_collections": [{"path": ["items"],
                     "identity_fields": identity_fields,
+                    "context_fields": ["title", "price_text", "numeric_snippets", "url"],
                     "change_identity_fields": change_fields, "cardinality": "many"}],
                 "session_id": session_id,
                 **({"result_kind": "browser_item_collection", "coverage": coverage}
@@ -5296,7 +5434,7 @@ class BrowserTools:
                 output["page_state_assertion"] = assertion
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Detail extraction failed: {e}")
+            return _fail(invocation, f"Detail extraction failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_click_id(self, invocation: ToolInvocation) -> ToolResult:
@@ -5338,7 +5476,7 @@ class BrowserTools:
             }
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Click failed: {e}")
+            return _fail(invocation, f"Click failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_type_id(self, invocation: ToolInvocation) -> ToolResult:
@@ -5517,7 +5655,7 @@ class BrowserTools:
                 )
             return _ok(invocation, {"result": result, "selected": result.get("selected_text"), "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Combobox selection failed: {e}")
+            return _fail(invocation, f"Combobox selection failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_extract_text(self, invocation: ToolInvocation) -> ToolResult:
@@ -5568,7 +5706,7 @@ class BrowserTools:
         try:
             screenshot = _run(self._backend.screenshot(session_id, mode=mode))
             if isinstance(screenshot, BrowserScreenshotResult):
-                if screenshot.page_url == "about:blank":
+                if screenshot.page_url == "about:blank" and screenshot.has_document_content is not True:
                     return _fail(
                         invocation,
                         "Screenshot session has no loaded page. Navigate in this session before capturing it.",
@@ -5594,6 +5732,7 @@ class BrowserTools:
                     "document_width": screenshot.document_width,
                     "document_height": screenshot.document_height,
                     "is_clipped": screenshot.is_clipped,
+                    **({"has_document_content":True} if screenshot.has_document_content is True else {}),
                 }
             else:
                 png_bytes = screenshot
@@ -5641,7 +5780,7 @@ class BrowserTools:
                 },
             )
         except Exception as e:
-            return _fail(invocation, f"Screenshot failed: {e}")
+            return _fail(invocation, f"Screenshot failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_scroll(self, invocation: ToolInvocation) -> ToolResult:
@@ -5655,7 +5794,7 @@ class BrowserTools:
             _run(self._backend.scroll(session_id, direction, amount))
             return _ok(invocation, {"scrolled": direction, "amount": amount, "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Scroll failed: {e}")
+            return _fail(invocation, f"Scroll failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_wait_for(self, invocation: ToolInvocation) -> ToolResult:
@@ -5820,7 +5959,7 @@ class BrowserTools:
             )
             return _ok(invocation, {"result": result, "verified": True, "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Page state assertion failed: {e}")
+            return _fail(invocation, f"Page state assertion failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_find(self, invocation: ToolInvocation) -> ToolResult:
@@ -5839,7 +5978,7 @@ class BrowserTools:
                 "observation_coverage": {"complete": complete, "kind": "element_label_preview",
                     "reason": 'element_matches_truncated' if matches_truncated else "text_preview_truncated" if complete is False else None}})
         except Exception as e:
-            return _fail(invocation, f"Find failed: {e}")
+            return _fail(invocation, f"Find failed: {e}", _browser_failure_output(e))
 
     @_serialized_browser_operation
     def browser_run_js(self, invocation: ToolInvocation) -> ToolResult:
@@ -5882,9 +6021,11 @@ class BrowserTools:
     def browser_close(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         try:
-            _run(self._backend.close_session(session_id))
-            return _ok(invocation, {"closed": session_id})
-        except Exception as e:
-            return _fail(invocation, f"Close failed: {e}")
-        finally:
+            closed = _run(self._backend.close_session(session_id))
             self._forget_session(session_id)
+            if closed is False:
+                return _ok(invocation, {"closed": None, "closed_count": 0, "scope": "session",
+                    "reason": "session_not_open"})
+            return _ok(invocation, {"closed": session_id, "closed_count": 1, "scope": "session"})
+        except Exception as e:
+            return _fail(invocation, f"Close failed: {e}", _browser_failure_output(e))

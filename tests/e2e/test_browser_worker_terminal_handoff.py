@@ -17,8 +17,8 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Doc
 
 @pytest.mark.parametrize('prompt',['表示価格を教えて。','Dime el precio mostrado.'])
 @pytest.mark.parametrize('fail',[False,True])
-@pytest.mark.parametrize('exit_after_publish',[False,True])
-def test_published_browser_report_survives_stuck_sdk_shutdown(tmp_path,monkeypatch,prompt,source_summary_model_reply,fail,exit_after_publish):
+@pytest.mark.parametrize('exit_after_publish,deny_exited_group_signal',[(False,False),(True,False),(True,True)])
+def test_published_browser_report_survives_stuck_sdk_shutdown(tmp_path,monkeypatch,prompt,source_summary_model_reply,fail,exit_after_publish,deny_exited_group_signal):
     from fastapi.testclient import TestClient
     from nullion import web_app,chat_store
     from nullion.runtime import bootstrap_persistent_runtime
@@ -26,13 +26,32 @@ def test_published_browser_report_survives_stuck_sdk_shutdown(tmp_path,monkeypat
     from nullion.plugins.browser_plugin import register_browser_tools
     from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy
     from nullion.tools import ToolRegistry
+    ready=tmp_path/'sdk-reading'
     class Source(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200);self.end_headers();self.wfile.write(b'Total $37')
+            self.send_response(200);self.end_headers()
+            self.wfile.write(b'Total $37' if ready.exists() else b'Ready for the detailed source check; no price is displayed yet.')
         def log_message(self,*args):pass
     server=ThreadingHTTPServer(('127.0.0.1',0),Source);threading.Thread(target=server.serve_forever,daemon=True).start()
     url=f'http://localhost:{server.server_port}/'
     sdk=tmp_path/'sdk-process';marker=tmp_path/'worker-pid'
+    denied_groups=[]
+    if deny_exited_group_signal:
+        from nullion.plugins.browser_plugin import browser_use_worker
+        original_signal_worker = browser_use_worker._signal_worker
+        def signal_after_verified_exit(process, *, force=False):
+            # Publishing the file and exiting are separate operations. Reap
+            # this fixture's real child before simulating an exited-group error.
+            process.wait(timeout=2)
+            return original_signal_worker(process,force=True)
+        monkeypatch.setattr(browser_use_worker,'_signal_worker',signal_after_verified_exit)
+        original_killpg = browser_use_worker.os.killpg
+        def signal_group(pid, sig):
+            if marker.exists() and pid==int(marker.read_text()) and not Path('/proc',str(pid)).exists():
+                denied_groups.append(pid)
+                raise PermissionError(1,'Synthetic macOS exited-group signal denial')
+            return original_killpg(pid,sig)
+        monkeypatch.setattr(browser_use_worker.os,'killpg',signal_group)
     sdk.write_text('''#!/usr/bin/env python3
 import asyncio,json,os,sys
 from pathlib import Path
@@ -42,13 +61,14 @@ from nullion.plugins.browser_plugin import browser_use_adapter as adapter
 from nullion.plugins.browser_plugin import browser_use_worker as worker
 job=json.loads(Path(sys.argv[-2]).read_text())
 Path(MARKER).write_text(str(os.getpid()))
-async def sdk_read(task,client,principal_id,policy,timeout):
+async def sdk_read(task,client,principal_id,policy,timeout,progress_callback=None,browser_mode="configured",tab_lease_path=None):
     async def stubborn():
         while True:
             try:await asyncio.sleep(60)
             except asyncio.CancelledError:pass
     asyncio.create_task(stubborn())
     if FAIL:raise ValueError('Synthetic SDK source failure')
+    Path(READY).touch()
     body=urlopen(task.url,timeout=2).read().decode()
     evidence=adapter.PageEvidence(principal_id,policy)
     await evidence.capture(SimpleNamespace(url=task.url,title='Owned source',screenshot=None,
@@ -69,9 +89,10 @@ if EXIT:
         os._exit(7)
     worker._publish_worker_result=publish_then_exit
 asyncio.run(worker._worker(job,Path(sys.argv[-1])))
-'''.replace('MARKER',repr(str(marker))).replace('FAIL',repr(fail)).replace('EXIT',repr(exit_after_publish)))
+'''.replace('MARKER',repr(str(marker))).replace('READY',repr(str(ready))).replace('FAIL',repr(fail)).replace('EXIT',repr(exit_after_publish)))
     sdk.chmod(0o700)
     for key,value in {'NULLION_HOME':str(tmp_path/'home'),'NULLION_BROWSER_USE_PYTHON':str(sdk),
+        'NULLION_BROWSER_BACKEND':'playwright','NULLION_BROWSER_HEADLESS':'true',
         'NULLION_BROWSER_BLOCK_PRIVATE':'false','NULLION_MEMORY_ENABLED':'false','NULLION_WORKSPACE_STORAGE_ROOT':str(tmp_path/'workspaces')}.items():monkeypatch.setenv(key,value)
     monkeypatch.setattr(chat_store,'_store',chat_store.ChatStore(tmp_path/'chat.db'))
     class Model:
@@ -98,6 +119,10 @@ asyncio.run(worker._worker(job,Path(sys.argv[-1])))
                 self.calls+=1;name='request_tool_scope';args={'capabilities':['web'],'tool_names':['browser_run_task'],'required_tool_names':['browser_run_task']}
             elif self.calls==1:
                 self.calls+=1;name='browser_run_task';args={'url':url,'task':prompt,'max_steps':1}
+            elif self.calls==2:
+                assert 'native_read_preflight' in json.dumps(kwargs['messages'])
+                self.calls+=1;name='browser_run_task';args={'url':url,'task':prompt,'max_steps':1,
+                    'execution_kind':'adaptive_interaction','interaction_reason':'Inspect the observed page state using the requested visual controller.'}
             else:
                 if fail:return {'stop_reason':'end_turn','content':[{'type':'text','text':'The source could not be read; no price was verified.'}]}
                 assert '$37' in json.dumps(kwargs['messages'])
@@ -123,17 +148,19 @@ asyncio.run(worker._worker(job,Path(sys.argv[-1])))
             assert time.monotonic()-before<10,'SDK shutdown held the visible response'
             rows=runtime.store.list_conversation_events(cid)
             turn=next(r for r in reversed(rows) if r.get('event_type')=='conversation.chat_turn')
-            report=next(t for t in turn['tool_results'] if t['tool_name']=='browser_run_task')
+            report=next(t for t in turn['tool_results'] if t['tool_name']=='browser_run_task'
+                and t['output'].get('strategy',{}).get('kind')!='native_read_preflight')
             if fail:
                 assert report['status']=='failed' and 'Synthetic SDK source failure' in report['error'],report
             else:
                 assert report['status']=='completed' and report['output']['report_status']=='partial',report
                 assert report['output']['observations'][0]['value']=='$37'
                 assert report['output']['execution_audit']['complete'] is False
-            assert len([t for t in turn['tool_results'] if t['tool_name']=='browser_run_task'])==1
+            assert len([t for t in turn['tool_results'] if t['tool_name']=='browser_run_task'])==2
             history=client.get('/api/chat/history/'+cid+'?sync_runtime=1').json()['messages']
             assert any(r['role']=='bot' and r['text'].strip() for r in history)
             if not fail:assert any(r['role']=='bot' and '$37' in r['text'] for r in history)
         with pytest.raises(ProcessLookupError):os.kill(int(marker.read_text()),0)
+        if deny_exited_group_signal:assert denied_groups
         assert not list((tmp_path/'home'/'browser-task-scratch').glob('run-*'))
     finally:server.shutdown();server.server_close()

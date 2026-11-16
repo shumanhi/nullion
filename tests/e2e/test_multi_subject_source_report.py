@@ -1,13 +1,14 @@
 """One real tool invocation may prove several independently bound report subjects."""
 from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
-import copy,json,os
+import copy,json,os,threading
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker E2E')
 
 @pytest.mark.parametrize('prompt',['Compare the three destinations and attach one HTML report.','Compara los tres destinos y adjunta un informe HTML.','3つの目的地を比較し、HTMLレポートを1つ添付してください。'])
 @pytest.mark.parametrize('long_excerpt',[False,True])
-def test_single_browser_capture_supports_distinct_subjects_in_one_final_report(tmp_path,monkeypatch,prompt,long_excerpt):
+def test_single_browser_capture_supports_distinct_subjects_in_one_final_report(tmp_path,monkeypatch,prompt,long_excerpt,request):
     from fastapi.testclient import TestClient
     from PIL import Image
     from nullion import web_app,chat_store
@@ -28,6 +29,20 @@ def test_single_browser_capture_supports_distinct_subjects_in_one_final_report(t
             'source_url':'https://example.com/'+str(i),'captured_at':100+i,'evidence_path':str(image)} for i,fact in enumerate(facts)],
         'execution_audit':{'version':1,'complete':True,'read_only_actions_only':True,'host_file_actions_enabled':False,
             'downloaded_file_count':0,'deliverable_file_count':0,'captures_are_internal':True},'artifact_paths':[str(image)]}
+    class Page(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.end_headers()
+            self.wfile.write(('<html><body>'+''.join('<p>'+fact+'</p>' for fact in facts)+'</body></html>').encode())
+        def log_message(self,*args): pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Page)
+    threading.Thread(target=server.serve_forever,daemon=True).start()
+    def cleanup_source(): server.shutdown();server.server_close()
+    request.addfinalizer(cleanup_source)
+    url=f'http://localhost:{server.server_port}/'
+    monkeypatch.setenv('NULLION_BROWSER_BLOCK_PRIVATE','false')
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND','playwright')
+    monkeypatch.setenv('NULLION_BROWSER_HEADLESS','true')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL',raising=False)
     worker_calls=[]
     def worker(*args,**kw):worker_calls.append(1);return copy.deepcopy(report)
     monkeypatch.setattr(browser_use_worker,'run_isolated_browser_task',worker)
@@ -70,9 +85,14 @@ def test_single_browser_capture_supports_distinct_subjects_in_one_final_report(t
             if 'select_attachment_format' in names:return tool('select_attachment_format',{'extension':'.html','confidence':1})
             if not names:return text('{}')
             self.phase+=1
-            if self.phase==1:return tool('request_tool_scope',{'capabilities':['web','local_files'],'tool_names':['browser_run_task','file_write'],
+            if self.phase==1:return tool('request_tool_scope',{'capabilities':['web','local_files'],'tool_names':['browser_read_pages','browser_run_task','file_write'],
                 'required_tool_names':['browser_run_task','file_write'],'artifact_extensions':['.html']})
-            if self.phase==2:return tool('browser_run_task',{'task':'Compare the three destination stations.','url':'https://example.com/'})
+            if self.phase==2:
+                result=tool('browser_run_task',{'task':'Compare the three destination stations.','url':url,
+                    'execution_kind':'adaptive_interaction','interaction_reason':'Exercise distinct subject observations from the delegated capture after the native read'})
+                result['content'].insert(0,{'type':'tool_use','id':'native-first','name':'browser_read_pages',
+                    'input':{'pages':[{'url':url,'read_kind':'text'}]}})
+                return result
             if self.phase==3:return tool('file_write',{'path':str(path),'content':expected})
             assert self.phase==4,'The reviewer restarted completed research or generation'
             return text('The comparison report is attached.\nMEDIA:'+str(path))

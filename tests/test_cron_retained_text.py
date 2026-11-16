@@ -100,10 +100,39 @@ def test_report_writer_inspection_and_transport_share_one_deadline(monkeypatch):
                     'evidence_requests': [{'invocation_id': 'e0', 'json_pointer': '', 'offset': 0, 'length': 100}]})}]}
             clock[0] += kw['timeout']
             raise TimeoutError('provider writer timed out')
+    events = []
     delivery._repair_cron_agent_final_text_if_needed(SimpleNamespace(name='確認', task='確認'), state,
-        model_client=Provider())
+        model_client=Provider(), record_preflight=lambda stage, **values: events.append((stage, values)))
     assert calls == [45, 45, 5] and clock[0] == 60
     assert state['cron_agent_final_repair_failed'] and state['response_fulfilled'] is False
+    assert state['cron_agent_final_repair_failure'] == 'model_timeout'
+    errors = [row for stage, row in events if stage == 'final_repair_error']
+    assert errors and all(row['error_type'] == 'TimeoutError' and row['timed_out'] for row in errors)
+    assert 'report writer timed out' in delivery._cron_report_failure_notice(state)
+    assert 'provider writer timed out' not in json.dumps(errors)
+
+
+def test_a_failure_notice_cannot_become_a_retained_partial_report():
+    state = captured()
+    state['response_presentation'] = {'kind': 'scheduled_failure', 'fulfillment_satisfied': False}
+    assert not delivery._retained_cron_text_available(None, state)
+    assert not delivery._partial_cron_report_available(None, state)
+
+
+def test_report_processing_error_is_not_mislabeled_as_provider_failure():
+    class InvalidResponse(dict):
+        def get(self, *args, **kwargs): raise ValueError('private source body')
+    class Provider:
+        def create(self, **kwargs): return InvalidResponse()
+    state = {'text': 'Preview', 'response_presentation': {'kind': 'source_preview'},
+        'tool_results': [ToolResult('read-a', 'web_fetch', 'completed', {'text': 'Appointment at 7 PM.'})]}
+    events = []
+    delivery._repair_cron_agent_final_text_if_needed(SimpleNamespace(name='確認', task='確認'), state,
+        model_client=Provider(), record_preflight=lambda stage, **values: events.append((stage, values)))
+    assert state['cron_agent_final_repair_failure'] == 'report_processing_failed'
+    assert state['cron_agent_final_repair_error']['phase'] == 'response_processing'
+    assert state['cron_agent_final_repair_error']['error_type'] == 'ValueError'
+    assert 'private source body' not in json.dumps(events)
 
 
 @pytest.mark.parametrize("contradicted", [False, True])

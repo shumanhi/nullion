@@ -25,3 +25,14 @@ def test_native_probe_keeps_explicit_upload_root(monkeypatch, tmp_path):
     monkeypatch.delenv('NULLION_E2E_CONTAINER', raising=False)
     monkeypatch.setenv('NULLION_LIVE_STAGE_UPLOAD_ROOT', str(tmp_path))
     assert _stage_workspace_upload_root() == tmp_path
+
+
+@pytest.mark.parametrize('value',['[8742]','[8752]','[8753]','[true]','["43210"]','{}','[0]'])
+def test_live_forwarding_rejects_other_lanes_and_invalid_port_metadata(value):
+    from scripts.live_stage_tcp_forwarder import live_forward_ports
+    with pytest.raises(ValueError):live_forward_ports(value)
+
+
+def test_live_forwarding_keeps_owned_fixture_ports_without_duplicate_listeners():
+    from scripts.live_stage_tcp_forwarder import live_forward_ports
+    assert live_forward_ports('[43210,43211,43210]')==[8753,43210,43211]

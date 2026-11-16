@@ -513,7 +513,7 @@ def test_cron_record_budget_preserves_research_tools_and_delivers_html(
 
     result = run_cron_delivery_workflow(job, label="Scheduled task", callbacks=callbacks)
 
-    assert set(model.tool_sets[2]) == {"browser_assert_page_state", "browser_extract_items", "file_write"}
+    assert set(model.tool_sets[2]) == {"request_tool_scope", "browser_assert_page_state", "browser_extract_items", "file_write"}
     assert result.get("cron_delivery_failed") is not True
     assert len(deliveries) == 1
     assert deliveries[0].attachments == (report_path,)
@@ -579,7 +579,7 @@ def test_telegram_background_artifact_delivery_awaits_document_upload_and_record
     assert delivered is True
     assert len(FakeBot.instances) == 1
     assert FakeBot.instances[0].documents == [
-        {"chat_id": "514132807", "data": artifact.read_bytes(), "caption": None}
+        {"chat_id": "514132807", "data": artifact.read_bytes(), "caption": "Attached the requested file."}
     ]
     receipts = [
         json.loads(line)

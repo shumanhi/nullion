@@ -97,6 +97,12 @@ def record_request_delivery_requirements(results, user_message, extensions, *, p
             native = result.response_requirements.get("_native_artifact_media") if isinstance(result.response_requirements, dict) else None
             if isinstance(native, dict):
                 record["_native_artifact_media"] = dict(native)
+            reads = result.response_requirements.get("_native_completed_reads") if isinstance(result.response_requirements, dict) else None
+            if isinstance(reads, dict):
+                record["_native_completed_reads"] = dict(reads)
+            origin = result.response_requirements.get('_retained_observation') if isinstance(result.response_requirements, dict) else None
+            if isinstance(origin, dict):
+                record['_retained_observation'] = dict(origin)
             reviewed = result.response_requirements.get('_reviewed_action_reply') if isinstance(result.response_requirements, dict) else None
             if isinstance(reviewed, dict):
                 record['_reviewed_action_reply'] = dict(reviewed)

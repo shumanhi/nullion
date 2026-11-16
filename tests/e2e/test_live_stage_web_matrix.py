@@ -99,12 +99,28 @@ def watch_chat_frames(page, frames, errors, base, *, on_frame=None):
         try:accept(json.loads(raw))
         except (ValueError,TypeError):pass
     def response(item):
+        if item.request.method=='GET' and item.url.startswith(base+'/api/chat/progress?'):
+            data=item.json()
+            if data.get('active') and data.get('text'):
+                accept({**data,'transport':'web-http-progress'})
         if item.request.method=='POST' and item.url==base+'/api/chat':
             data=item.json()
             accept({**data,'type':'done' if data.get('type')=='message' else data.get('type'),
                 'transport':'web-http-fallback'})
+    def submitted(raw):
+        try:
+            data=json.loads(raw) if isinstance(raw,str) else raw
+            if isinstance(data,dict) and data.get('turn_id') and isinstance(data.get('text'),str):
+                accept({**data,'type':'_submitted'})
+        except (ValueError,TypeError):pass
+    def socket_opened(socket):
+        socket.on('framereceived',received)
+        socket.on('framesent',submitted)
+    def requested(request):
+        if request.method=='POST' and request.url==base+'/api/chat':submitted(request.post_data)
     page.on('pageerror',lambda error:errors.append(str(error)))
-    page.on('websocket',lambda socket:socket.on('framereceived',received))
+    page.on('websocket',socket_opened)
+    page.on('request',requested)
     page.on('response',response)
 
 
@@ -150,7 +166,7 @@ def live_web(request):
                 page.screenshot(path=str(evidence / "web.png"), full_page=False, timeout=10000)
             except Exception as error:
                 screenshot_error = str(error)
-            (evidence / "frames.json").write_text(json.dumps({"conversation_id":conversation,
+            (evidence / "frames.json").write_text(json.dumps({"conversation_id":conversation,"test_nodeid":request.node.nodeid,
                 "frames":frames,"page_errors":errors,"screenshot_error":screenshot_error}, ensure_ascii=False, indent=2))
             try:
                 saved = getattr(request.node, '_nullion_saved_background_execution', None)
@@ -169,9 +185,22 @@ def live_web(request):
                 browser.close()
 
 
+def _terminal_for_submission(frames,prompt,conversation):
+    submitted=[frame for frame in frames if frame.get('type')=='_submitted'
+        and frame.get('text')==prompt and frame.get('conversation_id')==conversation]
+    if not submitted:return None
+    turn_id=submitted[-1]['turn_id']
+    terminal=[frame for frame in frames if frame.get('type') in {'done','error','approval_required'}
+        and frame.get('turn_id')==turn_id and frame.get('conversation_id',conversation)==conversation
+        and not frame.get('superseded')]
+    return terminal[-1] if terminal else None
+
+
 def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=None):
     from playwright.sync_api import expect
     from scripts.live_stage_provider_guard import process_provider_guard
+    # The real composer submits input.value.trim(); audit that same message.
+    prompt = prompt.strip()
     provider_guard = process_provider_guard()
     page, frames, errors, database, conversation, base = live_web
     before = len(frames)
@@ -188,12 +217,8 @@ def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=
             if blocked:
                 pytest.exit(blocked, returncode=1)
             next_provider_check = time.monotonic() + 15
-        candidates = [frame for frame in frames[before:]
-                      if frame.get("type") in {"done", "error", "approval_required"}
-                      and frame.get("conversation_id", conversation) == conversation
-                      and not frame.get("superseded")]
-        if candidates:
-            terminal = candidates[-1]
+        terminal = _terminal_for_submission(frames[before:],prompt,conversation)
+        if terminal is not None:
             break
         if poll_full_status and time.monotonic() >= next_status_poll:
             status = page.request.get(base + '/api/status?full=1', timeout=15000)
@@ -216,7 +241,10 @@ def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=
         "Unexpected permission prompt for a read-only or task-owned artifact request", terminal)
     terminal_elapsed_ms = (time.monotonic() - started) * 1000
     turn = None
-    deadline = time.monotonic() + 3
+    # Runtime audit persistence is asynchronous; terminal UI timing above is
+    # already captured. Waiting for evidence must not inflate product latency
+    # or replace a completed tool run with a synthetic empty tool list.
+    deadline = time.monotonic() + catalogue._native_receipt_wait_seconds(terminal)
     while time.monotonic() < deadline:
         turn = catalogue._select_new_chat_turn(_turns(database, conversation), audit_prompt if audit_prompt is not None else prompt,
             turn_id=terminal.get('turn_id'), prior_turn_ids=prior_turn_ids)
@@ -224,6 +252,7 @@ def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=
             break
         page.wait_for_timeout(200)
     if turn is None:
+        assert not terminal.get('artifacts'), 'Delivered artifacts lack a persisted native turn receipt'
         # Plain turns deliberately defer the large runtime checkpoint. Their
         # canonical visible history is still synchronously persisted.
         history = catalogue._get_json(base + "/api/chat/history/" + conversation, timeout=10)
@@ -247,6 +276,20 @@ def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=
     turn["delivered_reply"] = reply
     assert reply or terminal.get("artifacts"), "Empty terminal response"
     turn_id = terminal.get("turn_id") or turn.get("turn_id")
+    deferred = [r.get('output',{}).get('deferred_execution') for r in turn.get('tool_results',[])
+        if r.get('status')=='completed' and isinstance(r.get('output'),dict)]
+    accepted = next((item for item in deferred if isinstance(item,dict)
+        and item.get('version')==1 and item.get('phase')=='accepted'
+        and item.get('owner')=='cron_delivery'),None)
+    group = accepted.get('configuration',{}).get('task_group_id') if accepted else None
+    if group and any(frame.get('type')=='task_status' and frame.get('group_id')==group
+            for frame in frames[before:]):
+        card=page.locator('.bubble[data-task-group-id='+json.dumps(group)+']')
+        expect(card).to_be_visible(timeout=10000)
+        assert card.inner_text().strip()
+        assert not errors,errors
+        return {'text':reply,'artifacts':terminal.get('artifacts',[]),
+            'execution_state':'accepted','task_group_id':group},turn,terminal_elapsed_ms
     bubble = page.locator('.msg.bot .bubble[data-turn-id=' + json.dumps(turn_id) + ']')
     expect(bubble).to_have_count(1, timeout=10000)
     expect(bubble).to_be_visible()
@@ -284,11 +327,9 @@ def test_live_stage_web_catalogue(name, live_web):
         if not config.get('image_generate_enabled') or not config.get('image_generate_available'):
             pytest.skip('Stage image_generate is disabled or unavailable; media configuration is unchanged')
     if name == "browser_flight_live_records":
-        # The original request omits trip type/passenger count. Exercise the
-        # numeric clarification and then require a completed lookup.
-        scenario = replace(scenario, followups=(
-            "1. One adult, economy, one-way JFK to ORD tomorrow. Any departure time. "
-            "Show up to three bookable options with their displayed total USD fares; do not book.",))
+        # Use the same dated, complete request as the API catalogue. Leaving
+        # its template unresolved adds an artificial clarification round.
+        scenario = catalogue._scenario_for_config(scenario, {})
     if name == "browser_rental_live_records":
         # Fixed June dates become ambiguous after the original incident. Keep
         # the real rental boundary, with explicit future dates and times.
@@ -371,10 +412,9 @@ def test_live_stage_web_catalogue(name, live_web):
                 response, turn, elapsed = _submit(live_web, "1", timeout=max(90, (scenario.max_single_ms or 180000) / 1000 + 30))
                 responses.append(response); turns.append(turn); samples.append(elapsed)
         if name in {"calendar", "calendar_tomorrow_live_access", "calendar_weekend_live_access", "calendar_answer_not_raw_listing"}:
-            reviews=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_review')
-            latest=reviews[-1] if reviews else {}
-            if (latest.get('disposition')=='needs_user_input'
-                    and latest.get('source_consent',{}).get('source_selection_required') is True):
+            from nullion.source_selection import pending_source_selection
+            selection=pending_source_selection([row for item in turns for row in item.get('tool_results',[])])
+            if selection is not None:
                 # An independent date-only request can need a real source choice.
                 # Complete the numbered UI exchange, then demand a final read.
                 choices=re.findall(r'(?m)^\s*(\d+)[.)]\s+', responses[-1]['text'])
@@ -383,8 +423,9 @@ def test_live_stage_web_catalogue(name, live_web):
                 responses.append(response);turns.append(turn);samples.append(elapsed)
                 assert any(r['tool_name']=='calendar_list' and r['status']=='completed'
                     for r in turn.get('tool_results',[])), 'Selected calendar was not read'
-                reviews=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_review')
-            assert reviews and reviews[-1]['disposition']=='complete', 'Calendar lookup did not reach verified completion'
+            assert turns[-1].get('response_fulfilled') is True,turns[-1]
+            assert any(row['tool_name']=='calendar_list' and row['status']=='completed'
+                for item in turns for row in item.get('tool_results',[])), 'Calendar lookup lacks its native read'
         response = dict(responses[-1])
         if name == "email_read_followup":
             assert len(response["text"]) >= 120, response
@@ -407,12 +448,12 @@ def test_live_stage_web_catalogue(name, live_web):
             assert not pending,('The visible answer has no durable runtime audit after 60 seconds',pending)
         results = [result for turn in turns for result in turn.get("tool_results", [])]
         if name in {'browser_rental_live_records','browser_flight_live_records'}:
-            # Words such as price/total do not prove a completed lookup. Both
-            # verified options and an explicitly permitted, observed blocker
-            # must pass the request-owned material outcome review.
+            # Require completion plus a real source read; a navigation or
+            # price-like word alone cannot establish the requested lookup.
             assert turns[-1].get('response_fulfilled') is True,turns[-1]
-            reviews=catalogue._conversation_event_payloads(database,conversation,event_type='conversation.completion_review')
-            assert reviews and reviews[-1].get('disposition')=='complete',reviews[-1:]
+            assert any(row['status']=='completed' and row['tool_name'] in {
+                'browser_run_task','browser_read_pages','browser_extract_text','browser_extract_items',
+                'browser_extract_detail','browser_run_js','web_fetch'} for row in results),results
             proof['lookup_request_completed']=True
         if name == "scheduler_inventory_read_only":
             inventories = [row["output"] for row in results if row["tool_name"] == "list_crons"
@@ -514,7 +555,7 @@ def test_live_stage_web_catalogue(name, live_web):
                 proof['public_followup_boundary']=assert_public_followup_outcome(
                     response=response,turns=turns,reviews=reviews)
             else:
-                assert reviews and reviews[-1].get("disposition") == "complete", reviews[-1:]
+                assert turns[-1].get('response_fulfilled') is True,turns[-1]
         if response["artifacts"]:
             manifests=[result["output"].get("artifact_delivery_manifest") for result in results
                        if isinstance(result.get("output"),dict)]
@@ -548,7 +589,9 @@ def test_live_stage_web_catalogue(name, live_web):
             from collections import Counter
             from openpyxl import load_workbook
             extraction=next(r['output'] for r in results if r['tool_name']=='archive_extract' and r['status']=='completed')
-            expected_count=extraction['entry_count']
+            from tests.e2e.live_archive_assertions import archive_real_inventory
+            source_inventory=archive_real_inventory(extraction,database)
+            expected_count=source_inventory['record_count']
             workbook_artifact=next(a for a in response['artifacts'] if catalogue._artifact_name(a).endswith('.xlsx'))
             workbook_bytes,_=catalogue._artifact_bytes(base,workbook_artifact,timeout=60)
             workbook=load_workbook(io.BytesIO(workbook_bytes),read_only=True,data_only=True)
@@ -560,13 +603,15 @@ def test_live_stage_web_catalogue(name, live_web):
                     assert all('__MACOSX' not in value and not Path(value).name.startswith('._') for value in column)
                     distributions.append(Counter(Path(value).suffix.casefold() for value in column))
             assert distributions,'No actual file identities in delivered workbook'
+            assert source_inventory['extension_counts'] in distributions, ('Workbook differs from the exact source ZIP',distributions,source_inventory)
             proof['archive_inventory']={'expected_rows':expected_count,'delivered_rows':len(rows)-1,
-                'complete':True}
+                'complete':True,'source_sha256':source_inventory['source_sha256'],
+                'metadata_excluded':source_inventory['metadata_count']}
         if name == "archive_tool_fallback_followup_chain":
             summary_artifact=next(a for a in response['artifacts'] if catalogue._artifact_name(a).endswith('.csv'))
             summary_bytes,_=catalogue._artifact_bytes(base,summary_artifact,timeout=30)
             summary=list(csv.reader(io.StringIO(summary_bytes.decode('utf-8-sig'))))
-            observed=Counter({row[0].casefold():int(row[1]) for row in summary[1:] if row})
+            observed=Counter({'.'+row[0].casefold().lstrip('.'):int(row[1]) for row in summary[1:] if row})
             assert sum(observed.values())==expected_count and observed in distributions,('Follow-up counted stale or missing files',observed,distributions,expected_count)
         if name == "html_research_real_images":
             from tests.e2e.live_artifact_assertions import assert_three_practical_itineraries
@@ -647,7 +692,12 @@ def test_live_stage_web_catalogue(name, live_web):
 def test_live_stage_web_event_entities_in_three_languages(live_web, prompt):
     page, frames, errors, database, conversation, base = live_web
     response, turn, elapsed = _submit(live_web, prompt, timeout=300)
-    assert "dracula" in response["text"].lower(), response
+    # The current programme changes over time; a day with no performance is
+    # valid too. Require captured, linked public evidence rather than a past
+    # production's name, and keep the interface-label exclusions below.
+    from tests.e2e.live_public_followup_assertions import assert_public_followup_outcome
+    assert_public_followup_outcome(response=response, turns=[turn], reviews=[])
+    assert 'hartfordstage.org/' in response['text'], response
     # Interface labels are not extra event subjects in any output language.
     result = response["text"]
     assert "**Main Stage**" not in result and "**Let us choose seats" not in result

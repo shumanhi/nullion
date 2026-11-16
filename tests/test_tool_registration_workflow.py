@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4461,3 +4462,45 @@ def test_browser_image_collect_caps_candidate_fanout_and_fetch_timeout(monkeypat
     assert result.output["timeout_seconds"] == 2
     assert fetch_timeouts
     assert max(fetch_timeouts) <= 2
+
+
+@pytest.mark.parametrize('status,effect,expected',[
+    ('completed',tools.ToolSideEffectClass.READ,'completed'),
+    ('failed',tools.ToolSideEffectClass.READ,'failed'),
+    ('completed',tools.ToolSideEffectClass.WRITE,'failed'),
+    ('completed',tools.ToolSideEffectClass.DANGEROUS_EXEC,'completed')])
+def test_exact_observed_source_url_is_not_rejected_as_fabricated(tmp_path,status,effect,expected):
+    from dataclasses import replace
+    url='https://example.com/aurora?record=73&scope=original'
+    registry=tools.ToolRegistry()
+    registry.register(tools.ToolSpec('source','source',tools.ToolRiskLevel.LOW,effect,False,10),lambda _:None)
+    source=tools.ToolResult('source','source',status,{'content':json.dumps({'url':url})})
+    invocation=_invoke('file_write',{'path':str(tmp_path/'report.html'),
+        'content':'<html><body><a href="'+url.replace('&','&amp;')+'">Aurora 73</a></body></html>'})
+    invocation=replace(invocation,flow_context={'_native_observed_reference_urls':[url]})
+    bound=tools.with_observed_artifact_reference_urls(invocation,[source],registry=registry)
+    result=tools._build_file_write_handler(workspace_root=tmp_path)(bound)
+    assert result.status==expected,result
+    assert (tmp_path/'report.html').exists() is (expected=='completed')
+    forged=tools.with_observed_artifact_reference_urls(invocation,[],registry=registry)
+    assert forged.flow_context['_native_observed_reference_urls']==[]
+
+
+@pytest.mark.parametrize('tool_name,url_field', [('browser_navigate','page_url'), ('web_fetch','url'), ('web_fetch','source_url')])
+@pytest.mark.parametrize('status,effect,source,accepted', [
+    ('completed', tools.ToolSideEffectClass.READ, 'https://example.com', True),
+    ('completed', tools.ToolSideEffectClass.READ, 'https://example.com/other', False),
+    ('failed', tools.ToolSideEffectClass.READ, 'https://example.com', False),
+    ('completed', tools.ToolSideEffectClass.WRITE, 'https://example.com', False),
+])
+def test_native_containing_page_attests_exact_artifact_reference(tmp_path,status,effect,source,accepted,tool_name,url_field):
+    registry = tools.ToolRegistry()
+    registry.register(tools.ToolSpec(tool_name, 'Native source read',
+        tools.ToolRiskLevel.LOW, effect, False, 5), lambda _:None)
+    invocation = _invoke('file_write', {'path':str(tmp_path/'観測.html'),
+        'content':'<a href="https://example.com/">出典</a><a href="https://example.com">Fuente</a>'})
+    result = tools.ToolResult('observed', tool_name, status, {url_field:source})
+    bound = tools.with_observed_artifact_reference_urls(invocation, [result], registry=registry)
+    assert bool(bound.flow_context['_native_observed_reference_urls']) is accepted
+    if accepted:
+        assert set(bound.flow_context['_native_observed_reference_urls']) == {'https://example.com', 'https://example.com/'}

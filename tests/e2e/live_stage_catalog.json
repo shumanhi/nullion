@@ -1,0 +1,932 @@
+{
+  "version": 1,
+  "scope": "tests/e2e/test_live_stage*.py; reviewed developer test metadata, never product intent routing",
+  "categories": {
+    "latency": {
+      "title": "Plain chat and latency",
+      "purpose": "First-response timing, model-call counts, startup and ordinary-turn fast paths."
+    },
+    "context": {
+      "title": "Context, memory and retained evidence",
+      "purpose": "Follow-ups, profile facts, history, numbered choices, compaction and exact retained references."
+    },
+    "research": {
+      "title": "Research and source accuracy",
+      "purpose": "Search coverage, bounded research, recommendations, prices, source links and missing facts."
+    },
+    "browser": {
+      "title": "Browser lifecycle and recovery",
+      "purpose": "Desktop attachment, navigation, screenshots, native delegation, owned tabs and recovery."
+    },
+    "artifacts": {
+      "title": "Files and generated deliverables",
+      "purpose": "Document creation, format fidelity, selected versions, downloadable bytes and artifact reuse."
+    },
+    "execution": {
+      "title": "Code Mode and terminal execution",
+      "purpose": "Programs, host modules, projections, reusable tools, unsupported imports and terminal outcomes."
+    },
+    "scheduler": {
+      "title": "Scheduled jobs and live trackers",
+      "purpose": "Owned job changes, cancellation, finite lifetimes, conditions, alert delivery and saved-run recovery."
+    },
+    "consent": {
+      "title": "Account access and approvals",
+      "purpose": "Source consent, read-only account boundaries, explicit choices and action approvals."
+    },
+    "presentation": {
+      "title": "Progress, rendering and delivery",
+      "purpose": "Shared status, compact reports, exact captions, Web history, sockets and reload behavior."
+    },
+    "harness": {
+      "title": "Local test infrastructure",
+      "purpose": "Deterministic transport, provider-stop controls and static catalogue invariants; no live model requests."
+    }
+  },
+  "kinds": {
+    "live_workflow": "A running stage workflow that can consume model or tool quota. One case may send multiple chat requests.",
+    "saved_replay": "Stage UI/history/byte checks of saved evidence; no new test-initiated model or source work.",
+    "local_harness": "Deterministic local fixture/control checks; no real stage/provider workflow.",
+    "aggregate_entry_point": "An alternative multi-scenario entry point; do not combine it with individual scenario cases."
+  },
+  "modules": {
+    "test_live_stage_api_scenarios.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_bounded_comparison.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_chat_contracts.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_code_mode.py": {
+      "category": "execution",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_compaction_integrity.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_cron_execution_contract.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_dispatch_handoff.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_failure_attribution.py": {
+      "category": "browser",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_live_tracking.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_profile_shopping_contract.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_provider_guard_boundary.py": {
+      "category": "harness",
+      "kind": "local_harness"
+    },
+    "test_live_stage_receipt_continuity.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_repair_budget_contract.py": {
+      "category": "browser",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_retained_artifact_validation.py": {
+      "category": "artifacts",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_scheduler_cancellation.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_scheduler_followups.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_search_coverage.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_small_mutations.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_snapshot_tracker.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_transport.py": {
+      "category": "harness",
+      "kind": "local_harness"
+    },
+    "test_live_stage_user_time_policy.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_batched_research.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_compact_report.py": {
+      "category": "presentation",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_cron_recovery.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_extended.py": {
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_file_lookup.py": {
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_followups.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_matrix.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_native_report.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_output_continuation.py": {
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_producer_generation.py": {
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_reasoning.py": {
+      "category": "context",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_report_density.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_research_efficiency.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_response_proof.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_review_layout.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_review_links.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_review_outage.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_saved_report_rendering.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_shopping.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_socket_delivery.py": {
+      "category": "presentation",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_source_groups.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_source_incident.py": {
+      "category": "research",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_source_recovery.py": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "test_live_stage_web_startup_latency.py": {
+      "category": "latency",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_tracker_updates.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_trip_completion.py": {
+      "category": "artifacts",
+      "kind": "live_workflow"
+    }
+  },
+  "test_overrides": {
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_conceptual_answer_avoids_shell_completion_detour": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_core_exec_is_discoverable_and_preserves_approval": {
+      "category": "execution"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_default_matrix_covers_core_tool_families": {
+      "category": "harness",
+      "kind": "local_harness"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_draft_artifact_is_never_delivered_or_restored": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_email_to_web_answer_preserves_status_and_tool_evidence": {
+      "category": "consent"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_existing_source_path_remains_read_only_then_edits_explicitly": {
+      "category": "execution"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_research_discloses_missing_information_once": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_reusable_tool_creation_and_independent_reuse_contract": {
+      "category": "execution"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_source_comparison_retains_verified_quotes": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_targeted_scheduler_answer_and_core_tools": {
+      "category": "scheduler"
+    },
+    "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_text_lookup_keeps_browser_evidence_internal": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_same_pdf_keeps_its_bytes_and_thread_identity": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_calendar_trip_infographic_delivers_real_image": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_calendar_trip_pdf_efficiency": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_code_mode_writes_and_delivers_html": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_delegation_runs_native_preflight_without_repair_program": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_email_uses_code_session": {
+      "category": "consent"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_flight_form_reaches_interactive_worker": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_inline_read_recovery_stays_in_one_program": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_large_transfer_after_numeric_choice": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_local_request_keeps_profile_after_separate_trip": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_mixed_pdf_package_has_no_unused_fallback": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_multi_source_facts_survive_compaction": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_pdf_email_shows_native_approval_without_sending": {
+      "category": "consent"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_plain_turns_keep_the_fast_path": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_progress_is_compact_and_visibly_smaller": {
+      "category": "presentation"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_quote_keeps_billing_period_separate_from_elapsed_duration": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_read_only_code_mode": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_recent_production_run_regressions": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_recent_recommendations_open_underlying_sources": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_recovers_capture_in_one_code_session": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_reservation_composes_reads": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_code_mode.py::test_live_stage_visual_worker_closes_its_tabs": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_live_tracking.py::test_live_stage_existing_condition_amendment_render": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "tests/e2e/test_live_stage_snapshot_tracker.py::test_live_stage_web_snapshot_alert_survives_reload": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    },
+    "tests/e2e/test_live_stage_web_batched_research.py::test_live_compact_plain_turns_keep_one_model_call_and_fast_feedback": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_web_batched_research.py::test_live_history_lookup_updates_the_shared_card_without_fresh_source_work": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_web_batched_research.py::test_live_native_reads_show_meaningful_shared_progress": {
+      "category": "presentation"
+    },
+    "tests/e2e/test_live_stage_web_batched_research.py::test_live_research_preserves_schedule_and_delivers_generated_page": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_batched_research.py::test_live_screenshot_followup_keeps_the_current_page_context": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_web_batched_research.py::test_live_visual_page_and_text_use_shared_production_and_generic_preparation": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_account_read_waits_for_explicit_source_choice": {
+      "category": "consent"
+    },
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_missing_public_fact_is_explained_once_without_losing_findings": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_archive_extract_transformation_returns_only_final_file": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_facts_can_become_a_generated_visual": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_facts_do_not_block_raster_image_generation": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_report_synthesis_preserves_helmet_answer": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_command_named_file_uses_shared_attachment_delivery": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_conceptual_question_does_not_end_with_shell_receipt": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_email_pagination_follows_exact_continuation_without_query_partitioning": {
+      "category": "consent"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_generated_csv_has_one_delivery_and_reload_keeps_it": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_local_read_does_not_append_activity_when_verbose_is_off": {
+      "category": "presentation"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_owned_cron_delivers_report_with_actual_data": {
+      "category": "scheduler"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_owned_scheduler_rename_and_cancel": {
+      "category": "scheduler"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_plain_turn_latency_across_languages": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_rejected_image_provider_does_not_publish_a_placeholder": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_single_page_sdk_lookup_returns_verified_values": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_stop_releases_owned_browser_and_next_lookup_completes": {
+      "category": "browser"
+    },
+    "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_image_bytes_and_followup_keep_selected_subject": {
+      "category": "context"
+    },
+    "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_inventory_does_not_start_scheduled_work": {
+      "category": "scheduler"
+    },
+    "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_weather_delivers_current_tool_result": {
+      "category": "research"
+    },
+    "tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_generated_text_delivers_exact_bytes_once": {
+      "category": "artifacts"
+    },
+    "tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_plain_requests_retain_fast_path": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_read_workflow_latency_uses_multiple_samples": {
+      "category": "latency"
+    },
+    "tests/e2e/test_live_stage_web_source_groups.py::test_live_completed_product_reply_keeps_fields_on_reload_without_another_model_call": {
+      "category": "presentation",
+      "kind": "saved_replay"
+    }
+  },
+  "scenario_categories": {
+    "latency": [
+      "simple",
+      "startup_warm_first_chat",
+      "plain_chat_attachment_planner_fast_path"
+    ],
+    "context": [
+      "active_followup_context_guard",
+      "active_related_followup_context_guard",
+      "reply_anchor_context_guard",
+      "browser_followup_account_scope_guard",
+      "single_numbered_choice_list_contract",
+      "chat_history_memory_recall_artifact",
+      "recent_context_artifact_reuse_chain",
+      "ambiguous_report_reference",
+      "artifact_context_followup",
+      "profile_weather"
+    ],
+    "research": [
+      "browser_price_stock_no_files",
+      "browser_not_found_catalog_guard",
+      "browser_filter_followup",
+      "browser_rental_live_records",
+      "browser_flight_live_records",
+      "market_quote_live_records",
+      "weather"
+    ],
+    "browser": [
+      "browser_continuation_registry_guard",
+      "browser_screenshot_artifact_delivery",
+      "browser_context_capture_recovery",
+      "browser_context_capture_recovery_variant",
+      "browser_page_screenshot_artifact_delivery"
+    ],
+    "artifacts": [
+      "artifact_preflight_scope_fast_path",
+      "requested_workspace_file_delivery",
+      "svg_artifact_file_write",
+      "image",
+      "email_image",
+      "complex_artifact_pack",
+      "mixed_embedded_media_artifact_package",
+      "html_research_real_images",
+      "archive_download_extract_manifest",
+      "archive_transform_workbook",
+      "planner_complex_artifact_workbook",
+      "planner_downloaded_data_workbook",
+      "artifact_twenty_row_xlsx_delivery",
+      "random_website_artifact_bundle",
+      "planner_large_web_dataset_handoff",
+      "artifact_followup_retry_guard",
+      "archive_tool_fallback_followup_chain",
+      "formatted_pdf_flyer_pack",
+      "kids_playbook_artifact_pack",
+      "spreadsheet_visual_workbook_pack",
+      "executive_personal_briefing_pack",
+      "research_artifact_email_followup_pack",
+      "file_search_listing_no_attachment"
+    ],
+    "execution": [
+      "structured_tool_id_boundary_guards",
+      "local_system_terminal_fallback",
+      "local_system_followup_terminal_fallback",
+      "local_system_update_followup_terminal_outcome"
+    ],
+    "scheduler": [
+      "scheduler_manual_run",
+      "scheduler_manual_run_short_followup",
+      "scheduler_inventory_read_only",
+      "scheduler_disable_not_delete",
+      "scheduler_bulk_enable_recovery",
+      "scheduler_fresh_followup_after_bulk_enable",
+      "agent_turn_limit_doctor_card"
+    ],
+    "consent": [
+      "account_answer_fulfillment",
+      "calendar",
+      "calendar_tomorrow_live_access",
+      "calendar_weekend_live_access",
+      "calendar_answer_not_raw_listing",
+      "email_send_approval_payload_live",
+      "email_read_followup",
+      "email_urgent_read_recovery",
+      "email_simple_live_access",
+      "email_request_overrides_pr_context",
+      "email_request_overrides_security_history",
+      "complex_html_email_with_attachments",
+      "vague_account_source_selection",
+      "github_prs"
+    ],
+    "presentation": [
+      "platform_code_fence_formatting",
+      "stage_runtime_patch_regressions"
+    ]
+  },
+  "run_sets": {
+    "smoke": [
+      "tests/e2e/test_live_stage_web_startup_latency.py::test_live_stage_plain_requests_preserve_fast_path_and_report_startup_timings",
+      "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_weather_delivers_current_tool_result",
+      "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_inventory_does_not_start_scheduled_work",
+      "tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_generated_text_delivers_exact_bytes_once",
+      "tests/e2e/test_live_stage_web_followups.py::test_live_web_archived_history_recall_from_fresh_conversation",
+      "tests/e2e/test_live_stage_web_batched_research.py::test_live_text_reader_preserves_exact_links",
+      "tests/e2e/test_live_stage_code_mode.py::test_live_stage_visual_worker_closes_its_tabs",
+      "tests/e2e/test_live_stage_web_extended.py::test_live_web_account_read_waits_for_explicit_source_choice[en]"
+    ]
+  },
+  "overlap_reviews": [
+    {
+      "id": "plain-fast-path",
+      "selectors": [
+        "tests/e2e/test_live_stage_code_mode.py::test_live_stage_plain_turns_keep_the_fast_path",
+        "tests/e2e/test_live_stage_web_startup_latency.py::test_live_stage_plain_requests_preserve_fast_path_and_report_startup_timings",
+        "tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_plain_requests_retain_fast_path",
+        "tests/e2e/test_live_stage_web_batched_research.py::test_live_compact_plain_turns_keep_one_model_call_and_fast_feedback",
+        "tests/e2e/test_live_stage_web_followups.py::test_live_web_plain_turn_latency_across_languages"
+      ],
+      "decision": "Keep startup phase timing and the one-model-call assertion; run one representative for routine smoke and the others only for changed latency boundaries."
+    },
+    {
+      "id": "final-document-only",
+      "selectors": [
+        "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_draft_artifact_is_never_delivered_or_restored",
+        "tests/e2e/test_live_stage_web_extended.py::test_live_web_only_final_document_survives_delivery_and_reload"
+      ],
+      "decision": "DOCX canonical workflow now includes the primary-owner/history checks. Retain the API draft-manifest case for its separate native boundary."
+    },
+    {
+      "id": "saved-file-reuse",
+      "selectors": [
+        "tests/e2e/test_live_stage_web_extended.py::test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input",
+        "tests/e2e/test_live_stage_code_mode.py::test_live_same_pdf_keeps_its_bytes_and_thread_identity"
+      ],
+      "decision": "File-lookup workflow includes primary-owner/history checks once. PDF byte identity remains separate coverage."
+    },
+    {
+      "id": "missing-public-fact",
+      "selectors": [
+        "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_research_discloses_missing_information_once",
+        "tests/e2e/test_live_stage_web_extended.py::test_live_web_missing_public_fact_is_explained_once_without_losing_findings"
+      ],
+      "decision": "API and Web check related incomplete-source behavior. Prefer the affected surface; retain source proof and exactly-once rendering assertions."
+    },
+    {
+      "id": "capture-language-variants",
+      "scenarios": [
+        "browser_screenshot_artifact_delivery",
+        "browser_context_capture_recovery",
+        "browser_context_capture_recovery_variant"
+      ],
+      "decision": "Shared runner and setup, distinct English/Japanese/Arabic prompts. Retain multilingual coverage; choose one for routine capture smoke."
+    },
+    {
+      "id": "archive-transform-and-retry",
+      "scenarios": [
+        "archive_transform_workbook",
+        "artifact_followup_retry_guard"
+      ],
+      "decision": "Shared archive fixture runner, different workbook columns and forbidden-retry assertions. Not duplicates; retain both for the affected paths."
+    }
+  ],
+  "reviewed_functions": {
+    "test_live_stage_api_scenarios.py": [
+      "test_live_stage_api_scenario"
+    ],
+    "test_live_stage_bounded_comparison.py": [
+      "test_live_scoped_recommendation_resolves_real_contenders_without_exhaustive_listing_reads"
+    ],
+    "test_live_stage_chat_contracts.py": [
+      "test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf",
+      "test_live_stage_default_matrix_covers_core_tool_families",
+      "test_live_stage_text_lookup_keeps_browser_evidence_internal",
+      "test_live_stage_targeted_scheduler_answer_and_core_tools",
+      "test_live_stage_core_exec_is_discoverable_and_preserves_approval",
+      "test_live_stage_email_to_web_answer_preserves_status_and_tool_evidence",
+      "test_live_stage_conceptual_answer_avoids_shell_completion_detour",
+      "test_live_stage_independent_memory_and_history_recall_contract",
+      "test_live_stage_reusable_tool_creation_and_independent_reuse_contract",
+      "test_live_stage_existing_source_path_remains_read_only_then_edits_explicitly",
+      "test_live_stage_source_comparison_retains_verified_quotes",
+      "test_live_stage_draft_artifact_is_never_delivered_or_restored",
+      "test_live_stage_research_discloses_missing_information_once"
+    ],
+    "test_live_stage_code_mode.py": [
+      "test_live_stage_pdf_email_shows_native_approval_without_sending",
+      "test_live_stage_plain_turns_keep_the_fast_path",
+      "test_live_same_pdf_keeps_its_bytes_and_thread_identity",
+      "test_live_stage_read_only_code_mode",
+      "test_live_stage_output_projection_preserves_native_findings",
+      "test_live_stage_email_uses_code_session",
+      "test_live_stage_reservation_composes_reads",
+      "test_live_stage_inline_read_recovery_stays_in_one_program",
+      "test_live_stage_progress_is_compact_and_visibly_smaller",
+      "test_live_stage_code_mode_writes_and_delivers_html",
+      "test_live_stage_recovers_capture_in_one_code_session",
+      "test_live_stage_assignment_only_program_returns_page_evidence",
+      "test_live_stage_local_renderer_delivers_png_without_image_provider",
+      "test_live_stage_host_modules_create_and_deliver_html",
+      "test_live_stage_calendar_trip_infographic_delivers_real_image",
+      "test_live_stage_visual_worker_closes_its_tabs",
+      "test_live_stage_recent_production_run_regressions",
+      "test_live_stage_calendar_trip_pdf_efficiency",
+      "test_live_stage_mixed_pdf_package_has_no_unused_fallback",
+      "test_live_stage_recent_recommendations_open_underlying_sources",
+      "test_live_stage_large_transfer_after_numeric_choice",
+      "test_live_stage_flight_form_reaches_interactive_worker",
+      "test_live_stage_multi_source_facts_survive_compaction",
+      "test_live_stage_delegation_runs_native_preflight_without_repair_program",
+      "test_live_stage_local_request_keeps_profile_after_separate_trip",
+      "test_live_stage_quote_keeps_billing_period_separate_from_elapsed_duration",
+      "test_live_stage_terminal_timeout_retains_partial_output_without_rescan"
+    ],
+    "test_live_stage_compaction_integrity.py": [
+      "test_large_uploaded_source_preserves_middle_record_in_delivered_report"
+    ],
+    "test_live_stage_cron_execution_contract.py": [
+      "test_live_stage_saved_cron_has_valid_scope_and_visible_terminal_outcome"
+    ],
+    "test_live_stage_dispatch_handoff.py": [
+      "test_live_vague_followup_does_not_cancel_generated_file"
+    ],
+    "test_live_stage_failure_attribution.py": [
+      "test_live_fallback_keeps_confirmed_findings_and_current_uncertainty"
+    ],
+    "test_live_stage_live_tracking.py": [
+      "test_live_stage_web_any_finite_window_and_same_tracker_amendments",
+      "test_live_stage_web_temporary_tracking_and_numbered_clarification",
+      "test_live_stage_cnn_developing_section_delivers_one_grounded_match",
+      "test_live_stage_web_expiry_followup_renews_saved_window",
+      "test_live_stage_web_cadence_clarification_uses_actual_tracker_contract",
+      "test_live_stage_web_numeric_lifetime_and_cadence_creates_article_tracker",
+      "test_live_stage_web_real_semantic_tracker_alerts_only_for_a_new_url",
+      "test_live_stage_two_source_tracker_does_not_substitute_the_last_page",
+      "test_live_stage_web_repairs_changed_observation_region",
+      "test_live_stage_shared_presentation_and_filter_amendment",
+      "test_live_stage_existing_condition_amendment_render"
+    ],
+    "test_live_stage_profile_shopping_contract.py": [
+      "test_live_stage_shopping_and_saved_profile_context"
+    ],
+    "test_live_stage_provider_guard_boundary.py": [
+      "test_paid_live_session_stops_after_first_terminal_provider_failure"
+    ],
+    "test_live_stage_receipt_continuity.py": [
+      "test_live_receipt_facts_survive_management_only_amendment"
+    ],
+    "test_live_stage_repair_budget_contract.py": [
+      "test_live_stage_keeps_answer_after_two_failed_waits"
+    ],
+    "test_live_stage_retained_artifact_validation.py": [
+      "test_real_delivered_report_retains_its_ui_files_bytes_and_original_contract"
+    ],
+    "test_live_stage_scheduler_cancellation.py": [
+      "test_live_confirmation_questions_offer_numeric_choices",
+      "test_live_stage_completed_scheduler_followup_and_adjacent_edit"
+    ],
+    "test_live_stage_scheduler_followups.py": [
+      "test_live_status_followup_after_enable_does_not_start_the_job"
+    ],
+    "test_live_stage_search_coverage.py": [
+      "test_live_web_follows_discovered_alternate_after_primary_negative"
+    ],
+    "test_live_stage_small_mutations.py": [
+      "test_live_reminder_changes_commit_quickly_and_clean_up_the_owned_record",
+      "test_live_status_update_does_not_invent_a_personal_task"
+    ],
+    "test_live_stage_snapshot_tracker.py": [
+      "test_live_stage_web_snapshot_tracker_ignores_clock_and_alerts_on_changed_total",
+      "test_live_stage_web_snapshot_alert_survives_reload",
+      "test_live_stage_web_snapshot_tracker_checks_the_public_incident_source"
+    ],
+    "test_live_stage_transport.py": [
+      "test_stage_transport_waits_before_forwarding_and_never_resends_bytes",
+      "test_stage_transport_closes_when_connection_deadline_expires"
+    ],
+    "test_live_stage_user_time_policy.py": [
+      "test_live_stage_web_uses_saved_time_policy_in_foreign_browser"
+    ],
+    "test_live_stage_web_batched_research.py": [
+      "test_live_visual_page_and_text_use_shared_production_and_generic_preparation",
+      "test_live_history_lookup_updates_the_shared_card_without_fresh_source_work",
+      "test_live_comparison_uses_visible_quantities_without_an_extra_tool_round",
+      "test_live_availability_reconsiders_sources_before_giving_up",
+      "test_live_compact_plain_turns_keep_one_model_call_and_fast_feedback",
+      "test_live_source_audit_uses_retained_native_composite_reads",
+      "test_live_screenshot_followup_keeps_the_current_page_context",
+      "test_live_research_uses_short_reads_and_keeps_plain_and_weather_turns_fast",
+      "test_live_text_reader_preserves_exact_links",
+      "test_live_native_reads_show_meaningful_shared_progress",
+      "test_live_readable_news_uses_shared_native_read_policy",
+      "test_live_research_preserves_schedule_and_delivers_generated_page"
+    ],
+    "test_live_stage_web_compact_report.py": [
+      "test_live_compact_scheduled_report_preserves_required_findings"
+    ],
+    "test_live_stage_web_cron_recovery.py": [
+      "test_live_saved_cron_finishes_remaining_work_and_persists_evidence"
+    ],
+    "test_live_stage_web_extended.py": [
+      "test_live_web_only_final_document_survives_delivery_and_reload",
+      "test_live_web_missing_public_fact_is_explained_once_without_losing_findings",
+      "test_live_web_compact_pdf_summary_keeps_heading_and_bullets_together",
+      "test_live_web_dashboard_polling_during_generation_keeps_final_file_and_history",
+      "test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input",
+      "test_live_web_account_read_waits_for_explicit_source_choice"
+    ],
+    "test_live_stage_web_file_lookup.py": [
+      "test_live_web_missing_filename_finishes_without_creating_replacement"
+    ],
+    "test_live_stage_web_followups.py": [
+      "test_live_web_command_named_file_uses_shared_attachment_delivery",
+      "test_live_web_owned_scheduler_rename_and_cancel",
+      "test_live_web_generated_csv_has_one_delivery_and_reload_keeps_it",
+      "test_live_web_plain_turn_latency_across_languages",
+      "test_live_web_conceptual_question_does_not_end_with_shell_receipt",
+      "test_live_web_archived_history_recall_from_fresh_conversation",
+      "test_live_web_owned_cron_delivers_report_with_actual_data",
+      "test_live_web_archive_extract_transformation_returns_only_final_file",
+      "test_live_web_browser_report_synthesis_preserves_helmet_answer",
+      "test_live_web_stop_releases_owned_browser_and_next_lookup_completes",
+      "test_live_web_single_page_sdk_lookup_returns_verified_values",
+      "test_live_web_email_pagination_follows_exact_continuation_without_query_partitioning",
+      "test_live_web_browser_facts_can_become_a_generated_visual",
+      "test_live_web_browser_facts_do_not_block_raster_image_generation",
+      "test_live_web_local_read_does_not_append_activity_when_verbose_is_off",
+      "test_live_web_rejected_image_provider_does_not_publish_a_placeholder"
+    ],
+    "test_live_stage_web_matrix.py": [
+      "test_live_stage_web_catalogue",
+      "test_live_stage_web_event_entities_in_three_languages"
+    ],
+    "test_live_stage_web_native_report.py": [
+      "test_native_corrected_report_has_one_title_and_preserves_required_content"
+    ],
+    "test_live_stage_web_output_continuation.py": [
+      "test_live_web_negotiated_output_keeps_goal_and_delivers_generated_png"
+    ],
+    "test_live_stage_web_producer_generation.py": [
+      "test_live_web_primary_xlsx_has_all_twenty_rows",
+      "test_live_web_primary_inventory_does_not_start_scheduled_work",
+      "test_live_web_primary_weather_delivers_current_tool_result",
+      "test_live_web_primary_image_bytes_and_followup_keep_selected_subject"
+    ],
+    "test_live_stage_web_reasoning.py": [
+      "test_live_stage_web_plain_requests_retain_fast_path",
+      "test_live_stage_web_checks_contradicted_premise_before_actions",
+      "test_live_stage_web_generated_text_delivers_exact_bytes_once",
+      "test_live_stage_web_read_workflow_latency_uses_multiple_samples"
+    ],
+    "test_live_stage_web_report_density.py": [
+      "test_native_report_is_compact_and_keeps_decision_facts"
+    ],
+    "test_live_stage_web_research_efficiency.py": [
+      "test_live_stage_research_releases_only_its_desktop_tabs",
+      "test_live_stage_bounded_research_delivers_without_unnecessary_expansion",
+      "test_live_stage_readonly_deadline_summary_keeps_account_findings",
+      "test_live_stage_research_then_artifact_preserves_source_and_delivers_file"
+    ],
+    "test_live_stage_web_response_proof.py": [
+      "test_live_web_forecast_and_composed_question_use_different_proof"
+    ],
+    "test_live_stage_web_review_layout.py": [
+      "test_live_replayed_amazon_report_is_compact_and_readable_in_web_and_saved_history"
+    ],
+    "test_live_stage_web_review_links.py": [
+      "test_reviewed_recommendation_preserves_actionable_links_after_reload"
+    ],
+    "test_live_stage_web_review_outage.py": [
+      "test_review_outage_notice_and_report_render_once_without_losing_attachment"
+    ],
+    "test_live_stage_web_saved_report_rendering.py": [
+      "test_live_saved_report_preserves_facts_in_history_and_rendered_web",
+      "test_live_completed_report_receipt_matches_caption_and_download_bytes",
+      "test_live_captured_package_downloads_and_renders_without_regeneration",
+      "test_live_public_followup_retained_source_and_ui_after_optional_review_outage"
+    ],
+    "test_live_stage_web_shopping.py": [
+      "test_live_web_amazon_powder_comparison_uses_profile_marketplace"
+    ],
+    "test_live_stage_web_socket_delivery.py": [
+      "test_live_socket_returns_a_matching_terminal_result"
+    ],
+    "test_live_stage_web_source_groups.py": [
+      "test_live_browser_groups_subject_fields_and_delivers_only_specific_limitations",
+      "test_live_completed_product_reply_keeps_fields_on_reload_without_another_model_call"
+    ],
+    "test_live_stage_web_source_incident.py": [
+      "test_live_event_artist_research_keeps_original_question",
+      "test_live_image_question_followed_by_event_link",
+      "test_live_structured_source_record_comparison_keeps_relationships"
+    ],
+    "test_live_stage_web_source_recovery.py": [
+      "test_reviewed_long_source_answer_survives_web_publication_and_reload"
+    ],
+    "test_live_stage_web_startup_latency.py": [
+      "test_live_stage_plain_requests_preserve_fast_path_and_report_startup_timings"
+    ],
+    "test_live_stage_web_tracker_updates.py": [
+      "test_live_web_amended_filter_continues_for_new_matches_without_duplicate_alerts",
+      "test_live_web_saved_filter_replay_finishes_alert_delivery_without_recreating"
+    ],
+    "test_live_stage_web_trip_completion.py": [
+      "test_trip_research_completes_with_source_progress_and_verified_pdf"
+    ]
+  },
+  "retired_selectors": [
+    {
+      "selector": "tests/e2e/test_live_stage_web_producer_completion.py::test_live_web_primary_report_download_without_quality_grading",
+      "replacement": "tests/e2e/test_live_stage_web_extended.py::test_live_web_compact_pdf_summary_keeps_heading_and_bullets_together",
+      "reason": "Extra ownership/history assertions merged into the canonical workflow.",
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    {
+      "selector": "tests/e2e/test_live_stage_web_producer_completion.py::test_live_web_primary_keeps_native_account_source_consent",
+      "replacement": "tests/e2e/test_live_stage_web_extended.py::test_live_web_account_read_waits_for_explicit_source_choice[en]",
+      "reason": "Extra ownership/history assertions merged into the canonical workflow.",
+      "category": "consent",
+      "kind": "live_workflow"
+    },
+    {
+      "selector": "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_docx_selects_only_final_version",
+      "replacement": "tests/e2e/test_live_stage_web_extended.py::test_live_web_only_final_document_survives_delivery_and_reload",
+      "reason": "Extra ownership/history assertions merged into the canonical workflow.",
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    {
+      "selector": "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_csv_survives_dashboard_polling",
+      "replacement": "tests/e2e/test_live_stage_web_extended.py::test_live_web_dashboard_polling_during_generation_keeps_final_file_and_history",
+      "reason": "Extra ownership/history assertions merged into the canonical workflow.",
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    {
+      "selector": "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_file_lookup_followup_does_not_regenerate",
+      "replacement": "tests/e2e/test_live_stage_web_extended.py::test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input",
+      "reason": "Extra ownership/history assertions merged into the canonical workflow.",
+      "category": "artifacts",
+      "kind": "live_workflow"
+    },
+    {
+      "selector": "tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_plain_chat_stays_fast_in_three_languages",
+      "replacement": "tests/e2e/test_live_stage_web_followups.py::test_live_web_plain_turn_latency_across_languages",
+      "reason": "Extra ownership/history assertions merged into the canonical workflow.",
+      "category": "latency",
+      "kind": "live_workflow"
+    },
+    {
+      "selector": "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_chat_tool_scope_and_latency_contracts",
+      "replacement": "tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario",
+      "reason": "Use explicit individual API scenarios; standalone probe CLI remains available.",
+      "category": "research",
+      "kind": "aggregate_entry_point"
+    }
+  ],
+  "consolidated_assertions": {
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_compact_pdf_summary_keeps_heading_and_bullets_together": {
+      "expected_turns": 1,
+      "allow_deferred": false
+    },
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_account_read_waits_for_explicit_source_choice": {
+      "expected_turns": 1,
+      "allow_deferred": false
+    },
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_only_final_document_survives_delivery_and_reload": {
+      "expected_turns": 1,
+      "allow_deferred": false
+    },
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_dashboard_polling_during_generation_keeps_final_file_and_history": {
+      "expected_turns": 1,
+      "allow_deferred": false
+    },
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_existing_filename_lookup_does_not_recreate_or_attach_input": {
+      "expected_turns": 2,
+      "allow_deferred": false
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_plain_turn_latency_across_languages": {
+      "expected_turns": 3,
+      "allow_deferred": true
+    }
+  },
+  "split_variants": {
+    "tests/e2e/test_live_stage_web_extended.py::test_live_web_account_read_waits_for_explicit_source_choice": [
+      "en",
+      "es",
+      "ja"
+    ]
+  }
+}

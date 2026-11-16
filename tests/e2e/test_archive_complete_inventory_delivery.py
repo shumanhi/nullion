@@ -5,10 +5,12 @@ from pathlib import Path
 import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker product boundary')
 
-@pytest.mark.parametrize('create_from_source',[False,True])
-@pytest.mark.parametrize('mixed_media',[False,True])
+@pytest.mark.parametrize('create_from_source,include_metadata',[(False,False),(True,False),(True,True)])
+@pytest.mark.parametrize('code_mode',['off','on'])
+@pytest.mark.parametrize('mixed_media',[False,True,'svg'])
 @pytest.mark.parametrize('prompt',['List every real archive file in inventory.xlsx and attach only that workbook.','Enumera todos los archivos reales en inventory.xlsx y adjunta solo ese libro.','実際の全ファイルを inventory.xlsx に一覧にして、そのファイルだけ添付してください。'])
-def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monkeypatch,prompt,create_from_source,mixed_media):
+def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monkeypatch,prompt,create_from_source,include_metadata,mixed_media,code_mode):
+    monkeypatch.setenv('NULLION_CODE_MODE',code_mode)
     from fastapi.testclient import TestClient
     from openpyxl import load_workbook
     from nullion import web_app,chat_store
@@ -20,14 +22,17 @@ def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monk
     from datetime import datetime,UTC
     monkeypatch.setenv('HOME',str(tmp_path));monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'));monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'none.env'));monkeypatch.setenv('NULLION_MEMORY_ENABLED','0');monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off');chat_store._store=None
     archive=tmp_path/'input.zip';expected={f'entry-{i:03}.txt' for i in range(111)}
-    if mixed_media:expected.remove('entry-110.txt');expected.add('poster.png')
+    poster='poster.svg' if mixed_media=='svg' else 'poster.png'
+    if mixed_media:expected.remove('entry-110.txt');expected.add(poster)
     image=io.BytesIO()
     if mixed_media:
         from PIL import Image
-        Image.new('RGB',(320,200),'green').save(image,'PNG')
+        Image.effect_noise((320,200),75).convert('RGB').save(image,'PNG')
+    artwork=(b'<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="320" height="200" fill="green"/><circle cx="100" cy="100" r="50" fill="navy"/></svg>'
+        if mixed_media=='svg' else image.getvalue())
     with zipfile.ZipFile(archive,'w') as z:
-        for name in sorted(expected):z.writestr(name,image.getvalue() if name=='poster.png' else 'Actual file content 37')
-        z.writestr('__MACOSX/._entry-050.txt','metadata')
+        for name in sorted(expected):z.writestr(name,artwork if name==poster else 'Actual file content 37')
+        z.writestr('__MACOSX/._sidecar.txt','metadata')
     root=artifact_root_for_principal('web:inventory');root.mkdir(parents=True,exist_ok=True);manifest=root/'complete-source.xlsx'
     stale=root/'expanded';stale.mkdir();(stale/'unrelated.txt').write_text('Previous run');(stale/'entry-000.txt').write_text('Preserve this prior version')
     registry=ToolRegistry(filesystem_allowed_roots=[tmp_path]);native=_build_archive_extract_handler(tmp_path,allowed_roots=[tmp_path]);extractions=[]
@@ -51,7 +56,16 @@ def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monk
             if not names:return text('{}')
             self.phase+=1
             if self.phase==1:return call('request_tool_scope',{'capabilities':['local_files'],'tool_names':['archive_extract','spreadsheet_create'] if create_from_source else ['archive_extract'],'required_tool_names':['archive_extract','spreadsheet_create'] if create_from_source else ['archive_extract'],'artifact_extensions':['.xlsx']})
-            if self.phase==2:return call('archive_extract',{'path':str(archive),'output_dir':str(root/'expanded'),'manifest_output_path':str(manifest)})
+            if self.phase==2:
+                context=json.dumps(kw['messages'],ensure_ascii=False)
+                assert 'artifact_production_guidance' in context
+                assert 'artifact_output_root' in context
+                assert 'read or extract the exact current input file' in context
+                args={'path':str(archive),'output_dir':str(root/'expanded'),'manifest_output_path':str(manifest),'include_metadata':include_metadata}
+                if code_mode=='on':
+                    return call('code_mode',{'tool_names':['archive_extract'],
+                        'code':"extracted = call_tool('archive_extract', "+repr(args)+")"})
+                return call('archive_extract',args)
             if self.phase==4 and create_from_source:
                 assert creations[0].status=='completed',creations[0].error
                 return text('The complete inventory workbook is ready.\nMEDIA:'+str(root/'inventory.xlsx'))
@@ -63,7 +77,7 @@ def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monk
             assert 'entry-050.txt' not in context,'The model packet should remain compact'
             if create_from_source:
                 assert 'rows_source' in context
-                return call('spreadsheet_create',{'output_path':str(root/'inventory.xlsx'),'rows_source':{'path':extractions[0].output['manifest_json_path'],'rows_key':'rows','columns_key':'columns'},'expected_rows':111,
+                return call('spreadsheet_create',{'output_path':str(root/'inventory.xlsx'),'rows_source':{'path':extractions[0].output['manifest_json_path'],'rows_key':'real_rows' if include_metadata else 'rows','columns_key':'columns'},'expected_rows':111,
                     **({'image_paths':extractions[0].output['source_image_paths']} if mixed_media else {})})
             return text('The complete inventory workbook is ready.\nMEDIA:'+str(manifest))
     model=Model();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model
@@ -75,7 +89,10 @@ def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monk
         body=client.get(data['artifacts'][0]['url']).content
         workbook=load_workbook(io.BytesIO(body),read_only=True);rows=list(workbook.active.iter_rows(values_only=True));workbook.close()
         column=rows[0].index('Filename');assert {r[column] for r in rows[1:]}==expected
-        assert len(extractions)==1 and extractions[0].output['entry_count']==111 and extractions[0].output['metadata_entries_ignored']==1
+        assert len(extractions)==1 and extractions[0].output['entry_count']==111+include_metadata and extractions[0].output['metadata_entries_ignored']==1-include_metadata
+        source=extractions[0].output['source_inventory']
+        assert source['real_record_count']==111 and source['metadata_record_count']==include_metadata
+        assert sum(source['real_extension_counts'].values())==111
         assert not any(a['name'].endswith(('.json','.csv','.zip')) for a in data['artifacts'])
 
         assert len(creations)==int(create_from_source)
@@ -84,4 +101,6 @@ def test_full_archive_inventory_survives_compaction_and_final_name(tmp_path,monk
 
         actual_root=Path(extractions[0].output['output_dir'])
         assert actual_root!=stale and {p.name for p in actual_root.iterdir() if p.is_file()}==expected
+        actual_files={str(p.relative_to(actual_root)) for p in actual_root.rglob('*') if p.is_file()}
+        assert actual_files==expected.union({'__MACOSX/._sidecar.txt'} if include_metadata else set()), 'Rendering polluted the archive source inventory'
         assert (stale/'unrelated.txt').read_text()=='Previous run' and (stale/'entry-000.txt').read_text()=='Preserve this prior version'

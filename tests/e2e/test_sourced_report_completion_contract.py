@@ -93,6 +93,7 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
         step = 0
         review_calls = 0
         planner_calls = 0
+        scope_declared = False
         def __init__(self):
             self.errors = []
         def create(self, **kwargs):
@@ -139,6 +140,12 @@ def test_real_browser_report_recovers_missing_comparisons_and_pdf_arguments(tmp_
                     'disposition': 'complete', 'all_material_requirements_enumerated': True,
                     'material_requirements': material, 'unresolved_requirements': [], 'retry_tool_names': []}))
             names = {t['name'] for t in kwargs.get('tools', [])}
+            if not self.scope_declared:
+                self.scope_declared = True
+                return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'research-scope',
+                    'name':'request_tool_scope','input':{'capabilities':['web','local_files'],
+                        'tool_names':['browser_navigate','browser_snapshot','browser_type_field','browser_click_element','browser_extract_text','pdf_create'],
+                        'research_effort':'extended','research_questions':['Compare all three required travel windows and prepare the report']}}]}
             self.step += 1
             assert {'browser_type_field', 'browser_click_element', 'browser_extract_text', 'pdf_create'} <= names, 'Research disappeared after raw page text'
             if self.step == 1:

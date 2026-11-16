@@ -2,8 +2,18 @@
 import asyncio
 import logging
 import time
+import json
 
 logger = logging.getLogger(__name__)
+
+
+def live_forward_ports(fixture_ports='[]'):
+    """Expose only explicitly owned fixture ports alongside the stage lane."""
+    ports=json.loads(fixture_ports or '[]')
+    if not isinstance(ports,list) or any(type(port) is not int or not 1024<=port<=65535
+            or port in {8742,8752,8753} for port in ports):
+        raise ValueError('Fixture ports must be integer ports outside the runtime lanes')
+    return [8753,*dict.fromkeys(ports)]
 
 
 async def forward_connection(reader, writer, *, host, port, connect_seconds=2.0):

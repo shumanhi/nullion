@@ -101,21 +101,25 @@ def default_browser_backend_for_web_research(settings: Any) -> str | None:
 
 
 def format_web_research_guidance(*, tool_registry: Any, settings: Any) -> str | None:
+    from nullion.reasoning_guidance import RESEARCH_STOPPING_GUIDANCE
     spec_names = {
         str(getattr(spec, "name", "") or "")
         for spec in (getattr(tool_registry, "list_specs", lambda: [])() or ())
     }
-    if "browser_navigate" not in spec_names:
+    if not spec_names.intersection({'browser_navigate', 'browser_read_pages', 'web_search', 'web_fetch'}):
         return None
+    stopping = '\n- ' + RESEARCH_STOPPING_GUIDANCE
+    if 'browser_navigate' not in spec_names:
+        return 'Public web research mode:' + stopping
     if api_backed_search_configured(settings):
         if "web_fetch" in spec_names:
-            return None
+            return 'Public web research mode:' + stopping
         return (
             "Public web research mode:\n"
             "- Use web_search for source discovery and browser_navigate, browser_extract_text, and browser_screenshot for page evidence.\n"
             "- Cite direct source URLs beside the material findings or subject profiles they support; keep them readable and do not invent links.\n"
             "- Search to discover enough suitable sources, then read those pages to verify the requested facts before producing a researched report. Avoid repeatedly broadening discovery when the remaining need is a specific fact on an already identified page.\n"
-            "- Direct web_fetch is not registered in this session."
+            "- Direct web_fetch is not registered in this session." + stopping
         )
     provider = configured_search_provider(settings) or "not configured"
     return (
@@ -123,5 +127,5 @@ def format_web_research_guidance(*, tool_registry: Any, settings: Any) -> str | 
         f"- Search API provider is {provider}, without usable API credentials; direct web_fetch/web_search tools are not registered.\n"
         "- Use browser_navigate, browser_extract_text, and browser_screenshot for public web evidence.\n"
         "- When browser research is used for the final answer, "
-        f"{setup_tip_instruction(WEB_RESEARCH_SETUP_TIP)}"
+        f"{setup_tip_instruction(WEB_RESEARCH_SETUP_TIP)}" + stopping
     )

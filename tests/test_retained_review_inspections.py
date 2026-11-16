@@ -40,6 +40,36 @@ def test_changed_source_cannot_reuse_a_window(change):
     assert reasoning.retained_review_inspections(cache, results=[replace(result, **change)]) == []
 
 
+def test_overlapping_inspections_preserve_unique_coverage_instead_of_spending_budget_on_duplicates():
+    result = ToolResult('owned', 'opaque_read', 'completed', {'body': ''.join(chr(0x4e00+i%100) for i in range(16081))})
+    cache = {}
+    for offset in (0, 100, 200, 300, 400, 500):
+        windows = reasoning.inspect_review_evidence([{'invocation_id':'owned', 'json_pointer':'/body',
+            'offset':offset, 'length':12000}], results=[result], references={}, visible_ids={'owned'})
+        reasoning.remember_review_inspections(cache, windows, results=[result], references={})
+    # A shorter later request at the same offset must not erase earlier bytes.
+    windows = reasoning.inspect_review_evidence([{'invocation_id':'owned', 'json_pointer':'/body',
+        'offset':0, 'length':9000}], results=[result], references={}, visible_ids={'owned'})
+    reasoning.remember_review_inspections(cache, windows, results=[result], references={})
+    rows = reasoning.retained_review_inspections(cache, results=[result], max_chars=12500)
+    assert sum(w['shown_chars'] for w in rows) == 12500
+    assert ''.join(w['content'] for w in sorted(rows, key=lambda w:w['offset'])) == result.output['body'][:12500]
+
+
+def test_inspection_union_never_invents_a_gap_or_combines_sources():
+    a = ToolResult('a','opaque_read','completed',{'body':'abc__xyz'})
+    b = ToolResult('b','opaque_read','completed',{'body':'DIFFERENT'})
+    cache = {}
+    windows = reasoning.inspect_review_evidence([
+        {'invocation_id':'a','json_pointer':'/body','offset':0,'length':3},
+        {'invocation_id':'a','json_pointer':'/body','offset':5,'length':3},
+        {'invocation_id':'b','json_pointer':'/body','offset':0,'length':3},
+    ], results=[a,b], references={}, visible_ids={'a','b'})
+    reasoning.remember_review_inspections(cache, windows, results=[a,b], references={})
+    rows = reasoning.retained_review_inspections(cache, results=[a,b])
+    assert [(w['invocation_id'],w['offset'],w['content']) for w in rows] == [('a',0,'abc'),('a',5,'xyz'),('b',0,'DIF')]
+
+
 def test_missing_or_unexposed_result_cannot_reuse_a_window():
     cache, result = retain()
     assert reasoning.retained_review_inspections(cache, results=[]) == []
@@ -163,3 +193,13 @@ def test_short_windows_leave_their_unused_share_for_longer_sources():
     assert all(row['shown_chars'] == 20 and row['complete'] is True
                for row in windows if int(row['invocation_id']) >= 3)
     assert all(row['shown_chars'] >= 2940 for row in windows if int(row['invocation_id']) < 3)
+
+
+@pytest.mark.parametrize('window',[{}, {'length':4}, {'offset':1}])
+def test_producer_inspection_defaults_preserve_exact_owned_subject(window):
+    from nullion.retained_work_context import inspect_retained
+    from nullion.tools import ToolResult
+    result=ToolResult('owned','web_search','completed',{'body':'abcdef'})
+    output=inspect_retained({'requests':[{'invocation_id':'owned','json_pointer':'/body',**window}]},[result])
+    inspected=output['windows'][0]
+    assert inspected['content']=='abcdef'[window.get('offset',0):window.get('offset',0)+window.get('length',2000)]

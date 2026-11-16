@@ -109,6 +109,14 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
     if model_client_getter is not None:
         registry.live_tracker_model_client_getter = model_client_getter
 
+    def validate_selected_history(matcher):
+        # New model-authored conditions must choose comparison semantics. Keep
+        # legacy stored plans readable without inferring intent from their text.
+        if isinstance(matcher, dict) and matcher.get('kind') == 'semantic' and 'history_mode' not in matcher:
+            raise LiveTrackerPlanError('Choose comparison history_mode explicitly: records for new identified records, '
+                'or snapshot for changes to existing values/content.', code='comparison_history_mode_required',
+                allowed_history_modes=['records', 'snapshot'])
+
     def creation_review_context(invocation, retained_results):
         """Project exact prepared bindings without IO, execution or permission."""
         from jsonschema import validate, ValidationError
@@ -196,6 +204,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                 matcher = None
                 if args.get('matcher') is not None:
                     try:
+                        validate_selected_history(args['matcher'])
                         _, matcher = validate_plan(saved['probe'], args['matcher'], registry)
                     except LiveTrackerPlanError:
                         raise
@@ -309,6 +318,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                         "A supported live check interval is required",
                     )
                 try:
+                    validate_selected_history(args.get('matcher'))
                     probe, matcher = validate_plan(args.get("probe"), args.get("matcher"), registry)
                 except LiveTrackerPlanError:
                     raise
@@ -331,9 +341,14 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                     if check.status not in {"matched", "no_match"}:
                         problem = observation_problem(check)
                         raise LiveTrackerPlanError("The prepared source cannot evaluate this condition: " + problem["message"] +
-                                         " Repair and test a small dedicated READ source before creating this tracker. Include all required result fields, such as direct URLs.",
+                                         " Check the selected comparison history mode and unresolved facts. Repair the dedicated READ source when its coverage, readiness or required fields are incomplete.",
                                          code="semantic_condition_unresolved", problem=problem,
-                                         observation_history_available="observation_history" in (check.diagnostics or {}))
+                                         selected_history_mode=matcher.get('history_mode', 'records'),
+                                         supported_history_modes={
+                                             'records': 'New records from a source declaring stable change_identity_fields.',
+                                             'snapshot': 'Changes to existing values or content, compared with the previous successful observation; the first complete read establishes a baseline.'},
+                                         observation_history_available="observation_history" in (check.diagnostics or {}),
+                                         snapshot_history_available='snapshot_history' in (check.diagnostics or {}))
                     if check.comparison_snapshot is not None:
                         from nullion.live_tracking import snapshot_plan_binding, _semantic_packet, MAX_SEMANTIC_PACKET_CHARS
                         # Admission must reserve room for a real prior snapshot,
@@ -429,6 +444,13 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
             context = invocation.flow_context or {}
             ready = [receipt["probe"] for receipt in (context.get("observation_preparations") or {}).values()
                      if receipt.get("status") == "ready"]
+            repairable = [{key: receipt[key] for key in ('status','probe','supported_parameters','next_action','observed_chars','limit_chars') if key in receipt}
+                for receipt in (context.get('observation_preparations') or {}).values()
+                if receipt.get('status') in {'needs_source_readiness','needs_narrower_source','unsupported_source_output'}]
+            repeatable = [spec.name for spec in registry.list_specs()
+                if spec.side_effect_class is ToolSideEffectClass.READ and not spec.delegated_tools
+                and not spec.source_artifact_extensions and not spec.source_artifact_only
+                and isinstance(spec.timeout_seconds,(int,float)) and 0<spec.timeout_seconds<=30]
             return ToolResult(
                 invocation.invocation_id,
                 invocation.tool_name,
@@ -438,7 +460,9 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                      "executed": False, "validation": exc.validation, "ready_prepared_probes": ready,
                      "recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
                          "argument_constraints": {"validation": exc.validation,
-                             "ready_prepared_probes": ready, "requires_verified_probe": True}}}
+                             "ready_prepared_probes": ready, "requires_verified_probe": True,
+                             "repairable_preparations": repairable,
+                             "repeatable_native_read_tools": repeatable}}}
                     if isinstance(exc, LiveTrackerPlanError) else {})},
                 str(exc),
             )
@@ -477,7 +501,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                         },
                         "required": ["tool_name", "arguments"],
                     },
-                    "description": "Prepared dedicated READ data tools only, without generating artifacts or screenshots. Test the source first. Include refresh/navigation when needed; never rely on an unrelated open page. No shell, writes, agent-run tools or generic gateways.",
+                    "description": "Exact tested native READ tools and arguments, not code_mode or batch/delegated executors. For browser text verify an observed results landmark through ready_selector or ready_text. Keep the complete relevant observation within its stated size limit. Use ready_prepared_probes or repairable_preparations from a failed admission; do not replace a native read with an orchestrator wrapper. No shell, writes, screenshots or generic gateways.",
                 },
                 "matcher": {
                     "type": "object",
@@ -521,7 +545,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                     "required": ["kind"],
                     "anyOf": [
                         {"properties": {"kind": {"enum": ["structured"]}}, "required": ["conditions", "summary"]},
-                        {"properties": {"kind": {"enum": ["semantic"]}}, "required": ["instruction"]},
+                        {"properties": {"kind": {"enum": ["semantic"]}}, "required": ["instruction", "history_mode"]},
                     ],
                     "description": "Prefer structured conditions over verified source output JSON pointers, relative to the output object itself (for example /field, without an /output wrapper). Missing fields are unknown, never a match. Do not use exists for a field that contains unavailable/placeholder states; exclude those observed states explicitly. changed establishes its baseline on the first check. Use semantic only when deterministic comparisons cannot express the observed condition.",
                 },
@@ -565,7 +589,9 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
         'description': 'Complete replacement alert condition. Preserve saved history_mode unless the user changes comparison semantics. Omit to retain the condition. Never change the deadline or cadence unless requested.'}
     descriptions = {
         "create_live_tracker": (
-            "Start a live tracker with a finite end time in the current chat. Reuses a small read-only source check every 15 seconds by default, "
+            "Create finite live tracking from tested native READ probes, never code_mode or batch/delegated executors. "
+            "For browser probes, read actual results with an observed readiness landmark before creation. "
+            "Reuses a small read-only source check every 15 seconds by default, "
             "independently of cron workers. Requires an explicit finite duration/deadline, with no product lifetime maximum. By default it keeps checking for new changes until that deadline, without asking to continue after each alert. "
             "Only use stop_after_match=true when the user explicitly requests a one-shot alert. "
             "Use for condition-based monitoring within any chosen finite window; use create_cron for recurring scheduled work. If the monitoring condition, lifetime or recurring intent is unclear, "

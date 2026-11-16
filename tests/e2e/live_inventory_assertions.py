@@ -7,6 +7,11 @@ def _text(value):
     return ' '.join(unicodedata.normalize('NFKC',str(value)).replace('**','').split())
 
 
+def _identity_text(value):
+    # Typography can replace a dash without changing the numbered native name.
+    return ''.join('-' if unicodedata.category(char)=='Pd' else char for char in value).casefold()
+
+
 def assert_numbered_inventory_identities(reply,inventory):
     expected={int(row['selection_index']):_text(row['name']) for row in inventory['inventory_index']}
     rendered={}
@@ -18,7 +23,7 @@ def assert_numbered_inventory_identities(reply,inventory):
     assert set(rendered)==set(expected),('Missing or extra numbered identities',set(expected)-set(rendered),set(rendered)-set(expected))
     for index,name in expected.items():
         body=rendered[index]
-        if name in body:
+        if name in body or _identity_text(name) in _identity_text(body):
             continue
         # A concise label is valid only if it is a unique whole-field prefix
         # of this exact numbered identity, followed by a presentation divider.

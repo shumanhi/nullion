@@ -141,6 +141,9 @@ def test_telegram_capture_preserves_real_browser_session_and_finishes_without_re
                 raise AssertionError(f"Unexpected model retry: tools={names}, max_tokens={kwargs.get('max_tokens')}")
             if name == "request_tool_scope" and not self.opening:
                 args.update(source_artifact_delivery_requested=True, source_artifact_request_evidence=prompt, artifact_extensions=[".png"])
+            if self.opening and name in {"browser_open", "browser_navigate"}:
+                args["keep_open"] = True
+                args["retention_request_evidence"] = f"Open {url} and keep it open."
             if name in names:
                 return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": f"call-{self.agent_calls}", "name": name, "input": args}]}
             raise AssertionError(f"Unexpected model retry: tools={names}, max_tokens={kwargs.get('max_tokens')}")
@@ -159,8 +162,8 @@ def test_telegram_capture_preserves_real_browser_session_and_finishes_without_re
 
     monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path / "workspaces"))
     monkeypatch.setenv("NULLION_MEMORY_ENABLED", "0")
-    monkeypatch.setenv("NULLION_BROWSER_BACKEND", "auto")
-    monkeypatch.setenv("NULLION_BROWSER_HEADLESS", "false")
+    monkeypatch.setenv("NULLION_BROWSER_BACKEND", "playwright")
+    monkeypatch.setenv("NULLION_BROWSER_HEADLESS", "true")
     monkeypatch.setattr(auto_backend, "_is_cdp_reachable", lambda: False)
     monkeypatch.setattr(auto_backend, "_reuse_preferred_cdp_if_available", lambda: False)
     monkeypatch.setattr(auto_backend, "_find_chrome", lambda: None)

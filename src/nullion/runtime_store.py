@@ -195,6 +195,7 @@ class RuntimeStore:
     _dirty_memory_entry_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _memory_reinforcement_only_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _memory_checkpoint_path: Path | None = field(default=None, init=False, repr=False)
+    _code_mode_sessions: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     skill_execution_plans: dict[str, SkillExecutionPlan] = field(default_factory=dict)
     cancelled_mission_ids: set[str] = field(default_factory=set)
     task_frames: dict[str, TaskFrame] = field(default_factory=dict)
@@ -207,12 +208,14 @@ class RuntimeStore:
     conversation_events: list[dict[str, Any]] = field(default_factory=list)
     _conversation_events_by_conversation: dict[str, list[dict[str, Any]]] = field(default_factory=dict, init=False)
     _conversation_session_settings: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)
+    _latest_conversation_events: dict[tuple[str, str], tuple[int, dict[str, Any]]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self._rebuild_conversation_event_index()
 
     def _rebuild_conversation_event_index(self) -> None:
         index: dict[str, list[dict[str, Any]]] = {}
+        latest = {}
         session_settings: dict[str, dict[str, Any]] = {}
         for event in self.conversation_events:
             if not isinstance(event, dict):
@@ -221,6 +224,7 @@ class RuntimeStore:
             if not isinstance(conversation_id, str):
                 continue
             index.setdefault(conversation_id, []).append(event)
+            latest[(conversation_id, event.get("event_type"))] = (len(index[conversation_id]), event)
             if event.get("event_type") == "conversation.session_settings":
                 settings = session_settings.setdefault(conversation_id, {})
                 for key in _CONVERSATION_SESSION_SETTING_FIELDS:
@@ -228,6 +232,7 @@ class RuntimeStore:
                         settings[key] = event.get(key)
         self._conversation_events_by_conversation = index
         self._conversation_session_settings = session_settings
+        self._latest_conversation_events = latest
 
     def set_conversation_events(self, events: list[dict[str, Any]]) -> None:
         self.conversation_events = events
@@ -527,6 +532,8 @@ class RuntimeStore:
         conversation_id = normalized.get("conversation_id")
         if isinstance(conversation_id, str):
             self._conversation_events_by_conversation.setdefault(conversation_id, []).append(normalized)
+            self._latest_conversation_events[(conversation_id, normalized["event_type"])] = (
+                len(self._conversation_events_by_conversation[conversation_id]), normalized)
             if normalized.get("event_type") == "conversation.session_settings":
                 settings = self._conversation_session_settings.setdefault(conversation_id, {})
                 for key in _CONVERSATION_SESSION_SETTING_FIELDS:
@@ -548,12 +555,22 @@ class RuntimeStore:
     def get_conversation_session_setting(self, conversation_id: str, key: str) -> Any | None:
         return deepcopy(self._conversation_session_settings.get(conversation_id, {}).get(key))
 
-    def list_conversation_events(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
+    def latest_conversation_event_after_reset(self, conversation_id: str, event_type: str) -> dict[str, Any] | None:
+        row = self._latest_conversation_events.get((conversation_id, event_type))
+        reset = self._latest_conversation_events.get((conversation_id, "conversation.session_reset"))
+        if row is None or (reset is not None and row[0] <= reset[0]):
+            return None
+        return deepcopy(row[1])
+
+    def list_conversation_events(self, conversation_id: str | None = None, *,
+                                 event_types: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         if conversation_id is None:
             events = self.conversation_events
         else:
             events = self._conversation_events_by_conversation.get(conversation_id, [])
-        return [deepcopy(event) for event in events]
+        selected_types = frozenset(event_types) if event_types is not None else None
+        return [deepcopy(event) for event in events
+                if selected_types is None or event.get('event_type') in selected_types]
 
     def list_recent_conversation_events(
         self,

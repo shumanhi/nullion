@@ -1,7 +1,7 @@
 """Shared reasoning instruction, independent of workflow, language and provider.
 
-This is part of the existing model call, not an intent classifier or permission
-grant. Tool workflows additionally receive independent outcome review.
+This is part of the existing producer call, not a separate reviewer, intent
+classifier or permission grant.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,8 +216,12 @@ def compact_evidence_value(value, *, max_chars):
                     # shortened query can look malformed; a shortened date or
                     # cursor can select the wrong evidence. Omit the containing
                     # view if it cannot fit, never silently alter these values.
-                    if path and path[-1] in {'id', 'query', 'start', 'end', 'url', 'source_url',
-                            'provider_id', 'date', 'dateTime', 'next_page_token', 'inventory_version'}:
+                    field = path[-2] if len(path) > 1 and type(path[-1]) is int else path[-1] if path else None
+                    if field in {'id', 'query', 'start', 'end', 'url', 'source_url',
+                            'provider_id', 'date', 'dateTime', 'next_page_token', 'inventory_version',
+                            'invocation_id', 'task_id', 'frame_id', 'approval_id', 'request_id', 'artifact_id',
+                            'cursor', 'next_cursor', 'path', 'artifact_path', 'output_path', 'sha256', 'timezone',
+                            'artifact_paths', 'source_urls', 'urls', 'task_ids', 'approval_ids', 'request_ids'}:
                         return item
                     if len(item) <= text_cap:
                         return item
@@ -419,20 +423,35 @@ def remember_review_inspections(cache, inspections, *, results, references):
         entries.append({'invocation_id': identity, 'json_pointer': window['json_pointer'],
             'offset': window['offset'], 'length': window['shown_chars'],
             'source_fingerprint': fingerprints[identity]})
-    seen = set()
-    selected = []
     previous = cache.get('retained_inspection_windows') or ()
     if not isinstance(previous, (list, tuple)):
         previous = ()
-    for entry in [*entries, *previous]:
+    cache['retained_inspection_windows'] = _coalesce_inspection_windows([*entries, *previous])[:REVIEW_INSPECTION_MAX_WINDOWS]
+
+
+def _coalesce_inspection_windows(entries):
+    """Union overlapping exact ranges; never fill gaps or shrink prior coverage."""
+    groups = {}
+    for rank, entry in enumerate(entries):
         if not _valid_inspection_window(entry):
             continue
-        key = (entry['invocation_id'], entry['json_pointer'], entry['offset'], entry['source_fingerprint'])
-        if key not in seen:
-            seen.add(key)
-            selected.append({key: entry[key] for key in (
-                'invocation_id', 'json_pointer', 'offset', 'length', 'source_fingerprint')})
-    cache['retained_inspection_windows'] = selected[:REVIEW_INSPECTION_MAX_WINDOWS]
+        key = (entry['invocation_id'], entry['json_pointer'], entry['source_fingerprint'])
+        groups.setdefault(key, []).append((entry['offset'], entry['offset'] + entry['length'], rank))
+    selected = []
+    for (identity, pointer, fingerprint), spans in groups.items():
+        merged = []
+        for start, end, rank in sorted(spans):
+            if merged and start < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end), min(rank, merged[-1][2]))
+            else:
+                merged.append((start, end, rank))
+        for start, end, rank in sorted(merged, key=lambda row:row[2]):
+            while start < end:
+                length = min(end - start, REVIEW_INSPECTION_MAX_WINDOW_CHARS)
+                selected.append({'invocation_id': identity, 'json_pointer': pointer,
+                    'source_fingerprint': fingerprint, 'offset': start, 'length': length})
+                start += length
+    return selected
 
 
 def retained_review_inspections(cache, *, results, references=None, max_chars=RETAINED_INSPECTION_CHAR_BUDGET):
@@ -453,7 +472,7 @@ def retained_review_inspections(cache, *, results, references=None, max_chars=RE
     entries = cache.get('retained_inspection_windows') or ()
     if not isinstance(entries, (list, tuple)):
         return []
-    for entry in entries[:REVIEW_INSPECTION_MAX_WINDOWS]:
+    for entry in _coalesce_inspection_windows(entries)[:REVIEW_INSPECTION_MAX_WINDOWS]:
         if not _valid_inspection_window(entry):
             continue
         identity = entry.get('invocation_id')
@@ -515,6 +534,14 @@ WORKFLOW_REASONING_INSTRUCTION = (
     "discovery result or created file alone does not prove the request is fulfilled. Notice irrelevant "
     "results, missing constraints, superseded evidence and mistakes in your own plan; correct the approach "
     "using permitted capabilities and preserve completed actions rather than repeating them. "
+    "A clarification answer supplies a parameter for the whole selected request; it does not replace "
+    "that request with only the latest parameter or only one deliverable. Finish all requested components. "
+    "When generating files with terminal_exec, declare output_paths for every intended deliverable and "
+    "use its returned artifact receipts. A filename in stdout or a successful file read is not delivery. "
+    "For an action needing confirmation, prepare its complete arguments through the native approval "
+    "flow so the user can review the actual message and selected attachments. Do not substitute a claim "
+    "that something was drafted for the draft itself. If only a draft is requested, show the draft without "
+    "executing the action. Creating an attachment alone does not prepare an associated message or action. "
     "Before answering, review the entire request against what the answer actually says and what will be "
     "delivered. Correct omissions, contradictions and unsupported claims. Reuse details already supplied "
     "instead of asking again. If necessary evidence or authority is missing, give the useful confirmed "

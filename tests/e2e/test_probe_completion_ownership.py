@@ -34,7 +34,9 @@ def test_probe_continues_to_native_tracker_but_explicit_answer_stays_fast(tmp_pa
             self.phase+=1
             if self.phase==1:return call('request_tool_scope',{'capabilities':['weather'],'tool_names':['weather_forecast'],'required_tool_names':['weather_forecast'],'direct_read_complete_request':direct})
             if self.phase==2:return call('weather_forecast',args)
-            assert not direct,'An explicit answer-only scope must not add a completion call'
+            if direct:
+                assert self.phase == 3
+                return {'stop_reason':'end_turn','content':[{'type':'text','text':'London is currently 12°C, feeling like 10°C.'}]}
             if self.phase==3:return call('request_tool_scope',{'capabilities':['live_tracking','weather'],'tool_names':['create_live_tracker','weather_forecast'],'required_tool_names':['create_live_tracker'],'tracking_mode':'live'})
             if self.phase==4:return call('weather_forecast',args)
             if self.phase==5:return call('create_live_tracker',{'name':'Owned observation','duration_seconds':90,'interval_seconds':5,'probe':[{'tool_name':'weather_forecast','arguments':args}],'matcher':{'kind':'structured','conditions':[{'step':0,'pointer':'/current/temperature_2m','op':'greater_than','value':1000}],'summary':'Temperature above threshold'}})
@@ -48,7 +50,7 @@ def test_probe_continues_to_native_tracker_but_explicit_answer_stays_fast(tmp_pa
         assert response.status_code==200,response.text
         data=response.json();assert not model.errors,(model.errors,[(r.get('tool_name'),r.get('status'),r.get('error'),r.get('output')) for t in runtime.store.list_conversation_events('web:probe-owner') if t.get('event_type')=='conversation.chat_turn' for r in t.get('tool_results',[])])
         jobs=LiveTrackerStore(tmp_path/'runtime.db').list('workspace_admin',include_finished=True)
-        if direct:assert not jobs and '12' in data['text'] and model.phase==2,data
+        if direct:assert not jobs and '12' in data['text'] and model.phase==3,data
         else:
             assert len(jobs)==1 and jobs[0]['state']=='active',data
             assert jobs[0]['probe']==[{'tool_name':'weather_forecast','arguments':args}]

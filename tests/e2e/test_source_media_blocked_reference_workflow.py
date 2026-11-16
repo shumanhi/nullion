@@ -9,7 +9,7 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Doc
 @pytest.mark.parametrize('prompt',['Keep the attached reference and compare it with the linked page.',
     'Conserva la referencia adjunta y compárala con la página enlazada.',
     '添付した資料を保持し、リンク先のページと比較してください。'])
-def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkeypatch,prompt):
+def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkeypatch,prompt,native_browser_source):
     from fastapi.testclient import TestClient
     from nullion import web_app,chat_store
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -20,15 +20,16 @@ def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkey
     monkeypatch.setenv('HOME',str(tmp_path));monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'))
     monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'missing.env'));monkeypatch.setenv('NULLION_MEMORY_ENABLED','0')
     monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off');chat_store._store=None
+    url=native_browser_source('<html><body>Access challenge</body></html>')
     image=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1sAAAAASUVORK5CYII=')
     source=tmp_path/'reference.png';source.write_bytes(image);calls=[]
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_available',lambda:True)
     monkeypatch.setattr('nullion.plugins.browser_plugin.browser_use_adapter.browser_use_python',lambda:'/external/python')
     def read(*a,**kw):
         calls.append(1);return {'result_kind':'source_observations','report_status':'blocked','goal_status':'blocked',
-            'completion_scope':'tool_step','next_action':'report','page_url':'https://reference.example/page',
+            'completion_scope':'tool_step','next_action':'report','page_url':url,
             'observations':[],'unknowns':[],'blocker':'The reference page returned an access challenge.',
-            'execution_audit':{'complete':True,'read_only_actions_only':True,'visited_urls':['https://reference.example/page']}}
+            'execution_audit':{'complete':True,'read_only_actions_only':True,'visited_urls':[url]}}
     monkeypatch.setattr(browser_use_worker,'run_isolated_browser_task',read)
     def text(v):return {'stop_reason':'end_turn','content':[{'type':'text','text':v}]}
     def tool(name,args):return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':name,'name':name,'input':args}]}
@@ -60,10 +61,14 @@ def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkey
                     'focus_roles':['context'],'points':[],'limitation_ids':[limit_id]})
             if not names:return text('{}')
             self.phase+=1
-            if self.phase==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_run_task'],'required_tool_names':['browser_run_task']})
+            if self.phase==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['browser_read_pages','browser_run_task'],'required_tool_names':['browser_run_task']})
             if self.phase==3:return text("The supplied reference image is retained. The remote page presented an access challenge.")
             assert self.phase==2
-            return tool('browser_run_task',{'task':prompt,'url':'https://reference.example/page'})
+            result=tool('browser_run_task',{'task':prompt,'url':url,'execution_kind':'adaptive_interaction',
+                'interaction_reason':'Exercise the delegated source-evidence contract after the native read'})
+            result['content'].insert(0,{'type':'tool_use','id':'native-first','name':'browser_read_pages',
+                'input':{'pages':[{'url':url,'read_kind':'text'}]}})
+            return result
     model=Provider();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model
     registry=ToolRegistry();register_browser_tools(registry,policy=BrowserPolicy(),model_client_getter=lambda:model)
     captured=[]
@@ -71,7 +76,7 @@ def test_blocked_reference_does_not_discard_selected_input_media(tmp_path,monkey
         def run_turn(self,**kw):
             result=super().run_turn(**kw);captured.append(result);return result
     with TestClient(web_app.create_app(runtime,orchestrator=Capture(model_client=model),registry=registry)) as client:
-        result=client.post('/api/chat',json={'text':prompt+' https://reference.example/page','conversation_id':'web:reference',
+        result=client.post('/api/chat',json={'text':prompt+' '+url,'conversation_id':'web:reference',
             'attachments':[{'path':str(source),'name':source.name,'media_type':'image/png'}]})
         assert result.status_code==200,result.text
         reply=result.json()['text'];assert 'reference image is retained' in reply and 'access challenge' in reply,reply

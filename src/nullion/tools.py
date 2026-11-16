@@ -33,10 +33,12 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import stat
 import subprocess
+import sys
 import tempfile
 import tarfile
 import textwrap
@@ -365,6 +367,12 @@ _BROWSER_IMAGE_FORMAT_SUFFIXES = {
     "GIF": ".gif",
 }
 _LEGACY_GLOBAL_PERMISSION_PRINCIPALS = ("operator", "workspace:workspace_admin")
+
+
+def _calendar_record_collections() -> list[dict[str, object]]:
+    return [{"path": ["results"], "cardinality": "many",
+             "identity_fields": ["id", "htmlLink"],
+             "context_fields": ["summary", "start", "end", "location", "status", "description"]}]
 
 
 def _calendar_list_input_schema(*, include_provider_id: bool = True) -> dict[str, object]:
@@ -728,6 +736,7 @@ _FILESYSTEM_PATH_ARGUMENTS_BY_TOOL = {
     "file_patch": ("path",),
     "image_extract_text": ("path",),
     "image_generate": ("source_path", "output_path"),
+    "image_render": ("output_path",),
     "document_create": ("output_path",),
     "presentation_create": ("output_path",),
     "spreadsheet_create": ("output_path",),
@@ -1562,6 +1571,17 @@ class ToolSpec:
     # intervening non-read attempt invalidates the snapshot cache. Browsers
     # and live observations must remain fresh and do not opt in.
     same_request_read_cache: bool = False
+    # READ navigation/UI adapters can change an observation without writing
+    # an account. Invalidate request snapshots before those operations too.
+    invalidates_read_cache: bool = False
+    read_cache_context_keys: tuple[str, ...] = ()
+    # False keeps native controls outside Code Mode. None includes scoped tools
+    # in on mode; read_only retains the transitional READ/UI capability limit.
+    code_mode_allowed: bool | None = None
+    # New-layer efficiency precondition, declared by an adapter, never prose routing.
+    code_mode_observation_tools: tuple[str, ...] = ()
+    # Adapter-approved native UI controls still use ordinary action policy.
+    code_mode_ui_interaction: bool = False
     # Optional adapter-owned, read-only projection of retained evidence for an
     # exact proposed target. Must perform no IO or actions and grants no consent.
     action_review_context: Callable[..., dict[str, object]] | None = None
@@ -1571,6 +1591,11 @@ class ToolSpec:
     observation_inline_setup_tools: tuple[str, ...] = ()
     # Adapter-owned output formats; source captures must never declare these.
     produced_artifact_extensions: tuple[str, ...] = ()
+    # Adapter-owned array argument and explicit independence flag. Only READ
+    # calls with matching remaining arguments may share one native batch.
+    independent_batch: tuple[str, str] | tuple[()] = ()
+    batch_item_required_fields: tuple[str, ...] = ()
+    independent_batch_validator: Callable[..., bool] | None = None
 
 
 @dataclass(slots=True)
@@ -1582,6 +1607,9 @@ class ToolInvocation:
     capsule_id: str | None = None
     trusted_filesystem_selectors: tuple[str, ...] = ()
     flow_context: dict[str, object] | None = None
+    # Runtime-owned progress channel, never serialized into model arguments or
+    # approval state. Adapters report counts, not source text or internal notes.
+    progress_callback: Callable[[dict[str, object]], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -1675,6 +1703,10 @@ def _invoke_tool_handler_with_timeout(
     invocation: ToolInvocation,
 ) -> ToolResult:
     timeout_seconds = _tool_handler_timeout_seconds(spec)
+    from nullion.research_budget import source_timeout
+    remaining_research = source_timeout(spec)
+    if remaining_research is not None:
+        timeout_seconds = max(.001, min(timeout_seconds, remaining_research)) if timeout_seconds is not None else max(.001, remaining_research)
     deadline = perf_counter() + timeout_seconds if timeout_seconds is not None else None
     cancellation_checker = _TOOL_EXECUTION_CANCEL_CHECK.get()
     authority = _TOOL_EXECUTION_AUTHORITY.get()
@@ -1791,6 +1823,10 @@ def _cron_tool_properties() -> dict[str, object]:
 
 
 def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
+    from nullion.pdf_design import card_pages_schema
+    if tool_name == "image_render":
+        from nullion.image_render import input_schema
+        return input_schema()
     def cron_tool_properties() -> dict[str, object]:
         return copy.deepcopy(_CRON_TOOL_PROPERTIES)
 
@@ -2410,8 +2446,18 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "Use semantic HTML/CSS with readable text; scripts are ignored. "
                         "Complete self-contained SVG markup and SVG image data are supported. Reuse the exact "
                         "saved HTML content and artwork when converting an existing HTML design to PDF. "
-                        "Use text_pages for plain report PDFs and html_pages for intentionally designed PDFs."
+                        "Use text_pages for plain report PDFs and html_pages for intentionally designed PDFs. "
+                        "Keep CSS compact and use content-driven sizing rather than large fixed-height cards. "
+                        "Images retain their full frame by default; mark decorative cropped art with data-nullion-crop='true'. "
+                        "Rendered previews are returned for visual review in the next normal model pass."
                     ),
+                },
+                "card_pages": {
+                    **card_pages_schema(),
+                    "description": "Prefer this compact content-only format for infographic pages, itineraries and card reports. "
+                    "Provide page title/subtitle and cards with heading/text, optional local image_path and wide=true. "
+                    "The native renderer supplies typography, spacing and image fitting; avoid generating repetitive HTML/CSS. "
+                    "Distinguish fixed source records from suggestions in the supplied card headings."
                 },
                 "media_alignment": {
                     "type": "string",
@@ -2435,7 +2481,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             },
             "anyOf": [
                 {"required": [field], "properties": {field: {"minItems": 1}}}
-                for field in ("image_paths", "screenshot_paths", "text_pages", "html_pages")
+                for field in ("image_paths", "screenshot_paths", "text_pages", "html_pages", "card_pages")
             ],
             "additionalProperties": False,
         },
@@ -2500,6 +2546,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute."},
+                "output_paths": {
+                    "type": "array", "maxItems": 25, "items": {"type": "string"},
+                    "description": "Declare every deliverable this command will create or overwrite. Use absolute paths or paths relative to the execution directory. Only files changed by this invocation become downloadable attachments; stdout paths alone are not delivery receipts.",
+                },
                 "shell": {
                     "type": "string",
                     "enum": ["auto", "sh", "bash", "zsh", "powershell", "pwsh", "cmd"],
@@ -2736,9 +2786,14 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query."},
+                "queries": {"type": "array", "minItems": 1, "maxItems": 6,
+                    "items": {"type": "string", "minLength": 1},
+                    "description": "Independent search queries to run together, with at most two active reads. Use instead of query; do not batch queries that depend on another result."},
+                "independent_queries": {"type": "boolean", "description": "Must be true when supplying queries."},
                 "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of results to return."},
             },
-            "required": ["query"],
+            "oneOf": [{"required": ["query"], "not": {"required": ["queries"]}},
+                      {"required": ["queries", "independent_queries"], "not": {"required": ["query"]}}],
             "additionalProperties": False,
         },
         "file_search": {
@@ -3875,6 +3930,32 @@ class SubprocessTerminalExecutorBackend:
             metadata={},
         )
 
+    @staticmethod
+    def _run_owned_process(argv, *, cwd, timeout, env):
+        # A dedicated session keeps timeout/cancellation cleanup away from the
+        # app's own process group and includes shell pipeline descendants.
+        with subprocess.Popen(list(argv), shell=False, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
+                              start_new_session=True) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    stdout, stderr = process.communicate(timeout=1)
+                except subprocess.TimeoutExpired as drain_exc:
+                    # An intentionally detached descendant may retain a pipe.
+                    # Cleanup must not turn the original timeout into a hang.
+                    stdout, stderr = drain_exc.stdout, drain_exc.stderr
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    raise subprocess.TimeoutExpired(argv, timeout, output=stdout or exc.stdout,
+                                                    stderr=stderr or exc.stderr) from exc
+                raise
+            return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
     def run(
         self,
         command: str,
@@ -3885,17 +3966,28 @@ class SubprocessTerminalExecutorBackend:
         shell: str | None = None,
     ) -> TerminalExecutionResult:
         del policy
+        # launchd and login-shell startup can select a global Python even
+        # when Nullion itself runs in its installed virtual environment.
+        # Activate that existing environment after shell profiles; never
+        # rewrite scripts, install packages, or retry a command automatically.
+        runtime_env = None
+        if sys.prefix != sys.base_prefix and sys.executable:
+            python_bin = str(Path(sys.executable).parent)
+            runtime_env = dict(os.environ)
+            runtime_env["PATH"] = python_bin + os.pathsep + runtime_env.get("PATH", "")
+            runtime_env["VIRTUAL_ENV"] = sys.prefix
+            runtime_env.pop("PYTHONHOME", None)
+            if os.name != "nt":
+                command = "export PATH=" + shlex.quote(python_bin) + ':"$PATH"\n' + command
         invocation = _resolve_terminal_shell_invocation(command, shell=shell)
         try:
-            completed = subprocess.run(
-                list(invocation.argv),
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=cwd,
-                check=False,
-            )
+            if os.name == "posix":
+                completed = self._run_owned_process(invocation.argv, cwd=cwd, timeout=timeout, env=runtime_env)
+            else:
+                completed = subprocess.run(
+                    list(invocation.argv), shell=False, capture_output=True, text=True,
+                    timeout=timeout, cwd=cwd, check=False, env=runtime_env,
+                )
         except KeyboardInterrupt:
             return TerminalExecutionResult(
                 exit_code=self._INTERRUPTED_EXIT_CODE,
@@ -4085,16 +4177,14 @@ class SandboxLauncherTerminalExecutorBackend:
         invocation = self._build_invocation(command, policy=policy)
         env = {**os.environ, **invocation.env}
         try:
-            completed = subprocess.run(
-                list(invocation.argv),
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=cwd,
-                check=False,
-                env=env,
-            )
+            if os.name == "posix":
+                completed = SubprocessTerminalExecutorBackend._run_owned_process(
+                    invocation.argv, cwd=cwd, timeout=timeout, env=env)
+            else:
+                completed = subprocess.run(
+                    list(invocation.argv), shell=False, capture_output=True, text=True,
+                    timeout=timeout, cwd=cwd, check=False, env=env,
+                )
         except KeyboardInterrupt:
             return TerminalExecutionResult(
                 exit_code=self._INTERRUPTED_EXIT_CODE,
@@ -4151,6 +4241,69 @@ def normalize_tool_result(result: ToolResult) -> ToolResult:
         recovered_by=tuple(result.recovered_by),
         response_requirements=dict(result.response_requirements) if isinstance(result.response_requirements, dict) else None,
     )
+
+
+def completed_runtime_tool_names(results) -> set[str]:
+    """Completed outer calls and registry-validated constituent READ receipts."""
+    names = set()
+    for result in results or ():
+        value = result.get if isinstance(result, Mapping) else lambda key, default=None: getattr(result, key, default)
+        if normalize_tool_status(value("status")) != "completed":
+            continue
+        name = value("tool_name")
+        if isinstance(name, str) and name:
+            names.add(name)
+        metadata = value("response_requirements")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        receipt = metadata.get("_native_completed_reads")
+        if (isinstance(receipt, dict) and receipt.get("version") == 1
+                and receipt.get("invocation_id") == value("invocation_id")
+                and receipt.get("parent_tool") == name):
+            values = receipt.get("tool_names")
+            if isinstance(values, (list, tuple)):
+                names.update(name for name in values if isinstance(name, str))
+    return names
+
+
+def is_completed_read_observation(result: ToolResult, registry) -> bool:
+    """Read facts, including adapter-attested read-only composite invocations."""
+    if normalize_tool_status(result.status) != "completed" or result.error:
+        return False
+    try:
+        spec = registry.get_spec(result.tool_name)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
+    if spec.side_effect_class is ToolSideEffectClass.READ:
+        return True
+    metadata = result.response_requirements if isinstance(result.response_requirements, dict) else {}
+    receipt = metadata.get('_native_completed_reads')
+    if not isinstance(receipt, dict) or receipt.get('read_only') is not True:
+        return False
+    children = completed_runtime_tool_names([result]) - {result.tool_name}
+    if not children or not children.issubset(spec.delegated_tools):
+        return False
+    try:
+        return all(registry.get_spec(name).side_effect_class is ToolSideEffectClass.READ for name in children)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def retained_observation_result(result: ToolResult, *, invocation_id: str | None = None) -> ToolResult:
+    """Keep read provenance across lineage without inheriting action contracts."""
+    target_id = invocation_id or result.invocation_id
+    metadata = result.response_requirements if isinstance(result.response_requirements, dict) else {}
+    receipt = metadata.get('_native_completed_reads')
+    retained = None
+    if (isinstance(receipt, dict) and receipt.get('read_only') is True
+            and completed_runtime_tool_names([result]) - {result.tool_name}):
+        retained = {'_native_completed_reads': {**copy.deepcopy(receipt), 'invocation_id': target_id}}
+    origin = metadata.get('_retained_observation')
+    if isinstance(origin, dict) and all(isinstance(origin.get(key), str) and origin[key]
+            for key in ('parent_turn_id', 'observed_at', 'original_invocation_id')):
+        retained = {**(retained or {}), '_retained_observation': {
+            key: origin[key] for key in ('parent_turn_id', 'observed_at', 'original_invocation_id')}}
+    return replace(result, invocation_id=target_id, output=copy.deepcopy(result.output),
+        response_requirements=retained)
 
 
 _ACTION_RECEIPT_DETAIL_KEYS = (
@@ -4267,6 +4420,11 @@ def _with_default_action_receipt(
         or _connector_request_is_read_only(invocation)
     ):
         return result
+    metadata = result.response_requirements or {}
+    receipt = metadata.get('_native_completed_reads')
+    if (isinstance(receipt, dict) and receipt.get('read_only') is True
+            and completed_runtime_tool_names([result]) - {result.tool_name}):
+        return result
 
     output = dict(result.output)
     summary = str(output.get("message") or output.get("summary") or "").strip()
@@ -4282,13 +4440,7 @@ def _with_default_action_receipt(
         summary=summary,
         details=_generic_action_receipt_details(output),
     )
-    return ToolResult(
-        invocation_id=result.invocation_id,
-        tool_name=result.tool_name,
-        status=result.status,
-        output=output,
-        error=result.error,
-    )
+    return replace(result, output=output)
 
 
 
@@ -4441,7 +4593,39 @@ class ToolRegistry:
         if tool_execution_cancelled():
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
                 {"reason": "request_cancelled", "executed": False})
+        from nullion.research_budget import before_tool, after_tool
+        research_result = before_tool(spec, invocation)
+        if research_result is not None:
+            return research_result
         result = _invoke_tool_handler_with_timeout(spec, handler, invocation)
+        metadata = dict(result.response_requirements) if isinstance(result.response_requirements, dict) else {}
+        metadata.pop('_native_unavailable_file_producer_formats',None)
+        facts=result.output if isinstance(result.output,dict) else {}
+        if (normalize_tool_status(result.status)=='failed' and facts.get('failure_scope')=='tool'
+                and facts.get('terminal_user_action_required') is True
+                and spec.side_effect_class is ToolSideEffectClass.WRITE and not spec.source_artifact_only
+                and spec.produced_artifact_extensions):
+            metadata['_native_unavailable_file_producer_formats']=list(spec.produced_artifact_extensions)
+        result.response_requirements=metadata or None
+        proposed = metadata.get("_native_completed_reads")
+        if proposed is not None:
+            # Only adapter-owned metadata can propose a receipt. Source/page
+            # output cannot declare completion. A composite can attest only
+            # registered READ operations explicitly declared by its spec;
+            # a WRITE-capable composite may first return native READ evidence.
+            accepted = []
+            if normalize_tool_status(result.status) == "completed" and isinstance(proposed, dict):
+                for name in proposed.get("tool_names", ()) if isinstance(proposed.get("tool_names"), (list, tuple)) else ():
+                    child = self._specs.get(name) if isinstance(name, str) else None
+                    if name in spec.delegated_tools and child is not None and child.side_effect_class is ToolSideEffectClass.READ:
+                        accepted.append(name)
+            retained = {key: value for key, value in metadata.items() if key != "_native_completed_reads"}
+            if accepted:
+                retained["_native_completed_reads"] = {"version": 1, "invocation_id": invocation.invocation_id,
+                    "parent_tool": invocation.tool_name, "tool_names": sorted(set(accepted)),
+                    **({"read_only": True} if proposed.get("read_only") is True
+                        and len(accepted) == len(proposed.get("tool_names", ())) else {})}
+            result.response_requirements = retained or None
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
         if "required_embedded_media_extensions" in context:
             from nullion.response_fulfillment_contract import (
@@ -4455,6 +4639,7 @@ class ToolRegistry:
                     "_native_artifact_media": {"version": 1, "extension": extension,
                                                "required": extension in required},
                 }
+        after_tool(spec, invocation, result)
         return result
 
     def register_cleanup_hook(self, hook: ToolCleanupHook) -> None:
@@ -5117,6 +5302,9 @@ def _write_archive_entry_manifests(
         writer.writeheader()
         writer.writerows(rows)
     extension_counts = _archive_extension_counts(str(entry["name"]) for entry in entries)
+    real_entries = [entry for entry in entries if not _archive_entry_is_metadata(str(entry["name"]))]
+    real_rows = [row for row in rows if not _archive_entry_is_metadata(str(row["Name"]))]
+    real_extension_counts = _archive_extension_counts(str(entry["name"]) for entry in real_entries)
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -5124,6 +5312,9 @@ def _write_archive_entry_manifests(
                 "rows": rows,
                 "entry_count": len(rows),
                 "extension_counts": extension_counts,
+                "real_rows": real_rows,
+                "real_record_count": len(real_rows),
+                "real_extension_counts": real_extension_counts,
             },
             handle,
             ensure_ascii=False,
@@ -5140,7 +5331,9 @@ def _write_archive_entry_manifests(
         "extension_counts": extension_counts,
         "source_inventory": {"path": str(json_path), "format": "json", "rows_key": "rows",
             "columns_key": "columns", "extracted_root": str(output_dir), "record_count": len(rows),
-            "role": "source", "extension_counts": extension_counts},
+            "role": "source", "extension_counts": extension_counts,
+            "real_rows_key": "real_rows", "real_record_count": len(real_rows),
+            "real_extension_counts": real_extension_counts, "metadata_record_count": len(rows)-len(real_rows)},
     }
     try:
         from openpyxl import Workbook
@@ -5595,6 +5788,13 @@ def _build_archive_create_handler(
                 error="archive_create output_path must use a supported archive/compression extension.",
                 reason="invalid_output_extension",
             )
+        if (include_principal_workspace and _file_write_artifact_path_should_use_workspace_artifacts(
+                output_path, principal_id=invocation.principal_id, effective_roots=effective_roots)):
+            # Match text and document producers: new deliverables belong in
+            # the principal's artifact root, while existing files and scratch
+            # outputs retain their exact authorized location.
+            output_path = _workspace_generated_artifact_path(invocation,
+                raw_path=str(output_path), suffix=output_path.suffix, stem="archive")
         if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
             output_path, invocation.trusted_filesystem_selectors
         ):
@@ -6777,6 +6977,8 @@ _FILE_WALK_PRUNED_DIR_NAMES = frozenset(
         ".git",
         ".hg",
         ".mypy_cache",
+        ".nullion-artifact-media",
+        ".nullion-optimized-media",
         ".pytest_cache",
         ".ruff_cache",
         ".svn",
@@ -7227,6 +7429,8 @@ def _build_file_write_handler(
         # enforcement remains at the execution boundary for generated code.
         placeholder_errors = (_text_artifact_placeholder_url_errors(raw_content)
                               if path.suffix.lower() in {".html", ".htm", ".md", ".txt", ".csv", ".tsv", ".svg"} else [])
+        observed_urls = (invocation.flow_context or {}).get('_native_observed_reference_urls', ())
+        placeholder_errors = [url for url in placeholder_errors if url not in observed_urls]
         if placeholder_errors:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -7475,9 +7679,62 @@ def _build_file_write_handler(
 _TEXT_ARTIFACT_URL_RE = re.compile(r"https?://[^\s\"'<>),;]+", flags=re.IGNORECASE)
 
 
+def with_observed_artifact_reference_urls(invocation, prior_results, *, registry):
+    """Accept exact references in completed native reads, without trusting a guessed URL."""
+    context = dict(invocation.flow_context or {})
+    context.pop('_native_observed_reference_urls', None)
+    if invocation.tool_name != 'file_write':
+        return replace(invocation, flow_context=context or None)
+    candidates = set(_text_artifact_placeholder_url_errors(str(invocation.arguments.get('content') or '')))
+    if not candidates:
+        return replace(invocation, flow_context=context or None)
+    def reference_key(url):
+        # An empty origin path and '/' identify the same HTTP resource. Keep
+        # every other path, query and fragment exact; this is comparison only.
+        try:
+            parsed = urlparse(url)
+            return parsed._replace(path=parsed.path or '/').geturl()
+        except ValueError:
+            return url
+    candidate_keys = {}
+    for url in candidates:
+        candidate_keys.setdefault(reference_key(url), set()).add(url)
+    observed = set()
+    for row in prior_results:
+        if normalize_tool_status(row.status) != 'completed':
+            continue
+        try:
+            spec = registry.get_spec(row.tool_name)
+        except (AttributeError, KeyError):
+            continue
+        if spec.side_effect_class not in {ToolSideEffectClass.READ, ToolSideEffectClass.DANGEROUS_EXEC}:
+            continue
+        output = row.output if isinstance(row.output, dict) else {}
+        # Paths and authoring arguments cannot attest observed source content.
+        values = [output.get(key) for key in ('content', 'text', 'stdout', 'record', 'results', 'sources')]
+        if spec.side_effect_class is ToolSideEffectClass.READ:
+            from nullion.turn_context_policy import tool_uses_external_observation
+            if tool_uses_external_observation(spec):
+                # Native adapters expose the containing page separately from
+                # its rendered text. It is source evidence, not an authored URL.
+                values.extend(output.get(key) for key in ('page_url', 'source_url', 'url'))
+        pending = list(values)
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                pending.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                pending.extend(value)
+            elif isinstance(value, str):
+                observed.update(candidate for url in _TEXT_ARTIFACT_URL_RE.findall(unescape(value))
+                    if (key := reference_key(url.rstrip('.,)'))) in candidate_keys for candidate in candidate_keys[key])
+    context['_native_observed_reference_urls'] = sorted(observed)
+    return replace(invocation, flow_context=context)
+
+
 def _text_artifact_placeholder_url_errors(content: str) -> list[str]:
     errors: list[str] = []
-    for raw_url in _TEXT_ARTIFACT_URL_RE.findall(content or ""):
+    for raw_url in _TEXT_ARTIFACT_URL_RE.findall(unescape(content or "")):
         url = raw_url.rstrip(".,)")
         try:
             parsed = urlparse(url)
@@ -8874,6 +9131,24 @@ def _spreadsheet_row_has_media_contract(
     return any(is_media_key(key) for key in row)
 
 
+def _artifact_media_cache_dir(source_path: Path, kind: str) -> Path:
+    """Keep generated derivatives outside user/source trees, per workspace."""
+    from nullion.artifacts import nullion_data_home
+    from nullion.workspace_storage import workspace_storage_base
+    base = workspace_storage_base()
+    try:
+        relative = source_path.resolve().relative_to(base)
+    except ValueError:
+        root = nullion_data_home() / ".cache" / ".nullion-artifact-media"
+    else:
+        if len(relative.parts) < 2:
+            raise ValueError("Image source must belong to a workspace")
+        root = base / relative.parts[0] / "scratch" / ".nullion-artifact-media"
+    directory = root / kind
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def _render_svg_raster(svg_path: Path) -> Path | None:
     """Render the actual self-contained SVG; never fabricate a preview tile."""
     temporary_raster = None
@@ -8898,7 +9173,7 @@ def _render_svg_raster(svg_path: Path) -> Path | None:
         if not self_contained_svg_fragment(content):
             return None
         digest = hashlib.sha256(b"svg-chromium-v1:" + content).hexdigest()[:20]
-        raster_path = svg_path.with_name(f".{svg_path.stem}.rendered-{digest}.png")
+        raster_path = _artifact_media_cache_dir(svg_path, "svg") / f"{svg_path.stem}-{digest}.png"
         if raster_path.is_symlink():
             return None
         if raster_path.is_file():
@@ -9163,8 +9438,7 @@ def optimized_embedded_image_path(
                     "utf-8"
                 )
             ).hexdigest()[:16]
-            cache_dir = source_path.parent / ".nullion-optimized-media"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir = _artifact_media_cache_dir(source_path, "embedded")
             output_suffix = ".png" if has_alpha else ".jpg"
             output_path = cache_dir / f"{source_path.stem}-{digest}-embed{output_suffix}"
             if output_path.is_file():
@@ -11225,6 +11499,21 @@ def _pdf_html_fragment(raw_html: str) -> tuple[str, list[str]]:
     return fragment.strip() or "<p></p>", styles
 
 
+def _render_designed_pdf_previews(path: Path) -> dict:
+    from nullion.pdf_preview import render_pdf_previews
+    return render_pdf_previews(path)
+
+
+def _pdf_card_argument_failure(invocation: ToolInvocation, error: str) -> ToolResult:
+    from nullion.pdf_design import card_pages_schema
+    return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+        "reason": "invalid_tool_arguments", "executed": False, "failure_scope": "invocation",
+        "recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
+            "approval_bypass": False, "argument_constraints": {
+                "required": ["card_pages"], "properties": {"card_pages": card_pages_schema()},
+                "omit_arguments": ["html_pages", "text_pages"]}}}, error)
+
+
 def _save_html_pdf_with_chromium(
     path: Path,
     *,
@@ -11322,6 +11611,9 @@ def _save_html_pdf_with_chromium(
         ".designed-page-inner>:first-child:not(.primary-media){box-sizing:border-box!important;width:100%!important;max-width:100%!important;"
         "height:auto!important;min-height:auto!important;overflow:visible!important;}"
         ".designed-page-inner img,.designed-page-inner svg,.designed-page-inner canvas{max-width:100%!important;}"
+        # Cover is safe only when the author explicitly marks decorative art.
+        # Logos, maps, charts and photographs otherwise retain their full frame.
+        ".designed-page-inner img:not([data-nullion-crop='true']){object-fit:contain!important;}"
         "body.nullion-print-flow-safe .designed-page{height:auto!important;min-height:auto!important;overflow:visible!important;}"
         "body.nullion-print-flow-safe .designed-page [data-nullion-flow-safe='1']{position:static!important;inset:auto!important;"
         "top:auto!important;right:auto!important;bottom:auto!important;left:auto!important;transform:none!important;width:auto!important;"
@@ -11531,6 +11823,14 @@ def _build_pdf_create_handler(
         html_pages, html_error = _coerce_string_list(invocation.arguments.get("html_pages"), field="html_pages")
         if html_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, html_error)
+        if invocation.arguments.get("card_pages") is not None:
+            if html_pages or text_pages:
+                return _pdf_card_argument_failure(invocation, "Use card_pages, html_pages or text_pages separately.")
+            from nullion.pdf_design import render_card_pages
+            try:
+                html_pages = render_card_pages(invocation.arguments["card_pages"], image_paths=image_paths)
+            except ValueError as exc:
+                return _pdf_card_argument_failure(invocation, str(exc))
         if not image_paths and not screenshot_paths and not text_pages and not html_pages:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -11544,12 +11844,12 @@ def _build_pdf_create_handler(
                         "argument_constraints": {
                             "anyOf": [
                                 {"required": [field], "properties": {field: {"type": "array", "minItems": 1}}}
-                                for field in ("image_paths", "screenshot_paths", "text_pages", "html_pages")
+                                for field in ("image_paths", "screenshot_paths", "text_pages", "html_pages", "card_pages")
                             ],
                         },
                     },
                 },
-                error="pdf_create requires at least one image_paths, screenshot_paths, text_pages, or html_pages entry",
+                error="pdf_create requires at least one image_paths, screenshot_paths, text_pages, html_pages, or card_pages entry",
             )
 
         title = str(invocation.arguments.get("title") or "Nullion PDF").strip()
@@ -11714,6 +12014,7 @@ def _build_pdf_create_handler(
                             "text_layer": True,
                             "quality_profile": "designed_pdf_v1",
                             "layout_features": layout_features,
+                            **_render_designed_pdf_previews(output_path),
                         },
                         error=None,
                     )
@@ -12452,6 +12753,34 @@ def _build_terminal_exec_handler(
                 artifact_root.mkdir(parents=True, exist_ok=True)
                 command_cwd = artifact_root
 
+        declared_paths = []
+        def invalid_output_paths(message):
+            scratch=command_cwd if command_cwd is not None and any(command_cwd.is_relative_to(root) for root in resolved_allowed_roots) else next(iter(resolved_allowed_roots),None)
+            constraints={"field":"output_paths","maxItems":_MAX_TERMINAL_DISCOVERED_ARTIFACTS,
+                "allowed_roots":[str(root) for root in resolved_allowed_roots],
+                "supported_extensions":sorted(_TERMINAL_DELIVERABLE_ARTIFACT_EXTENSIONS),
+                "suggested_scratch_root":str(scratch) if scratch is not None else None}
+            return ToolResult(invocation.invocation_id,invocation.tool_name,"failed",
+                {"reason":"invalid_output_paths","executed":False,"command_executed":False,
+                    "recovery":{"kind":"correct_arguments","retry_tool_name":invocation.tool_name,
+                        "approval_bypass":False,"argument_constraints":constraints,
+                        "instruction":"The command did not execute. Correct all script and output paths to a permitted workspace root, then retry the corrected command. Normal approvals and policy still apply."}},message)
+        raw_outputs = invocation.arguments.get("output_paths", [])
+        if not isinstance(raw_outputs, list) or len(raw_outputs) > _MAX_TERMINAL_DISCOVERED_ARTIFACTS:
+            return invalid_output_paths("Declare at most 25 generated file paths.")
+        for raw_path in raw_outputs:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                return invalid_output_paths("Output paths must be nonempty file paths.")
+            path = Path(raw_path).expanduser()
+            path = (path if path.is_absolute() else (command_cwd or Path.cwd()) / path).resolve()
+            if (not any(path.is_relative_to(root) for root in resolved_allowed_roots)
+                    or path.suffix.lower() not in _TERMINAL_DELIVERABLE_ARTIFACT_EXTENSIONS):
+                return invalid_output_paths("Generated outputs must use supported file formats within permitted roots.")
+            if path not in declared_paths:
+                declared_paths.append(path)
+        if declared_paths and not requested_extensions:
+            requested_extensions = tuple(dict.fromkeys(path.suffix.lower() for path in declared_paths))
+
         filesystem_denial = _terminal_filesystem_safety_denial(
             raw_command,
             allowed_roots=resolved_allowed_roots,
@@ -12595,13 +12924,23 @@ def _build_terminal_exec_handler(
                 _runtime_artifact_root(), *resolved_allowed_roots,
             ) if root is not None))
         recent_signatures = {}
-        if requested_extensions:
+        if requested_extensions and not declared_paths:
             for value in _terminal_deliverable_artifact_paths_since(artifact_scan_roots, since_timestamp=started_at):
                 try:
                     stat = Path(value).stat()
                     recent_signatures[value] = (stat.st_mtime_ns, stat.st_size)
                 except OSError:
                     continue
+        # Snapshot exact declared outputs independently of bounded directory
+        # discovery. A broad allowed home can contain millions of files, and an
+        # old file must never become an attachment merely by being declared.
+        declared_signatures = {}
+        for path in declared_paths:
+            try:
+                stat = path.stat()
+                declared_signatures[str(path)] = (stat.st_mtime_ns, stat.st_size)
+            except FileNotFoundError:
+                declared_signatures[str(path)] = None
         try:
             try:
                 completed = backend.run(
@@ -12620,17 +12959,26 @@ def _build_terminal_exec_handler(
                     timeout=timeout_seconds,
                     policy=policy,
                 )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # communicate() can retain useful bytes even with text=True. Keep
+            # the native failure and its incomplete coverage visible together.
+            def captured_text(value):
+                return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
             output = {"egress_attempts": egress_attempts} if has_network_egress else {}
+            output.update({"stdout": captured_text(exc.stdout), "stderr": captured_text(exc.stderr),
+                           "output_complete": False, "command_executed": True, "shell": shell,
+                           "execution_outcome": "timeout"})
             if network_mode is not None:
                 output["network_mode"] = network_mode
             output["timeout_seconds"] = timeout_seconds
+            from nullion.tool_partial_capture import partial_capture_requirements
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
                 output=output,
                 error=f"Command timed out after {timeout_seconds}s",
+                response_requirements=partial_capture_requirements(invocation.invocation_id, output),
             )
 
         output = {
@@ -12645,18 +12993,28 @@ def _build_terminal_exec_handler(
         if has_network_egress:
             output["egress_attempts"] = egress_attempts
         if completed.exit_code == 0:
-            artifact_paths = _terminal_deliverable_artifact_paths_since(
-                artifact_scan_roots, since_timestamp=started_at)
+            artifact_paths = ([str(path) for path in declared_paths] if declared_paths else
+                _terminal_deliverable_artifact_paths_since(artifact_scan_roots, since_timestamp=started_at))
+            recent_signatures.update(declared_signatures)
             if requested_extensions:
                 staged_paths = []
                 staged_sources = {}
+                generated_outputs = []
                 principal_root = _workspace_artifact_root_for_principal(invocation.principal_id)
                 for value in artifact_paths:
                     path = Path(value)
                     try:
                         stat = path.stat()
-                        if (path.suffix.lower() not in requested_extensions
+                        if (not path.is_file() or stat.st_size <= 0 or stat.st_mtime < started_at - 1
+                                or not any(path.resolve().is_relative_to(root) for root in resolved_allowed_roots)
                                 or recent_signatures.get(value) == (stat.st_mtime_ns, stat.st_size)):
+                            continue
+                        if path.suffix.lower() not in requested_extensions:
+                            # Explicit supporting outputs can feed a later producer
+                            # without becoming final attachments themselves.
+                            if path in declared_paths:
+                                generated_outputs.append(artifact_output_descriptor(
+                                    path, role=ARTIFACT_ROLE_INTERMEDIATE, kind="terminal_generated_artifact"))
                             continue
                         if principal_root is not None and not path.is_relative_to(principal_root):
                             # Copy only current-invocation output receipts from
@@ -12671,6 +13029,8 @@ def _build_terminal_exec_handler(
                     except OSError:
                         logger.warning("Could not stage terminal artifact for invocation %s", invocation.invocation_id)
                 artifact_paths = staged_paths
+                if generated_outputs:
+                    output["generated_outputs"] = generated_outputs
             if artifact_paths:
                 output["artifact_paths"] = artifact_paths
                 if requested_extensions:
@@ -12680,6 +13040,10 @@ def _build_terminal_exec_handler(
                     for descriptor in output["artifact_descriptors"]:
                         if descriptor["path"] in staged_sources:
                             descriptor["source_path"] = staged_sources[descriptor["path"]]
+            if declared_paths and not artifact_paths and not output.get("generated_outputs"):
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                    {**output, "reason": "declared_outputs_not_created"},
+                    "The command exited successfully but none of its declared deliverables were created or changed. No file was attached.")
         terminal_output_path = _materialize_terminal_output_attachment(
             output,
             invocation=invocation,
@@ -12711,7 +13075,28 @@ def _build_terminal_exec_handler(
             )
             output["artifact_descriptors"] = descriptors
         error = None
+        response_requirements = None
+        if completed.exit_code == 0 and output.get("artifact_paths"):
+            from nullion.artifact_validation import validate_generated_document_paths
+            validation = validate_generated_document_paths(output["artifact_paths"])
+            if not validation.ok:
+                issues = [{"path": issue.path, "code": issue.code, "message": issue.message}
+                          for issue in validation.issues]
+                output["artifact_validation"] = {
+                    "ok": False, "issues": issues,
+                    "recovery": "The command completed, but these generated files are invalid and cannot be delivered. "
+                                "Repair the documents with a native format producer or a document library, then recreate any affected archive.",
+                }
+                response_requirements = {"_native_artifact_validation": {
+                    "version": 1, "invocation_id": invocation.invocation_id,
+                    "invalid_paths": [issue.path for issue in validation.issues],
+                }}
         if completed.exit_code != 0:
+            output["output_complete"] = False
+            output["execution_outcome"] = "nonzero_exit"
+            output["command_executed"] = True
+            from nullion.tool_partial_capture import partial_capture_requirements
+            response_requirements = partial_capture_requirements(invocation.invocation_id, output)
             if completed.exit_code == 127 and completed.stderr.startswith(
                 ("Shell startup failed:", "Terminal launcher startup failed:")
             ):
@@ -12724,6 +13109,7 @@ def _build_terminal_exec_handler(
             status="completed" if completed.exit_code == 0 else "failed",
             output=output,
             error=error,
+            response_requirements=response_requirements,
         )
 
     return handler
@@ -13356,6 +13742,8 @@ def register_browser_image_collect_tool(registry: ToolRegistry) -> ToolRegistry:
             timeout_seconds=30,
             capability_tags=("public_web", "browser", "media", "image", "artifact"),
             continuation_tools=("document_create", "spreadsheet_create", "presentation_create", "pdf_create"),
+            source_artifact_only=True,
+            source_artifact_extensions=(".png", ".jpg", ".jpeg", ".webp", ".gif"),
         ),
         _build_browser_image_collect_handler(),
     )
@@ -13382,6 +13770,7 @@ def register_web_fetch_tool(
             side_effect_class=ToolSideEffectClass.READ,
             requires_approval=False,
             timeout_seconds=20,
+            same_request_read_cache=True,
         ),
         _build_web_fetch_handler(web_fetcher or _default_web_fetcher),
     )
@@ -13950,10 +14339,14 @@ def _resolve_nominatim_weather_location(
         return None
     label = str(first.get("display_name") or location_text).strip() or location_text
     address = first.get("address")
+    locality = next((str(address[key]).strip() for key in ("city", "town", "village", "municipality")
+        if isinstance(address, dict) and address.get(key)), "")
+    region = str(address.get("state") or "").strip() if isinstance(address, dict) else ""
+    display = ", ".join(dict.fromkeys(part for part in (locality, region) if part))
     return {
         "latitude": latitude,
         "longitude": longitude,
-        "name": label,
+        "name": display or label,
         "country": address.get("country") if isinstance(address, dict) else None,
         **({"postal_code": address["postcode"]} if isinstance(address, dict) and address.get("postcode") else {}),
         "timezone": None,
@@ -14268,7 +14661,7 @@ def _build_kernel_tool_registry(
             ToolSpec(
                 name="file_write",
                 produced_artifact_extensions=('.csv', '.htm', '.html', '.json', '.md', '.svg', '.tsv', '.txt', '.yaml', '.yml'),
-                description="Write a local file inside the workspace.",
+                description="Write workspace text files. HTML embeds local raster images from img src paths by default; use those paths instead of base64 blobs in programs. Set inline_local_html_images=false for linked HTML.",
                 risk_level=ToolRiskLevel.MEDIUM,
                 side_effect_class=ToolSideEffectClass.WRITE,
                 requires_approval=False,
@@ -14301,7 +14694,9 @@ def _build_kernel_tool_registry(
             ToolSpec(
                 name="archive_extract",
                 description=(
-                    "Extract supported archive/compression files (.zip, .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, "
+                    "Extract archives. Use the returned download path. Optional manifest_output_path must end in .xlsx; "
+                    "the receipt includes the complete source_inventory and ready workbook. "
+                    "Supported formats: .zip, .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, "
                     ".tar.xz/.txz, .gz, .bz2, .xz) into a workspace directory. Skips macOS metadata sidecar "
                     "entries unless include_metadata is true. Also writes full CSV, JSON, and XLSX entry "
                     "manifests so downstream spreadsheet/report tasks can use the complete inventory even when "
@@ -14411,13 +14806,21 @@ def _build_kernel_tool_registry(
                 allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
             ),
         )
+        from nullion.image_render import build_handler as build_image_render_handler
+        registry.register(ToolSpec(
+            name="image_render", produced_artifact_extensions=(".png",),
+            description="Create a sharp infographic PNG locally from card_pages. Prefer this for designed text-and-data images: safe contrast, readable type and 2x resolution. No image-generation API or browser source capture is required.",
+            risk_level=ToolRiskLevel.MEDIUM, side_effect_class=ToolSideEffectClass.WRITE,
+            requires_approval=False, timeout_seconds=30, capability_tags=("local_files",), code_mode_allowed=True),
+            build_image_render_handler(workspace_root, allowed_roots=allowed_roots))
         registry.register(
             ToolSpec(
                 name="pdf_create",
                 produced_artifact_extensions=('.pdf',),
                 description=(
-                    "Create a real PDF artifact locally from existing image files and/or report text pages. "
-                    "Use text_pages for readable report content; image-only PDFs are only appropriate when the requested deliverable is image pages. "
+                    "Create a local PDF. Prefer card_pages for designed infographic, itinerary and card reports: supply content, not CSS. "
+                    "Use text_pages for plain reports or html_pages for custom layout. "
+                    "Image-only PDFs are only appropriate when the requested deliverable is image pages. "
                     "Try this before terminal_exec; local shell remains the last-resort fallback when this cannot complete."
                 ),
                 risk_level=ToolRiskLevel.MEDIUM,
@@ -14461,7 +14864,12 @@ def _build_kernel_tool_registry(
                     "Execute a local shell command with approval. Use this for local system inspection, installed software "
                     "or package-manager changes, service/process control, environment/path checks, and other computer-level "
                     "work when no safer dedicated structured tool can satisfy the task. Use dedicated structured tools and "
-                    "reusable Python-backed local tools first when they can satisfy the task."
+                    "reusable Python-backed local tools first when they can satisfy the task. "
+                    "For inspection, prefer indexed metadata and narrowly scoped, bounded reads; avoid whole-tree scans "
+                    "and temporary files requiring cleanup. Start with the default short timeout. Reuse captured output "
+                    "after a failure or timeout, state incomplete coverage, and narrow any necessary follow-up instead "
+                    "of repeating a broader scan. A nonzero pipeline exit does not invalidate every captured row or "
+                    "prove complete coverage; avoid truncation pipelines that cause upstream SIGPIPE."
                 ),
                 risk_level=ToolRiskLevel.HIGH,
                 side_effect_class=ToolSideEffectClass.DANGEROUS_EXEC,
@@ -16470,6 +16878,7 @@ def _build_connector_calendar_list_handler() -> ToolHandler:
                     **({"query": query} if query else {}),
                     "result_count": len(results),
                     "results": results,
+                    "source_record_collections": _calendar_record_collections(),
                     'has_more': bool(next_token), 'next_page_token': next_token,
                     'next_page_request': ({'provider_id': provider_id, 'start': raw_start.strip(),
                         'end': raw_end.strip(), 'max': limit, **({'query': query} if query else {}),
@@ -16946,6 +17355,9 @@ def _build_web_search_handler(
     web_searcher: Callable[[str, int], list[dict[str, object]]],
 ) -> ToolHandler:
     def handler(invocation: ToolInvocation) -> ToolResult:
+        if "queries" in invocation.arguments:
+            from nullion.public_search_batch import search_batch
+            return search_batch(invocation, handler)
         raw_query = invocation.arguments.get("query")
         raw_limit = invocation.arguments.get("limit", 5)
         if not isinstance(raw_query, str) or not raw_query:
@@ -17022,6 +17434,9 @@ def _build_web_search_handler(
                 error="web_search returned result rows without usable source evidence",
             )
 
+        from nullion.request_progress import publish_source_progress
+        publish_source_progress(invocation, unit='searches', completed=1,
+            failed=0, total=1, records=len(usable_results))
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -17279,6 +17694,7 @@ def _build_file_search_handler(
             status="completed",
             output={
                 "matches": matches,
+                "pattern": raw_pattern,
                 "match_details": match_details,
                 "searched_roots": [str(root) for root in search_roots],
                 "searched_file_count": scanned_files,
@@ -17315,6 +17731,8 @@ def register_search_plugin(
                     name="web_search",
                     description=(
                         "Search the web and return ranked source links with evidence snippets. "
+                        "Use queries with independent_queries=true for multiple independent searches in one call; "
+                        "at most two run together. Dependent searches must wait for their prerequisite results. "
                         "Use this to locate subjects, corroborating sources, or accessible alternatives, including when "
                         "a supplied URL is only the starting source or is blocked. Cite the returned source URLs "
                         "beside the material findings they support so the user can inspect the original sources. If the result has "
@@ -17326,6 +17744,9 @@ def register_search_plugin(
                     requires_approval=False,
                     timeout_seconds=20,
                     capability_tags=("public_source_discovery",),
+                    same_request_read_cache=True,
+                    input_schema=_default_input_schema_for_tool("web_search"),
+                    independent_batch=("queries", "independent_queries"),
                     continuation_tools=(
                         "web_fetch",
                         "browser_navigate",
@@ -17636,6 +18057,7 @@ def _build_calendar_list_handler(
                 **({"query": query} if query else {}),
                 "result_count": len(results),
                 "results": results,
+                "source_record_collections": _calendar_record_collections(),
                 **_calendar_selected_results_payload(results, query=query),
             },
             error=None,
@@ -17755,7 +18177,12 @@ def _image_generation_http_failure(error: BaseException) -> dict[str, object]:
         if isinstance(current, HTTPError):
             status = current.code
             if isinstance(status, int):
-                return {"http_status_code": status, "retryable": status in {408, 429} or status >= 500}
+                facts = {"http_status_code": status, "retryable": status in {408, 429} or status >= 500}
+                if status in {401, 402}:
+                    # Authentication/payment refusals describe provider
+                    # availability, rather than a prompt that can be repaired.
+                    facts.update(failure_scope="tool", terminal_user_action_required=True)
+                return facts
             return {}
         current = current.__cause__
     return {}
@@ -18161,10 +18588,11 @@ def _build_set_reminder_handler(runtime, *, default_chat_id: str | None) -> Tool
                 text=text.strip(),
                 due_at=due_at,
             )
-            try:
-                runtime.checkpoint(force=True)
-            except TypeError:
-                runtime.checkpoint()
+            if not callable(getattr(runtime, "commit_reminder_change", None)):
+                try:
+                    runtime.checkpoint(force=True)
+                except TypeError:
+                    runtime.checkpoint()
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
@@ -18220,6 +18648,9 @@ def _build_list_reminders_handler(runtime) -> ToolHandler:
             denial = _cron_workspace_access_denial(invocation, workspace)
             if denial is not None:
                 return denial
+            refresh = getattr(runtime, "refresh_reminders", None)
+            if callable(refresh):
+                refresh()
             all_reminders = runtime.store.list_reminders()
             pending = [
                 {
@@ -18276,6 +18707,9 @@ def _build_delete_reminder_handler(runtime) -> ToolHandler:
                 required_source_tool="list_reminders",
             )
         try:
+            refresh = getattr(runtime, "refresh_reminders", None)
+            if callable(refresh):
+                refresh()
             reminder = runtime.store.get_reminder(normalized_task_id)
             if reminder is None:
                 return ToolResult(
@@ -18288,12 +18722,17 @@ def _build_delete_reminder_handler(runtime) -> ToolHandler:
             denial = _cron_workspace_access_denial(invocation, _reminder_owner_workspace_id(reminder.chat_id))
             if denial is not None:
                 return denial
-            removed = runtime.store.remove_reminder(normalized_task_id)
-            runtime.store.scheduled_tasks.pop(normalized_task_id, None)
-            try:
-                runtime.checkpoint(force=True)
-            except TypeError:
-                runtime.checkpoint()
+            commit = getattr(runtime, "commit_reminder_change", None)
+            if callable(commit):
+                commit(normalized_task_id, task=None, reminder=None, previous_reminder=reminder)
+                removed = True
+            else:
+                removed = runtime.store.remove_reminder(normalized_task_id)
+                runtime.store.scheduled_tasks.pop(normalized_task_id, None)
+                try:
+                    runtime.checkpoint(force=True)
+                except TypeError:
+                    runtime.checkpoint()
             if not removed:
                 return ToolResult(
                     invocation_id=invocation.invocation_id,
@@ -18367,6 +18806,9 @@ def _build_update_reminder_handler(runtime) -> ToolHandler:
                 reason="invalid_reminder_task_id",
                 required_source_tool="list_reminders",
             )
+        refresh = getattr(runtime, "refresh_reminders", None)
+        if callable(refresh):
+            refresh()
         reminder = runtime.store.get_reminder(normalized_task_id)
         if reminder is None:
             return ToolResult(
@@ -18432,14 +18874,19 @@ def _build_update_reminder_handler(runtime) -> ToolHandler:
             )
 
         updated = replace(reminder, text=new_text, due_at=new_due_at, delivered_at=None)
-        runtime.store.add_reminder(updated)
         task = runtime.store.get_scheduled_task(normalized_task_id)
-        if task is not None:
-            runtime.store.add_scheduled_task(replace(task, enabled=True))
-        try:
-            runtime.checkpoint(force=True)
-        except TypeError:
-            runtime.checkpoint()
+        commit = getattr(runtime, "commit_reminder_change", None)
+        if callable(commit):
+            commit(normalized_task_id, task=replace(task, enabled=True) if task else None,
+                reminder=updated, previous_reminder=reminder)
+        else:
+            runtime.store.add_reminder(updated)
+            if task is not None:
+                runtime.store.add_scheduled_task(replace(task, enabled=True))
+            try:
+                runtime.checkpoint(force=True)
+            except TypeError:
+                runtime.checkpoint()
         due_at_details = reminder_due_at_output(new_due_at)
         due_at_display = due_at_details.get("due_at_display") or due_at_details.get("due_at") or new_due_at.isoformat()
         return ToolResult(

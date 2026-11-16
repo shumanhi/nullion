@@ -60,13 +60,21 @@ def invalid_candidate_identities(results):
     for r in results or ():
         output = _output(r)
         status = r.get("status") if isinstance(r, Mapping) else getattr(r, "status", None)
+        # Later writes retire an earlier invalid version, including multi-file
+        # terminal receipts. Reads do not create producer versions.
+        if status == "completed":
+            invalid.difference_update(artifact_candidate_versions([r]))
+        metadata = r.get("response_requirements") if isinstance(r, Mapping) else getattr(r, "response_requirements", None)
+        validation = metadata.get("_native_artifact_validation") if isinstance(metadata, Mapping) else None
+        invocation_id = r.get("invocation_id") if isinstance(r, Mapping) else getattr(r, "invocation_id", None)
+        if (isinstance(validation, Mapping) and validation.get("version") == 1
+                and validation.get("invocation_id") == invocation_id):
+            invalid.update(identity(path) for path in validation.get("invalid_paths", ()) if isinstance(path, str))
         path = output.get("path") or output.get("artifact_path")
         if not isinstance(path, str):
             continue
         if status == "failed" and output.get("reason") in {"artifact_page_count_mismatch", "artifact_validation_failed"}:
             invalid.add(identity(path))
-        elif status == "completed" and (output.get("artifact_path") or output.get("artifact_paths")):
-            invalid.discard(identity(path))
     return invalid
 
 

@@ -99,6 +99,45 @@ def test_terminal_read_cannot_promote_recent_unchanged_files(tmp_path,monkeypatc
     assert unrelated.read_text()=='private,value\nkeep,12\n'
 
 
+@pytest.mark.parametrize('extension', ['.png', '.pdf', '.csv', '.xlsx', '.docx'])
+def test_declared_terminal_output_is_staged_even_when_broad_scan_is_exhausted(tmp_path, monkeypatch, extension):
+    import shlex
+    import nullion.tools as tools
+    monkeypatch.setenv('NULLION_HOME', str(tmp_path/'home'))
+    # A home-wide scan can exhaust its bound before reaching this directory.
+    monkeypatch.setattr(tools, '_MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES', 1)
+    output = tmp_path/'nested'/('rendered'+extension)
+    output.parent.mkdir()
+    script = f'from pathlib import Path; Path({str(output)!r}).write_bytes(b"generated result")'
+    result = _build_terminal_exec_handler(tmp_path, allowed_roots=[tmp_path])(
+        ToolInvocation('generated-'+extension, 'terminal_exec', 'web:declared',
+            {'command': 'python -c '+shlex.quote(script), 'output_paths': [str(output)]},
+            flow_context={'requested_artifact_extensions': [extension]}))
+    assert result.status == 'completed', result.error
+    descriptor, = result.output['artifact_descriptors']
+    assert descriptor['source_path'] == str(output)
+    assert Path(descriptor['path']).read_bytes() == b'generated result'
+    assert descriptor['role'] == 'deliverable'
+
+
+@pytest.mark.parametrize('state', ['unchanged', 'missing', 'outside', 'symlink'])
+def test_declaring_an_output_does_not_promote_an_old_or_unowned_file(tmp_path, monkeypatch, state):
+    monkeypatch.setenv('NULLION_HOME', str(tmp_path/'home'))
+    allowed = tmp_path/'allowed'; allowed.mkdir()
+    output = allowed/'file.csv'
+    if state == 'unchanged': output.write_text('private data')
+    if state in {'outside', 'symlink'}:
+        outside = tmp_path/'private.csv'; outside.write_text('private data')
+        if state == 'outside': output = outside
+        else: output.symlink_to(outside)
+    result = _build_terminal_exec_handler(allowed, allowed_roots=[allowed])(
+        ToolInvocation('not-created', 'terminal_exec', 'web:declared',
+            {'command':'pwd', 'output_paths':[str(output)]},
+            flow_context={'requested_artifact_extensions':['.csv']}))
+    assert result.status == 'failed'
+    assert not result.output.get('artifact_paths')
+
+
 def test_source_image_replacement_needs_a_successful_source_receipt_and_adds_no_plain_download_obligation(tmp_path):
     from nullion.response_fulfillment_contract import _collected_browser_image_path_identities,artifact_media_required_extensions
     from nullion.tools import ToolResult

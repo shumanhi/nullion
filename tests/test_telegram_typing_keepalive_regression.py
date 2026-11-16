@@ -7,6 +7,35 @@ import pytest
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('pooled', [False, True])
+async def test_cancellation_at_indicator_completion_never_restarts_keepalive(monkeypatch, pooled):
+    from nullion import telegram_app
+    target=None
+    calls=[]
+    async def completed_send(*args, **kwargs):
+        calls.append(1)
+        # Complete the send at the same boundary as its owner's cancellation.
+        # wait_for can consume that cancellation when its child is already done.
+        asyncio.get_running_loop().call_soon(target.cancel)
+    class BotContext:
+        async def __aenter__(self):return SimpleNamespace()
+        async def __aexit__(self,*args):pass
+    monkeypatch.setattr(telegram_app,'build_telegram_bot',lambda *a,**kw:BotContext())
+    monkeypatch.setattr(telegram_app,'_send_typing_indicator',completed_send)
+    monkeypatch.setattr(telegram_app,'_send_telegram_chat_typing_indicator',completed_send)
+    coroutine=(telegram_app._run_telegram_chat_typing_keepalive('synthetic',chat_id='77',runtime=SimpleNamespace(),text='1')
+               if pooled else telegram_app._run_typing_keepalive(SimpleNamespace(),runtime=SimpleNamespace(),text='1'))
+    target=asyncio.create_task(coroutine)
+    try:
+        done,_=await asyncio.wait({target},timeout=.2)
+        assert done and target.done(), 'Completion swallowed cancellation and kept typing alive'
+        assert calls==[1]
+    finally:
+        if not target.done():target.cancel()
+        await asyncio.gather(target,return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_cancel_status_typing_keepalive_from_group_cancels_task() -> None:
     from nullion import telegram_app
 

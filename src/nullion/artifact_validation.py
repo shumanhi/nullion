@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 import gzip
+import io
 from html.parser import HTMLParser
 import json
 from pathlib import Path
@@ -79,6 +80,53 @@ class ArtifactValidationResult:
     @property
     def ok(self) -> bool:
         return not self.issues
+
+
+def validate_generated_document_paths(paths) -> ArtifactValidationResult:
+    """Inspect newly written PDF containers, including PDF members of ZIPs.
+
+    This is a producer check, not a restriction on reading existing sources.
+    A successful shell exit is an execution receipt, not document validity.
+    """
+    issues = []
+    for value in paths:
+        path = Path(value)
+        try:
+            if path.suffix.lower() == ".pdf":
+                with path.open("rb") as source:
+                    _check_pdf_page_contents(source)
+            elif path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as archive:
+                    members = [row for row in archive.infolist() if row.filename.lower().endswith(".pdf")]
+                    if sum(row.file_size for row in members) > 64 * 1024 * 1024:
+                        raise ValueError("PDF members exceed the bounded document validation budget")
+                    for member in members:
+                        try:
+                            _check_pdf_page_contents(io.BytesIO(archive.read(member)))
+                        except Exception as exc:
+                            raise ValueError(f"Invalid PDF member {member.filename}: {exc}") from exc
+        except Exception as exc:
+            issues.append(_issue(str(path), "generated_document_invalid", str(exc)[:600]))
+    return ArtifactValidationResult(tuple(issues))
+
+
+def _check_pdf_page_contents(source) -> None:
+    from pypdf import PdfReader
+    from pypdf.generic import ArrayObject, NullObject, StreamObject
+
+    reader = PdfReader(source)
+    if not reader.pages:
+        raise ValueError("PDF has no pages")
+    for index, page in enumerate(reader.pages):
+        contents = page.get("/Contents")
+        if contents is None:
+            continue  # Empty pages are valid; this check does not judge design.
+        contents = contents.get_object()
+        if isinstance(contents, NullObject):
+            continue
+        streams = contents if isinstance(contents, ArrayObject) else [contents]
+        if any(not isinstance(item.get_object(), StreamObject) for item in streams):
+            raise ValueError(f"PDF page {index + 1} Contents must reference a stream or array of streams")
 
 
 class _HtmlShapeParser(HTMLParser):

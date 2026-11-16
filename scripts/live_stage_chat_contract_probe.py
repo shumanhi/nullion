@@ -80,6 +80,7 @@ class Scenario:
     max_artifact_count: int = 0
     require_no_artifacts: bool = False
     min_xlsx_rows: int = 0
+    min_html_step_groups: int = 0
     require_no_tools: bool = False
     allow_approval_required: bool = False
     auto_approve: bool = False
@@ -87,6 +88,7 @@ class Scenario:
     runner: str = "http"
     max_numbered_blocks_per_response: int | None = None
     forbidden_after_artifact_tool_any: tuple[str, ...] = ()
+    require_fulfilled: bool = False
 
 
 _LOCAL_SYSTEM_FORBIDDEN_TOOL_OUTPUT = (
@@ -541,7 +543,7 @@ SCENARIOS: dict[str, Scenario] = {
         max_single_ms=60000,
         required_text_any=("shumanhi/nullion", "pull request", "pulls", "open"),
         forbidden_text=("send one of these", "repository url", "github account connection", "need the repository"),
-        required_tool_any=("browser_navigate", "browser_extract_text", "web_fetch", "terminal_exec", "connector_request"),
+        required_tool_any=("browser_read_pages", "browser_navigate", "browser_extract_text", "web_fetch", "terminal_exec", "connector_request"),
     ),
     "browser_not_found_catalog_guard": Scenario(
         name="browser_not_found_catalog_guard",
@@ -559,7 +561,7 @@ SCENARIOS: dict[str, Scenario] = {
             "privacy policy",
             "website terms",
         ),
-        required_tool_any=("browser_navigate", "browser_extract_text", "web_fetch"),
+        required_tool_any=("browser_read_pages", "browser_navigate", "browser_extract_text", "web_fetch"),
         require_no_artifacts=True,
     ),
     "browser_filter_followup": Scenario(
@@ -568,28 +570,30 @@ SCENARIOS: dict[str, Scenario] = {
         followups=("Compare a second nearby pickup location too.",),
         max_average_ms=90000, max_single_ms=120000,
         forbidden_text=("task is still open", "enough verified evidence", "couldn't complete the requested operation"),
-        required_tool_any=("browser_navigate", "browser_extract_text", "browser_extract_items", "web_search"),
+        required_tool_any=("browser_read_pages", "browser_navigate", "browser_extract_text", "browser_extract_items", "web_search"),
         require_no_artifacts=True,
     ),
     "browser_rental_live_records": Scenario(
         name="browser_rental_live_records",
         prompt=(
-            "Can you find a rental car on Enterprise from downtown Providence, RI from Jun 29 pickup "
-            "after 12pm and return on Jul 5? Give actual available options with prices, or name the "
+            "Find a rental car on Enterprise at any downtown Providence, RI location for a driver age 39. "
+            "Pickup {rental_start} at 12:30 PM and return {rental_end} at 12:30 PM, local time. "
+            "This is a read-only quote; do not book. Give actual available options with prices, or name the "
             "specific live-search blocker if no verified result records can be produced."
         ),
         max_average_ms=240000,
         max_single_ms=240000,
         required_text_any=("$", "price", "total", "blocker", "unable to complete"),
         forbidden_text=_BROWSER_VERIFIED_RESULT_FORBIDDEN,
-        required_tool_any=("browser_run_task", "browser_navigate", "browser_extract_text", "browser_extract_items", "browser_run_js", "web_fetch"),
+        required_tool_any=("browser_read_pages", "browser_run_task", "browser_navigate", "browser_extract_text", "browser_extract_items", "browser_run_js", "web_fetch"),
         require_no_artifacts=True,
         auto_approve=True,
     ),
     "browser_flight_live_records": Scenario(
         name="browser_flight_live_records",
         prompt=(
-            "Can you find a flight from JFK to Chicago for this weekend? Give actual flight options "
+            "Find a one-way flight from JFK to any Chicago airport on {flight_date}, any departure time, "
+            "for 1 adult in economy. No checked bag is needed for this comparison. Do not book. Give actual flight options "
             "with prices and carriers, or name the specific live-search blocker if no verified result "
             "records can be produced."
         ),
@@ -597,7 +601,7 @@ SCENARIOS: dict[str, Scenario] = {
         max_single_ms=240000,
         required_text_any=("$", "price", "airline", "flight", "blocker", "unable to complete"),
         forbidden_text=_BROWSER_VERIFIED_RESULT_FORBIDDEN,
-        required_tool_any=("browser_run_task", "browser_navigate", "browser_extract_text", "browser_extract_items", "browser_run_js", "web_fetch"),
+        required_tool_any=("browser_read_pages", "browser_run_task", "browser_navigate", "browser_extract_text", "browser_extract_items", "browser_run_js", "web_fetch"),
         require_no_artifacts=True,
         auto_approve=True,
     ),
@@ -638,7 +642,7 @@ SCENARIOS: dict[str, Scenario] = {
             "resend the task",
             "enable/request the browser tool scope",
         ),
-        required_tool_any=("browser_extract_text", "browser_extract_items", "web_fetch"),
+        required_tool_any=("browser_read_pages", "browser_extract_text", "browser_extract_items", "web_fetch"),
         forbidden_tool_output_text=("unknown tool: browser_snapshot", "unavailable/unknown tool"),
         require_no_artifacts=True,
     ),
@@ -653,7 +657,7 @@ SCENARIOS: dict[str, Scenario] = {
         max_single_ms=240000,
         required_text_any=("lamp", "source", "http"),
         forbidden_text=("Source-backed points", "checked your email", "matching messages", "email thread"),
-        required_tool_any=("browser_navigate", "browser_extract_text", "browser_extract_items", "web_search"),
+        required_tool_any=("browser_read_pages", "browser_navigate", "browser_extract_text", "browser_extract_items", "web_search"),
         forbidden_tool_any=("email_search", "email_read", "calendar_list"),
         require_no_artifacts=True,
     ),
@@ -855,7 +859,7 @@ SCENARIOS: dict[str, Scenario] = {
         max_single_ms=300000,
         required_text_any=(),
         forbidden_text=("placeholder.txt", "couldn't attach", "task is still open"),
-        required_tool_any=(
+        required_tool_any=("browser_read_pages",
             "browser_navigate",
             "browser_extract_text",
             "browser_extract_items",
@@ -897,6 +901,7 @@ SCENARIOS: dict[str, Scenario] = {
             "Use public travel and parks sources to research three train-accessible outdoor day trips. "
             "Create one self-contained HTML report with local/source raster images embedded in the HTML, "
             "source URLs, and a short practical itinerary. Do not use SVG placeholders."
+            " Present each trip's steps as an ordered list or time/action rows."
         ),
         max_average_ms=180000,
         max_single_ms=240000,
@@ -904,7 +909,7 @@ SCENARIOS: dict[str, Scenario] = {
         forbidden_text=("placeholder", "couldn't attach", "task is still open"),
         required_tool_any=("browser_image_collect",),
         required_artifact_extensions=(".html",),
-        required_artifact_text_all=("source", "itinerary"),
+        min_html_step_groups=3,
         require_visual_assets=True,
         require_raster_html_images=True,
         forbidden_artifact_extensions=(".txt", ".json", ".svg"),
@@ -1032,17 +1037,20 @@ SCENARIOS: dict[str, Scenario] = {
     ),
     "random_website_artifact_bundle": Scenario(
         name="random_website_artifact_bundle",
+        require_fulfilled=True,
         prompt=(
             "Create a random website artifact package for live stage QA about a fictional media archive. "
             "Deliver exactly these final artifacts: a CSV dataset, a linked HTML report, a self-contained "
-            "HTML report with embedded image assets, and a PDF media report. Include the phrase "
-            "STAGE RANDOM WEBSITE QA in every deliverable. Do not attach JSON sidecars, screenshots, "
+            "HTML report with embedded image assets, and a PDF media report. "
+            "Use finished original illustrations or verified source images, without temporary placeholder visuals. "
+            "Include the phrase STAGE RANDOM WEBSITE QA in every deliverable. Do not attach JSON sidecars, screenshots, "
             "raw source files, or only a PDF."
         ),
         max_average_ms=240000,
         max_single_ms=300000,
         required_text_any=(),
-        forbidden_text=("couldn't attach", "task is still open", "only generated", "only attached"),
+        forbidden_text=("couldn't attach", "task is still open", "only generated", "only attached",
+                        "No usable result", "couldn’t finish this request", "couldn't finish this request"),
         required_tool_all=("file_write", "pdf_create"),
         required_artifact_extensions=(".csv", ".html", ".pdf"),
         required_artifact_text_all=("STAGE RANDOM WEBSITE QA",),
@@ -1370,7 +1378,7 @@ SCENARIOS: dict[str, Scenario] = {
             "send me your calendar",
             "paste your calendar",
         ),
-        required_tool_any=("browser_navigate", "web_fetch"),
+        required_tool_any=("browser_read_pages", "browser_navigate", "web_fetch"),
         required_tool_all=(
             "weather_forecast",
             "market_quote",
@@ -1419,7 +1427,7 @@ SCENARIOS: dict[str, Scenario] = {
         max_single_ms=480000,
         required_text_any=("shumanhi@gmail.com", "email", "sent"),
         forbidden_text=("which artifacts", "couldn't attach", "placeholder.txt", "task is still open"),
-        required_tool_any=("image_generate", "browser_image_collect", "browser_navigate", "web_fetch"),
+        required_tool_any=("browser_read_pages", "image_generate", "browser_image_collect", "browser_navigate", "web_fetch"),
         required_tool_all=("spreadsheet_create", "pdf_create", "email_send"),
         required_artifact_extensions=(".xlsx", ".pdf"),
         required_embedded_media_extensions=(".xlsx",),
@@ -1432,6 +1440,14 @@ SCENARIOS: dict[str, Scenario] = {
         requires_email_send_flag=True,
     ),
 }
+
+
+# Native batches perform the same page reads as the individual extractors.
+# Screenshot-only and account/tool-specific contracts keep their exact tools.
+SCENARIOS = {name: replace(scenario, required_tool_any=tuple(dict.fromkeys([
+    *scenario.required_tool_any, 'browser_read_pages'])))
+    if set(scenario.required_tool_any).intersection({'browser_extract_text','browser_extract_items','browser_extract_detail'})
+    else scenario for name,scenario in SCENARIOS.items()}
 
 
 DEFAULT_LIVE_STAGE_SCENARIOS: tuple[str, ...] = (
@@ -1716,16 +1732,16 @@ def _event_tool_output_texts_with_poll(
         texts = _event_tool_output_texts(runtime_db, conversation_id)
         if not required:
             return texts
-        completed = set()
+        receipts = set()
         for raw in texts:
             try:
                 payload = json.loads(raw)
             except (TypeError, ValueError):
                 continue
             for record in _walk_json_mappings(payload):
-                if record.get("status") == "completed" and isinstance(record.get("output"), dict):
-                    completed.add(record.get("tool_name"))
-        if required.issubset(completed) or time.perf_counter() >= deadline:
+                if record.get("status") in {"completed", "failed", "denied", "approval_required"} and isinstance(record.get("output"), dict):
+                    receipts.add(record.get("tool_name"))
+        if required.issubset(receipts) or time.perf_counter() >= deadline:
             return texts
         time.sleep(min(0.1, max(0.0, deadline - time.perf_counter())))
 
@@ -1912,6 +1928,12 @@ def _latest_status_latency_mark_ms(
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _native_receipt_wait_seconds(terminal):
+    # Artifact bytes may arrive before a bounded, queued audit checkpoint can
+    # acquire SQLite's writer. This wait is separate from visible latency.
+    return 45 if isinstance(terminal, dict) and terminal.get('artifacts') else 15
 
 
 def _select_new_chat_turn(rows, prompt, *, turn_id=None, prior_turn_ids=()):
@@ -2152,6 +2174,13 @@ def _tool_names_for_user_message_with_poll(
     while True:
         chat_turn = _chat_turn_for_user_message(runtime_db, conversation_id, user_message)
         last_seen = _tool_names_from_chat_turn(chat_turn)
+        if (isinstance(chat_turn, dict) and chat_turn.get('turn_id')
+                and isinstance(chat_turn.get('tool_results'), list)
+                and chat_turn.get('evidence_kind') != 'deferred_runtime_checkpoint'):
+            # A durable full turn is terminal evidence, including a missing
+            # expected tool. Return it for contract failure; waiting cannot
+            # add calls to an already completed user request.
+            return last_seen
         received = _message_received_for_user_message(runtime_db, conversation_id, user_message)
         received_at = str((received or {}).get("created_at") or "").strip()
         if received_at:
@@ -2682,9 +2711,9 @@ async def _run_active_followup_context_guard_async(
         "an hour-by-hour breakdown."
     )
     followup_prompt = "Sure"
-    weather_turn_id = "turn-live-weather"
-    artifact_turn_id = "turn-live-artifact"
-    followup_turn_id = "turn-live-sure"
+    weather_turn_id = "turn-live-weather-"+uuid4().hex
+    artifact_turn_id = "turn-live-artifact-"+uuid4().hex
+    followup_turn_id = "turn-live-sure-"+uuid4().hex
     started = time.perf_counter()
     artifacts: list[Any] = []
     request_started = {weather_turn_id: started}
@@ -2800,8 +2829,8 @@ async def _run_active_related_followup_context_guard_async(
     assert scenario.followups, f"{scenario.name}: scenario must define the related follow-up prompt"
     followup_prompt = scenario.followups[0]
     conversation_id = f"web:live-stage-contract:{scenario.name}:{uuid4().hex[:10]}:{index}"
-    artifact_turn_id = "turn-live-related-artifact"
-    followup_turn_id = "turn-live-related-followup"
+    artifact_turn_id = "turn-live-related-artifact-"+uuid4().hex
+    followup_turn_id = "turn-live-related-followup-"+uuid4().hex
     started = time.perf_counter()
     artifacts: list[Any] = []
     done_text_by_turn: dict[str, str] = {}
@@ -3526,6 +3555,18 @@ def _tool_names_from_chat_turn(chat_turn: dict[str, Any] | None) -> set[str]:
     return names
 
 
+def _assert_fresh_scheduler_identity(turn, *, cron_id, cron_name, visible_text):
+    assert cron_id in visible_text or cron_name in visible_text, 'Fresh reply does not identify the selected task'
+    results=turn.get('tool_results',[])
+    assert not any(r.get('tool_name') in {'run_cron','toggle_cron','update_cron','delete_cron','create_cron'}
+        for r in results), 'A status follow-up attempted a scheduler effect'
+    rows=[item for result in results if result.get('tool_name')=='list_crons' and result.get('status')=='completed'
+        for item in (result.get('output') or {}).get('crons',[]) if isinstance(item,dict) and item.get('id')==cron_id]
+    assert rows and all(r.get('name')==cron_name and r.get('enabled') is True
+        and r.get('has_last_result') is False for r in rows), 'Missing fresh native identity/configuration proof'
+    return {'id':cron_id,'name':cron_name,'enabled':True,'has_last_result':False}
+
+
 def _run_scheduler_fresh_followup_after_bulk_enable(
     *,
     base_url: str,
@@ -3544,7 +3585,9 @@ def _run_scheduler_fresh_followup_after_bulk_enable(
         for row in initial_rows
         if isinstance(row, dict) and str(row.get("id") or "").strip()
     }
-    followup_prompt = "Do a fresh check"
+    followup_prompt = scenario.followups[0] if scenario.followups else (
+        "Check whether that exact scheduled task is enabled using its current configuration. "
+        "Inspect only; do not run, rerun, or change any scheduled task.")
     try:
         created, _elapsed = _post_json(
             f"{base_url}/api/crons",
@@ -3607,7 +3650,11 @@ def _run_scheduler_fresh_followup_after_bulk_enable(
             required_tool_any=("list_crons",),
             timeout_seconds=180.0,
         )
+        # The follow-up can be in another language. Bind its visible result to
+        # the selected task, then verify the fresh native read below; English
+        # status words are not evidence of a scheduler check.
         followup_contract = replace(scenario, required_tool_any=("list_crons",), required_tool_all=(),
+            required_text_any=(created_cron_id,fixture_name),
             forbidden_tool_any=(*scenario.forbidden_tool_any, "toggle_cron", "update_cron"))
         _assert_contract(followup_contract, response=followup_response, elapsed_ms=followup_elapsed_ms,
             tool_names=followup_tool_names, runtime_db_available=runtime_db_available)
@@ -3627,6 +3674,8 @@ def _run_scheduler_fresh_followup_after_bulk_enable(
                 f"{scenario.name}: follow-up started a manual cron run instead of checking inventory: "
                 f"{sorted(followup_tool_names)!r}"
             )
+            _assert_fresh_scheduler_identity(followup_turn,cron_id=created_cron_id,
+                cron_name=fixture_name,visible_text=followup_text)
         return {
             "scenario": scenario.name,
             "conversation_id": conversation_id,
@@ -5131,6 +5180,36 @@ def _html_raster_data_image_count(data: bytes) -> int:
     )
 
 
+def _html_step_groups_and_source_links(data: bytes) -> tuple[int,int]:
+    """Validate visible sequence structure without language-specific headings."""
+    class Structure(HTMLParser):
+        def __init__(self):
+            super().__init__();self.root={'tag':'root','text':[],'children':[]};self.stack=[self.root];self.links=set()
+        def handle_starttag(self,tag,attrs):
+            node={'tag':tag,'text':[],'children':[]};self.stack[-1]['children'].append(node)
+            href=dict(attrs).get('href')
+            if tag=='a' and isinstance(href,str) and urllib.parse.urlsplit(href).scheme in {'http','https'}:self.links.add(href)
+            if tag not in {'area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'}:self.stack.append(node)
+        def handle_endtag(self,tag):
+            for index in range(len(self.stack)-1,0,-1):
+                if self.stack[index]['tag']==tag:
+                    del self.stack[index:];break
+        def handle_data(self,value):self.stack[-1]['text'].append(value)
+    parser=Structure();parser.feed(data.decode('utf-8',errors='replace'))
+    def text(node):
+        if node['tag'] in {'script','style'}:return ''
+        return ''.join([*node['text'],*(text(c) for c in node['children'])]).strip()
+    def count(node):
+        rows=node['children']
+        ordered=node['tag']=='ol' and sum(c['tag']=='li' and bool(text(c)) for c in rows)>=3
+        paired=(node['tag'] not in {'ul','ol'} and len(rows)>=3 and len({r['tag'] for r in rows})==1
+            and sum(len([c for c in r['children'] if text(c)])+bool(''.join(r['text']).strip())==2 for r in rows)>=3)
+        flat_cells=(node['tag'] not in {'ul','ol'} and len(rows)>=6 and len(rows)%2==0
+            and len({r['tag'] for r in rows})==1 and all(not r['children'] and text(r) for r in rows))
+        return int(ordered or paired or flat_cells)+sum(count(c) for c in rows)
+    return count(parser.root),len(parser.links)
+
+
 def _office_media_count(data: bytes) -> int:
     with zipfile.ZipFile(io.BytesIO(data)) as package:
         return len(
@@ -5328,6 +5407,10 @@ def _download_and_check_artifacts(
                     )
         if suffix in {".html", ".htm"}:
             visible_text, artifact_visual_asset_count = _validate_html_visual_content(name, data)
+            if scenario.min_html_step_groups:
+                groups,links=_html_step_groups_and_source_links(data)
+                assert groups>=scenario.min_html_step_groups and links>=scenario.min_html_step_groups, (
+                    f'artifact {name!r} needs {scenario.min_html_step_groups} structured step groups and source links; got {groups} and {links}')
             if scenario.require_raster_html_images:
                 raster_count = _html_raster_data_image_count(data)
                 assert raster_count > 0, (
@@ -5609,7 +5692,19 @@ def _assert_contract(
             label=scenario.name + ': single request', advisories=latency_advisories)
 
 
-def _scenario_for_config(scenario: Scenario, config: dict[str, Any]) -> Scenario:
+def _live_source_dates(today=None):
+    from datetime import datetime,date,timedelta
+    from zoneinfo import ZoneInfo
+    today=today or datetime.now(ZoneInfo('America/New_York')).date()
+    rental_year=today.year+(today>=date(today.year,6,29))
+    return {'rental_start':date(rental_year,6,29).isoformat(),
+        'rental_end':date(rental_year,7,5).isoformat(),
+        'flight_date':(today+timedelta(days=(5-today.weekday())%7 or 7)).isoformat()}
+
+
+def _scenario_for_config(scenario: Scenario, config: dict[str, Any], *, today=None) -> Scenario:
+    if scenario.name in {'browser_rental_live_records','browser_flight_live_records'}:
+        return replace(scenario,prompt=scenario.prompt.format(**_live_source_dates(today)))
     if scenario.name != "image":
         return scenario
     if config.get("image_generate_available") or config.get("image_generate_enabled"):
@@ -5704,6 +5799,9 @@ def main(argv: list[str] | None = None) -> int:
         if scenario.requires_email_send_flag and not args.allow_email_send:
             failures.append(f"{scenario.name}: requires --allow-email-send")
             continue
+        # The observation deadline must cover this scenario's existing latency
+        # contract; short HTTP defaults must not abandon a still-valid run.
+        scenario_timeout = max(args.timeout, ((scenario.max_single_ms or 0) + 999) // 1000 + 30)
         samples: list[float] = []
         for index in range(args.repeat):
             blocked = provider_guard.check()
@@ -5722,7 +5820,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5734,7 +5832,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5745,7 +5843,7 @@ def main(argv: list[str] | None = None) -> int:
                 if scenario.runner == "structured_tool_id_boundary_guards":
                     result = _run_structured_tool_id_boundary_guards(
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                     )
                     samples.append(float(result["elapsed_ms"]))
@@ -5754,7 +5852,7 @@ def main(argv: list[str] | None = None) -> int:
                 if scenario.runner == "stage_runtime_patch_regressions":
                     result = _run_stage_runtime_patch_regressions(
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                     )
                     samples.append(float(result["elapsed_ms"]))
@@ -5765,7 +5863,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5777,7 +5875,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5790,7 +5888,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5802,7 +5900,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5814,7 +5912,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5826,7 +5924,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5838,7 +5936,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5850,7 +5948,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5863,7 +5961,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5876,7 +5974,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5889,7 +5987,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5902,7 +6000,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5915,7 +6013,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                         download_dir=args.download_dir,
@@ -5928,7 +6026,7 @@ def main(argv: list[str] | None = None) -> int:
                         base_url=base_url,
                         runtime_db=args.runtime_db,
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                         runtime_db_available=runtime_db_available,
                     )
@@ -5938,7 +6036,7 @@ def main(argv: list[str] | None = None) -> int:
                 if scenario.runner == "platform_code_fence_formatting":
                     result = _run_platform_code_fence_formatting(
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                     )
                     samples.append(float(result["elapsed_ms"]))
@@ -5947,7 +6045,7 @@ def main(argv: list[str] | None = None) -> int:
                 if scenario.runner == "agent_turn_limit_doctor_card":
                     result = _run_agent_turn_limit_doctor_card(
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                     )
                     samples.append(float(result["elapsed_ms"]))
@@ -5956,7 +6054,7 @@ def main(argv: list[str] | None = None) -> int:
                 if scenario.runner == "account_answer_fulfillment":
                     result = _run_account_answer_fulfillment(
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                     )
                     samples.append(float(result["elapsed_ms"]))
@@ -5965,7 +6063,7 @@ def main(argv: list[str] | None = None) -> int:
                 if scenario.runner == "reply_anchor_context_guard":
                     result = _run_reply_anchor_context_guard(
                         scenario=scenario,
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                         index=index,
                     )
                     samples.append(float(result["elapsed_ms"]))
@@ -5982,7 +6080,7 @@ def main(argv: list[str] | None = None) -> int:
                     response, elapsed_ms = _post_json(
                         f"{base_url}/api/chat",
                         {"text": turn_prompt, "conversation_id": conversation_id},
-                        timeout=args.timeout,
+                        timeout=scenario_timeout,
                     )
                     elapsed_total_ms += elapsed_ms
                     if response.get("type") == "approval_required" and scenario.auto_approve:
@@ -6046,6 +6144,9 @@ def main(argv: list[str] | None = None) -> int:
                     runtime_db_available=runtime_db_available,
                     tool_output_texts=tool_output_texts,
                 )
+                if scenario.require_fulfilled:
+                    turn = _chat_turn_for_user_message_with_poll(args.runtime_db, conversation_id, scenario.prompt)
+                    _assert_fulfilled_artifact_turn(scenario, turn)
                 model_start_ms = _latest_latency_mark_ms_with_poll(args.runtime_db, conversation_id, "model_start")
                 if model_start_ms is None and runtime_db_available:
                     model_start_ms = _latest_status_latency_mark_ms(
@@ -6069,7 +6170,7 @@ def main(argv: list[str] | None = None) -> int:
                     base_url,
                     all_artifacts,
                     scenario=scenario,
-                    timeout=args.timeout,
+                    timeout=scenario_timeout,
                     download_dir=scenario_download_dir,
                     structured_unavailable_tools=structured_unavailable_tools,
                 )

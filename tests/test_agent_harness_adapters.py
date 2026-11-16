@@ -139,6 +139,10 @@ async def test_langchain_tool_adapter_retries_transient_registry_failures(monkey
                 }
             ]
 
+        def get_spec(self, name):
+            from nullion.tools import ToolSideEffectClass
+            return SimpleNamespace(side_effect_class=ToolSideEffectClass.READ)
+
         def invoke(self, invocation):
             self.calls += 1
             if self.calls == 1:

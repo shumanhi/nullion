@@ -1,4 +1,5 @@
 """Real SDK/Chromium -> native report -> Web API/store for disabled choices."""
+from tests.browser_model_protocol import browser_schema_messages
 import json,os,threading
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 import pytest
@@ -82,7 +83,7 @@ def test_disabled_requested_choice_reaches_web_as_grounded_blocker(tmp_path,monk
                     'unresolved_requirements':[],'retry_tool_names':[],'material_requirements':[
                         {'requirement_id':r['requirement_id'],'satisfied':True,'draft_covered':True,'evidence_invocation_ids':[ident]}
                         for r in packet['material_requirement_contract']]}))
-            schemas=[m['content'] for m in kw['messages'] if isinstance(m.get('content'),str) and m['content'].startswith('Return valid JSON matching this schema: ')]
+            schemas=[m['content'] for m in browser_schema_messages(kw)]
             if schemas:
                 self.browser_calls+=1
                 if self.browser_calls==1:action={'read_page_state':{}}
@@ -110,10 +111,13 @@ def test_disabled_requested_choice_reaches_web_as_grounded_blocker(tmp_path,monk
             if 'select_attachment_format' in names:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'format','name':'select_attachment_format','input':{'extension':None,'confidence':1}}]}
             self.outer_calls+=1
-            if self.outer_calls==1:name,args='request_tool_scope',{'capabilities':['web'],'tool_names':['browser_run_task'],'required_tool_names':['browser_run_task']}
-            elif self.outer_calls==2:name,args='browser_run_task',{'task':'2027-01-04: report the selected choice or the displayed blocker. Do not book.','url':url,'max_steps':3}
+            if self.outer_calls==1:name,args='request_tool_scope',{'capabilities':['web'],'tool_names':['browser_read_pages','browser_run_task'],'required_tool_names':['browser_run_task']}
+            elif self.outer_calls==2:name,args='browser_run_task',{'task':'2027-01-04: report the selected choice or the displayed blocker. Do not book.','url':url,'max_steps':3,'execution_kind':'adaptive_interaction','interaction_reason':'Inspect the requested disabled calendar control state'}
             else:return response(detail+' — '+url)
-            return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(self.outer_calls),'name':name,'input':args}]}
+            return {'stop_reason':'tool_use','content':[
+                *([{'type':'tool_use','id':'native-first','name':'browser_read_pages',
+                    'input':{'pages':[{'url':url,'read_kind':'text'}]}}] if self.outer_calls==2 else []),
+                {'type':'tool_use','id':str(self.outer_calls),'name':name,'input':args}]}
     model=Model();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model
     registry=ToolRegistry();register_browser_tools(registry,policy=BrowserPolicy(),model_client_getter=lambda:model)
     cid='web:disabled-choice'
@@ -123,7 +127,7 @@ def test_disabled_requested_choice_reaches_web_as_grounded_blocker(tmp_path,monk
             assert result.status_code==200 and detail in result.json()['text'],result.json()
             turns=[r for r in runtime.store.list_conversation_events(cid) if r.get('event_type')=='conversation.chat_turn']
             report=next(r['output'] for r in turns[-1]['tool_results'] if r['tool_name']=='browser_run_task')
-            assert report['observations'],json.dumps({'report':report,'browser_calls':model.browser_calls,'turn':turns[-1]},ensure_ascii=False)
+            assert report.get('observations'),json.dumps({'report':report,'browser_calls':model.browser_calls,'turn':turns[-1]},ensure_ascii=False)
             assert report['report_status']=='blocked' and report['observations'][0]['control_state']['disabled'] is True
             assert report['observations'][0]['evidence_kind']=='source_blocker' and not result.json()['artifacts']
             assert turns[-1].get('response_fulfilled') is True,json.dumps({'turn':turns[-1],'events':runtime.store.list_conversation_events(cid)},ensure_ascii=False)
@@ -131,3 +135,11 @@ def test_disabled_requested_choice_reaches_web_as_grounded_blocker(tmp_path,monk
             history=client.get('/api/chat/history/'+cid+'?sync_runtime=1').json()['messages']
             assert any(r['role']=='bot' and detail in r['text'] for r in history)
     finally:server.shutdown();server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def explicit_independent_sdk_fixture(monkeypatch):
+    # These anonymous-provider fixtures exercise the independent SDK mode.
+    # Managed login preservation has its own real shared-CDP/cookie contract.
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND', 'playwright')
+    monkeypatch.delenv('NULLION_BROWSER_CDP_URL', raising=False)

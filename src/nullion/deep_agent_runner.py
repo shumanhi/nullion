@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from nullion.preferences import current_presentation_prompt
+from nullion.research_budget import research_scope
 
 import asyncio
 from collections import deque
@@ -50,7 +51,10 @@ def _task_tool_flow_context(config: Any) -> dict[str, Any]:
     from nullion.response_fulfillment_contract import normalize_artifact_media_required_extensions
     metadata = dict(getattr(config.task, "metadata", {}) or {})
     required = metadata.get("required_embedded_media_extensions", metadata.get("embedded_media_artifact_extensions", ()))
-    return {**metadata, "browser_session_scope": config.task.task_id,
+    request_context = {key:value for key, value in (
+        ("conversation_id",getattr(config.task,"conversation_id",None)),
+        ("original_user_message",getattr(config.task,"description",None))) if isinstance(value,str)}
+    return {**metadata, **request_context, "browser_session_scope": config.task.task_id,
             "required_embedded_media_extensions": normalize_artifact_media_required_extensions(required)}
 
 
@@ -116,6 +120,7 @@ _BROWSER_ITEM_IMAGE_COLLECT_CHUNK_SIZE = 8
 class DeepAgentMiniAgentRunner:
     """Run a Nullion mini-agent task through the optional deepagents harness."""
 
+    @research_scope
     async def run(
         self, config, **kwargs,
     ) -> TaskResult:
@@ -123,6 +128,11 @@ class DeepAgentMiniAgentRunner:
         from nullion.tools import ToolResult
         from nullion.tools import tool_execution_cancellation_scope
         from threading import Event
+        from nullion.research_budget import current_budget, ensure_research_scope
+        budget = current_budget()
+        registry = kwargs['tool_registry'] = ensure_research_scope(kwargs['tool_registry'])
+        budget.configure(registry, getattr(registry, 'turn_tool_scope_decision', None))
+        budget.register_sources(registry)
         evidence = []
         admitted_action_ids = set()
         cancelled = Event()
@@ -136,9 +146,14 @@ class DeepAgentMiniAgentRunner:
 
         try:
             with action_reasoning_scope(owner_guard), tool_execution_cancellation_scope(cancelled.is_set):
-                return await self._run(config, **kwargs, tool_results=evidence,
+                result = await self._run(config, **kwargs, tool_results=evidence,
                     admitted_action_ids=admitted_action_ids,
                     cancelled_event=cancelled)
+                if budget.writer_forced_stop and result.status == 'success':
+                    result = replace(result, status='partial' if result.artifacts else 'failure',
+                        report_presentation={**result.report_presentation, 'fulfillment_satisfied':False,
+                            'research_budget':budget.usage()})
+                return result
         finally:
             cancelled.set()
             await _run_tool_registry_cleanup(kwargs["tool_registry"], scope_id=config.task.task_id)
@@ -354,6 +369,12 @@ class DeepAgentMiniAgentRunner:
 
         def record_tool_result(result: Any) -> None:
             tool_results.append(result)
+            if result.tool_name == 'code_mode' and isinstance(result.output, dict):
+                from nullion.code_mode import TERMINAL_REASONS
+                if result.output.get('reason') == 'code_mode_awaiting_approval':
+                    task.metadata['code_mode_session_id'] = result.output['session_id']
+                elif result.output.get('reason') in TERMINAL_REASONS:
+                    raise DeepAgentStalledLoopError('The execution session cannot continue safely; completed actions were retained.')
             from nullion.tool_repair_contract import resolve_plan_revisions
             resolve_plan_revisions(tool_results, result,
                 preflight_proceeded=result.invocation_id in (admitted_action_ids or ()))
@@ -386,6 +407,10 @@ class DeepAgentMiniAgentRunner:
         if skill_files:
             payload["files"] = skill_files
         try:
+            for tool in tools:
+                resume = getattr(getattr(tool, 'coroutine', None), '_nullion_code_mode_resume', None)
+                if callable(resume):
+                    await resume()
             response = await _invoke_agent_with_heartbeat(
                 agent,
                 payload,
@@ -425,6 +450,11 @@ class DeepAgentMiniAgentRunner:
                 model_client=anthropic_client,
             )
             response = {"content": [{"type": "text", "text": fallback_text}]}
+        finally:
+            for tool in tools:
+                finish = getattr(getattr(tool, 'coroutine', None), '_nullion_code_mode_finish', None)
+                if callable(finish):
+                    finish()
         output_text = _extract_response_text(response)
         if not output_text:
             try:
@@ -2108,6 +2138,7 @@ def _artifact_fallback_file_stem(task: Any) -> str:
 
 
 def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = None) -> str:
+    from nullion.reasoning_guidance import ARTIFACT_PRODUCTION_GUIDANCE, RESEARCH_STOPPING_GUIDANCE
     from nullion.workflow_reasoning import WORKFLOW_REASONING_INSTRUCTION
     from datetime import datetime, timezone
     task = config.task
@@ -2169,6 +2200,8 @@ def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = Non
         f"{tool_inventory}"
         f"{html_artifact_guidance}"
         "File delivery rules:\n"
+        f"{ARTIFACT_PRODUCTION_GUIDANCE}"
+        f"\n{RESEARCH_STOPPING_GUIDANCE}\n"
         f"- Save final user-facing files under the workspace artifact directory: {artifact_root}\n"
         "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
         "- Temporary scratch files must also stay inside the workspace storage area unless a tool explicitly returns "
@@ -3455,7 +3488,8 @@ async def _fallback_answer_from_tool_evidence(
         "Use only the verified tool-result evidence provided by the runtime. "
         "Output only JSON with this schema: "
         '{"status":"success"|"failure","answer":"string"}. '
-        "Set status=failure when the evidence is insufficient. "
+        "Set status=failure when the evidence is insufficient. A sampled result set or omitted field "
+        "does not establish absence or complete coverage. Do not invent facts hidden by compaction. "
         "Do not mention internal graph limits, retries, tools, or recovery mechanics to the user."
     )
     user_payload = {
@@ -3558,23 +3592,28 @@ def _deterministic_scheduled_tool_evidence_answer(config, tool_results: list[Any
 
 
 def _tool_evidence_payload(tool_results: list[Any], *, max_results: int = 12, max_chars: int = 1200) -> list[dict[str, Any]]:
+    from nullion.source_observation_contract import compact_source_observations
+    from nullion.workflow_reasoning import compact_evidence_value
     evidence: list[dict[str, Any]] = []
-    for result in tool_results[-max_results:]:
-        output = getattr(result, "output", None)
-        try:
-            output_text = json.dumps(output, ensure_ascii=False, default=str)
-        except TypeError:
-            output_text = str(output)
-        if len(output_text) > max_chars:
-            output_text = output_text[:max_chars] + "...[truncated]"
-        evidence.append(
-            {
-                "tool_name": str(getattr(result, "tool_name", "") or ""),
-                "status": str(getattr(result, "status", "") or ""),
-                "output": output_text,
-                "error": str(getattr(result, "error", "") or ""),
-            }
-        )
+    selected = tool_results[-max_results:]
+    if len(selected) < len(tool_results):
+        evidence.append({'evidence_selection':{'total_results':len(tool_results),
+            'shown_results':len(selected), 'omitted_results':len(tool_results)-len(selected),
+            'complete':False}})
+    for result in selected:
+        name = str(getattr(result, 'tool_name', '') or '')
+        original = getattr(result, 'output', None)
+        output = compact_source_observations(original, max_chars=max_chars)
+        if output is None:
+            output = original
+        compact, omitted = compact_evidence_value(output, max_chars=max_chars)
+        if output != original:
+            omitted = [[], *omitted]
+        evidence.append({'invocation_id':str(getattr(result, 'invocation_id', '') or ''),
+            'tool_name':name, 'status':str(getattr(result, 'status', '') or ''),
+            'output':compact, 'error':str(getattr(result, 'error', '') or ''),
+            'retained_evidence':{'preview_only':bool(omitted), 'omitted_paths':omitted[:16]}})
+
     return evidence
 
 
@@ -3969,6 +4008,8 @@ def _message_role(message: Any) -> str | None:
 
 def _pending_approval_from_tool_results(tool_results: list[Any]) -> dict[str, str | None] | None:
     for result in tool_results:
+        if getattr(result, "recovered_by", ()):
+            continue
         output = getattr(result, "output", None)
         if not isinstance(output, dict):
             continue

@@ -1,6 +1,7 @@
 """Real-provider Web receipt amendment; only a disposable local form is opened."""
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,10 @@ def test_live_receipt_facts_survive_management_only_amendment(live_web, tmp_path
             'Just notify management. Prepare a draft from that receipt and open the feedback form at '
             + source + '/management/ . Do not submit anything; show the draft for approval first.', timeout=240)
     assert '05B33' in second['text'] and '11' in second['text'], second
-    assert second_turn['parent_turn_id'], second_turn
+    # A model can treat drafting as a new request using this conversation's
+    # receipt. Verify the original facts and untouched form, rather than
+    # requiring one internal branch classification for the same visible work.
+    assert second_turn['conversation_id']==first_turn['conversation_id'],second_turn
     tools = second_turn.get('tool_results', [])
     # Navigation to a verified destination and clicking its observed link
     # are equivalent. Assert the form state, not a particular browser primitive.
@@ -88,7 +92,12 @@ def test_live_receipt_facts_survive_management_only_amendment(live_web, tmp_path
         assert stopped.ok, stopped.text()
         third_turn = next(row for row in _turns(database, conversation)
                           if row['turn_id'] == third_turn['turn_id'])
-    assert third_turn['parent_turn_id'] == second_turn['turn_id'], third_turn
+    # Completed requests can start a fresh runtime branch while retaining the
+    # same conversation history. Continuity is the exact receipt content and
+    # consent boundary, not whether an already-completed frame stays active.
+    assert third_turn['conversation_id'] == second_turn['conversation_id'], third_turn
+    for count, sauce in [(2, 'Honey Mustard'), (5, 'Polynesian'), (4, 'House')]:
+        assert re.search(r'\b'+str(count)+r'\b[^\n]*'+re.escape(sauce), third['text']), third
     assert not any(t['tool_name'] in {'browser_type_id', 'browser_type_field'} and t['status'] == 'completed'
                    for t in third_turn.get('tool_results', [])), third_turn
     assert page.request.get(source + '/management/state').json()['submissions'] == before

@@ -43,6 +43,7 @@ from nullion.platform_activity import (
 )
 from nullion.chat_operator import activity_trace_enabled_for_chat
 from nullion.session_stop import stop_session_async, stop_session_reply
+from nullion.chat_streaming import LatestTextUpdateQueue
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER, TurnPublicationRevoked
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.users import resolve_messaging_user
@@ -249,6 +250,7 @@ class _SlackTextDeltaStreamer:
         self._parts: list[str] = []
         self._last_update_at = 0.0
         self._last_text = ""
+        self._updates = LatestTextUpdateQueue(loop, self._publish_draft)
 
     @property
     def text(self) -> str:
@@ -265,19 +267,22 @@ class _SlackTextDeltaStreamer:
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
             return
         self._last_update_at = now
-        try:
-            delivered = asyncio.run_coroutine_threadsafe(
-                _update_slack_message(self._client, channel=self._channel, ts=self._ts, text=_format_slack_reply(text)),
-                self._loop,
-            ).result(timeout=2)
-            if delivered:
-                self._last_text = text
-        except TurnPublicationRevoked:
+        self._updates.submit(text)
+
+    async def _publish_draft(self, text: str) -> None:
+        if self._publication_gate is not None and not await self._publication_gate.wait():
             return
-        except Exception:
-            logger.debug("Slack text streaming update failed", exc_info=True)
+        delivered = await _update_slack_message(
+            self._client, channel=self._channel, ts=self._ts, text=_format_slack_reply(text),
+        )
+        if delivered:
+            self._last_text = text
 
     async def finish(self, final_text: str | None) -> bool:
+        try:
+            await self._updates.drain()
+        except Exception:
+            logger.warning("Draft update failed before finalization", exc_info=True)
         if self._publication_gate is not None and not await self._publication_gate.wait():
             return False
         text = str(final_text or "")
@@ -586,9 +591,6 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
     working_channel = str(event.get("channel") or "").strip()
     working_ts = None
 
-    def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
-        del event
-
     turn_registration = await GLOBAL_TURN_DISPATCH_TRACKER.register(
         ingress.operator_chat_id,
         ingress.text,
@@ -612,6 +614,19 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         for name in ("chat_postMessage", "chat_update", "files_upload_v2", "files_upload")
     })
     guarded_say = gate.guard(say, withdraw=withdraw_sent)
+    from nullion.request_progress import RequestProgressDelivery
+    async def send_progress(text):
+        return await delivery_client.chat_postMessage(channel=working_channel, text=_format_slack_reply(text))
+    async def edit_progress(sent, text):
+        return await _update_slack_message(delivery_client, channel=working_channel,
+            ts=_slack_response_field(sent, 'ts'), text=_format_slack_reply(text))
+    async def remove_progress(sent):
+        delete = getattr(client, 'chat_delete', None)
+        if callable(delete):
+            await delete(channel=working_channel, ts=_slack_response_field(sent, 'ts'))
+    progress_delivery = RequestProgressDelivery(loop=asyncio.get_running_loop(),
+        send=send_progress, edit=edit_progress, remove=remove_progress, can_publish=gate.can_publish,
+        on_published=lambda fact: _mark_timing('progress_'+fact['operation']+'_'+fact['phase_id']))
     text_streamer = _SlackTextDeltaStreamer(loop=asyncio.get_running_loop(), client=delivery_client,
         channel=working_channel, ts=working_ts, publication_gate=gate)
     _mark_timing("turn_registered")
@@ -625,8 +640,9 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             turn_dispatch_decision=turn_registration.decision,
             cancellation_checker=turn_registration.is_cancelled,
             text_delta_callback=text_streamer.emit,
-            activity_callback=emit_working_ack_for_tool_activity,
+            activity_callback=progress_delivery.emit,
         )
+        await progress_delivery.freeze()
         _mark_timing("handler_completed")
         if await turn_registration.is_superseded():
             if working_ts:
@@ -662,6 +678,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             target_id=working_channel,
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
+            artifact_paths=getattr(turn_result, 'artifact_paths', ()),
             request_id=ingress.request_id,
             message_id=ingress.message_id,
             reply_already_sent=reply_already_sent,
@@ -686,6 +703,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         _mark_timing("delivery_complete")
         _log_turn_timing(turn_outcome)
     finally:
+        await progress_delivery.finish()
         await turn_registration.finish()
 
 
@@ -718,6 +736,11 @@ async def handle_slack_command(service, settings: NullionSettings, *, command: d
         return
     for formatted_chunk, plain_chunk in chunks:
         await _send_slack_callable_with_plain_fallback(respond, formatted_text=formatted_chunk, plain_text=plain_chunk)
+
+
+async def send_slack_update_notice(client, target: str, text: str) -> bool:
+    response = await client.chat_postMessage(channel=target, text=_format_slack_reply(text))
+    return bool(response.get('ok'))
 
 
 async def run_slack_app(
@@ -799,11 +822,24 @@ async def run_slack_app(
     reminder_task = asyncio.create_task(
         run_reminder_delivery_loop(service.runtime, send=_send_slack_reminder, settings=settings)
     )
+    from nullion.update_notifications import run_update_notification_loop
+    from slack_sdk.web.async_client import AsyncWebClient
+    # A connection reset can follow acceptance. The shared claim policy, rather
+    # than the SDK's automatic transport replay, owns retries for this notice.
+    update_client = AsyncWebClient(token=bot_token, retry_handlers=[])
+
+    async def _send_update(target, text):
+        return await send_slack_update_notice(update_client, target, text)
+
+    update_task = asyncio.create_task(run_update_notification_loop(service.runtime,
+        channel='slack', target=lambda: settings.slack.operator_user_id, send=_send_update))
     recovery_task = (asyncio.create_task(service.agent_orchestrator.run_delivery_recovery(service.runtime, surface="slack"))
                      if hasattr(service.agent_orchestrator, "run_delivery_recovery") else None)
     try:
         await AsyncSocketModeHandler(app, app_token).start_async()
     finally:
+        update_task.cancel()
+        await asyncio.gather(update_task, return_exceptions=True)
         reminder_task.cancel()
         if recovery_task is not None:
             recovery_task.cancel()

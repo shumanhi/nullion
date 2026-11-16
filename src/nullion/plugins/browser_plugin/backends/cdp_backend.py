@@ -57,7 +57,8 @@ def _page_url(page: object) -> str:
 
 def normalized_cdp_url(raw_url: str | None = None) -> str:
     """Use IPv4 loopback for local CDP to avoid localhost resolving to ::1."""
-    url = (raw_url or os.environ.get("NULLION_BROWSER_CDP_URL") or DEFAULT_CDP_URL).strip()
+    from nullion.plugins.browser_plugin.browser_config import shared_browser_cdp_url
+    url = (raw_url or shared_browser_cdp_url() or DEFAULT_CDP_URL).strip()
     if not url:
         return DEFAULT_CDP_URL
     parsed = urlparse(url)
@@ -348,7 +349,7 @@ def _base_locator_for_target(page: object, target: dict[str, object]):
     if placeholder and hasattr(page, "get_by_placeholder"):
         return page.get_by_placeholder(placeholder)
     role = str(target.get("role") or "").strip()
-    name = str(target.get("name") or "").strip()
+    name = str(target.get("name") or target.get("text") or "").strip()
     if role and hasattr(page, "get_by_role"):
         kwargs = {"name": name} if name else {}
         return page.get_by_role(role, **kwargs)
@@ -1096,6 +1097,10 @@ class _RawCDPPage:
             self._client._event_backlog.pop(method, None)
         navigation = await self._client.send("Page.navigate", {"url": url}, timeout=10)
         if navigation.get("errorText"):
+            try:
+                await self._client.wait_event("Page.domContentEventFired", timeout=1)
+            except TimeoutError:
+                pass
             raise RuntimeError("Browser navigation failed: " + str(navigation["errorText"]))
         if navigation.get("isDownload"):
             raise RuntimeError("Navigation started a download rather than loading a source document")
@@ -1347,16 +1352,13 @@ class _RawCDPPage:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         try:
             target_closed = False
             if self._close_target_on_close and self._cdp_url and self.target_id:
                 target_closed = await _async_close_cdp_target(self._cdp_url, self.target_id)
             if self._close_target_on_close and not target_closed:
-                try:
-                    await self._client.send("Page.close", timeout=2)
-                except Exception:
-                    pass
+                await self._client.send("Page.close", timeout=2)
+            self._closed = True
         finally:
             await self._client.close()
 
@@ -1418,6 +1420,7 @@ class CDPBackend:
         self._browser: "Browser | _RawCDPBrowser | None" = None
         self._pages: dict[str, "Page | _RawCDPPage"] = {}
         self._owned_page_ids: set[int] = set()
+        self._closing_page_ids: set[int] = set()
         self._lock = asyncio.Lock()
 
     def _owned_pages(self) -> set[int]:
@@ -1426,6 +1429,13 @@ class CDPBackend:
             owned_page_ids = set()
             self._owned_page_ids = owned_page_ids
         return owned_page_ids
+
+    def _closing_pages(self) -> set[int]:
+        pages=getattr(self,'_closing_page_ids',None)
+        if not isinstance(pages,set):
+            pages=set()
+            self._closing_page_ids=pages
+        return pages
 
     def _remember_backend_owned_pages(self, browser: "Browser | _RawCDPBrowser") -> None:
         owned_page_ids = self._owned_pages()
@@ -1467,9 +1477,36 @@ class CDPBackend:
             if self._playwright is playwright:
                 self._playwright = None
 
+    async def reconnect(self, session_id=None):
+        # Detach only the dead transport; never close the borrowed browser.
+        async with self._lock:
+            old_urls = dict(getattr(self, "_reconnect_page_urls", {}))
+            old_urls.update({key: _page_url(page) for key, page in self._pages.items()
+                            if _page_url(page) not in {"", "about:blank"}})
+            self._reconnect_page_urls = old_urls
+            if self._playwright is not None:
+                await self._stop_failed_playwright_connection(self._playwright)
+            self._browser = None
+            self._pages.clear()
+            browser = await self._ensure_browser()
+            for key, old_url in tuple(old_urls.items()):
+                matches = [page for context in browser.contexts for page in context.pages
+                           if _page_url(page) == old_url and not page.is_closed()]
+                if len(matches) == 1:
+                    self._pages[key] = matches[0]
+                    self._reconnect_page_urls.pop(key, None)
+            if session_id in self._reconnect_page_urls:
+                raise ConnectionError("The original browser page could not be identified after reconnecting")
+
     async def _ensure_browser(self) -> "Browser | _RawCDPBrowser":
         if self._browser is None or not self._browser.is_connected():
-            await _async_cdp_targets(self._cdp_url)
+            try:
+                await _async_cdp_targets(self._cdp_url)
+            except OSError:
+                from nullion.plugins.browser_plugin.backends.auto_backend import reopen_configured_desktop_browser
+                if not await asyncio.to_thread(reopen_configured_desktop_browser, self._cdp_url):
+                    raise
+                await _async_cdp_targets(self._cdp_url)
             pw = await async_playwright().__aenter__()
             self._playwright = pw
             try:
@@ -1487,12 +1524,16 @@ class CDPBackend:
 
     async def _get_page(self, session_id: str) -> "Page | _RawCDPPage":
         async with self._lock:
+            if session_id in getattr(self, "_reconnect_page_urls", {}):
+                raise ConnectionError("The original browser page still needs to be reopened")
             owned_page_ids = self._owned_pages()
+            closing_page_ids = self._closing_pages()
             cached = self._pages.get(session_id)
-            if cached is not None and cached.is_closed():
+            if cached is not None and (cached.is_closed() or id(cached) in closing_page_ids):
                 self._pages.pop(session_id, None)
-                owned_page_ids.discard(id(cached))
-                self._forget_raw_context_page(cached)
+                if cached.is_closed():
+                    owned_page_ids.discard(id(cached))
+                    self._forget_raw_context_page(cached)
             if session_id not in self._pages:
                 browser = await self._ensure_browser()
                 # Use the first existing context (the user's real browser session)
@@ -1504,7 +1545,7 @@ class CDPBackend:
                         "Connected to CDP, but no visible browser context was available. "
                         "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
                     )
-                pages = [page for page in ctx.pages if not page.is_closed()]
+                pages = [page for page in ctx.pages if not page.is_closed() and id(page) not in closing_page_ids]
                 assigned_page_ids = {id(page) for page in self._pages.values()}
                 unassigned_owned_pages = [
                     page
@@ -1553,8 +1594,9 @@ class CDPBackend:
         return f"Opened browser session {session_id} — visible in your browser"
 
     async def navigate(self, session_id: str, url: str) -> str:
+        from nullion.plugins.browser_plugin.browser_session import goto_with_settled_failure
         page = await self._get_page(session_id)
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        response = await goto_with_settled_failure(page, url)
         status = response.status if response else 0
         return f"Navigated to {url} (status {status}) — visible in your browser"
 
@@ -1601,6 +1643,14 @@ class CDPBackend:
 
     async def screenshot(self, session_id: str, mode: str = "auto") -> BrowserScreenshotResult:
         page = await self._get_page(session_id)
+        has_document_content=None
+        if _page_url(page)=='about:blank':
+            try:
+                from ..browser_session import DOCUMENT_CONTENT_SCRIPT
+                value=await page.evaluate(DOCUMENT_CONTENT_SCRIPT)
+                has_document_content=value if type(value) is bool else None
+            except Exception:
+                pass
         client = None
         if isinstance(page, _RawCDPPage):
             await page.bring_to_front()
@@ -1673,6 +1723,7 @@ class CDPBackend:
             document_width=document_width,
             document_height=document_height,
             is_clipped=not full_page and exceeds_viewport,
+            has_document_content=has_document_content,
         )
 
     async def scroll(self, session_id: str, direction: str, amount: int) -> None:
@@ -1747,17 +1798,27 @@ class CDPBackend:
         page = await self._get_page(session_id)
         return await page.evaluate(script)
 
-    async def close_session(self, session_id: str) -> None:
+    async def close_session(self, session_id: str) -> bool:
         async with self._lock:
-            page = self._pages.pop(session_id, None)
+            page = self._pages.get(session_id)
+            if page is not None:
+                # Closing a CDP target involves async transport IO. It must
+                # remain unavailable to other sessions until that IO finishes;
+                # otherwise the next parallel read can borrow a closing tab.
+                self._closing_pages().add(id(page))
         if page:
             try:
                 await page.close()
-            except Exception:
-                pass
+                async with self._lock:
+                    if self._pages.get(session_id) is page:
+                        self._pages.pop(session_id, None)
+                    self._owned_pages().discard(id(page))
+                    self._forget_raw_context_page(page)
             finally:
-                self._owned_pages().discard(id(page))
-                self._forget_raw_context_page(page)
+                async with self._lock:
+                    self._closing_pages().discard(id(page))
+            return True
+        return False
 
     async def shutdown(self) -> None:
         owned_page_ids = self._owned_pages()

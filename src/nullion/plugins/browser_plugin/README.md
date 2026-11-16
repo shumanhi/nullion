@@ -6,6 +6,28 @@ configured backend and preserve trusted session identity across related reads.
 Temporary [live trackers](../../../../docs/live-tracking.md) use these narrow
 read tools when suitable; they do not invoke Browser Use on every poll.
 
+## Batched rendered-page reads
+
+Use `browser_read_pages` for known URLs and readable source comparisons. It
+combines navigation, an optional observed readiness condition, and structured
+item/detail or text extraction without an inner model loop. A single read can
+omit its URL to inspect the current task tab. For multiple URLs, the primary
+agent must explicitly declare `independent_pages=true`; up to two read-only tabs
+run concurrently in the configured browser context. Dependent forms, shared
+settings changes and account actions must remain sequential.
+
+The source records retain actual page URLs and coverage. Text reads, including
+ordinary `browser_extract_text`, also retain visible link labels and exact hrefs
+with explicit coverage so the primary can provide actionable links. A loaded shell does
+not prove that filters were applied or no matches exist. Missing regions and
+failed pages remain explicit, while successfully read pages are retained. Batch
+tabs close after reading; the user's tab and browser profile remain intact.
+The batch accepts up to six URLs per invocation and a bounded read window;
+these are resource bounds, not a limit on the user's overall research request.
+The primary can continue remaining work or request adaptive browser interaction
+when the observed page requires it. Live trackers continue using their prepared
+narrow read contracts rather than starting multi-page research on each poll.
+
 ## Optional Browser Use worker
 
 The optional `browser_run_task` tool uses Browser Use 0.13.10 with Nullion's
@@ -16,6 +38,15 @@ worker. Existing low-level readers remain available, and an interactive workflow
 can request the worker when it needs visual navigation. This uses registry
 metadata without adding a classifier call to ordinary chat; idle chat never
 imports Browser Use or starts a browser.
+
+Select the worker in both `tool_names` and `required_tool_names`. Calls default
+to `execution_kind="read"`, which returns lightweight native page evidence and
+reuses a current-request read when available. To delegate an interaction after
+inspecting that evidence, set `execution_kind="adaptive_interaction"` and provide
+an `interaction_reason` grounded in the observed page. Additional research alone
+does not require the nested agent. A typed source-PNG capture request can use the
+visual worker directly. Cached reads are invalidated by native browser operations
+and cleared with request cleanup.
 
 New installations prepare the worker automatically. Existing installations can
 run the plugin setup with their application Python:
@@ -36,23 +67,31 @@ uses its own dependencies first and falls back to app-only packages from the
 parent environment. Model calls use an authenticated ephemeral loopback bridge
 to the parent's configured client. No model credentials are passed to the worker.
 
-Each job launches an isolated Chromium profile. Browsing is visible on desktop
-systems and headless on Linux when no display is available. Install
+In Auto/CDP mode, the worker uses the configured managed browser and its login
+state. To sign in, select **Auto visible browser**, open the agent browser from
+the Web header, and sign in in that window. Explicit Playwright mode uses
+separate workspace-owned SDK storage state. Install
 Chromium with the worker environment's `python -m playwright install chromium`.
 `NULLION_BROWSER_HEADLESS=true` selects headless browsing, which some sites reject.
 `NULLION_BROWSER_USE_EXECUTABLE_PATH` may select a compatible local Chromium
 binary. The sandbox defaults to enabled; containers which require an unsandboxed
 browser must explicitly set `NULLION_BROWSER_USE_SANDBOX=false`.
 
-`NULLION_BROWSER_USE_CDP_URL` can attach to a dedicated browser owned by this
-adapter, including a headed browser inside a container. Do not point it at a
-personal browser: jobs navigate its active tab. The adapter detaches from an
-explicit CDP endpoint and kills only browsers it launched itself. Access to a shared CDP endpoint is serialized between Browser Use jobs across Web and messaging workers. Reserve that endpoint for this adapter; other browser tools should use a separate browser.
+`NULLION_BROWSER_CDP_URL` selects the shared managed endpoint for both ordinary
+browser tools and the SDK controller. The legacy `NULLION_BROWSER_USE_CDP_URL`
+is used only when no managed endpoint is configured. The adapter detaches from
+an explicit CDP endpoint and kills only browsers it launched itself. SDK jobs
+serialize their access to the same endpoint. On SDK attach/capacity failure,
+ordinary controls can continue on that browser without creating a replacement.
+Native controls try a bounded reconnect after connection failure. If recovery
+fails, numbered choices let the user restore the existing browser or select a
+task-local headless session. Public pages often require no login; headless does
+not inherit the visible browser's login or change other tasks' browser settings.
 A concurrent job reports a busy resource instead of mixing its pages with another request. Browser Use jobs are bounded to 600 seconds and
 at most 30 steps; the default is 20 steps.
 
 A task supplies a URL and objective as structured tool arguments. Navigation
-and redirects are limited to that target host. Browser policy is checked before
+and redirects remain subject to the configured browser policy. Policy is checked before
 startup; private IPs and blocked domains remain restricted. File upload, raw
 JavaScript, filesystem, PDF generation and separate extraction-model actions
 are excluded. This tool is for reading/comparing pages, not purchases, sign-in,
@@ -151,5 +190,7 @@ independent page-URL reads usable for source bindings on extracted text. The
 fallback is covered against real Chromium and the shared chat/artifact boundary.
 
 The full visual worker declares `required_scope_only` as well as `explicit_scope_only`. A scope listing it as an optional alternative does not expose it alongside mandatory lightweight readers. When the structured workflow actually delegates to it, select its exact name in both `tool_names` and `required_tool_names`; later exact scoping remains available. This avoids starting a several-minute worker before the ordinary reads selected for the same request.
+
+The registered adaptive tool also enforces a native read before starting its inner agent. On the first call it returns actual page text and exact visible links as tool-step evidence; the primary can answer directly or delegate interaction after inspecting that evidence. This uses the configured browser and login, not a separate HTTP scraper or headless fallback. Observations belong to the current request and objective, expire, and are cleared during scope cleanup. Old history cannot unlock delegation. Explicit typed PNG capture requirements can proceed directly to visual work. Native failures can lead to adaptive recovery after the primary sees them; pending user consent and cancellation never authorize it. The same registered handler applies to every client, with no client-name routing or additional classifier.
 
 Native item collections declare their record path and title/URL identity fields in `source_record_collections`. History compaction can then retain identities across a large collection without treating a clipped JSON preview as complete source evidence. Direct prices and other mutable values still require actual captured records; identity paths alone do not prove them.

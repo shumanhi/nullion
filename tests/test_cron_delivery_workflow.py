@@ -2403,7 +2403,7 @@ def test_cron_delivery_blocks_structured_evidence_fallback() -> None:
     )
 
 
-def test_cron_delivery_blocks_web_search_leads_fallback() -> None:
+def test_cron_delivery_blocks_empty_answer_search_snippet_fallback() -> None:
     cron_task = "Generate a concise mid-market stock alert from verified market data."
     tool_result = ToolResult(
         "search-1",
@@ -2432,7 +2432,7 @@ def test_cron_delivery_blocks_web_search_leads_fallback() -> None:
     )
     fallback = sanitize_user_visible_reply(
         user_message=cron_task,
-        reply="The market alert is ready.",
+        reply="",
         tool_results=[tool_result],
     )
     result_payload = {"text": fallback, "tool_results": [tool_result], "cron_task": cron_task}
@@ -2447,7 +2447,7 @@ def test_cron_delivery_blocks_web_search_leads_fallback() -> None:
     )
 
 
-def test_cron_final_repair_triggers_for_web_search_leads_fallback() -> None:
+def test_cron_final_repair_recovers_empty_answer_search_snippet_fallback() -> None:
     cron_task = "Generate a concise mid-market stock alert from verified market data."
     tool_result = ToolResult(
         "search-1",
@@ -2476,7 +2476,7 @@ def test_cron_final_repair_triggers_for_web_search_leads_fallback() -> None:
     )
     fallback = sanitize_user_visible_reply(
         user_message=cron_task,
-        reply="The market alert is ready.",
+        reply="",
         tool_results=[tool_result],
     )
     repaired_report = "📈 Mid-market stock check\n\nWatchlist pulse:\n- No verified quote rows were returned."

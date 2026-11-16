@@ -293,3 +293,58 @@ def test_verified_probe_repair_binds_the_saved_snapshot_to_the_replacement(fixtu
     assert saved['probe']==[replacement]
     assert saved['comparison_snapshot']['outputs']==[{'reading':23}]
     assert saved['comparison_snapshot']['plan_binding']==snapshot_plan_binding(saved['probe'],saved['probe_contexts'])
+
+
+def test_invalid_probe_recovery_names_native_reads_and_retains_exact_source_repair(fixture):
+    from nullion.live_tracking_tools import register_live_tracker_tools
+    from nullion.tools import ToolInvocation
+    f=fixture;register_live_tracker_tools(f.registry)
+    probe={'tool_name':'sensor_read','arguments':{}}
+    context={'prepared_observations':{},'observation_preparations':{'owned':{
+        'status':'needs_narrower_source','probe':probe,'observed_chars':9000,'limit_chars':8000,
+        'next_action':'narrow_and_read_source_again','unrelated_payload':'must not enter repair metadata'}}}
+    result=f.registry.invoke(ToolInvocation('bad-wrapper','create_live_tracker','web:alpha',{
+        'name':'比較','duration_seconds':60,'probe':[{'tool_name':'code_mode','arguments':{'code':'read()'}}],
+        'matcher':{'kind':'semantic','history_mode':'snapshot','instruction':'変化を通知'}},flow_context=context))
+    assert result.status=='failed' and result.output['executed'] is False,result
+    constraints=result.output['recovery']['argument_constraints']
+    assert 'sensor_read' in constraints['repeatable_native_read_tools'] and 'code_mode' not in constraints['repeatable_native_read_tools']
+    assert constraints['repairable_preparations']==[{key:value for key,value in context['observation_preparations']['owned'].items() if key!='unrelated_payload'}]
+    assert not f.store.list('workspace_admin')
+
+
+@pytest.mark.parametrize('condition', ['測定値の変化を通知', 'Avisar de cambios en la lectura', 'أبلغني عند تغير القراءة'])
+def test_semantic_setup_requires_history_choice_and_can_repair_it_without_rereading(fixture, condition):
+    from nullion.live_tracking_tools import register_live_tracker_tools
+    f=fixture;packets=[]
+    class Model:
+        def create(self, **kw):
+            packet=json.loads(kw['messages'][0]['content'][0]['text']);packets.append(packet)
+            decision=({'status':'no_match'} if 'snapshot_history' in packet
+                      else {'status':'unknown','reason':'missing_data'})
+            return {'content':[{'type':'text','text':json.dumps(decision)}]}
+    register_live_tracker_tools(f.registry,model_client_getter=lambda:Model())
+    f.registry.live_tracker_store_path=f.store.path
+    probe=[{'tool_name':'sensor_read','arguments':{}}]
+    context={'conversation_id':'web:alpha','prepared_observations':{
+        json.dumps(probe[0],sort_keys=True):{'reading':23}}}
+    arguments={'name':'Comparison','duration_seconds':60,'probe':probe,
+               'matcher':{'kind':'semantic','instruction':condition}}
+    def invoke(identity):
+        return f.registry.invoke(ToolInvocation(identity,'create_live_tracker','web:alpha',arguments,
+            flow_context=context))
+    missing=invoke('missing-mode')
+    assert missing.status=='failed' and not packets and not f.store.list('workspace_admin')
+    arguments['matcher']['history_mode']='records'
+    wrong=invoke('record-mode')
+    assert wrong.status=='failed' and not f.store.list('workspace_admin')
+    validation=wrong.output['validation']
+    assert validation['selected_history_mode']=='records'
+    assert validation['snapshot_history_available'] is False
+    assert set(validation['supported_history_modes'])=={'records','snapshot'}
+    arguments['matcher']['history_mode']='snapshot'
+    repaired=invoke('snapshot-mode')
+    assert repaired.status=='completed',repaired
+    job=f.store.get(repaired.output['id'])
+    assert job['comparison_snapshot']['outputs']==[{'reading':23}]
+    assert packets[-1]['snapshot_history']=={'baseline_established':False,'previous_observations':None}

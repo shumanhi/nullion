@@ -97,7 +97,7 @@ def tool_repair_kind(result: object) -> str | None:
         tools = recovery.get("required_tool_names")
         if isinstance(tools, list) and tools and all(isinstance(name, str) and name.strip() for name in tools):
             return kind
-    if kind == "correct_arguments" and output.get("reason") in ("invalid_tool_arguments", "inventory_changed", "source_not_ready"):
+    if kind == "correct_arguments" and output.get("reason") in ("invalid_tool_arguments", "invalid_output_paths", "inventory_changed", "source_not_ready"):
         constraints = recovery.get("argument_constraints")
         if isinstance(constraints, Mapping) and constraints:
             return kind

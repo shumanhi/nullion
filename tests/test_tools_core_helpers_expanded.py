@@ -2216,3 +2216,68 @@ def test_empty_search_is_query_failure_not_tool_outage(query):
     result=handler(ToolInvocation('empty','web_search','p',{'query':query}))
     assert result.status=='failed' and result.output['reason']=='no_usable_search_results'
     assert result.output['failure_scope']=='invocation'
+
+
+@pytest.mark.parametrize("active_venv", [False, True])
+def test_terminal_subprocess_uses_runtime_environment_after_login_profiles(monkeypatch, tmp_path, active_venv):
+    import shlex
+    from nullion.tools import SubprocessTerminalExecutorBackend, TerminalExecutionPolicy
+    runtime = tmp_path / "runtime '環境'"
+    binary = runtime / "bin" / "python3"
+    monkeypatch.setattr(sys, "prefix", str(runtime) if active_venv else sys.base_prefix)
+    monkeypatch.setattr(sys, "executable", str(binary))
+    monkeypatch.setenv("PATH", "/fixture/system-bin")
+    monkeypatch.setenv("PYTHONHOME", "/fixture/wrong-python")
+    calls = []
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    class Process:
+        returncode = 0
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+        def __enter__(self): return self
+        def __exit__(self, *exc): pass
+        def communicate(self, **kwargs): return ("ok", "")
+    monkeypatch.setattr(tools_module.subprocess, "Popen", Process)
+    monkeypatch.setattr(tools_module.subprocess, "run", execute)
+    monkeypatch.setattr(tools_module, "_which_shell", lambda name: "/bin/bash")
+    command = "python3 -c 'print(37)'"
+    result = SubprocessTerminalExecutorBackend().run(command, cwd=None, timeout=5,
+        policy=TerminalExecutionPolicy(network_mode="approved_only", approved_targets=()), shell="bash")
+    assert result.exit_code == 0 and len(calls) == 1
+    argv, kwargs = calls[0]
+    if active_venv:
+        assert argv[-1] == "export PATH=" + shlex.quote(str(binary.parent)) + ':"$PATH"\n' + command
+        assert kwargs["env"]["PATH"].split(tools_module.os.pathsep)[0] == str(binary.parent)
+        assert kwargs["env"]["VIRTUAL_ENV"] == str(runtime)
+        assert "PYTHONHOME" not in kwargs["env"]
+    else:
+        assert argv[-1] == command and kwargs["env"] is None
+    assert tools_module.os.environ["PATH"] == "/fixture/system-bin"
+    assert tools_module.os.environ["PYTHONHOME"] == "/fixture/wrong-python"
+
+
+@pytest.mark.parametrize('suffix',['.zip','.tar.gz'])
+@pytest.mark.parametrize('location',['new_upload','existing_upload','scratch'])
+def test_archive_output_uses_shared_generated_file_policy(tmp_path,monkeypatch,suffix,location):
+    from nullion.artifacts import artifact_root_for_principal
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+    home=tmp_path/'runtime'
+    monkeypatch.setenv('NULLION_HOME',str(home))
+    monkeypatch.setenv('NULLION_DATA_DIR',str(home))
+    monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT',str(home/'workspaces'))
+    monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'absent.env'))
+    source=tmp_path/'north.csv';source.write_text('Region,Value\nNorth,12\n')
+    roots=workspace_storage_roots_for_principal('operator')
+    output=(roots.scratch if location=='scratch' else home/'uploads')/('source'+suffix)
+    output.parent.mkdir(parents=True,exist_ok=True)
+    if location=='existing_upload': output.write_bytes(b'previous archive')
+    handler=_build_archive_create_handler(workspace_root=tmp_path)
+    result=handler(ToolInvocation('archive','archive_create','operator',{
+        'output_path':str(output),'source_paths':[str(source)]}))
+    assert result.status=='completed',result
+    expected=artifact_root_for_principal('operator')/output.name if location=='new_upload' else output
+    assert result.output['artifact_path']==str(expected)
+    assert expected.is_file()
+    if location=='new_upload': assert not output.exists()

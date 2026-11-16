@@ -3,7 +3,7 @@
 Tries to connect to an existing Chrome/Brave CDP session.
 If none is running, launches Chrome automatically (visible window),
 then connects via CDP so the user can watch.
-Falls back to Playwright headless if Chrome is not found on this system.
+Keeps visible-browser failures explicit; headless mode requires configuration.
 
 Environment vars:
   NULLION_BROWSER_CDP_URL   override CDP URL (default: http://127.0.0.1:9222)
@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen
@@ -81,34 +82,54 @@ def _candidate_matches_preference(candidate: str, preferred: str | None) -> bool
 
 def _find_chrome() -> str | None:
     explicit_path = os.environ.get("NULLION_BROWSER_PATH", "").strip()
-    if explicit_path and os.path.exists(explicit_path):
-        return explicit_path
+    if explicit_path:
+        return explicit_path if (os.path.exists(explicit_path)
+            and _candidate_matches_preference(explicit_path, _preferred_browser_kind())) else None
 
     system = platform.system()
     candidates = list(_CHROME_CANDIDATES.get(system, []))
     preferred = _preferred_browser_kind()
     if preferred:
-        candidates.sort(key=lambda candidate: 0 if _candidate_matches_preference(candidate, preferred) else 1)
+        candidates = [candidate for candidate in candidates if _candidate_matches_preference(candidate, preferred)]
 
+    installed = []
     for candidate in candidates:
         if os.path.isabs(candidate):
             if os.path.exists(candidate):
-                return candidate
+                installed.append(candidate)
         else:
             found = shutil.which(candidate)
             if found:
-                return found
-    return None
+                installed.append(found)
+    if not preferred and not os.environ.get('NULLION_BROWSER_USER_DATA_DIR', '').strip():
+        # Older installations may have a saved managed login without an
+        # explicit preferred-browser setting. Its runtime-owned directory key
+        # identifies the browser; installed-app order does not identify it.
+        saved = {}
+        for candidate in installed:
+            kind = _browser_kind_from_text(candidate)
+            if kind:
+                profile = browser_user_data_dir(kind)
+                if any((profile / marker).is_file() for marker in
+                        ('Local State', 'Default/Cookies', 'Default/Network/Cookies')):
+                    saved.setdefault(str(profile.resolve()), candidate)
+        if len(saved) == 1:
+            return next(iter(saved.values()))
+        if saved:
+            return None  # Multiple saved identities need an explicit selection.
+    return installed[0] if installed else None
 
 
 def _cdp_url() -> str:
     from nullion.plugins.browser_plugin.backends.cdp_backend import normalized_cdp_url
 
-    return normalized_cdp_url(os.environ.get("NULLION_BROWSER_CDP_URL", f"http://{_DEFAULT_CDP_HOST}:{_CDP_PORT}"))
+    from nullion.plugins.browser_plugin.browser_config import shared_browser_cdp_url
+    return normalized_cdp_url(shared_browser_cdp_url() or f"http://{_DEFAULT_CDP_HOST}:{_CDP_PORT}")
 
 
 def _has_explicit_cdp_url() -> bool:
-    return bool(os.environ.get("NULLION_BROWSER_CDP_URL", "").strip())
+    return bool((os.environ.get("NULLION_BROWSER_CDP_URL") or "").strip()
+        or (os.environ.get("NULLION_BROWSER_USE_CDP_URL") or "").strip())
 
 
 def _cdp_url_for(host: str, port: int) -> str:
@@ -335,13 +356,52 @@ def _launch_chrome(chrome_path: str) -> None:
     )
 
 
+def reopen_configured_desktop_browser(endpoint: str) -> bool:
+    """Restart an existing local agent profile without changing its endpoint.
+
+    Explicit remote connections remain attach-only. A missing local browser
+    can reuse its configured installed application and existing saved profile.
+    Never scan ports, replace profiles, or launch a headless substitute here.
+    """
+    parsed = urlparse(endpoint)
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+            or os.environ.get("NULLION_BROWSER_HEADLESS", "").lower() == "true"):
+        return False
+    host, port = parsed.hostname, parsed.port or 9222
+    if _is_cdp_reachable_at(host, port):
+        return False
+    executable = _find_chrome()
+    if not executable or not _candidate_matches_preference(executable, _preferred_browser_kind()):
+        return False
+    profile = Path(_browser_profile_dir(executable))
+    if not profile.is_dir():
+        return False  # Do not replace an external or not-yet-configured profile.
+    from hashlib import sha256
+    from portalocker import Lock
+    from nullion.plugins.browser_plugin.browser_config import nullion_runtime_home
+    lock_root = nullion_runtime_home() / "browser-launch-locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    with Lock(str(lock_root / (sha256(endpoint.encode()).hexdigest()+".lock")), timeout=6):
+        if _is_cdp_reachable_at(host, port):
+            return True
+        subprocess.Popen([executable, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check", "--disable-default-apps"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(25):
+            if _is_cdp_reachable_at(host, port):
+                return True
+            time.sleep(.2)
+    return False
+
+
 class AutoBackend:
     """Auto-launch browser backend.
 
     On first use:
       1. If CDP port is already open → attach via CDP (user sees it)
       2. Elif Chrome/Brave found → launch it with --remote-debugging-port, attach
-      3. Else → fall back to Playwright headless
+      3. Else → report the visible-browser connection failure
 
     Subsequent calls reuse the same browser.
     """
@@ -357,6 +417,11 @@ class AutoBackend:
         return self._connection_notice
 
     def _use_playwright_fallback(self) -> Any:
+        if os.environ.get("NULLION_BROWSER_HEADLESS", "").lower() != "true":
+            raise ConnectionError(
+                "The visible agent browser is unavailable. Reopen the agent browser and retry. "
+                "Its saved profile has been preserved; no replacement headless browser was opened."
+            )
         self._connection_notice = _CDP_FALLBACK_NOTICE
         self._backend = self._make_playwright()
         return self._backend
@@ -369,11 +434,17 @@ class AutoBackend:
         backend = await self._ensure_backend()
         try:
             return await getattr(backend, method_name)(*args, **kwargs)
-        except Exception:
+        except Exception as error:
             if self._is_cdp_backend(backend) and not _is_cdp_reachable():
-                fallback = self._use_playwright_fallback()
-                return await getattr(fallback, method_name)(*args, **kwargs)
+                raise ConnectionError("The configured browser disconnected") from error
             raise
+
+    async def reconnect(self, session_id=None):
+        if self._backend is not None and self._is_cdp_backend(self._backend):
+            await self._backend.reconnect(session_id)
+        else:
+            self._backend = None
+            await self._ensure_backend()
 
     async def _ensure_backend(self) -> Any:
         async with self._lock:
@@ -426,6 +497,15 @@ class AutoBackend:
     async def open(self, session_id: str) -> str:
         return await self._call("open", session_id)
 
+    async def share_session_context(self, parent: str, child: str) -> None:
+        import inspect
+        backend = await self._ensure_backend()
+        share = getattr(backend, "share_session_context", None)
+        if share is not None:
+            pending = share(parent, child)
+            if inspect.isawaitable(pending):
+                await pending
+
     async def navigate(self, session_id: str, url: str) -> str:
         return await self._call("navigate", session_id, url)
 
@@ -471,7 +551,8 @@ class AutoBackend:
 
     async def close_session(self, session_id: str) -> None:
         if self._backend:
-            await self._backend.close_session(session_id)
+            return await self._backend.close_session(session_id)
+        return False
 
     async def shutdown(self) -> None:
         if self._backend:

@@ -19,6 +19,11 @@ def test_reviewed_long_source_answer_survives_web_publication_and_reload(live_we
     assert len(reviews)==1 and reviews[0]['presentation_repaired']
     page,frames,errors,database,cid,base=live_web
     body=record['result']['final_text']
+    from nullion.chat_text import apply_presentation_preferences
+    from nullion.preferences import Preferences
+    settings=page.request.get(base+'/api/preferences').json()
+    prefs=Preferences(**{key:settings[key] for key in ('emoji_level','markdown_style','response_structure')})
+    expected=apply_presentation_preferences(body,preferences=prefs)
     assert page.request.post(base+'/api/chat/history/'+cid+'/message',data={'role':'user',
         'text':'Controlled retained-source composition replay; fictional catalog.'}).ok
     assert page.request.post(base+'/api/chat/history/'+cid+'/message',data={'role':'bot','text':body}).ok
@@ -30,12 +35,10 @@ def test_reviewed_long_source_answer_survives_web_publication_and_reload(live_we
         visible=bubble.inner_text()
         assert '**' not in visible and 'Optional specification catalog' not in visible
         assert len(visible.split())<=300
-        # The producer may choose a relevant emoji; the shared policy keeps it
-        # rather than forcing a second generic chart icon onto the title.
-        assert any(ord(char)>=0x1F300 for char in visible)
+        assert any(ord(char)>=0x1F300 for char in visible)==any(ord(char)>=0x1F300 for char in expected)
         assert bubble.locator('li').count()>=3 and not errors
         history=page.request.get(base+'/api/chat/history/'+cid).json()['messages']
-        assert [r['text'] for r in history if r['role']=='bot']==[body]
+        assert [r['text'] for r in history if r['role']=='bot']==[expected]
     out=Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])
     page.screenshot(path=str(out/'source-review-web.png'))
     (out/'source-review-web.json').write_text(json.dumps({'conversation_id':cid,'text':body,

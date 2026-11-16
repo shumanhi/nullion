@@ -81,12 +81,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run Docker E2E suite
-        run: ./scripts/e2e-docker.sh
+        env:
+          NULLION_E2E_BATCH_FILES: "40"
+        run: ./scripts/e2e-docker.sh tests/e2e --maxfail=1 --tb=short -vv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: e2e-artifacts
           path: .e2e-artifacts
+          include-hidden-files: true
           if-no-files-found: ignore
 
   linux-installer:

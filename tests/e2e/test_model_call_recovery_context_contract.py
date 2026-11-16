@@ -38,6 +38,12 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
                               'source_url': 'https://example.com/powder'}], 'limitations': []})
     registry.register(ToolSpec('lookup_source', 'Read live offers', ToolRiskLevel.LOW,
         ToolSideEffectClass.READ, False, 2, capability_tags=('web',)), read)
+    def stable_request(kwargs):
+        # Retry deadlines and authoritative accounting advance on each real
+        # attempt. All source/profile messages, tools and other inputs stay exact.
+        stable = {key:value for key,value in kwargs.items() if key != 'timeout'}
+        stable['system'] = str(stable.get('system') or '').partition('\n\nRuntime research state (authoritative): ')[0]
+        return stable
     class Model:
         steps = 0; failures = 0; normal_calls = 0
         failed_kwargs = None
@@ -65,10 +71,10 @@ def test_chat_retains_profile_and_completed_tools_after_model_failure(tmp_path, 
                 if self.failures == 0 or failure_phase == 'persistent':
                     self.failures += 1
                     if self.failed_kwargs is None: self.failed_kwargs = kw
-                    else: assert kw == self.failed_kwargs
+                    else: assert stable_request(kw) == stable_request(self.failed_kwargs)
                     if failure_phase == 'invalid_schema': return None
                     raise RuntimeError('Synthetic external provider failure')
-                assert kw == self.failed_kwargs
+                assert stable_request(kw) == stable_request(self.failed_kwargs)
             if names == {'present_source_answer'}: return source_presentation_response(kw)
             self.steps += 1
             if self.steps == 1:

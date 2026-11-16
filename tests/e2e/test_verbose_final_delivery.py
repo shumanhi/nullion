@@ -78,7 +78,7 @@ def test_web_tool_reply_obeys_session_verbose_setting(tmp_path,monkeypatch,enabl
             bubble=page.locator('#messages .msg.bot .bubble').filter(has_text='Lectura completada: 42.')
             expect(bubble).to_have_count(1,timeout=20000)
             raw=bubble.get_attribute('data-raw-text')
-            assert ('Activity' in raw) is enabled,raw
+            assert ('Activity' in raw) is enabled,(raw,page.locator('#messages').inner_text())
             assert ('file_read' in raw) is enabled,raw
             assert str(source) not in raw and source.name not in raw,raw
             history=context.request.get(server.base_url+'/api/chat/history/'+cid).json()
@@ -95,3 +95,31 @@ def test_web_tool_reply_obeys_session_verbose_setting(tmp_path,monkeypatch,enabl
             assert source.name not in bubble.get_attribute('data-raw-text')
             assert not errors,errors
         finally:browser.close()
+
+
+from tests.e2e.test_live_stage_web_matrix import live_web
+
+@pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1' or not os.environ.get('NULLION_LIVE_VERBOSE_SOURCE_FILE'),
+    reason='Explicit live stage source fixture required')
+def test_live_verbose_activity_survives_canonical_delivery_and_reload(live_web):
+    from tests.e2e.test_live_stage_web_matrix import _submit,catalogue
+    from playwright.sync_api import expect
+    page,frames,errors,database,cid,base=live_web
+    path=os.environ['NULLION_LIVE_VERBOSE_SOURCE_FILE']
+    for enabled in (True,False):
+        setting=page.request.post(base+'/api/chat',data={
+            'text':'/verbose '+('on' if enabled else 'off'),'conversation_id':cid})
+        assert setting.ok,setting.text()
+        response,turn,_=_submit(live_web,'Read the current value in '+path+
+            '. Use file_read. Reply with that value only; no attachments or file changes.',timeout=120)
+        assert '37' in response['text'] and not response['artifacts'],response
+        assert ('file_read' in response['text']) is enabled,response
+        assert response['text'].count('Activity')==(1 if enabled else 0),response
+        assert path not in response['text'] and os.path.basename(path) not in response['text'],response
+        assert any(row['tool_name']=='file_read' and row['status']=='completed' for row in turn['tool_results']),turn
+        before=response['text'].strip()
+        page.reload(wait_until='domcontentloaded')
+        bubble=page.locator('#messages .msg.bot .bubble[data-turn-id='+json.dumps(turn['turn_id'])+']')
+        expect(bubble).to_have_count(1);expect(bubble).to_be_visible()
+        assert (bubble.get_attribute('data-raw-text') or '').strip()==before
+    assert not errors,errors

@@ -33,6 +33,17 @@ def test_typed_selection_preserves_two_requested_same_format_outputs(tmp_path,mo
          'selected',package=True,draft_lists_all=True,same_format_package=True)
 
 
+@pytest.mark.parametrize('mode',['repair_then_select','selected_bad_csv','repair_stays_invalid','repair_unique'])
+@pytest.mark.parametrize('prompt',['Deliver the approved CSV and HTML package.', '承認済みCSVとHTMLを渡してください。'])
+def test_native_table_validation_repairs_only_invalid_component_once(tmp_path,monkeypatch,mode,prompt):
+    _run(tmp_path,monkeypatch,'.csv',prompt,mode,package=True)
+
+
+@pytest.mark.parametrize('mode',['scope_stall_selected','scope_stall_invalid'])
+def test_stalled_discovery_stops_generation_but_selects_completed_package(tmp_path,monkeypatch,mode):
+    _run(tmp_path,monkeypatch,'.csv','承認済みCSVとHTMLを渡してください。',mode,package=True)
+
+
 def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_all=False,same_format_package=False):
     from fastapi.testclient import TestClient
     from nullion import chat_store,web_app
@@ -48,6 +59,7 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
     conversation='web:typed-selection';root=artifact_root_for_principal(conversation);root.mkdir(parents=True,exist_ok=True)
     earlier=root/(uuid4().hex+extension);approved=root/(uuid4().hex+extension)
     support=root/(uuid4().hex+'.txt'); extra=root/(uuid4().hex+(extension if same_format_package else '.html'))
+    repair_mode=mode in {"repair_then_select","selected_bad_csv","repair_stays_invalid","repair_unique"}
     expected=[approved,extra] if package else [approved]
     formats=[extension,extra.suffix] if package else [extension]
     def body(value,fmt=extension):
@@ -58,7 +70,7 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
     registry.register(ToolSpec('file_write','Write requested files',ToolRiskLevel.LOW,ToolSideEffectClass.WRITE,False,10),
         _build_file_write_handler(tmp_path,allowed_roots=[tmp_path]))
     class Provider:
-        phase=0;selections=0;reviews=0
+        phase=0;selections=0;reviews=0;sibling_stat=None
         def create(self,**kw):
             protocol_reply = workflow_provider_reply(kw, completion=False)
             if protocol_reply is not None: return protocol_reply
@@ -83,9 +95,16 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
                 self.selections+=1;assert names=={'select_artifact_delivery'}
                 raw=kw['messages'][0]['content'][0]['text'].split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n',1)[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,1)[0]
                 candidates=json.loads(raw)
-                assert len(candidates)==len(expected)+1 and all(c['extension'] in formats for c in candidates),candidates
+                assert len(candidates)==len(expected)+(mode!='repair_unique') and all(c['extension'] in formats for c in candidates),candidates
                 selected=[c['candidate_id'] for c in candidates if '12' in c.get('content_preview','')]
                 assert len(selected)==len(expected),candidates
+                if repair_mode:
+                    if self.selections==1:self.sibling_stat=extra.stat().st_mtime_ns
+                    else:assert extra.stat().st_mtime_ns==self.sibling_stat
+                    if mode!='selected_bad_csv' and (self.selections==1 or mode=='repair_stays_invalid'):
+                        return tool('select_artifact_delivery',{'status':'none_ready','selected_ids':[],
+                            'repair_ids':[c['candidate_id'] for c in candidates if c['extension']=='.csv' and 'METADATA' in c.get('content_preview','')],
+                            'reason':'The requested final CSV has inconsistent columns.'})
                 if mode=='unknown_id':selected=['unregistered-file']
                 if mode=='changed_file':approved.write_text(body(99))
                 return tool('select_artifact_delivery',{'status':'none_ready' if mode=='none_ready' else 'selected',
@@ -98,8 +117,13 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
             if self.phase==2:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(i),'name':'file_write',
                     'input':{'path':str(path),'content':value}} for i,(path,value) in enumerate([
-                        (earlier,body(10)),(approved,body(12)),*([(extra,body(12,extra.suffix).replace('Record','Other') if same_format_package else body(12,extra.suffix))] if package else []),(support,'Internal preparation notes')])]}
-            assert self.phase==3,'Selection or terminal failure restarted generation'
+                        *([(earlier,body(10))] if mode!='repair_unique' else []),(approved,("METADATA\n" if repair_mode or mode=='scope_stall_invalid' else "")+body(12)),*([(extra,body(12,extra.suffix).replace('Record','Other') if same_format_package else body(12,extra.suffix))] if package else []),(support,'Internal preparation notes')])]}
+            if repair_mode and self.phase==4:
+                return tool('file_write',{'path':str(approved),'content':('METADATA\n' if mode=='repair_stays_invalid' else '')+body(12)})
+            if mode in {'scope_stall_selected','scope_stall_invalid'} and self.phase in {3,4,5}:
+                return tool('request_tool_scope',{'capabilities':['local_files'],'tool_names':['file_write'],
+                    'required_tool_names':['file_write'],'artifact_extensions':formats})
+            assert self.phase==(5 if repair_mode and self.selections else 3),'Selection or terminal failure restarted generation'
             draft='Prepared the requested file.'
             if draft_lists_all:
                 draft+='\n'+'\n'.join('MEDIA:'+str(path) for path in [earlier,*expected])
@@ -109,12 +133,13 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
         response=client.post('/api/chat',json={'text':prompt+' '+' '.join(formats),'conversation_id':conversation})
         assert response.status_code==200,response.text
         data=response.json();assert not data.get('suspended_for_approval'),data
-        assert model.selections==1 and model.phase==3
+        assert model.selections==(2 if repair_mode and mode!='repair_unique' else 1) and model.phase==(5 if repair_mode or mode in {'scope_stall_selected','scope_stall_invalid'} else 3)
         turns=[e for e in runtime.store.list_conversation_events(conversation) if e.get('event_type')=='conversation.chat_turn']
-        assert len([r for r in turns[-1]['tool_results'] if r['tool_name']=='file_write'])==len(expected)+2
+        assert len([r for r in turns[-1]['tool_results'] if r['tool_name']=='file_write'])==len(expected)+2+(1 if repair_mode else 0)-(mode=='repair_unique')
         selected=delivery_manifest(turns[-1]['tool_results'])
-        if mode=='selected':
+        if mode in {'selected','repair_then_select','selected_bad_csv','repair_unique','scope_stall_selected'}:
             assert len(data['artifacts'])==len(expected) and selected==tuple(str(p) for p in expected),data
+            if mode=='scope_stall_selected':assert turns[-1]['response_fulfilled'] is True,turns[-1]
             for artifact in data['artifacts']:
                 download=client.get(artifact['url']);assert download.status_code==200
                 expected_body=body(12,Path(artifact['name']).suffix)
@@ -127,7 +152,8 @@ def _run(tmp_path,monkeypatch,extension,prompt,mode,package=False,draft_lists_al
             assert not data['artifacts'] and (not selected) and (model.reviews == 0), data
             diagnostic = next(row['output']['artifact_delivery_manifest']['selection_diagnostic']
                 for row in reversed(turns[-1]['tool_results']) if row.get('output', {}).get('artifact_delivery_manifest'))
-            assert diagnostic['candidate_count']==2
+            assert diagnostic['candidate_count']==len(expected)+1
             assert diagnostic['valid_response'] is (mode!='unknown_id')
-            assert diagnostic['status']==('none_ready' if mode=='none_ready' else 'selected')
+            assert diagnostic['status']==('none_ready' if mode in {'none_ready','repair_stays_invalid'} else 'selected')
+            if repair_mode:assert 'format validation after one repair attempt' in data.get('text','')
             if mode=='changed_file': assert diagnostic['files_unchanged'] is False

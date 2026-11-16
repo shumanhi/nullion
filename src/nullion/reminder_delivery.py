@@ -270,7 +270,13 @@ def _claim_due_reminder_persistently(runtime: Any, task: Any, due_time: datetime
                 "SELECT payload FROM reminders_crons WHERE collection = ? AND item_key = ?",
                 ("scheduled_tasks", task_id),
             ).fetchone()
+            from nullion.runtime_persistence import _deserialize_reminder, _deserialize_scheduled_task
+            persisted_reminder = _deserialize_reminder(reminder_payload)
             task_payload = json.loads(str(task_row[0])) if task_row is not None else {}
+            if (not task_payload.get("enabled") or persisted_reminder.due_at > due_time):
+                conn.execute("ROLLBACK")
+                return (None, None)
+            persisted_task = _deserialize_scheduled_task(task_payload)
             now = datetime.now(UTC).isoformat()
             claimed_reminder_payload = {**reminder_payload, "delivered_at": due_time.isoformat()}
             claimed_task_payload = {
@@ -295,22 +301,16 @@ def _claim_due_reminder_persistently(runtime: Any, task: Any, due_time: datetime
                        WHERE collection = ? AND item_key = ?""",
                     (json.dumps(claimed_task_payload, sort_keys=True), now, "scheduled_tasks", task_id),
                 )
+            conn.execute("INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)",
+                ("native_reminder:" + task_id, now))
             conn.execute("COMMIT")
     except Exception:
         logger.debug("Persistent reminder claim failed; skipping this delivery attempt", exc_info=True)
         return (None, None)
-    reminder = runtime.store.get_reminder(task_id)
-    current_task = (
-        runtime.store.get_scheduled_task(task_id)
-        if hasattr(runtime.store, "get_scheduled_task")
-        else task
-    )
-    if reminder is None:
-        return (None, None)
-    claimed_task = disable_task(mark_task_ran(current_task or task, due_time))
-    runtime.store.add_reminder(replace(reminder, delivered_at=due_time))
+    claimed_task = disable_task(mark_task_ran(persisted_task, due_time))
+    runtime.store.add_reminder(replace(persisted_reminder, delivered_at=due_time))
     runtime.store.add_scheduled_task(claimed_task)
-    return reminder, current_task or task
+    return persisted_reminder, persisted_task
 
 
 def _sync_claimed_reminder_from_payload(runtime: Any, task: Any, reminder_payload: dict[str, object]) -> None:
@@ -341,6 +341,18 @@ def _rollback_due_reminder_claim(runtime: Any, task: Any, reminder: Any) -> None
         current = runtime.store.get_reminder(reminder.task_id)
         if current is not None and current.delivered_at is None:
             return
+        commit = getattr(runtime, "commit_reminder_change", None)
+        if callable(commit):
+            # A delivery failure cannot undo a concurrent edit or deletion.
+            if current is None or (current.text, current.chat_id, current.due_at) != (
+                    reminder.text, reminder.chat_id, reminder.due_at):
+                return
+            try:
+                commit(reminder.task_id, task=task, reminder=replace(reminder, delivered_at=None),
+                    previous_reminder=current)
+            except ValueError:
+                logger.debug("Reminder changed before claim rollback", exc_info=True)
+            return
         runtime.store.add_reminder(replace(reminder, delivered_at=None))
         runtime.store.add_scheduled_task(task)
         runtime.checkpoint()
@@ -348,6 +360,9 @@ def _rollback_due_reminder_claim(runtime: Any, task: Any, reminder: Any) -> None
 
 async def _due_reminder_load_tasks_node(state: _DueReminderDeliveryState) -> dict[str, object]:
     due_time = _normalize_due_time(state.get("now"))
+    refresh = getattr(state["runtime"], "refresh_reminders", None)
+    if callable(refresh):
+        await asyncio.to_thread(refresh)
     if hasattr(state["runtime"].store, "list_scheduled_tasks"):
         from nullion.runtime import run_due_scheduled_tasks
 
