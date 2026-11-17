@@ -16,7 +16,7 @@ PROGRESS_KIND = 'request_progress'
 OPERATION_KIND = 'operation_progress'
 _PROGRESS_PHASE_IDS = frozenset({'prepare', 'source', 'operation', 'phase-check-task-state',
     'phase-load-memory', 'phase-check-attachments', 'phase-select-tools', 'phase-build-context',
-    'phase-start-model', 'phase-prepare-artifacts', 'phase-save-conversation'})
+    'phase-start-model', 'phase-process-results', 'phase-prepare-artifacts', 'phase-save-conversation'})
 SOURCE_ACTIVITY_PHASES = {
     'reading_pages': 'Reading pages.',
     'reviewing_captured_evidence': 'Reviewing captured page details.',
@@ -28,6 +28,12 @@ SOURCE_ACTIVITY_PHASES = {
 # Core native tool identities are presentation metadata, never prompt routing.
 TOOL_ACTIVITY_PHASES = {
     'web_search': ('Searching the web.', 'Reviewing search results.'),
+    'browser_snapshot': ('Inspecting the current page.', 'Reviewing page details.'),
+    'browser_find': ('Finding page controls.', 'Reviewing page controls.'),
+    'browser_click_id': ('Opening the selected page control.', 'Checking the updated page.'),
+    'browser_click_element': ('Opening the selected page control.', 'Checking the updated page.'),
+    'browser_run_js': ('Working with the current page.', 'Reviewing page results.'),
+    'code_mode': ('Working through the next steps.', 'Reviewing step results.'),
     'browser_navigate': ('Opening a page.', 'Reviewing page details.'),
     'browser_read_pages': ('Reading pages.', 'Reviewing page details.'),
     'browser_extract_text': ('Reading a page.', 'Reviewing page details.'),
@@ -168,8 +174,8 @@ class RequestProgress:
                     self.phase = ('Reviewing saved information.' if status == 'completed' and operation.get('category') == 'saved_information'
                         else 'Reviewing captured evidence.' if status == 'completed' and operation.get('category') == 'retained_evidence'
                         else (_tool_activity_phase(operation,1) or
-                            ('Reviewing findings.' if self.batches or self.observations else '')) if status == 'completed'
-                        else '')
+                            ('Reviewing findings.' if self.batches or self.observations else 'Reviewing step results.')) if status == 'completed'
+                        else 'Checking the next step.')
         from nullion.chat_text import WORKING_ACK_SUMMARY
         phases = {
             'prepare': WORKING_ACK_SUMMARY,
@@ -179,6 +185,7 @@ class RequestProgress:
             'phase-select-tools': 'Preparing the tools for your request.',
             'phase-build-context': 'Preparing request context.',
             'phase-start-model': 'Planning the next step.',
+            'phase-process-results': 'Reviewing results and planning the next step.',
             'phase-prepare-artifacts': 'Preparing your response.',
             'phase-save-conversation': 'Finishing your response.',
         }
@@ -186,7 +193,8 @@ class RequestProgress:
         if (event.get('status') == 'running' or accepted) and event.get('id') in phases:
             self.phase = phases[event['id']]
             self.phase_id = event['id']
-            self.completion_fact = ''
+            if event['id'] != 'phase-process-results':
+                self.completion_fact = ''
         if not self.phase and not self.operations:
             return
         from nullion.chat_text import UserMessage, render_user_message
@@ -282,7 +290,7 @@ class RequestProgressDelivery:
             if self.handle is None:
                 with self.phase_lock:
                     phase = self.phases.get(text)
-                    if self.acceptance_text and phase in _PROGRESS_PHASE_IDS - {'operation', 'source'}:
+                    if self.acceptance_text and phase in _PROGRESS_PHASE_IDS - {'operation', 'source', 'phase-process-results'}:
                         # Preserve the initial acceptance copy on slow prep.
                         # Actual source/tool facts can still be the first view.
                         text = self.acceptance_text

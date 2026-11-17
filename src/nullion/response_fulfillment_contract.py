@@ -2153,6 +2153,19 @@ def operation_failure_reply(tool_results: Iterable[ToolResult], *, required_tool
         if output['execution_outcome'] == 'timeout':
             return f"The command timed out after {output['timeout_seconds']}s. Its captured output is incomplete."
         return f"The command ended with exit code {output['exit_code']}. Its captured output is incomplete."
+    tracker_failures = [r for r in failures if isinstance(r.output, dict)
+                        and r.output.get("validation_kind") == "live_tracker_invalid_plan"
+                        and r.output.get("executed") is False]
+    if tracker_failures:
+        code = (tracker_failures[-1].output.get("validation") or {}).get("code")
+        detail = {
+            "observation_too_large": "the source read was too large for repeated checks",
+            "semantic_condition_unresolved": "the source did not provide enough information to evaluate the alert condition",
+            "unrepeatable_probe": "the selected source check could not safely run repeatedly",
+            "source_readiness_unverified": "the source was not ready for reliable repeated checks",
+            "incomplete_observation": "the source read was incomplete",
+        }.get(code, "the source check could not be validated")
+        return f"I couldn't start the alert because {detail}. No new alert was created."
     if failures:
         return "I couldn't complete the request because a required step failed."
     return "I couldn't complete the request because a required step didn't run."

@@ -249,6 +249,15 @@ def _restart_launchd_service(service: ManagedService) -> str | None:
         if not plist.exists():
             continue
         target = f"gui/{uid}/{label}"
+        if os.environ.get("XPC_SERVICE_NAME") == label:
+            # bootout removes the very job executing this code. Its process
+            # dies before bootstrap, leaving ingress permanently unloaded.
+            # launchd owns replacement once kickstart is accepted, even when
+            # that command terminates this caller before it can return.
+            restarted = _run(["launchctl", "kickstart", "-k", target], timeout=15)
+            if restarted.returncode != 0:
+                raise RuntimeError(f"{service.display_name} self-restart failed ({label}).")
+            return f"Restarted the {service.display_name} service ({label})."
         _run(["launchctl", "bootout", target], timeout=15)
         if not _wait_for_launchd_stopped(label, timeout=10):
             raise RuntimeError(f"{service.display_name} launchd service did not stop before restart ({label}).")

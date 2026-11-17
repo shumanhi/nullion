@@ -6,6 +6,7 @@ import inspect
 import importlib.util
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -1668,3 +1669,41 @@ def test_webview_loading_health_api_reports_failure(monkeypatch) -> None:
     assert payload["ok"] is False
     assert payload["status"] == 0
     assert "Cannot reach the local app" in payload["message"]
+
+
+def test_fresh_health_envelope_covers_sequential_child_checks(monkeypatch):
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout='ok', stderr='')
+    monkeypatch.setattr(updater.subprocess, 'run', run)
+    assert updater.fresh_health_check(timeout=10, require_web=True, require_messaging=True)
+    assert calls[-1]['timeout'] >= 30 + 10 + 30 + 5
+
+
+@pytest.mark.parametrize('error', [subprocess.TimeoutExpired('health', 45), OSError('cannot start probe')])
+def test_update_health_execution_failure_uses_rollback(monkeypatch, tmp_path, error):
+    def fail(**kwargs): raise error
+    rolled_back = []
+    monkeypatch.setattr(updater, 'fresh_health_check', fail)
+    monkeypatch.setattr(updater, 'rollback', lambda snap: rolled_back.append(snap) or True)
+    state = {'snap': tmp_path/'backup', 'from_label': 'old', 'to_label': 'new'}
+    result = asyncio.run(updater._update_health_node(state))['result']
+    assert not result.success and result.rolled_back
+    assert rolled_back == [state['snap']]
+    assert result.steps[-1].step == 'rollback'
+
+
+
+def test_health_bootstraps_overlap_without_skipping_either(monkeypatch):
+    entered = threading.Barrier(2)
+    calls = []
+    def web(**kwargs):
+        calls.append('web'); entered.wait(timeout=2); return True
+    def messaging(**kwargs):
+        calls.append('messaging'); entered.wait(timeout=2); return False
+    monkeypatch.setattr(updater, '_probe_web_bootstrap', web)
+    monkeypatch.setattr(updater, '_probe_messaging_platform_bootstrap', messaging)
+    monkeypatch.setattr(updater, '_probe_web_status', lambda **kwargs: True)
+    assert updater.health_check() is False
+    assert sorted(calls) == ['messaging', 'web']

@@ -1539,3 +1539,14 @@ def test_pause_diagnostics_keep_typed_repair_cause_without_provider_payload():
     assert problem['source_recovery'] == {'status': 'model_unavailable'}
     assert 'model connection' in problem['message'] and 'Settings' in problem['remedy']
     assert 'private' not in json.dumps(problem)
+
+
+@pytest.mark.parametrize('code', ['observation_too_large', 'semantic_condition_unresolved', 'unrepeatable_probe'])
+def test_terminal_setup_failure_explains_source_without_leaking_records(code):
+    from nullion.response_fulfillment_contract import operation_failure_reply
+    result = ToolResult('failed-source', 'create_live_tracker', 'failed', {
+        'validation_kind': 'live_tracker_invalid_plan', 'executed': False,
+        'validation': {'code': code}, 'internal': 'private opaque source'}, 'private diagnostic')
+    reply = operation_failure_reply([result], required_tool_names=['create_live_tracker'])
+    assert 'No new alert was created.' in reply
+    assert 'required step failed' not in reply and 'private' not in reply

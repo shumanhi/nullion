@@ -65,10 +65,10 @@ def test_progress_is_visible_without_verbose_and_final_is_delivered_once(tmp_pat
         history_registry=registry
     runtime.active_tool_registry=registry
     from nullion.chat_text import WORKING_ACK_SUMMARY
-    expected_progress = (('Planning the next step' if surface in {'web','web_http'}
-        else WORKING_ACK_SUMMARY.removesuffix('.')) if tool_family=='initial_ack' else
+    expected_progress = (WORKING_ACK_SUMMARY.removesuffix('.') if tool_family=='initial_ack' else
         'Calendar checked' if tool_family in {'calendar_list','calendar_then_search'} else
         '1 step completed' if tool_family=='chat_history_search' else '2 searches')
+    release_final=threading.Event()
     class Model:
         calls=0
         requests=[]
@@ -109,7 +109,10 @@ def test_progress_is_visible_without_verbose_and_final_is_delivered_once(tmp_pat
                 return self.program(['web_search'],
                     "call_tool('web_search', {'queries':['現在の選択肢','otras opciones'], 'independent_queries':True})")
             # A slow external inference call must leave verified progress visible.
-            time.sleep(3.2)
+            if surface in {'web','web_http'}:
+                assert release_final.wait(15), 'The browser never finished observing progress'
+            else:
+                time.sleep(3.2)
             return text('確認結果: Alpha, $17. https://example.test/option')
     model=Model();orchestrator=AgentOrchestrator(model_client=model)
     sent=[];edited=[];removed=[];typing=[]
@@ -153,6 +156,10 @@ def test_progress_is_visible_without_verbose_and_final_is_delivered_once(tmp_pat
                         raise AssertionError({'model_calls':model.calls,'requests':model.requests,'turns':turns}) from error
                     expect(latest).not_to_contain_text('Calendar checked')
                     progress=latest
+                if tool_family != 'initial_ack':
+                    # During the slow model round, the shared phase must remain
+                    # visible alongside completed counts, across both Web transports.
+                    expect(progress).to_contain_text('Reviewing', timeout=2500)
                 assert '\n\n' not in progress.inner_text()
                 assert len(progress.inner_text())<120
                 from pathlib import Path
@@ -170,6 +177,7 @@ def test_progress_is_visible_without_verbose_and_final_is_delivered_once(tmp_pat
                     path=server.base_url+'/api/chat/progress?'
                     assert page.request.get(path+urlencode({'turn_id':ident,'conversation_id':conv})).json()['active'] is True
                     assert page.request.get(path+urlencode({'turn_id':ident,'conversation_id':'web:other'})).json()['active'] is False
+                release_final.set()
                 expect(page.locator('#messages .msg.bot .bubble').filter(has_text='確認結果: Alpha')).to_have_count(1,timeout=5500)
                 expect(page.locator('#messages .status-bubble')).to_have_count(0)
                 if surface=='web_http':
@@ -181,7 +189,7 @@ def test_progress_is_visible_without_verbose_and_final_is_delivered_once(tmp_pat
                     assert completed_http and completed_http[-1].status==200
                     assert page.request.get(path+urlencode({'turn_id':ident,'conversation_id':conv})).json()['active'] is False
                 assert not errors
-            finally:browser.close();pw.stop()
+            finally:release_final.set();browser.close();pw.stop()
     else:
         from tests.e2e.test_delivery_acknowledgement_boundary import TOKEN,TelegramWire,install_wire
         wire=TelegramWire();original=wire.handle

@@ -3979,31 +3979,19 @@ def test_open_agent_browser_uses_open_without_navigation_when_no_url(tmp_path, m
     ]
 
 
-def test_live_browser_refresh_tracks_all_registered_browser_tools() -> None:
-    from nullion import web_app
+def test_live_browser_refresh_tracks_all_registered_browser_tools(monkeypatch) -> None:
+    from nullion.plugins.browser_plugin import register_browser_tools
+    from nullion.tools import ToolRegistry
 
-    expected = {
-        "browser_open",
-        "browser_navigate",
-        "browser_click",
-        "browser_click_element",
-        "browser_click_id",
-        "browser_type",
-        "browser_type_field",
-        "browser_type_id",
-        "browser_select_combobox",
-        "browser_snapshot",
-        "browser_extract_text",
-        "browser_screenshot",
-        "browser_scroll",
-        "browser_wait_for",
-        "browser_assert_page_state",
-        "browser_find",
-        "browser_run_js",
-        "browser_close",
-    }
-
-    assert expected <= set(web_app._BROWSER_TOOL_NAMES)
+    monkeypatch.setenv("NULLION_BROWSER_BACKEND", "auto")
+    replacement = ToolRegistry()
+    register_browser_tools(replacement)
+    expected = {spec.name for spec in replacement.list_specs()}
+    assert {"browser_open", "browser_navigate", "browser_read_pages"} <= expected
+    live = ToolRegistry()
+    live.replace_tool_group(replacement, tool_prefix="browser_", cleanup_group="browser_plugin")
+    assert {spec.name for spec in live.list_specs()} == expected
+    assert all(live.can_invoke_tool(name) for name in expected)
 
 
 def test_web_status_surfaces_memory_full_card_and_cleanup_actions(monkeypatch, tmp_path) -> None:
