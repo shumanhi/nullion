@@ -6,13 +6,13 @@ This is a coverage catalogue, not an execution-status record. Redundant entry po
 
 ## Counts
 
-The complete source inventory contains **295 potential parameterized entries** across 47 files and 148 test functions, with all 75 API scenarios explicitly selected.
+The complete source inventory contains **296 potential parameterized entries** across 48 files and 149 test functions, with all 75 API scenarios explicitly selected.
 
 The earlier 276-case combined selection was a particular run selection, not the whole repository inventory. An empty API scenario selection is a skipped placeholder, not a real workflow. A pytest case can contain several requests or scenarios; counts are not model-call counts.
 
 | Execution type | Entries | Meaning |
 | --- | ---: | --- |
-| `live_workflow` | 272 | A running stage workflow that can consume model or tool quota. One case may send multiple chat requests. |
+| `live_workflow` | 273 | A running stage workflow that can consume model or tool quota. One case may send multiple chat requests. |
 | `saved_replay` | 14 | Stage UI/history/byte checks of saved evidence; no new test-initiated model or source work. |
 | `local_harness` | 9 | Deterministic local fixture/control checks; no real stage/provider workflow. |
 | `aggregate_entry_point` | 0 | An alternative multi-scenario entry point; do not combine it with individual scenario cases. |
@@ -27,7 +27,7 @@ The earlier 276-case combined selection was a particular run selection, not the 
 | `browser` — Browser lifecycle and recovery | 21 | Desktop attachment, navigation, screenshots, native delegation, owned tabs and recovery. |
 | `artifacts` — Files and generated deliverables | 59 | Document creation, format fidelity, selected versions, downloadable bytes and artifact reuse. |
 | `execution` — Code Mode and terminal execution | 17 | Programs, host modules, projections, reusable tools, unsupported imports and terminal outcomes. |
-| `scheduler` — Scheduled jobs and live trackers | 42 | Owned job changes, cancellation, finite lifetimes, conditions, alert delivery and saved-run recovery. |
+| `scheduler` — Scheduled jobs and live trackers | 43 | Owned job changes, cancellation, finite lifetimes, conditions, alert delivery and saved-run recovery. |
 | `consent` — Account access and approvals | 32 | Source consent, read-only account boundaries, explicit choices and action approvals. |
 | `presentation` — Progress, rendering and delivery | 21 | Shared status, compact reports, exact captions, Web history, sockets and reload behavior. |
 | `harness` — Local test infrastructure | 9 | Deterministic transport, provider-stop controls and static catalogue invariants; no live model requests. |
@@ -321,6 +321,7 @@ Skip flags below come from declared test decorators. They are not a complete dep
 
 | Selector | Variants | Execution type | Declared skip flags |
 | --- | ---: | --- | --- |
+| `tests/e2e/test_live_stage_absolute_alert.py::test_live_stage_absolute_restoration_alert` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[scheduler_manual_run]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[scheduler_manual_run_short_followup]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[scheduler_inventory_read_only]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |

@@ -316,11 +316,46 @@ def _browser_profile_dir(chrome_path: str) -> str:
     return str(browser_user_data_dir(kind))
 
 
+def _managed_profile_cdp_port(chrome_path: str) -> int | None:
+    """Find the selected local application's exact saved profile, not a nearby login."""
+    host, _port = _cdp_endpoint()
+    if host not in {"127.0.0.1", "localhost", "::1"} or platform.system() not in {"Darwin", "Linux"}:
+        return None
+    try:
+        processes = subprocess.run(
+            ["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=1, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    expected_profile = Path(_browser_profile_dir(chrome_path)).resolve()
+    ports = set()
+    for command in processes.stdout.splitlines():
+        if not command.strip().startswith(chrome_path + " "):
+            continue
+        switches = {}
+        for part in command.split(" --")[1:]:
+            name, separator, value = part.partition("=")
+            if separator:
+                switches[name] = value
+        profile = switches.get("user-data-dir")
+        port = switches.get("remote-debugging-port", "")
+        if not profile or Path(profile).resolve() != expected_profile or not port.isdigit():
+            continue
+        number = int(port)
+        if 1024 <= number <= 65535 and _is_cdp_reachable_at(host, number):
+            ports.add(number)
+    return next(iter(ports)) if len(ports) == 1 else None
+
+
 def _launch_chrome(chrome_path: str) -> None:
     global _launched_proc
     if _is_cdp_reachable() and _running_cdp_matches_preference():
         return  # already running
     if _reuse_preferred_cdp_if_available():
+        return
+    managed_port = _managed_profile_cdp_port(chrome_path)
+    if managed_port is not None:
+        _set_cdp_port(managed_port)
         return
     if _is_cdp_reachable():
         _set_cdp_port(_next_available_cdp_port(_cdp_port() + 1))

@@ -13732,6 +13732,12 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
     # enforces source/model limits across programs and recovery passes.
     usage = state.setdefault("work_usage", {})
     input_chars = _message_payload_shape(list(create_kwargs.get("messages") or []))["text_chars"]
+    callback = state.get("foreground_event_callback")
+    if tool_results and callback is not None and not _agent_turn_was_cancelled(state):
+        try:
+            callback({"id": "phase-process-results", "label": "Reviewing results", "status": "running"})
+        except Exception:
+            logger.debug("Model progress callback failed; execution continues", exc_info=True)
     model_started_at = time.perf_counter()
     response = None
     promoted_from_truncation = False

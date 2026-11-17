@@ -237,6 +237,10 @@
     "test_live_stage_web_trip_completion.py": {
       "category": "artifacts",
       "kind": "live_workflow"
+    },
+    "test_live_stage_absolute_alert.py": {
+      "category": "scheduler",
+      "kind": "live_workflow"
     }
   },
   "test_overrides": {
@@ -843,6 +847,9 @@
     ],
     "test_live_stage_web_trip_completion.py": [
       "test_trip_research_completes_with_source_progress_and_verified_pdf"
+    ],
+    "test_live_stage_absolute_alert.py": [
+      "test_live_stage_absolute_restoration_alert"
     ]
   },
   "retired_selectors": [

@@ -4372,7 +4372,8 @@ def _serialized_browser_operation(method):
                             from nullion.plugins.browser_plugin.browser_reads import text_links_script
                             references = _run(self._backend.run_js(session_id, text_links_script(invocation.arguments.get("selector"))), timeout_seconds=1)
                             document_url = references.get("url") if isinstance(references, dict) else references
-                            if isinstance(references, dict) and isinstance(references.get("links"), list):
+                            if (invocation.arguments.get("include_links", True)
+                                    and isinstance(references, dict) and isinstance(references.get("links"), list)):
                                 result.output.update(links=references["links"], link_coverage=references.get("link_coverage"))
                         elif method.__name__ == 'browser_extract_detail':
                             state = _run(self._backend.run_js(session_id, _PAGE_CONTROL_STATE_SCRIPT), timeout_seconds=1)

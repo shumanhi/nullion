@@ -810,26 +810,8 @@ def _probe_messaging_platform_bootstrap(
     return "ok:" in result.stdout
 
 
-def health_check(
-    port: int = 8742,
-    timeout: float = 10.0,
-    *,
-    require_web: bool = True,
-    require_messaging: bool = True,
-    env_path: str | Path | None = None,
-    checkpoint_path: str | Path | None = None,
-    _warnings_out: list[str] | None = None,
-) -> bool:
-    """Try importing core module in a fresh subprocess + optionally probing /api/status.
-
-    Running the import check in a subprocess is critical: after a git pull the
-    updater's own Python process still has the OLD module code in memory, so any
-    in-process import check would use stale bytecode.  A subprocess always loads
-    the freshly-installed files.
-
-    Any ``PROVIDER_WARNING: …`` lines printed by _build_runtime are collected
-    into ``_warnings_out`` (if supplied) as clean human-readable strings.
-    """
+def _probe_web_bootstrap(*, _warnings_out: list[str] | None = None) -> bool:
+    """Validate freshly installed Web construction in its own bounded process."""
     # 1. Import + bootstrap check in a clean subprocess.  Importing only the
     # package is too weak: a broken app bootstrap can otherwise pass the update
     # health check and fail only after restart.
@@ -862,25 +844,44 @@ def health_check(
         log.warning("Import health check failed: %s", (result.stderr or result.stdout).strip())
         return False
 
-    # 2. HTTP probe when the caller knows the web UI should be reachable.
-    # CLI updates may be run while the web service is already down; in that
-    # case the post-restart check is responsible for enforcing web recovery.
-    if require_web and not _probe_web_status(port=port, timeout=timeout):
-        return False
-
-    # 3. Messaging adapter bootstrap probe.  This catches failures in connected
-    # messaging entrypoints, including Telegram launch-time plugin/config errors,
-    # without sending live messages to external platforms.
-    if require_messaging:
-        probe_env_path = env_path if env_path is not None else _default_env_path()
-        if not _probe_messaging_platform_bootstrap(
-            timeout=30.0,
-            env_path=probe_env_path,
-            checkpoint_path=checkpoint_path or _default_checkpoint_path(),
-        ):
-            return False
-
     return True
+
+
+def health_check(
+    port: int = 8742,
+    timeout: float = 10.0,
+    *,
+    require_web: bool = True,
+    require_messaging: bool = True,
+    env_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    _warnings_out: list[str] | None = None,
+) -> bool:
+    """Check independent bootstraps concurrently, including for older updaters.
+
+    An already-running old release keeps its 45-second outer probe deadline.
+    The new package must finish these bounded, independent probes within that
+    envelope too, rather than relying solely on a new parent updater deadline.
+    All checks remain required; bootstrap exceptions propagate as failures.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="update-health") as pool:
+        web_bootstrap = pool.submit(_probe_web_bootstrap, _warnings_out=_warnings_out)
+        messaging_bootstrap = (
+            pool.submit(
+                _probe_messaging_platform_bootstrap,
+                timeout=30.0,
+                env_path=env_path if env_path is not None else _default_env_path(),
+                checkpoint_path=checkpoint_path or _default_checkpoint_path(),
+            )
+            if require_messaging
+            else None
+        )
+        web_reachable = not require_web or _probe_web_status(port=port, timeout=timeout)
+        web_ready = web_bootstrap.result()
+        messaging_ready = messaging_bootstrap.result() if messaging_bootstrap is not None else True
+    return web_reachable and web_ready and messaging_ready
 
 
 def fresh_health_check(
@@ -935,7 +936,9 @@ def fresh_health_check(
         ],
         capture_output=True,
         text=True,
-        timeout=45,
+        # Import/bootstrap (30s), optional HTTP, messaging bootstrap (30s),
+        # plus fresh interpreter startup. The envelope must cover all stages.
+        timeout=40 + (max(0, timeout) if require_web else 0) + (30 if require_messaging else 0),
         cwd=_src_dir(),
     )
     if _warnings_out is not None:
@@ -1238,16 +1241,20 @@ async def _update_health_node(state: _UpdateWorkflowState) -> dict[str, object]:
     steps = _update_emit(state, "health", "Running health check...")
     await asyncio.sleep(1)  # brief pause so imports can settle
     _health_warnings: list[str] = []
-    healthy = await _update_run_blocking(
-        lambda: fresh_health_check(
-            port=int(state.get("web_port") or 8742),
-            require_web=bool(state.get("web_was_reachable", False)),
-            require_messaging=True,
-            env_path=state.get("env_path"),
-            checkpoint_path=state.get("checkpoint_path"),
-            _warnings_out=_health_warnings,
-        ),
-    )
+    try:
+        healthy = await _update_run_blocking(
+            lambda: fresh_health_check(
+                port=int(state.get("web_port") or 8742),
+                require_web=bool(state.get("web_was_reachable", False)),
+                require_messaging=True,
+                env_path=state.get("env_path"),
+                checkpoint_path=state.get("checkpoint_path"),
+                _warnings_out=_health_warnings,
+            ),
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.warning("Post-update health probe could not complete: %s", type(exc).__name__)
+        healthy = False
 
     if not healthy:
         if bool(state.get("ignore_check_failures", False)):

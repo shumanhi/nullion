@@ -369,7 +369,27 @@ def _default_observations(results, *, max_chars=48_000):
         budget = max(300, available_chars * weights[result.invocation_id] // max(1,sum(weights.values())))
         native = redact_value(result.output)
         output = compact_source_observations(native, max_chars=budget)
-        if output is None:
+        if (result.tool_name == 'browser_snapshot' and isinstance(native, dict)
+                and isinstance(native.get('snapshot'), dict)):
+            # Keep full native values in Python; project only this model view.
+            # Omit whole optional control rows, never part of a URL or id.
+            snapshot = _compact_tool_output_for_model_context(result.tool_name, native)
+            # A retained model view may pass through this projection again.
+            # Preserve original capture counts; the sampled rows are not a new read.
+            for key in ('captured_element_count', 'captured_editable_control_count', 'actionable_element_count'):
+                previous = native['snapshot'].get(key)
+                if type(previous) is int and previous >= snapshot.get(key, 0):
+                    snapshot[key] = previous
+            output = {**{key:value for key,value in native.items() if key != 'snapshot'}, 'snapshot': snapshot}
+            while snapshot.get('elements') and len(json.dumps(output, ensure_ascii=False)) > budget:
+                snapshot['elements'].pop()
+                snapshot['shown_element_count'] = len(snapshot['elements'])
+                snapshot['elements_truncated'] = {'shown': len(snapshot['elements']),
+                    'total': snapshot.get('actionable_element_count', snapshot.get('captured_element_count'))}
+            if len(json.dumps(output, ensure_ascii=False)) > budget:
+                output = {'retained_output': True}
+            omitted = [['snapshot']]
+        elif output is None:
             # Use the adapter's field/identity schema at this observation's
             # actual budget, before a generic serializer clips opaque handles.
             output = compact_collections(native, budget=budget, preserve_identities=True)
@@ -377,12 +397,6 @@ def _default_observations(results, *, max_chars=48_000):
                 omitted = []
             else:
                 view = _compact_tool_output_for_model_context(result.tool_name, native)
-                if (result.tool_name == 'browser_snapshot' and isinstance(native, dict)
-                        and isinstance(native.get('snapshot'), dict)):
-                    # Inspection pointers address the original receipt. Keep
-                    # its wrapper when projecting the nested snapshot fields.
-                    view = {**{key:value for key,value in native.items() if key != 'snapshot'},
-                        'snapshot': view}
                 output, omitted = compact_evidence_value(view,max_chars=budget)
         else:
             # Typed source compaction omits whole records with explicit counts;
@@ -1200,7 +1214,14 @@ def compact_output(output, *, max_chars):
             and row['output'].get('result_kind') == 'source_observations'}
         value_paths = _source_value_paths(output.get('value'))
         source_count = max(len(sources), len(value_paths), int(output.get('source_bundle_count') or 0))
-        max_chars = min(max_chars, min(48_000, 16_000*source_count) if source_count else 8_000)
+        has_snapshot = any(isinstance(row, dict) and row.get('tool_name') == 'browser_snapshot'
+            and isinstance(row.get('output'), dict) and isinstance(row['output'].get('snapshot'), dict)
+            for row in output.get('native_observations', ()))
+        # Browser controls need a structured index, not a clipped serialized
+        # page followed by more inspection/model rounds. Keep the existing
+        # overall ceiling; compact full native snapshots before generic leaves.
+        max_chars = min(max_chars, 48_000 if has_snapshot else
+            min(48_000, 16_000*source_count) if source_count else 8_000)
     if not isinstance(output, dict) or len(json.dumps(output, ensure_ascii=False, default=str)) <= max_chars:
         return output
     # Native operations already contain these read receipts. Do not let that

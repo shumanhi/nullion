@@ -469,7 +469,7 @@ def test_completed_tools_report_facts_without_repeating_working_results():
         for status in ('running','completed'):
             progress.emit({'status_kind':OPERATION_KIND,'operation_progress':{'id':str(index),'status':status}})
     text=[e['text'] for e in events if e.get('status_kind')=='request_progress']
-    assert text[-1]=='4 steps completed'
+    assert text[-1]=='Reviewing step results · 4 steps completed'
     assert all('Working with' not in value for value in text)
 
 
@@ -493,7 +493,18 @@ def test_busy_progress_stays_one_compact_line_without_zero_or_internal_counters(
     progress.emit({'operation_id':'adaptive','observed_progress':{'pages_checked':3,'findings_found':0}})
     progress.emit({'operation_progress':{'id':'failed','status':'failed'}})
     text=events[-1]['text']
-    assert text=='2 searches · 16 results · 3 pages checked'
+    assert text=='Checking the next step · 2 searches · 16 results · 3 pages checked'
     assert len(text)<80 and '\n' not in text
     assert progress.observations['adaptive']['findings_found']==0
     assert progress.operations['failed']=='failed'
+
+
+def test_model_round_after_an_opaque_step_keeps_current_activity_visible():
+    from nullion.request_progress import RequestProgress, OPERATION_KIND
+    events=[]; progress=RequestProgress(events.append)
+    progress.emit({'status_kind': OPERATION_KIND, 'operation_progress': {'id':'opaque','status':'completed'}})
+    assert events[-1]['text'].startswith('Reviewing step results')
+    progress.emit({'id':'phase-process-results','status':'running'})
+    assert events[-1]['text'].startswith('Reviewing results and planning the next step')
+    assert '1 step completed' in events[-1]['text']
+    assert events[-1]['phase_id']=='phase-process-results'

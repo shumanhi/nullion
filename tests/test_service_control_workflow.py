@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import pytest
 
 from nullion import service_control
 
@@ -134,3 +135,19 @@ def test_launchd_restart_kills_stale_tray_and_webview_processes(monkeypatch, tmp
     assert message == "Restarted the Tray service (com.nullion.tray)."
     assert ["kill", "-TERM", "111"] in killed
     assert ["kill", "-TERM", "112"] in killed
+
+
+@pytest.mark.parametrize('service,label', [('telegram', 'ai.nullion.telegram'), ('web', 'com.nullion.web'),
+                                         ('slack', 'ai.nullion.slack'), ('discord', 'ai.nullion.discord')])
+def test_self_restart_never_unloads_its_own_launchd_job(monkeypatch, tmp_path, service, label):
+    plist = tmp_path/(label+'.plist'); plist.write_text('<plist/>')
+    monkeypatch.setenv('XPC_SERVICE_NAME', label)
+    monkeypatch.setattr(service_control, 'launchd_plist_for_label', lambda _: plist)
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+    monkeypatch.setattr(service_control, '_run', run)
+    message = service_control.restart_managed_service(service, manager='launchd')
+    assert 'Restarted' in message
+    assert len(calls) == 1 and calls[0][:3] == ['launchctl', 'kickstart', '-k']

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import suppress
 
 import pytest
 
@@ -15,6 +16,54 @@ from nullion import update_notifications as notices
 from tests.test_update_notifications import release
 
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason='Docker E2E')
+
+
+def test_running_telegram_loop_discovers_new_release_without_chat(release, monkeypatch):
+    from tests.test_updater_release_channel import _git
+    from tests.e2e.test_delivery_acknowledgement_boundary import TOKEN, TelegramWire, install_wire
+    from nullion.telegram_app import send_telegram_update_notice
+    from nullion.telegram_transport import build_telegram_bot
+    from telegram import Bot
+    _git(release.repo, 'tag', '-d', 'v0.2.0')
+    _git(release.repo, 'push', 'origin', ':refs/tags/v0.2.0')
+    monkeypatch.setattr(notices, 'CHECK_INTERVAL', 0.1)
+    wire = TelegramWire()
+    install_wire(monkeypatch, wire)
+    async def replay():
+        async with build_telegram_bot(Bot, TOKEN) as bot:
+            task = asyncio.create_task(notices.run_update_notification_loop(release.runtime,
+                channel='telegram', target=lambda: '77',
+                send=lambda target, text: send_telegram_update_notice(bot, target, text),
+                initial_delay=0, poll_interval=0.05))
+            try:
+                deadline = time.monotonic() + 10
+                while not release.runtime.checkpoint_path.exists() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.02)
+                # A running instance sees no update before publication.
+                while time.monotonic() < deadline:
+                    with sqlite3.connect(release.runtime.checkpoint_path) as db:
+                        ready = db.execute("SELECT name FROM sqlite_master WHERE name='update_release_checks'").fetchone()
+                        row = db.execute('SELECT result FROM update_release_checks').fetchone() if ready else None
+                    if row and json.loads(row[0])['latest'] == 'v0.1.0':
+                        break
+                    await asyncio.sleep(0.02)
+                else:
+                    pytest.fail('Initial release check never completed')
+                assert wire.texts == []
+                await asyncio.to_thread(_git, release.repo, 'tag', 'v0.2.0', release.new)
+                await asyncio.to_thread(_git, release.repo, 'push', 'origin', '--tags')
+                while not wire.texts and time.monotonic() < deadline:
+                    await asyncio.sleep(0.02)
+                assert len(wire.texts) == 1 and 'v0.2.0' in wire.texts[0]
+                await asyncio.sleep(0.35)
+                assert len(wire.texts) == 1
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+    asyncio.run(replay())
+    with sqlite3.connect(release.runtime.checkpoint_path) as db:
+        assert db.execute('SELECT status FROM update_release_notices').fetchall() == [('sent',)]
 
 
 @contextmanager

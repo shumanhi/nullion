@@ -125,11 +125,15 @@ def test_browser_worker_closes_created_tabs_and_preserves_concurrent_user_tab(tm
                     expected = baseline | set(user_targets)
                     while True:
                         actual = {t["id"] for t in json.load(urllib.request.urlopen(endpoint+"/json/list")) if t["type"] == "page"}
-                        if actual == expected or time.monotonic() >= deadline: break
+                        leases = list((tmp_path/"NULLION_HOME"/"browser-tab-leases").glob("*.json"))
+                        # Closing targets precedes the independent verification
+                        # and ledger removal. Wait for both cleanup receipts;
+                        # a cancelled HTTP observer can finish before its worker.
+                        if (actual == expected and not leases) or time.monotonic() >= deadline: break
                         time.sleep(.1)
                     assert actual == expected, (actual, expected)
                     assert original.title() == "User original" and blank.url == "about:blank"
-                    assert not list((tmp_path/"NULLION_HOME"/"browser-tab-leases").glob("*.json"))
+                    assert not leases, [json.loads(path.read_text()) for path in leases]
             finally:
                 release.set()
                 browser.close()

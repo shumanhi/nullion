@@ -86,7 +86,8 @@ def test_history_mirror_cannot_delay_answer_or_starve_typing(tmp_path,monkeypatc
     record_property('max_answer_seconds',max(samples))
 
 
-def test_shared_initial_notice_is_visible_during_slow_preparation_provider(tmp_path,monkeypatch,record_property):
+@pytest.mark.parametrize('transport', ['websocket', 'http'])
+def test_shared_initial_notice_is_visible_during_slow_preparation_provider(tmp_path,monkeypatch,record_property,transport):
     from playwright.sync_api import expect
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.chat_operator import _remember_chat_turn
@@ -107,8 +108,13 @@ def test_shared_initial_notice_is_visible_during_slow_preparation_provider(tmp_p
             primary.set();return text('確認済みの結果です。')
     app=create_app(runtime,AgentOrchestrator(model_client=Model()),ToolRegistry())
     samples=[]
+    frames=[]
+    def configure(page):
+        page.on('websocket',lambda socket: socket.on('framereceived',lambda value: frames.append(value)))
+        if transport=='http':
+            page.add_init_script("window.WebSocket = class extends WebSocket { constructor() { throw new Error('Fixture: upgrade unavailable'); } };")
     with _UvicornThread(app,_free_port()) as server:
-        pw,browser,page,errors=_open_page(server.base_url)
+        pw,browser,page,errors=_open_page(server.base_url,configure_page=configure)
         try:
             for prompt in ['確認してください','Vérifiez ceci','Comprueba esto']:
                 # A real unresolved context frame gates an auxiliary provider
@@ -128,6 +134,14 @@ def test_shared_initial_notice_is_visible_during_slow_preparation_provider(tmp_p
                 expect(page.locator('#messages .msg.bot .bubble').filter(has_text='確認済みの結果です。')).to_have_count(len(samples),timeout=20000)
             assert sum(samples)/len(samples)<3.1 and max(samples)<3.3,samples
             assert not errors
+        except Exception:
+            from pathlib import Path
+            import json
+            evidence=Path('.e2e-artifacts/initial-progress')/transport;evidence.mkdir(parents=True,exist_ok=True)
+            page.screenshot(path=str(evidence/'failure.png'))
+            (evidence/'failure.json').write_text(json.dumps({'frames':frames,
+                'bubbles':page.locator('#messages .bubble').all_text_contents()},ensure_ascii=False,indent=2))
+            raise
         finally:browser.close();pw.stop()
     record_property('mean_initial_notice_seconds',sum(samples)/len(samples))
     record_property('max_initial_notice_seconds',max(samples))

@@ -118,3 +118,37 @@ def test_overflow_keeps_all_completed_source_views_and_saved_values_without_repl
         identity='data-only',executor=native)
     assert followup['tool_results'][-1].output['value']==['flight-37','hotel-37']
     assert calls==['flight','hotel','opaque']
+
+
+def test_browser_snapshot_stays_complete_in_python_and_typed_in_model_view():
+    from copy import deepcopy
+    url='https://store.test/item?record='+('opaque-'*700)
+    rows=[{'element_id': str(i), 'tag': 'a', 'href': url+str(i), 'text': '商品',
+           'rect': {'x':1,'y':2,'height':3,'width':4}, 'unused':'z'*700} for i in range(180)]
+    original={'snapshot': {'element_count': 180, 'elements': rows}, 'session_id': 'exact-session'}
+    result=ToolResult('large-controls', 'browser_snapshot', 'completed', original)
+    before=deepcopy(original)
+    payload,_=code_mode._bounded_native_payload(result, remaining=4_000_000, per_call=2_000_000)
+    assert payload['output']==before and 'output_projection' not in payload
+    view=code_mode._default_observations([result], max_chars=48_000)['observations'][0]
+    snapshot=view['output']['snapshot']
+    assert 0<len(snapshot['elements'])<80
+    assert snapshot['elements_truncated']['shown']==len(snapshot['elements'])
+    assert all(row['href']==url+row['element_id'] for row in snapshot['elements'])
+    assert len(json.dumps(view,ensure_ascii=False))<48_000
+    assert view['inspection_reference']['invocation_id']=='large-controls'
+    assert result.output==before
+
+
+def test_model_snapshot_index_does_not_fall_back_to_cut_json():
+    result=ToolResult('native-snapshot','browser_snapshot','completed',{'session_id':'owned-session',
+        'snapshot':{'element_count':180,'elements':[{'element_id':str(i),'tag':'a','role':'link',
+            'text':f'品目 {i}','href':f'https://store.test/item/{i}?opaque='+('x'*350)} for i in range(180)]}})
+    output={'value':result.output,'operations':[{'tool_name':result.tool_name,'invocation_id':result.invocation_id}],
+        'native_observations':code_mode._default_observations([result])['observations']}
+    view=code_mode.compact_output(output, max_chars=64_000)
+    snapshots=[row['output']['snapshot'] for row in view['native_observations'] if 'snapshot' in row['output']]
+    assert snapshots and snapshots[0]['elements'][0]['href']==result.output['snapshot']['elements'][0]['href']
+    assert snapshots[0]['captured_element_count']==180
+    assert 'preview' not in str(view.keys())
+    assert len(json.dumps(view,ensure_ascii=False))<48_000

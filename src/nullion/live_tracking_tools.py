@@ -462,7 +462,10 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                          "argument_constraints": {"validation": exc.validation,
                              "ready_prepared_probes": ready, "requires_verified_probe": True,
                              "repairable_preparations": repairable,
-                             "repeatable_native_read_tools": repeatable}}}
+                             "repeatable_native_read_tools": repeatable,
+                             "probe_input_schemas": {name: registry.get_spec(name).input_schema for name in
+                                 {step.get("tool_name") for step in (args.get("probe") if isinstance(args.get("probe"), list) else []) if isinstance(step, dict)}
+                                 if name in repeatable}}}}
                     if isinstance(exc, LiveTrackerPlanError) else {})},
                 str(exc),
             )

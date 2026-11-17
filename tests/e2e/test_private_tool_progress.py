@@ -70,7 +70,7 @@ def test_history_progress_advances_in_one_card_and_avoids_unrelated_history_copy
             expect(card.filter(has_text='1 step completed')).to_have_count(1, timeout=1700)
             expect(card.filter(has_text='2 steps completed')).to_have_count(1, timeout=2500)
             expect(card).to_have_count(1)
-            assert 'Reviewing saved information' in card.inner_text()
+            assert card.inner_text().startswith('Reviewing')
             assert 'Cedar' not in card.inner_text() and 'private_data' not in card.inner_text()
             expect(page.locator('#messages .msg.bot .bubble').filter(has_text='Saved result: Cedar 17.')).to_have_count(1, timeout=3000)
             expect(card).to_have_count(0)

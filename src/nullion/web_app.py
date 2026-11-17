@@ -823,29 +823,6 @@ class CronBackgroundDeliveryTracker:
             self._by_conversation.pop(conversation_key, None)
 
 
-_BROWSER_TOOL_NAMES = (
-    "browser_run_task",
-    "browser_open",
-    "browser_navigate",
-    "browser_click",
-    "browser_click_element",
-    "browser_click_id",
-    "browser_type",
-    "browser_type_field",
-    "browser_type_id",
-    "browser_select_combobox",
-    "browser_snapshot",
-    "browser_extract_detail",
-    "browser_extract_items",
-    "browser_extract_text",
-    "browser_screenshot",
-    "browser_scroll",
-    "browser_wait_for",
-    "browser_assert_page_state",
-    "browser_find",
-    "browser_run_js",
-    "browser_close",
-)
 _WEB_BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_BROWSER_AGENT_TURN_MAX_ITERATIONS"
 _WEB_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
 
@@ -13719,7 +13696,9 @@ function renderHeaderConfig(cfg) {
       : (
         browserBackend === 'playwright'
           ? 'Playwright runs headlessly for agent tasks.'
-          : 'Browser automation is not enabled. Choose a browser backend in Settings and save.'
+          : (browserBackend
+              ? 'Browser tools are unavailable. Save browser settings to retry initialization.'
+              : 'Choose a browser backend in Settings and save.')
       );
     browserBtn.setAttribute('aria-label', browserBtn.title);
     browserBtn.setAttribute('data-tooltip', browserBtn.title);
@@ -21460,32 +21439,6 @@ def create_app(runtime, orchestrator, registry):
             return app_settings
 
     def _refresh_live_browser_tools() -> None:
-        try:
-            registry.run_cleanup_hooks()
-        except Exception:
-            logger.debug("Could not close existing browser sessions before tool refresh", exc_info=True)
-
-        unregister = getattr(registry, "unregister", None)
-        for tool_name in _BROWSER_TOOL_NAMES:
-            try:
-                if callable(unregister):
-                    unregister(tool_name)
-                else:
-                    getattr(registry, "_specs", {}).pop(tool_name, None)
-                    getattr(registry, "_handlers", {}).pop(tool_name, None)
-            except Exception:
-                logger.debug("Could not unregister browser tool %s during live refresh", tool_name, exc_info=True)
-
-        unmark_plugin_installed = getattr(registry, "unmark_plugin_installed", None)
-        for plugin_name in ("browser_plugin", "browser"):
-            try:
-                if callable(unmark_plugin_installed):
-                    unmark_plugin_installed(plugin_name)
-                else:
-                    getattr(registry, "_installed_plugins", set()).discard(plugin_name)
-            except Exception:
-                logger.debug("Could not clear browser plugin marker %s during live refresh", plugin_name, exc_info=True)
-
         browser_backend = _resolve_browser_backend()
         if not browser_backend:
             try:
@@ -21494,14 +21447,22 @@ def create_app(runtime, orchestrator, registry):
                 browser_backend = default_browser_backend_for_web_research(app_settings)
             except Exception:
                 browser_backend = None
-        if not browser_backend:
-            logger.info("Browser plugin disabled after live config refresh")
-            return
+        replacement = ToolRegistry(filesystem_allowed_roots=registry.filesystem_allowed_roots())
+        if browser_backend:
+            os.environ["NULLION_BROWSER_BACKEND"] = browser_backend
+            from nullion.plugins.browser_plugin import register_browser_tools
 
-        os.environ["NULLION_BROWSER_BACKEND"] = browser_backend
-        from nullion.plugins.browser_plugin import register_browser_tools
-
-        register_browser_tools(registry, model_client_getter=lambda: getattr(runtime, "model_client", None))
+            try:
+                register_browser_tools(replacement, model_client_getter=lambda: getattr(runtime, "model_client", None))
+            except Exception:
+                replacement.run_cleanup_hooks()
+                raise
+        registry.replace_tool_group(
+            replacement,
+            tool_prefix="browser_",
+            cleanup_group="browser_plugin",
+            plugin_names=("browser_plugin", "browser"),
+        )
         logger.info("Browser plugin refreshed after live config update (backend=%s)", browser_backend)
 
     def _hot_reload_live_config(
@@ -26075,8 +26036,7 @@ def create_app(runtime, orchestrator, registry):
                 {
                     "ok": False,
                     "error": (
-                        "Browser automation is not enabled. Choose a browser backend in Settings, "
-                        "save, and try again."
+                        "Browser tools are unavailable. Save browser settings to retry initialization."
                     ),
                 },
                 status_code=400,
@@ -27901,6 +27861,7 @@ def create_app(runtime, orchestrator, registry):
         conv_id = "web:0"
         registration = None
         progress_key = None
+        progress_delivery = None
         try:
             try:
                 payload = await request.json()
@@ -27955,14 +27916,30 @@ def create_app(runtime, orchestrator, registry):
                     http_progress.setdefault(progress_key, {'owner':registration, 'text':''})
                 await registration.wait_for_dependencies()
 
-            def http_activity(event):
-                if event.get('status_kind') != 'request_progress' or progress_key is None:
-                    return
+            async def publish_http_progress(text):
+                if progress_key is None:
+                    return None
                 if registration is not None and not registration.publication_gate.can_publish():
-                    return
+                    return None
                 with http_progress_lock:
                     if progress_key in http_progress and http_progress[progress_key]['owner'] is registration:
-                        http_progress[progress_key]['text'] = event['text']
+                        http_progress[progress_key]['text'] = text
+                        return progress_key
+                return None
+
+            async def edit_http_progress(handle, text):
+                return await publish_http_progress(text) is not None
+
+            async def retain_http_progress(handle):
+                pass  # The request's finally block owns the polling entry.
+
+            from nullion.request_progress import RequestProgressDelivery
+            progress_delivery = RequestProgressDelivery(loop=loop, send=publish_http_progress,
+                edit=edit_http_progress, remove=retain_http_progress, delay=0, interval=.5,
+                can_publish=registration.publication_gate.can_publish if registration is not None else None)
+
+            def http_activity(event):
+                progress_delivery.emit(event)
 
             def _shared_platform_chat_turn(*, allow_mini_agents: bool = False):
                 return _run_shared_web_platform_chat_turn(
@@ -28029,6 +28006,8 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"type": "error", "text": f"Error: {_short_error_text(exc)}"}, status_code=500)
 
         finally:
+            if progress_delivery is not None:
+                await progress_delivery.finish()
             if progress_key is not None:
                 with http_progress_lock:
                     if http_progress.get(progress_key, {}).get('owner') is registration:
@@ -28160,6 +28139,7 @@ def create_app(runtime, orchestrator, registry):
             async def send_reply_text(reply_text: str) -> None:
                 # Producer deltas already stream while inference is running.
                 # Completed/fallback text must appear without an artificial reveal.
+                await progress_delivery.freeze()
                 await send_websocket_event(turn_payload({"type": "chunk", "text": reply_text}))
 
             def websocket_activity_events(event: dict[str, str]) -> list[dict[str, str]]:
@@ -28186,10 +28166,27 @@ def create_app(runtime, orchestrator, registry):
                 if show_thinking_enabled and str(text or "").strip():
                     await send_websocket_event(turn_payload({"type": "thinking", "text": str(text).strip()}))
 
+            async def publish_web_progress(text):
+                await send_websocket_event(turn_payload({'type': 'progress', 'text': text}))
+                return turn_id
+
+            async def edit_web_progress(handle, text):
+                await publish_web_progress(text)
+                return True
+
+            async def retain_web_progress(handle):
+                pass  # The terminal reply reuses the status bubble.
+
+            from nullion.request_progress import RequestProgressDelivery
+            # Web already renders acceptance on send. Coalesce subsequent
+            # views immediately rather than delaying a new native message.
+            progress_delivery = RequestProgressDelivery(loop=loop, send=publish_web_progress,
+                edit=edit_web_progress, remove=retain_web_progress, delay=0, interval=.5,
+                can_publish=registration.publication_gate.can_publish if registration is not None else None)
+
             def emit_activity_event(event: dict[str, str]) -> None:
                 if event.get('status_kind') == 'request_progress':
-                    asyncio.run_coroutine_threadsafe(send_websocket_event(turn_payload({
-                        'type': 'progress', 'text': event['text']})), loop)
+                    progress_delivery.emit(event)
                     return
                 if not activity_trace_enabled:
                     return
@@ -28203,6 +28200,7 @@ def create_app(runtime, orchestrator, registry):
                     logger.debug("Unable to send web activity event", exc_info=True)
 
             async def send_early_reply_payload(payload: dict[str, object]) -> bool:
+                await progress_delivery.freeze()
                 reply = str(payload.get("text") or "(no reply)")
                 task_group_id = str(payload.get("task_group_id") or "")
                 background_owns_status = payload.get("planner_status_owned_by_background") is True
@@ -28252,9 +28250,12 @@ def create_app(runtime, orchestrator, registry):
                     return
                 if not delta:
                     return
+                async def send_delta():
+                    await progress_delivery.freeze()
+                    await send_websocket_event(turn_payload({"type": "chunk", "text": delta}))
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        send_websocket_event(turn_payload({"type": "chunk", "text": delta})),
+                        send_delta(),
                         loop,
                     ).result(timeout=2)
                 except Exception:
@@ -28297,6 +28298,7 @@ def create_app(runtime, orchestrator, registry):
                         ),
                     )
                 except Exception as exc:
+                    await progress_delivery.freeze()
                     await send_activity_event({"id": "orchestrate", "label": "Running model and tools", "status": "failed"})
                     _report_web_client_issue(
                         runtime,
@@ -28314,6 +28316,8 @@ def create_app(runtime, orchestrator, registry):
                         "artifacts": [],
                     }))
                     return
+                finally:
+                    await progress_delivery.finish()
                 if result.get("suspended_for_approval"):
                     await send_thinking_event(result.get("thinking"))
                     await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
@@ -28393,6 +28397,7 @@ def create_app(runtime, orchestrator, registry):
                     ),
                 )
             except Exception as exc:
+                await progress_delivery.freeze()
                 await send_activity_event({"id": "orchestrate", "label": "Running model and tools", "status": "failed"})
                 _report_web_client_issue(
                     runtime,
@@ -28405,6 +28410,8 @@ def create_app(runtime, orchestrator, registry):
                     "text": f"Error: {_short_error_text(exc)}",
                 }))
                 return
+            finally:
+                await progress_delivery.finish()
 
             if registration is not None and await registration.is_superseded():
                 await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})

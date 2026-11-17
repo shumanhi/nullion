@@ -5155,3 +5155,19 @@ def test_typed_production_scope_supplies_shared_guidance_after_compact_start(ext
     else:
         assert 'artifact_production_guidance' not in result.output
         assert 'artifact_output_root' not in result.output
+
+
+@pytest.mark.parametrize('prompt', ['カートの中身は？', '¿Qué hay en mi cesta?'])
+def test_script_scope_keeps_native_read_recovery_tools(prompt):
+    from nullion.plugins.browser_plugin import register_browser_tools
+    registry = ToolRegistry(); register_browser_tools(registry)
+    try:
+        scoped = ScopedTurnToolRegistry(registry, evidence=TurnToolEvidence(current_user_message=prompt),
+            tool_scope_decision=TurnToolScopeDecision(valid=True, web_action='browser_interaction',
+                requested_tool_names=('browser_run_js',)))
+        names = {d['name'] for d in scoped.list_tool_definitions()}
+        assert {'browser_run_js','browser_snapshot','browser_navigate','browser_extract_text',
+                'browser_extract_items','browser_wait_for'} <= names
+        assert all(scoped.can_invoke_tool(n) for n in ('browser_snapshot','browser_navigate','browser_extract_text'))
+    finally:
+        registry.run_cleanup_hooks()

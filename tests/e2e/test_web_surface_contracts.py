@@ -493,6 +493,126 @@ def test_browser_backend_setting_hot_reloads_live_tool_registry(tmp_path: Path, 
     assert visible_open_calls == ["https://example.com"]
 
 
+def test_browser_settings_repeated_save_preserves_real_tools_and_toolbar(tmp_path: Path, monkeypatch) -> None:
+    from nullion import web_app
+    import nullion.auth as auth_module
+    from nullion.plugins.browser_plugin import register_browser_tools
+    from nullion.plugins.browser_plugin.backends import auto_backend, cdp_backend, playwright_backend
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.tools import ToolRegistry
+
+    env_path = tmp_path / ".env"
+    saved = {"browser_backend": "auto", "browser_preferred": "brave", "browser_enabled": True}
+    opened = []
+    closed = []
+    real_auto_backend = auto_backend.AutoBackend
+    process_ports = {"chrome": 9223, "brave": 9222}
+
+    class BrowserBoundary:
+        BACKEND_NAME = "cdp"
+
+        def __init__(self):
+            self.mode = os.environ["NULLION_BROWSER_BACKEND"]
+            self.preferred = os.environ.get("NULLION_BROWSER_PREFERRED")
+            self.connected_browser = next((kind for kind, port in process_ports.items()
+                if port == auto_backend._cdp_port()), None)
+
+        async def open(self, session_id):
+            opened.append((self.mode, self.preferred, session_id, self.connected_browser))
+            return "Browser opened"
+
+        async def close_session(self, session_id):
+            closed.append(session_id)
+
+        async def shutdown(self):
+            pass
+
+    monkeypatch.setenv("NULLION_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("NULLION_ENV_FILE", str(env_path))
+    monkeypatch.setenv("NULLION_BROWSER_BACKEND", "auto")
+    monkeypatch.setenv("NULLION_BROWSER_PREFERRED", "brave")
+    monkeypatch.setenv("NULLION_BROWSER_ENABLED", "true")
+    monkeypatch.setattr(web_app, "_find_env_path", lambda: env_path)
+    monkeypatch.setattr(web_app, "_read_credentials_json", lambda: dict(saved))
+    monkeypatch.setattr(auth_module, "load_stored_credentials", lambda: dict(saved))
+    monkeypatch.setattr(web_app, "_write_credentials_json", lambda values: saved.update(values))
+    monkeypatch.setenv("NULLION_BROWSER_CDP_URL", "http://127.0.0.1:9223")
+    monkeypatch.setattr(auto_backend, "_is_cdp_reachable_at", lambda host, port: port in process_ports.values())
+    monkeypatch.setattr(auto_backend, "_cdp_owner_browser_kind_for_port",
+        lambda port: next((kind for kind, value in process_ports.items() if port == value), None))
+    monkeypatch.setattr(auto_backend, "_find_chrome",
+        lambda: "/apps/" + os.environ["NULLION_BROWSER_PREFERRED"])
+    monkeypatch.setattr(auto_backend, "_managed_profile_cdp_port",
+        lambda executable: process_ports[os.environ["NULLION_BROWSER_PREFERRED"]])
+    monkeypatch.setattr(cdp_backend, "CDPBackend", BrowserBoundary)
+    monkeypatch.setattr(playwright_backend, "PlaywrightBackend", BrowserBoundary)
+    registry = ToolRegistry(filesystem_allowed_roots=[tmp_path])
+    unrelated_cleanup = []
+    registry.register_cleanup_hook(unrelated_cleanup.append)
+    register_browser_tools(registry)
+    original_tools = {spec.name for spec in registry.list_specs()}
+    assert "browser_read_pages" in original_tools
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    app = web_app.create_app(runtime, orchestrator=None, registry=registry)
+    with _UvicornThread(app, _free_port()) as server:
+        playwright, browser, page, errors = _open_page(server.base_url)
+        try:
+            button = page.locator("#browser-btn")
+            expect(button).to_be_enabled()
+            with page.expect_response("**/api/browser/open") as response:
+                button.click()
+            assert response.value.json()["ok"] is True
+            assert opened[-1][:2] == ("auto", "brave")
+            assert opened[-1][3] == "brave"
+            for mode, preferred in (("auto", "chrome"), ("auto", "brave"), ("cdp", "brave"), ("playwright", "brave"), ("auto", "brave")):
+                _open_settings_tab(page, "General")
+                page.locator("#cfg-browser-backend").select_option(mode)
+                if mode == "auto":
+                    page.locator("#cfg-browser-preferred").select_option(preferred)
+                _close_settings_tab_after_save(page, "General")
+                page.locator("#settings-overlay .modal-close").click()
+                expect(page.locator("#settings-overlay")).not_to_be_visible()
+                cfg = page.evaluate("fetch('/api/config').then(r => r.json())")
+                assert cfg["browser_tools_available"] is True
+                assert original_tools <= {spec.name for spec in registry.list_specs()}
+                assert len(registry._cleanup_hook_groups["browser_plugin"]) == 1
+                if mode == "playwright":
+                    expect(button).to_be_hidden()
+                else:
+                    expect(button).to_be_enabled()
+                    count = len(opened)
+                    with page.expect_response("**/api/browser/open") as response:
+                        button.click()
+                    assert response.value.json()["ok"] is True
+                    assert len(opened) == count + 1
+                    assert opened[-1][:2] == (mode, preferred)
+                    if mode == "auto":
+                        assert opened[-1][3] == preferred
+            assert closed, "Retired browser sessions must be cleaned up"
+            assert unrelated_cleanup == [], "Saving browser settings must not close other tool families"
+
+            def unavailable_backend():
+                raise RuntimeError("Browser initialization unavailable")
+            monkeypatch.setattr(auto_backend, "AutoBackend", unavailable_backend)
+            failed = page.evaluate("fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({browser_backend:'auto', browser_enabled:true})}).then(r => r.json())")
+            assert "Browser initialization unavailable" in failed["browser_reload_error"]
+            assert original_tools <= {spec.name for spec in registry.list_specs()}
+            count = len(opened)
+            with page.expect_response("**/api/browser/open") as response:
+                button.click()
+            assert response.value.json()["ok"] is True
+            assert len(opened) == count + 1
+            monkeypatch.setattr(auto_backend, "AutoBackend", real_auto_backend)
+            recovered = page.evaluate("fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({browser_backend:'auto', browser_enabled:true})}).then(r => r.json())")
+            assert "browser_reload_error" not in recovered
+            assert recovered["ok"] is True
+            assert unrelated_cleanup == []
+            assert not errors
+        finally:
+            browser.close()
+            playwright.stop()
+
+
 def test_browser_ui_auto_preferred_browser_is_saved_and_used_for_open(tmp_path: Path, monkeypatch) -> None:
     from nullion import web_app
     import nullion.auth as auth_module

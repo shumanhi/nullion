@@ -2542,6 +2542,7 @@ def test_auto_backend_launches_selected_browser_on_free_port_when_other_browser_
     tmp_path,
 ) -> None:
     launched: dict[str, object] = {}
+    monkeypatch.setattr(auto_backend, "_managed_profile_cdp_port", lambda executable: None)
 
     class Proc:
         pass

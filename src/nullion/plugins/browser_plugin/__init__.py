@@ -133,7 +133,7 @@ def register_browser_tools(
     effective_policy = policy or get_default_policy()
     tools = BrowserTools(backend=backend, pool=pool, policy=effective_policy)
     registry.mark_plugin_installed("browser_plugin")
-    registry.register_cleanup_hook(tools.close_tracked_sessions)
+    registry.register_cleanup_hook(tools.close_tracked_sessions, group="browser_plugin")
     from nullion.plugins.browser_plugin.browser_reads import PageReadBatch, can_batch_read_plan
     registry.register(
         _make_spec(
@@ -551,6 +551,8 @@ def register_browser_tools(
                         "type": "string",
                         "description": "Optional CSS selector. If omitted, extract visible text from the whole page.",
                     },
+                    "include_links": {"type": "boolean", "default": True,
+                        "description": "Set false for a text-only observation, omitting the link index to keep a live probe small. Text and source URL remain intact."},
                     "ready_selector": {"type": "string", "minLength": 1, "maxLength": 500,
                         "description": "Observed stable result-content CSS selector to wait for before reading, including every live poll. Do not use a guessed selector or the page shell."},
                     "ready_text": {"type": "string", "minLength": 1, "maxLength": 200,
@@ -721,6 +723,8 @@ def register_browser_tools(
             requires_approval=False,
             timeout=15,
             code_mode_observation_tools=("browser_read_pages", "browser_navigate", "browser_snapshot", "browser_extract_text"),
+            continuation_tools=("browser_read_pages", "browser_navigate", "browser_snapshot", "browser_extract_text",
+                                "browser_extract_items", "browser_extract_detail", "browser_wait_for"),
             input_schema=_object_schema(
                 {
                     "script": {

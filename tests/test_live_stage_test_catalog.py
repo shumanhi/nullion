@@ -20,9 +20,9 @@ def policy():
 def test_complete_inventory_preserves_parameterized_cases_and_execution_types():
     result=catalog.build_catalog()
     summary=result['summary']
-    assert summary['expanded_cases']==295
-    assert sum(summary['categories'].values())==sum(summary['kinds'].values())==295
-    assert summary['kinds']==dict(live_workflow=272,saved_replay=14,
+    assert summary['expanded_cases']==296
+    assert sum(summary['categories'].values())==sum(summary['kinds'].values())==296
+    assert summary['kinds']==dict(live_workflow=273,saved_replay=14,
                                  local_harness=9,aggregate_entry_point=0)
     assert len({row['selector'] for row in result['tests']})==len(result['tests'])
     assert summary['api_scenarios']==75 and summary['web_catalogue_scenarios']==48
@@ -34,7 +34,7 @@ def test_inventory_does_not_import_app_probes_or_live_test_modules(monkeypatch):
         assert not name.startswith(('nullion','tests.e2e','scripts.live_stage_chat_contract_probe')),name
         return original(name,*args,**kwargs)
     monkeypatch.setattr(builtins,'__import__',guarded)
-    assert catalog.build_catalog()['summary']['files']==47
+    assert catalog.build_catalog()['summary']['files']==48
 
 
 @pytest.mark.parametrize('change', ['module','scenario','function','override','run_set','duplicate_category'])

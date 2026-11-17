@@ -4457,6 +4457,7 @@ class ToolRegistry:
         self._specs: dict[str, ToolSpec] = {}
         self._handlers: dict[str, ToolHandler] = {}
         self._cleanup_hooks: list[ToolCleanupHook] = []
+        self._cleanup_hook_groups: dict[str, list[ToolCleanupHook]] = {}
         self._plugin_registration_allowed = plugin_registration_allowed
         self._installed_plugins: set[str] = set()
         self._filesystem_allowed_roots = tuple(Path(root).resolve() for root in (filesystem_allowed_roots or ()))
@@ -4642,8 +4643,46 @@ class ToolRegistry:
         after_tool(spec, invocation, result)
         return result
 
-    def register_cleanup_hook(self, hook: ToolCleanupHook) -> None:
+    def register_cleanup_hook(self, hook: ToolCleanupHook, *, group: str | None = None) -> None:
         self._cleanup_hooks.append(hook)
+        if group is not None:
+            self._cleanup_hook_groups.setdefault(group, []).append(hook)
+
+    def replace_tool_group(
+        self,
+        replacement: ToolRegistry,
+        *,
+        tool_prefix: str,
+        cleanup_group: str,
+        plugin_names: Iterable[str] = (),
+    ) -> None:
+        """Install an already-built tool family before retiring its old resources.
+
+        Registration failures happen in the separate registry, leaving the live
+        family intact. Discover members from registered names rather than a
+        second, potentially stale list of tools.
+        """
+        if not tool_prefix or any(not name.startswith(tool_prefix) for name in replacement._specs):
+            raise ValueError("Replacement contains tools outside its registered family")
+        specs = {name: spec for name, spec in self._specs.items() if not name.startswith(tool_prefix)}
+        handlers = {name: handler for name, handler in self._handlers.items() if not name.startswith(tool_prefix)}
+        specs.update(replacement._specs)
+        handlers.update(replacement._handlers)
+        old_hooks = self._cleanup_hook_groups.get(cleanup_group, [])
+        hooks = [hook for hook in self._cleanup_hooks if not any(hook is old for old in old_hooks)]
+        hooks.extend(replacement._cleanup_hooks)
+        self._specs, self._handlers = specs, handlers
+        self._cleanup_hooks = hooks
+        self._cleanup_hook_groups[cleanup_group] = list(replacement._cleanup_hooks)
+        self._installed_plugins.difference_update(plugin_names)
+        self._installed_plugins.update(replacement._installed_plugins)
+        self._registry_revision += 1
+        _clear_deep_agent_profile_cache()
+        for hook in old_hooks:
+            try:
+                hook(None)
+            except Exception:
+                logger.debug("Retired tool group cleanup failed", exc_info=True)
 
     def run_cleanup_hooks(self, *, scope_id: str | None = None) -> None:
         for hook in tuple(self._cleanup_hooks):

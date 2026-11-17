@@ -1933,3 +1933,40 @@ limitation while fulfillment remains false. This ends redundant success nudges
 only when captured operations are the entire missing tool contract; missing
 actions and artifacts continue through their existing recovery boundaries.
 Raw streams are never automatically appended to final messages.
+
+
+Live alert preparation supports a lossless text-only browser projection (`include_links=false`)
+when a full link index would exceed the polling observation limit. Admission failures return
+source-owned input schemas so the shared agent can repair that exact read before creating
+an alert. Missing confirmation in a complete relevant source is distinct from missing source
+data; admission and polling retain the same conditional evaluation and evidence checks.
+Terminal source validation failures use the shared outcome presenter across clients.
+
+Updater health verification runs independent Web and messaging bootstraps concurrently
+with the HTTP check. All enabled checks must pass. This also keeps the new release's
+health probe within the original 45-second deadline retained by a running v0.11.0
+updater during its first upgrade. New updater parents use a conservative outer budget;
+probe timeouts and process startup errors enter the same failed-health rollback path
+as an unsuccessful check.
+
+A launchd job restarting itself uses `kickstart -k`, preserving its registration.
+It must never unload itself before attempting to bootstrap its replacement.
+
+WebSocket and HTTP fallback progress use the same coalesced delivery queue as
+messaging clients. Preparation keeps the shared acceptance notice readable;
+subsequent tool and model phases advance through that queue. Streaming, early
+replies, failures, cancellation and terminal responses close pending progress
+before it can replace the result.
+
+
+Oversized native browser snapshots stay complete in the Code Mode program.
+Their model-facing views are projected by schema, keep exact control identities
+and URLs, mark omitted controls, and point to the retained full receipt. Browser script scope retains
+adapter-declared native read continuations so inspection and navigation remain
+available during recovery. Shared foreground progress reports the actual model
+review phase after tool execution alongside cumulative completion facts; an
+unmapped finished operation must not leave a count as the only active status.
+
+The context handling follows [Deep Agents offloading guidance](https://docs.langchain.com/oss/python/deepagents/context-engineering#offloading)
+and the [Monty host-value boundary](https://pydantic.dev/docs/monty/quickstart/python/#which-values-cross-the-boundary):
+retain original structured data for execution and retrieval; reduce only the model-facing view.
