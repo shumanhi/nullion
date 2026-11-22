@@ -190,6 +190,8 @@ def test_rendered_text_grounds_values_split_by_dom_metadata(tmp_path, monkeypatc
     asyncio.run(other.capture(state))
     claim['value'] = '$80'
     assert other.retain(BrowserReport(goal_status="partial", next_action="report", observations=[claim])) == 0
+    assert evidence.result(error=None, elapsed=1, steps=1, done=False)["captured_documents"][0]["visible_text_verified"] is True
+    assert other.result(error=None, elapsed=1, steps=1, done=False)["captured_documents"][0]["visible_text_verified"] is False
 
 
 @pytest.mark.parametrize('label,value', [('予約時間', '19:30'), ('Precio', '$84'), ('المخزون', '12')])

@@ -43,14 +43,14 @@ def render_card_pages(value, *, image_paths=(), output_kind="pdf"):
     .n-card-report{display:flow-root;padding:20px;background:#f4f2ed;color:#193b35;font-family:Arial,sans-serif;}
     .n-card-report header{border-bottom:3px solid #b68551;margin-bottom:16px;padding-bottom:12px;}
     .n-card-report h1{font-size:27px;line-height:1.15;margin:0 0 8px;}
-    .n-card-report header p{font-size:12px;color:#52645e;margin:0;}
+    .n-card-report header p{font-size:10.5pt;color:#52645e;margin:0;}
     .n-card-cover{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin:12px 0 0;}
     .n-card-cover img{width:auto;height:95px;max-width:100%;object-fit:contain;}
     .n-card-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start;}
     .n-card{background:white;border:1px solid #dfdfd5;border-left:4px solid #b68551;border-radius:10px;padding:14px;}
     .n-card-wide{grid-column:1/-1;}
     .n-card h2{font-size:16px;line-height:1.2;margin:0 0 9px;}
-    .n-card p{font-size:12px;line-height:1.45;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;}
+    .n-card p{font-size:11pt;line-height:1.45;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;}
     .n-card img{display:block;width:100%;height:auto;max-height:130px;object-fit:contain;margin:12px auto 0;}
     </style>"""
     if output_kind == "image":

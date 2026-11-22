@@ -179,11 +179,13 @@ def test_telegram_memory_save_then_web_recall_after_restart(tmp_path,monkeypatch
                for entry in restarted.store.list_user_memory_entries())
 
 
-def test_memory_tools_leave_plain_requests_on_one_call_fast_path(tmp_path,monkeypatch,record_property):
+@pytest.mark.parametrize('code_mode',['off','read_only','on'])
+def test_memory_tools_leave_plain_requests_on_one_call_fast_path(tmp_path,monkeypatch,record_property,code_mode):
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.conversation_history_tools import with_conversation_history_tool
     from nullion.turn_context_policy import turn_tool_registry_for_evidence,TurnToolEvidence
     runtime,registry=setup(tmp_path,monkeypatch)
+    monkeypatch.setenv('NULLION_CODE_MODE',code_mode)
     def expensive(*args,**kwargs):
         time.sleep(2)
         raise AssertionError('Plain chat loaded broad runtime/history state')
@@ -198,7 +200,10 @@ def test_memory_tools_leave_plain_requests_on_one_call_fast_path(tmp_path,monkey
                 protocol_reply = workflow_provider_reply(kwargs, completion=True)
                 if protocol_reply is not None: return protocol_reply
                 self.calls+=1
-                assert self.calls==1 and {r['name'] for r in kwargs['tools']}=={'request_tool_scope','terminal_exec','chat_history_search','memory_search'}
+                expected={'request_tool_scope','chat_history_search','memory_search'}
+                expected.add('code_mode' if code_mode=='on' else 'terminal_exec')
+                if code_mode=='read_only':expected.add('code_mode')
+                assert self.calls==1 and {r['name'] for r in kwargs['tools']}==expected
                 return response('Hello.')
         model=Plain();start=time.perf_counter()
         result=AgentOrchestrator(model_client=model).run_turn(conversation_id='web:plain',principal_id='operator',user_message=prompt,

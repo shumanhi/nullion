@@ -461,3 +461,16 @@ def test_real_json_file_read_binds_ten_findings_and_shares_compact_policy_with_b
     assert result['response_fulfilled'] is True, result
     assert len(reads) == 1 and provider.plans == provider.reviews == 0
     assert len(deliveries) == 1 and 'Historical detail' not in deliveries[0]['text']
+
+@pytest.mark.parametrize('summary', ['HTML report emailed successfully.', 'HTMLレポートを送信しました。'])
+def test_approval_report_envelope_is_rendered_at_telegram_delivery(tmp_path, monkeypatch, summary):
+    from types import SimpleNamespace
+    runtime = setup_runtime(tmp_path, monkeypatch)
+    deliveries, send = telegram_boundary(monkeypatch)
+    message, _, _ = report_fixture()
+    message['summary'] = summary
+    raw = json.dumps({'format':'nullion.report.v1', 'message':message})
+    send(SimpleNamespace(), 'telegram', '2222', raw)
+    visible = '\n'.join(row.get('text','') for row in deliveries)
+    assert summary in visible
+    assert 'nullion.report.v1' not in visible and 'title_is_required' not in visible

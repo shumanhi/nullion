@@ -273,3 +273,18 @@ def test_low_level_capture_role_requires_typed_delivery(tmp_path, monkeypatch, r
     assert result.status == 'completed'
     assert result.output['artifact_descriptors'][0]['role'] == ('deliverable' if requested else 'source')
     assert Path(result.output['artifact_path']).read_bytes() == data.getvalue()
+
+
+def test_public_pdf_capture_rejects_uniform_png(tmp_path):
+    from PIL import Image
+    from nullion.browser_capture_contract import capture_pixels_required, screenshot_has_visible_pixels
+
+    path = tmp_path / "map.png"
+    with Image.new("RGB", (1200, 800), "#262626") as image:
+        image.save(path)
+        assert not screenshot_has_visible_pixels(image)
+        image.putpixel((12, 10), (255, 255, 255))
+        assert screenshot_has_visible_pixels(image)
+    assert capture_pixels_required("https://example.com/route.PDF?download=1", True)
+    assert capture_pixels_required("https://example.com/page", False)
+    assert not capture_pixels_required("about:blank", True)

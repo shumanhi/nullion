@@ -15500,7 +15500,7 @@ def test_telegram_cards_and_decision_actions(tmp_path, monkeypatch) -> None:
     assert long_caption is None and kwargs == {} and too_long is True
     assert telegram_app._should_disable_web_preview("Opened https://example.com") is True
 
-    assert telegram_app._approval_card_actions(_approval("ap-web", context={"tool_name": "web_fetch", "tool_input": {"url": "https://example.com"}}))[0][1] == "allow_session"
+    assert telegram_app._approval_card_actions(_approval("ap-web", context={"tool_name": "web_fetch", "tool_input": {"url": "https://example.com"}}))[0][1] == "allow_once"
     assert telegram_app._approval_detail("", "", "abcdef1234") == "requested action \u00b7 request abcdef12"
     boundary_approval = ApprovalRequest(
         approval_id="ap-web",
@@ -15512,6 +15512,7 @@ def test_telegram_cards_and_decision_actions(tmp_path, monkeypatch) -> None:
         request_kind="boundary_policy",
         context={"boundary_kind": "outbound_network", "target": "https://example.com"},
     )
+    assert telegram_app._approval_card_actions(boundary_approval)[0][1] == "allow_session"
     boundary_card = telegram_app._approval_card_text(boundary_approval)
     assert boundary_card.startswith("🛡️ Allow web access?")
     assert "Requested URL: `example.com`" in boundary_card
@@ -15530,9 +15531,15 @@ def test_telegram_cards_and_decision_actions(tmp_path, monkeypatch) -> None:
     runtime.store.approvals = [_approval("ap-deny")]
     assert telegram_app._execute_decision_action(service, kind="approval", action="deny", record_id="ap-deny") == (
         "Denied web access",
-        "🚫 🛡️ Denied web access: `web_fetch`. I'll stop here.\n\nRequest:\n`web_fetch`",
+        "🚫 🛡️ Denied web access. I'll stop here.\n\nRequest:\n`web_fetch`",
     )
     assert runtime.denied == ["operator:ap-deny"]
+    # A bare tool label belongs in the review detail once. A typed network
+    # boundary still supplies the real target in its acknowledgement.
+    acknowledgement, decision_text = telegram_app._approval_decision_messages(boundary_approval, "deny")
+    assert acknowledgement == "Denied web access"
+    assert decision_text.startswith("🚫 🛡️ Denied web access: `example.com`. I'll stop here.")
+    assert "`https://example.com`" in decision_text
 
     runtime.store.actions = [{"action_id": "doc-1", "status": "pending", "summary": "Ready"}]
     runtime.start_doctor_action = lambda action_id: {"action_id": action_id, "status": "running", "summary": "Started"}
@@ -15829,9 +15836,9 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
     app = App()
     returned = svc.run_polling(application=app)
     assert returned is app and app.ran is True
-    deliver_holder["fn"]("telegram:123", "progress", is_status=True, group_id="g", status_kind="progress_note")
-    deliver_holder["fn"]("telegram:123", "status", is_status=True, group_id="g", status_kind="task_summary")
-    deliver_holder["fn"]("telegram:123", "hello")
+    asyncio.run(deliver_holder["fn"]("telegram:123", "progress", is_status=True, group_id="g", status_kind="progress_note"))
+    asyncio.run(deliver_holder["fn"]("telegram:123", "status", is_status=True, group_id="g", status_kind="task_summary"))
+    asyncio.run(deliver_holder["fn"]("telegram:123", "hello"))
 
     def refresh_live_config_for_test(self, *, force=False):
         self.bot_token = "654321:abcdefghijklmnopqrstuvwxyz"
@@ -15843,7 +15850,7 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
         await app.post_init(app)
         await asyncio.sleep(0.35)
         assert app.stopped is True
-        deliver_holder["fn"]("telegram:123", "/tmp/report.pdf", is_artifact=True)
+        await deliver_holder["fn"]("telegram:123", "/tmp/report.pdf", is_artifact=True)
         await app.post_shutdown(app)
 
     asyncio.run(run_lifecycle())
@@ -18586,7 +18593,7 @@ async def test_telegram_orchestrator_deliver_fn_confirms_task_summary_status(
     service.run_polling(application=App())
 
     assert orchestrator.deliver_fn is not None
-    delivered = orchestrator.deliver_fn(
+    delivered = await orchestrator.deliver_fn(
         "telegram:123",
         "Planner: Sequential Mission • 2 tasks\nFor: Build a file\n→ Working on 2 tasks:\n  ☐ Gather\n  ☐ Create",
         is_status=True,
@@ -18696,7 +18703,11 @@ async def test_telegram_planner_command_suppresses_text_when_matching_planner_ca
 
 
 def test_planner_summary_reply_should_be_suppressed_when_card_already_exists() -> None:
+    from nullion.runtime_store import RuntimeStore
     runtime = Runtime()
+    # Suppression requires the current group's typed history evidence. The
+    # legacy EventStore fixture lacks list_recent_conversation_events.
+    runtime.store = RuntimeStore()
     reply = (
         "Planner: Single Turn • 1 task\n"
         "For: Build the requested planner PDF\n"

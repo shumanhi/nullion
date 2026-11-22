@@ -17,8 +17,11 @@ def test_pdf_print_keeps_heading_with_next_block_and_preserves_all_text(tmp_path
     with sync_playwright() as playwright:
         monkeypatch.setenv('NULLION_CHROMIUM_EXECUTABLE', playwright.chromium.executable_path)
     output = tmp_path / 'section-report.pdf'
-    markup = ''.join(f'<p style="height:80px;margin:0">Record {i}</p>' for i in range(rows))
-    markup += f'<h2>{heading}</h2><p style="height:350px;margin:0">DETAILS FOLLOW</p>'
+    # These spacers put the heading near the physical page boundary at scale=1.
+    # The former 80px rows needed document shrink to fit two pages. The next
+    # small related block is explicit; long ordinary paragraphs remain flowable.
+    markup = ''.join(f'<p style="height:44px;margin:0">Record {i}</p>' for i in range(rows))
+    markup += f'<h2>{heading}</h2><p data-nullion-keep-together style="height:350px;margin:0">DETAILS FOLLOW</p>'
     result = _build_pdf_create_handler(tmp_path)(ToolInvocation(
         invocation_id='pdf-pagination', tool_name='pdf_create', principal_id='operator',
         arguments={'output_path': str(output), 'html_pages': [markup], 'title': 'Section report'}))

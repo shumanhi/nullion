@@ -342,17 +342,61 @@ def render_report_message(value: dict, *, diagnostics=None, preferences=None, fa
         sections=tuple(sections), footer=footer, kind='report' if include_title else None), preferences=prefs)
 
 
-def render_report_envelope(text: str | None, *, diagnostics=None, preferences=None, include_title: bool = True) -> str | None:
-    """Recognize only the explicit producer envelope, never infer intent."""
-    if not isinstance(text, str) or not text.lstrip().startswith('{'): return text
+def _report_json_candidate(text: str | None) -> str | None:
+    """Find the JSON start after an optional legacy presentation icon."""
+    if not isinstance(text, str):
+        return None
     raw = text.lstrip()
+    if raw.startswith('{'):
+        return raw
+    if not raw.startswith(_ROLE_ICON_PREFIXES):
+        return None
+    # Older saved replies can carry a single presentation icon.
+    for icon in _ROLE_ICONS.values():
+        if raw.startswith(icon + ' '):
+            raw = raw[len(icon) + 1:].lstrip()
+            break
+    return raw if raw.startswith('{') else None
+
+
+def render_report_reply(text: str | None) -> str | None:
+    """Keep ordinary replies outside the optional structured renderer."""
+    if _report_json_candidate(text) is None:
+        return text
+    return render_report_envelope(text)
+
+
+def _decode_report_envelope(text):
+    """Recognize only the explicit producer envelope, never infer intent."""
+    raw = _report_json_candidate(text)
+    if raw is None:
+        return None
     try: value, end = json.JSONDecoder().raw_decode(raw)
-    except (ValueError, TypeError): return text
-    if not isinstance(value, dict) or value.get('format') != REPORT_MESSAGE_FORMAT: return text
-    # The explicit format selects this contract. Preserve trailing producer
-    # text (including attachment descriptors) verbatim; it is not a reason to
-    # expose the envelope's optional/internal fields or discard public text.
-    suffix = raw[end:].strip()
+    except (ValueError, TypeError): return None
+    if not isinstance(value, dict) or value.get('format') != REPORT_MESSAGE_FORMAT: return None
+    return raw, value, end
+
+
+def canonical_report_envelope(text: str) -> str | None:
+    """Retain the structured report in history without presentation decoration."""
+    parsed = _decode_report_envelope(text)
+    if parsed is None:
+        return None
+    from nullion.redaction import redact_text, redact_value
+
+    raw, value, end = parsed
+    return json.dumps(redact_value(value), ensure_ascii=False) + redact_text(raw[end:])
+
+
+def render_report_envelope(text: str | None, *, diagnostics=None, preferences=None, include_title: bool = True) -> str | None:
+    parsed = _decode_report_envelope(text)
+    if parsed is None:
+        return text
+    raw, value, end = parsed
+    from nullion.redaction import redact_text
+
+    # Keep trailing delivery descriptors and redact the accompanying prose.
+    suffix = redact_text(raw[end:]).strip()
     fallback = value.get('text') if isinstance(value.get('text'), str) else ''
     rendered = render_report_message(value.get('message'), diagnostics=diagnostics,
         preferences=preferences, fallback=fallback, include_title=include_title)
@@ -431,7 +475,7 @@ def render_user_message(message: UserMessage | str, *, preferences=None) -> str:
         groups.append('\n'.join(f'{i}. {label}' for i, label in enumerate(message.choices, 1)))
     groups.append(message.footer)
     text = '\n\n'.join(part.strip() for part in groups if part and part.strip())
-    return apply_presentation_preferences(text, preferences=prefs, message_kind=message.kind)
+    return _apply_presentation_style(text, preferences=prefs, message_kind=message.kind)
 
 
 def complete_verified_findings(summary: str, findings: tuple[ReplyFinding, ...], *, preferences=None) -> str:
@@ -486,6 +530,7 @@ def structured_user_message(value: dict, *, diagnostics=None, preferences=None) 
 
 _ROLE_ICONS = {'email':'✉️', 'calendar':'📅', 'update':'🔔', 'report':'📊',
                'success':'✅', 'warning':'⚠️', 'error':'⚠️', 'scheduled':'⏰'}
+_ROLE_ICON_PREFIXES = tuple(icon + ' ' for icon in _ROLE_ICONS.values())
 
 
 def _decorative_character(char):
@@ -502,6 +547,13 @@ def presentation_prefix(message_kind, *, preferences=None) -> str:
 
 def apply_presentation_preferences(text: str, *, preferences=None, message_kind=None) -> str:
     """Shared final style boundary. Never rewrite facts or make another model call."""
+    envelope = canonical_report_envelope(text)
+    if envelope is not None:
+        return envelope
+    return _apply_presentation_style(text, preferences=preferences, message_kind=message_kind)
+
+
+def _apply_presentation_style(text: str, *, preferences=None, message_kind=None) -> str:
     from nullion.redaction import redact_text
     text = make_markdown_tables_chat_readable(redact_text(text))
     prefs = _presentation_preferences(preferences)

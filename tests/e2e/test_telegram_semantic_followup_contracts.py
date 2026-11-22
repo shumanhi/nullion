@@ -217,3 +217,121 @@ def test_web_numeric_followup_does_not_revive_old_scheduler_scope(tmp_path, monk
     choice = runtime.store.get_conversation_turn("choice")
     assert choice.parent_turn_id == "current"
     assert choice.disposition_reason in {"dispatch:numbered_option_reply", "dispatch:numbered_conversation_choice"}
+
+
+@pytest.mark.parametrize("open_task", [False, True])
+def test_idle_telegram_links_completed_source_around_unrelated_turn(tmp_path, monkeypatch, open_task):
+    from nullion import telegram_app
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.config import load_settings
+    from nullion.tools import ToolRegistry, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
+    from tests.e2e.test_quoted_reply_review_and_cleanup import isolate, call, text
+
+    runtime = isolate(tmp_path, monkeypatch)
+    monkeypatch.setenv("NULLION_CODE_MODE", "off")
+    source = "https://example.com/results"
+    first, unrelated, followup = "Consulta el precio", "Cuéntame un chiste", "ほかの便は？"
+    if open_task:
+        unrelated, followup = "日付を確認してから予定を作ってください。", "明日です。"
+    reads, decisions, sent = [], [], []
+    registry = ToolRegistry()
+
+    def read(invocation):
+        reads.append(invocation.invocation_id)
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "completed",
+                          {"result_kind": "browser_page_collection", "completed_pages": 1,
+                           "documents": [{"url": source, "text": "$20" if len(reads) == 1 else "$35"}]})
+
+    registry.register(ToolSpec("browser_read_pages", "Read source", ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 5, capability_tags=("web",), input_schema={"type": "object"}), read)
+    runtime.active_tool_registry = registry
+
+    class Model:
+        current = first
+
+        def create(self, **kwargs):
+            system = str(kwargs.get("system", ""))
+            messages = json.dumps(kwargs.get("messages", []), ensure_ascii=False)
+            if "keys relationship, effect" in system:
+                request = json.loads(kwargs["messages"][0]["content"][0]["text"])
+                decisions.append(request)
+                if self.current == followup:
+                    target = (0 if open_task else next(item["index"] for item in request["active_requests"]
+                                                       if item["user_request"] == first))
+                    return text(json.dumps({"relationship": "follow_up", "effect": "continue", "confidence": 1,
+                                            "target_index": target, "target_is_explicit": True}))
+                return text(json.dumps({"relationship": "separate", "confidence": 1, "target_index": None}))
+            protocol = workflow_provider_reply(kwargs, completion=False)
+            if protocol is not None:
+                return protocol
+            names = {tool["name"] for tool in kwargs.get("tools", [])}
+            if not names:
+                return text("{}")
+            if self.current == unrelated:
+                return text("何日ですか？" if open_task else "Un chiste breve.")
+            if open_task and self.current == followup:
+                return text("日付を確認しました。")
+            target_count = 1 if self.current == first else 2
+            if len(reads) < target_count:
+                assert "retained_browser_snapshot" not in messages
+                if "browser_read_pages" not in names:
+                    return call("request_tool_scope", {"capabilities": ["web"],
+                                "tool_names": ["browser_read_pages"], "required_tool_names": ["browser_read_pages"]})
+                return call("browser_read_pages", {"url": source})
+            return text("$20" if self.current == first else "$35")
+
+    model = Model()
+    settings = load_settings(env={"NULLION_TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                                 "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "123", "NULLION_TELEGRAM_CHAT_ENABLED": "true"})
+    service = telegram_app.ChatOperatorService(runtime=runtime, settings=settings, bot_token=settings.telegram.bot_token,
+        operator_chat_id="123", model_client=model, agent_orchestrator=AgentOrchestrator(model_client=model))
+
+    class Message:
+        caption = None
+        from_user = SimpleNamespace(id=123, first_name="Ada", last_name="", username="ada")
+        reply_to_message = None
+
+        def __init__(self, prompt, mid):
+            self.text, self.message_id = prompt, mid
+            self.chat = SimpleNamespace(id=123, send_action=self.send_action)
+
+        async def send_action(self, action):
+            return None
+
+        async def reply_text(self, reply, **kwargs):
+            sent.append((self.message_id, reply))
+            return SimpleNamespace(message_id=1000 + len(sent))
+
+    async def run():
+        for mid, prompt in enumerate((first, unrelated, followup), 1):
+            model.current = prompt
+            await service.on_message(SimpleNamespace(update_id=mid, message=Message(prompt, mid)), SimpleNamespace(bot=None))
+            if open_task and mid == 2:
+                from datetime import UTC, datetime
+                from nullion import turn_dispatch_choices
+                from nullion.task_frames import (TaskFrame, TaskFrameExecutionContract, TaskFrameFinishCriteria,
+                    TaskFrameOperation, TaskFrameOutputContract, TaskFrameStatus)
+
+                active = runtime.store.get_conversation_turn("telegram-update:2")
+                now = datetime.now(UTC)
+                frame = TaskFrame("fixture-open-task", active.conversation_id, active.branch_id, active.turn_id,
+                    None, TaskFrameStatus.WAITING_INPUT, TaskFrameOperation.ANSWER_WITH_CONTEXT, None,
+                    TaskFrameExecutionContract(), TaskFrameOutputContract(), TaskFrameFinishCriteria(False),
+                    unrelated, now, now)
+                runtime.store.add_task_frame(frame)
+                runtime.store.set_active_task_frame_id(active.conversation_id, frame.frame_id)
+
+                def reject_browser_fallback(*args, **kwargs):
+                    pytest.fail("Open task context must take priority over the older browser turn")
+
+                monkeypatch.setattr(turn_dispatch_choices, "completed_browser_dispatch_candidates", reject_browser_fallback)
+
+    asyncio.run(run())
+    assert len(reads) == (1 if open_task else 2)
+    expected = "日付を確認しました。" if open_task else "$35"
+    assert any(mid == 3 and expected in reply for mid, reply in sent)
+    assert decisions[-1]["current_message"] == followup
+    turn = runtime.store.get_conversation_turn("telegram-update:3")
+    assert turn.parent_turn_id == ("telegram-update:2" if open_task else "telegram-update:1")
+    assert turn.disposition.value == "continue"
+    assert not runtime.store.list_recent_conversation_events("telegram:123", event_type="conversation.retained_browser_snapshot")

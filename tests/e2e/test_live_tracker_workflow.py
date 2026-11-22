@@ -858,15 +858,16 @@ def test_one_structured_request_confirms_both_distinct_trackers(live_fixture):
         assert len(client.get("/api/live-trackers").json()["trackers"]) == 2
 
 
-def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, monkeypatch):
-    """Real Chromium keeps the prepared page and receives a later assignment."""
+def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, monkeypatch, record_property):
+    """Prepare one tracker-owned page, then reuse its state across checks."""
     from fastapi.testclient import TestClient
+    from pathlib import Path
     from nullion.web_app import create_app
     from nullion.plugins.browser_plugin import register_browser_tools
     from nullion.live_tracking import LiveTrackerStore
 
     f = live_fixture
-    state = SimpleNamespace(title="pending", loads=0)
+    state = SimpleNamespace(title="pending", loads=0, page_requests=[])
 
     class PageSource(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -876,8 +877,22 @@ def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, mo
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            state.page_requests.append(self.path)
+            if self.path != "/":
+                self.send_response(404)
+                self.end_headers()
+                return
             state.loads += 1
-            body = b'''<title>pending</title><script>sessionStorage.setItem('prepared','yes');
+            body = b'''<title>pending</title><main id="assignment-source" hidden>
+            <h1>Assignment source</h1><input name="page-instance" readonly>
+            <input name="prepared-marker" readonly><input name="document-instance" readonly></main><script>
+            sessionStorage.setItem('prepared','yes');
+            if(!sessionStorage.getItem('page-instance'))
+              sessionStorage.setItem('page-instance',crypto.randomUUID());
+            document.querySelector('[name="page-instance"]').value=sessionStorage.getItem('page-instance');
+            document.querySelector('[name="prepared-marker"]').value=sessionStorage.getItem('prepared');
+            document.querySelector('[name="document-instance"]').value=crypto.randomUUID();
+            document.querySelector('main').hidden=false;
             setInterval(async()=>{document.title=await(await fetch('/state')).text()},100)</script>'''
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -893,10 +908,51 @@ def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, mo
     monkeypatch.setenv("NULLION_BROWSER_BACKEND", "playwright")
     register_browser_tools(f.registry)
     phase = 0
-    session = None
+    prepared_probe = None
+    snapshots = []
+    native_steps = []
+    native_invoke = f.registry.invoke
+
+    def capture_native_snapshot(invocation):
+        result = native_invoke(invocation)
+        if invocation.tool_name in {"browser_navigate", "browser_snapshot", "create_live_tracker"}:
+            native_steps.append({"tool_name": invocation.tool_name, "arguments": dict(invocation.arguments),
+                "status": result.status, "html_loads": state.loads, "paths": list(state.page_requests),
+                "flow_kind": (invocation.flow_context or {}).get("flow_kind"),
+                "owner": (invocation.flow_context or {}).get("browser_session_owner"),
+                "session_id": result.output.get("session_id")})
+        if invocation.tool_name == "browser_snapshot" and result.status == "completed":
+            snapshots.append({"arguments": dict(invocation.arguments), "output": result.output,
+                "context": {key: (invocation.flow_context or {}).get(key) for key in
+                    ("flow_kind", "browser_session_owner", "browser_session_scope")}})
+        return result
+
+    monkeypatch.setattr(f.registry, "invoke", capture_native_snapshot)
+
+    def observed_snapshot(kwargs):
+        # The scripted external actor selects a landmark from the actual native
+        # message, rather than inventing a selector before observing the source.
+        for message in reversed(kwargs.get("messages", [])):
+            for block in reversed(message.get("content", []) if isinstance(message.get("content"), list) else []):
+                if block.get("type") != "tool_result":
+                    continue
+                content = block.get("content", "")
+                texts = [content] if isinstance(content, str) else [
+                    part.get("text", "") for part in content if part.get("type") == "text"]
+                for raw in reversed(texts):
+                    try:
+                        # Native JSON can be followed by runtime preparation
+                        # guidance. Decode that envelope without parsing prose.
+                        payload, _ = json.JSONDecoder().raw_decode(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    output = payload.get("output")
+                    if payload.get("status") == "completed" and isinstance(output, dict) and isinstance(output.get("elements"), list):
+                        return output
+        raise AssertionError("The actor did not receive the native source snapshot")
 
     def model(**kwargs):
-        nonlocal phase, session
+        nonlocal phase, prepared_probe
         protocol_reply = workflow_provider_reply(kwargs)
         if protocol_reply is not None: return protocol_reply
         names = {d["name"] for d in kwargs.get("tools", [])}
@@ -915,20 +971,41 @@ def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, mo
         if phase == 3:
             return use("browser_snapshot", {"session_id": "source-a"})
         if phase == 4:
+            observation = observed_snapshot(kwargs)
+            landmark = next(element for element in observation["elements"] if element.get("name") == "prepared-marker")
+            assert landmark["value"] == "yes"
+            # Native model context keeps observed control attributes even when
+            # the raw snapshot is compacted. Select exactly that visible input.
+            prepared_probe = {"session_id": "source-a", "ready_selector":
+                "input[name=" + json.dumps(landmark["name"]) + "]"}
+            return use("browser_snapshot", dict(prepared_probe))
+        if phase == 5:
+            assert any(element.get("name") == "prepared-marker" and element.get("value") == "yes"
+                       for element in observed_snapshot(kwargs)["elements"])
             return use("create_live_tracker", {
                 "name": "割り当ての観測", "duration_seconds": 90, "interval_seconds": 5,
-                "probe": [{"tool_name": "browser_snapshot", "arguments": {"session_id": "source-a"}}],
+                "source_refresh": "reuse",
+                "probe": [{"tool_name": "browser_snapshot", "arguments": dict(prepared_probe)}],
                 "matcher": {"kind": "structured", "summary": "Assigned resource is ready.", "conditions": [{
                     "step": 0, "pointer": "/snapshot/title", "op": "equals", "value": "slot-7", "label": "Assignment",
                 }]},
             })
+        assert phase == 6, "Polling must not restart the agent/model workflow"
         return text(fixture_action_acknowledgement(kwargs) or "Watching.")
 
-    f.model.create = model
+    model_errors = []
+    def checked_model(**kwargs):
+        try:
+            return model(**kwargs)
+        except Exception as exc:
+            model_errors.append({"phase": phase, "error": repr(exc)})
+            raise
+    f.model.create = checked_model
     try:
         with TestClient(create_app(f.runtime, f.orchestrator, f.registry)) as client:
             reply = client.post("/api/chat", json={"text": "このページの割り当てを90秒だけ監視してください。", "conversation_id": "web:stateful-observation"})
-            assert "Live tracker" in reply.json()["text"], reply.json()
+            assert "Live tracker" in reply.json()["text"], {"reply": reply.json(), "phase": phase,
+                "model_errors": [{"phase": row["phase"], "error": row["error"]} for row in model_errors]}
             store = LiveTrackerStore(f.tmp_path / "runtime.db")
             deadline = time.monotonic() + 25
             job = store.list("workspace_admin")[0]
@@ -938,6 +1015,41 @@ def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, mo
                     break
                 time.sleep(.1)
             assert job["checks"] >= 2 and job["last_outcome"] == "no_match", job
+            assert job["probe"][0]["arguments"] == prepared_probe
+            assert job["probe_contexts"][0]["observation_refresh"] == "reuse"
+            assert job["probe_contexts"][0]["observation_setup"][-1] == {
+                "tool_name": "browser_wait_for", "arguments": {"selector": prepared_probe["ready_selector"]}}
+            assert not any(key.startswith("browser_session_") for key in job["probe_contexts"][0]), job
+            creator = [row for row in snapshots if row["context"]["flow_kind"] != "live_tracker"]
+            worker = [row for row in snapshots if row["context"]["flow_kind"] == "live_tracker"]
+            assert len(creator) == 2 and len(worker) >= 2
+            assert creator[0]["output"]["observation_readiness"]["verified"] is False
+            assert creator[1]["output"]["observation_readiness"]["verified"] is True
+            assert all(row["output"]["observation_readiness"]["verified"] is True for row in worker)
+            creator_session = creator[0]["output"]["session_id"]
+            worker_session = worker[0]["output"]["session_id"]
+            assert creator_session != worker_session
+            assert all(row["output"]["session_id"] == creator_session for row in creator)
+            assert all(row["output"]["session_id"] == worker_session for row in worker)
+            assert all(row["context"]["browser_session_owner"] == "live-tracker:" + job["id"] for row in worker)
+            def markers(row):
+                return {element["name"]: element["value"] for element in row["output"]["snapshot"]["elements"]
+                        if element.get("name") in {"page-instance", "prepared-marker", "document-instance"}}
+            creator_instance = markers(creator[0])["page-instance"]
+            worker_instance = markers(worker[0])["page-instance"]
+            assert creator_instance and worker_instance and creator_instance != worker_instance
+            creator_document = markers(creator[0])["document-instance"]
+            worker_document = markers(worker[0])["document-instance"]
+            assert creator_document and worker_document and creator_document != worker_document
+            assert all(markers(row) == {"page-instance": creator_instance, "prepared-marker": "yes",
+                "document-instance": creator_document} for row in creator)
+            assert all(markers(row) == {"page-instance": worker_instance, "prepared-marker": "yes",
+                "document-instance": worker_document} for row in worker)
+            # One creator load plus one isolated worker preparation is expected.
+            # Repeated polling must preserve the worker's prepared page.
+            assert state.loads == 2, {"error": "A source was reopened during repeated checks", "paths": state.page_requests}
+            model_calls_after_setup = phase
+            assert model_calls_after_setup == 6
             state.title = "slot-7"
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
@@ -946,9 +1058,18 @@ def test_live_tracker_keeps_prepared_browser_page_across_checks(live_fixture, mo
                     break
                 time.sleep(.1)
             assert job["state"] == "matched" and job["notification_status"] == "sent", job
-            assert state.loads == 1, "Polling reopened the page instead of reusing the prepared tab"
-            assert phase == 5, "Polling restarted the agent/model workflow"
+            assert state.loads == 2, {"error": "Polling reopened the tracker-owned page", "paths": state.page_requests}
+            assert phase == model_calls_after_setup, "Polling restarted the agent/model workflow"
+            worker = [row for row in snapshots if row["context"]["flow_kind"] == "live_tracker"]
+            assert all(row["output"]["session_id"] == worker_session and markers(row) == {
+                "page-instance": worker_instance, "prepared-marker": "yes", "document-instance": worker_document} for row in worker)
     finally:
+        record_property("prepared_source_html_loads", state.loads)
+        evidence = Path("/outputs/tracker-page-reuse") if Path("/outputs").is_dir() else f.tmp_path / "evidence"
+        evidence.mkdir(parents=True, exist_ok=True)
+        (evidence / "native-preparation.json").write_text(json.dumps({"html_loads": state.loads,
+            "paths": state.page_requests, "native_steps": native_steps, "snapshots": snapshots,
+            "model_calls": phase}, ensure_ascii=False, indent=2, default=str))
         f.registry.run_cleanup_hooks()
         server.shutdown()
         thread.join(timeout=2)

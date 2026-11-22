@@ -88,11 +88,15 @@ from nullion.doctor_actions import (
 )
 from nullion.platform_activity import (
     PlatformTaskCardStore,
+    PlatformStatusMessageParts,
+    platform_status_message_confirmed,
+    deliver_platform_status_parts,
     platform_activity_capabilities,
     prepare_platform_task_status_update,
+    deliver_platform_task_status_update,
     should_deliver_task_status,
 )
-from nullion.run_activity import RunActivityPhase, classify_run_activity_phase
+from nullion.run_activity import RunActivityPhase, classify_run_activity_phase, task_planner_feed_enabled
 from nullion.health import HealthIssueType
 from nullion.operator_commands import (
     chat_model_option_for_token,
@@ -1458,8 +1462,8 @@ def _approval_card_actions(approval) -> tuple[tuple[str, str], ...]:
         calendar_actions = _CALENDAR_APPROVAL_CARD_ACTIONS.get(tool_name)
         if calendar_actions is not None:
             return calendar_actions
-    tool_name, detail = _approval_card_fields(approval)
-    if _approval_is_web_request(tool_name, detail):
+    from nullion.approval_decisions import is_outbound_boundary_approval
+    if is_outbound_boundary_approval(approval):
         return (
             ("Allow all web domains", "allow_session"),
             ("Allow once", "allow_once"),
@@ -2171,7 +2175,7 @@ def _telegram_streaming_mode(runtime: PersistentRuntime, *, chat_id: str | None)
 
 def _telegram_allows_status_streaming(runtime: PersistentRuntime, *, chat_id: str | None) -> bool:
     _ = (runtime, chat_id)
-    return True
+    return task_planner_feed_enabled()
 
 
 def _telegram_conversation_id(chat_id: str | None) -> str | None:
@@ -2334,7 +2338,7 @@ def _planner_summary_reply_should_be_suppressed(
     *,
     chat_id: str | None,
     reply: str | None,
-    status_messages: dict[tuple[str, str], int],
+    status_messages: dict[tuple[str, str], int | PlatformStatusMessageParts],
     status_texts: dict[tuple[str, str], str],
 ) -> bool:
     if not chat_id or not isinstance(reply, str):
@@ -2351,16 +2355,8 @@ def _planner_summary_reply_should_be_suppressed(
     if planner_card is None:
         return False
     planner_group_id = str(planner_card[0] or "").strip()
-    has_matching_status_card = bool(
-        planner_group_id
-        and status_messages.get((chat_id, planner_group_id))
-    )
-    if not has_matching_status_card:
-        has_matching_status_card = any(
-            key_chat == chat_id and "PLANNER" in str(status_text or "")
-            for (key_chat, _key_group), status_text in status_texts.items()
-        )
-    return has_matching_status_card
+    return bool(planner_group_id and platform_status_message_confirmed(
+        status_messages.get((chat_id, planner_group_id))))
 
 
 def _should_skip_telegram_primary_reply_delivery(
@@ -2389,7 +2385,7 @@ async def _deliver_telegram_planner_summary_card(
     chat_id: str | None,
     group_id: str,
     reply: str,
-    status_messages: dict[tuple[str, str], int] | None = None,
+    status_messages: dict[tuple[str, str], int | PlatformStatusMessageParts] | None = None,
     status_texts: dict[tuple[str, str], str] | None = None,
     status_locks: dict[tuple[str, str], threading.Lock] | None = None,
     typing_tasks: dict[tuple[str, str], asyncio.Task[None]] | None = None,
@@ -2398,7 +2394,7 @@ async def _deliver_telegram_planner_summary_card(
 ) -> bool:
     if not chat_id or not group_id or not bot_token:
         return False
-    if not force and not _telegram_allows_status_streaming(runtime, chat_id=chat_id):
+    if not _telegram_allows_status_streaming(runtime, chat_id=chat_id):
         return False
     include_activity = activity_trace_enabled_for_chat(runtime, chat_id=chat_id)
     if not force and not should_deliver_task_status(
@@ -2457,7 +2453,7 @@ def _should_live_stream_telegram_activity(
 
 async def _send_or_edit_telegram_status_message(
     bot,
-    status_messages: dict[tuple[str, str], int],
+    status_messages: dict[tuple[str, str], int | PlatformStatusMessageParts],
     *,
     chat_id: str,
     group_id: str,
@@ -2486,7 +2482,8 @@ async def _send_or_edit_telegram_status_message(
         finally:
             lock.release()
         return
-    if status_texts is not None and status_texts.get(key) == text:
+    if (status_texts is not None and status_texts.get(key) == text
+            and not isinstance(status_messages.get(key), PlatformStatusMessageParts)):
         return
     if isinstance(bot, str):
         try:
@@ -2504,45 +2501,46 @@ async def _send_or_edit_telegram_status_message(
                 status_texts=status_texts,
             )
         return
-    formatted, kwargs = format_telegram_text(text)
-    kwargs = {**kwargs, "disable_web_page_preview": True}
-    message_id = status_messages.get(key)
-    if message_id is not None:
+    chunks = format_telegram_chunks(text, limit=_TELEGRAM_MESSAGE_CHUNK_SIZE)
+    async def send_part(part):
+        formatted, options = part
+        sent = await retry_messaging_delivery_operation(
+            lambda: bot.send_message(chat_id, formatted, disable_web_page_preview=True, **options),
+            replay_safe=False, retry_policy=telegram_send_error_replay_safety)
+        message_id = getattr(sent, 'message_id', None)
+        if message_id is None:
+            raise UnconfirmedDelivery()
+        return int(message_id)
+    async def edit_part(message_id, part):
+        formatted, options = part
         try:
-            result = await retry_messaging_delivery_operation(
+            await retry_messaging_delivery_operation(
                 lambda: bot.edit_message_text(
                     text=formatted,
                     chat_id=chat_id,
                     message_id=message_id,
-                    **kwargs,
-                )
-            )
-            if status_texts is not None:
-                status_texts[key] = text
-            return
+                    disable_web_page_preview=True, **options,
+                ), replay_safe=True)
+            return True
         except Exception as exc:
             if "message is not modified" in str(exc).lower():
-                if status_texts is not None:
-                    status_texts[key] = text
-                return
-            error_name = exc.__class__.__name__.casefold()
-            if "timedout" in error_name or "timed out" in str(exc).casefold():
-                raise
-            logger.debug("Telegram planner status edit failed; sending replacement status message", exc_info=True)
-            status_messages.pop(key, None)
-    sent_message = await retry_messaging_delivery_operation(
-        lambda: bot.send_message(chat_id, formatted, **kwargs)
-    )
-    sent_message_id = getattr(sent_message, "message_id", None)
-    if sent_message_id is not None:
-        status_messages[key] = int(sent_message_id)
+                return True
+            raise
+    async def delete_part(message_id):
+        return bool(await retry_messaging_delivery_operation(
+            lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), replay_safe=True))
+    delivered = await deliver_platform_status_parts(messages=status_messages, key=key, parts=chunks,
+        send_part=send_part, edit_part=edit_part, delete_part=delete_part,
+        replay_safety=telegram_send_error_replay_safety)
+    if not delivered:
+        raise RuntimeError('Task status delivery was rejected')
     if status_texts is not None:
         status_texts[key] = text
 
 
 async def _send_or_edit_telegram_task_status_message(
     bot,
-    status_messages: dict[tuple[str, str], int],
+    status_messages: dict[tuple[str, str], int | PlatformStatusMessageParts],
     *,
     chat_id: str,
     group_id: str,
@@ -2569,6 +2567,9 @@ async def _send_or_edit_telegram_task_status_message(
             )
             delivered_status = True
             break
+        except UnconfirmedDelivery:
+            # A status tick cannot prove that an unacknowledged send failed.
+            raise
         except Exception:
             if attempt == 0:
                 await asyncio.sleep(0.75)
@@ -3448,7 +3449,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
             attachments.append(failed_attachment)
             _mark_timing(f"file_download_failed:{filename}:status={failure_status}:attempts={attempts}")
             continue
-        saved = save_messaging_attachment(
+        saved = await asyncio.to_thread(save_messaging_attachment,
             filename=filename,
             data=data,
             media_type=media_type,
@@ -3522,25 +3523,37 @@ async def _telegram_reply_attachments(message, context, *, runtime, settings) ->
     media_group_id = _telegram_media_group_id(replied)
     if media_group_id:
         message_id = f"telegram-media-group:{chat_id}:{media_group_id}"
+    from nullion.attachment_receipts import load_attachment_receipt, verified_receipt_attachments
+    from nullion.connections import workspace_id_for_principal
+    principal_id = _principal_id_for_telegram_message(message, settings)
+    workspace_id = workspace_id_for_principal(principal_id)
     list_events = getattr(getattr(runtime, "store", None), "list_recent_conversation_events", None)
     if callable(list_events):
         for event in reversed(list_events(f"telegram:{chat_id}", event_type="conversation.attachment_received", limit=64)):
             if event.get("message_id") != message_id:
                 continue
-            attachments = event.get("attachments")
-            if isinstance(attachments, list) and attachments and all(
-                isinstance(item, dict) and str(item.get("path") or "")
-                and Path(item["path"]).is_file() for item in attachments
-            ):
-                return [dict(item) for item in attachments]
+            attachments = await asyncio.to_thread(verified_receipt_attachments, event,
+                principal_id=principal_id, workspace_id=workspace_id)
+            if attachments:
+                return attachments
             break
+    checkpoint_path = getattr(runtime, 'checkpoint_path', None)
+    receipt = (await asyncio.to_thread(load_attachment_receipt, checkpoint_path,
+        f"telegram:{chat_id}", message_id)) if checkpoint_path else None
+    attachments = await asyncio.to_thread(verified_receipt_attachments, receipt,
+        principal_id=principal_id, workspace_id=workspace_id)
+    if attachments:
+        return attachments
     # Telegram includes the original media reference in reply_to_message. It
     # remains usable when no completed turn (or durable receipt) exists yet.
     return await _download_telegram_attachments(replied, context, settings=settings)
 
 
-def _checkpoint_telegram_attachment_receipt(runtime, *, conversation_id, message_id, request_id, text, attachments):
+def _checkpoint_telegram_attachment_receipt(runtime, *, conversation_id, message_id, request_id, text, attachments, principal_id=None):
     """Persist input identity before admission/classification or a model call."""
+    from nullion.connections import workspace_id_for_principal
+    if principal_id is None:
+        principal_id = principal_id_for_messaging_identity("telegram", conversation_id.removeprefix("telegram:"))
     receipt = {
         "event_type": "conversation.attachment_received",
         "created_at": datetime.now(UTC).isoformat(),
@@ -3549,14 +3562,23 @@ def _checkpoint_telegram_attachment_receipt(runtime, *, conversation_id, message
         "turn_id": request_id,
         "user_message": text,
         "attachments": [dict(item) for item in attachments],
+        "principal_id": principal_id,
+        "workspace_id": workspace_id_for_principal(principal_id),
     }
-    runtime.store.add_conversation_event(receipt)
+    from nullion.attachment_receipts import save_attachment_receipt
+    save_attachment_receipt(runtime.checkpoint_path, receipt)
     from nullion.runtime_persistence import checkpoint_runtime_conversation_events
-
-    checkpoint_runtime_conversation_events(
-        runtime.store, runtime.checkpoint_path, conversation_id=conversation_id,
-        conversation_events=[receipt], timeout_seconds=5,
-    )
+    try:
+        runtime.store.add_conversation_event(receipt)
+        checkpoint_runtime_conversation_events(
+            runtime.store, runtime.checkpoint_path, conversation_id=conversation_id,
+            conversation_events=[receipt], timeout_seconds=0.1,
+        )
+    except Exception as exc:
+        # The independent receipt is already durable and is used after restart.
+        # A busy optional history index must not reject owned input or request a
+        # resend. Never expose input text, paths or connector payloads in logs.
+        logger.warning("Attachment receipt saved; history indexing deferred (%s)", type(exc).__name__)
 
 
 def _telegram_media_group_id(message: object | None) -> str | None:
@@ -3797,12 +3819,12 @@ def _approval_decision_emoji(display_title: str) -> str:
     return first if separator else "✅"
 
 
-def _approval_decision_subject(approval, detail: str) -> str:
+def _approval_decision_subject(approval) -> str:
     display = approval_display_from_request(approval)
     if getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
         return "delete action"
     title = display.title.lower()
-    if display.is_web_request or _approval_is_web_request(display.label, detail):
+    if display.is_web_request:
         return "web access"
     if "file access" in title:
         return "file access"
@@ -3823,28 +3845,20 @@ def _approval_decision_subject(approval, detail: str) -> str:
     return display.label
 
 
-def _approval_decision_target(approval, detail: str) -> str:
-    display = approval_display_from_request(approval)
-    if getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
-        context = getattr(approval, "context", None)
-        if isinstance(context, dict):
-            target = str(context.get("target") or "").strip()
-            if target:
-                return target
-        return ""
-    target_url = _approval_target_url(detail)
-    if display.is_web_request and target_url:
-        return _approval_target_host(target_url)
-    for key in ("URL", "Path", "Target", "Command", "Query", "Resource", "Operation"):
-        match = re.search(rf"(?: · )?{key}:\s*(?P<value>.+)$", detail, flags=re.IGNORECASE)
-        if match:
-            value = match.group("value").strip()
-            if key == "URL" and value:
-                return _approval_target_host(value)
-            return value
-    if target_url:
-        return _approval_target_host(target_url)
-    return detail.strip().rstrip(".")
+def _approval_decision_target(approval) -> str:
+    from nullion.approval_decisions import approval_boundary_kind, is_outbound_boundary_approval
+
+    context = getattr(approval, "context", None)
+    context = context if isinstance(context, dict) else {}
+    target = context.get("target") or context.get("path")
+    if approval_boundary_kind(approval) is not None:
+        target = target or getattr(approval, "resource", None)
+        if isinstance(target, str) and is_outbound_boundary_approval(approval):
+            return _approval_target_host(target)
+    if (approval_boundary_kind(approval) is not None
+            or getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND):
+        return target.strip() if isinstance(target, str) else ""
+    return ""
 
 
 def _approval_decision_detail_suffix(detail: str) -> str:
@@ -3873,8 +3887,8 @@ def _approval_decision_messages(approval, action: str) -> tuple[str, str]:
             "Denied Doctor continuation",
             f"🚫 {emoji} Denied Doctor continuation. I'll stop here.{detail_suffix}",
         )
-    subject = _approval_decision_subject(approval, detail)
-    target = _approval_decision_target(approval, detail)
+    subject = _approval_decision_subject(approval)
+    target = _approval_decision_target(approval)
     target_suffix = f" for {approval_inline_code(target)}" if target else ""
     target_colon = f": {approval_inline_code(target)}" if target else ""
 
@@ -3898,11 +3912,11 @@ def _approval_decision_messages(approval, action: str) -> tuple[str, str]:
 
 
 def _approval_resume_fallback_reply(approval, reply: str) -> str:
-    text = reply.strip()
-    text = re.sub(r"\s+Continuing\.\.\.$", ".", text)
+    # The decision card already contains the full review. A follow-up only
+    # reports continuation guidance; repeating the card also repeats its draft.
     if approval is None:
-        return f"{text}\nPlease resend your message to continue."
-    return f"{text}\nPlease resend your message if it does not continue automatically."
+        return "Please resend your message to continue."
+    return "Please resend your message if it does not continue automatically."
 
 
 def _resume_delivery_channel_for_approval(runtime, approval) -> str:
@@ -4266,7 +4280,7 @@ class ChatOperatorService:
     _first_run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _live_config_signature_cache: tuple[object, ...] | None = None
     _live_media_signature_cache: str | None = None
-    _status_messages: dict[tuple[str, str], int] = field(default_factory=dict)
+    _status_messages: dict[tuple[str, str], int | PlatformStatusMessageParts] = field(default_factory=dict)
     _status_texts: dict[tuple[str, str], str] = field(default_factory=dict)
     _status_locks: dict[tuple[str, str], threading.Lock] = field(default_factory=dict)
     _status_typing_tasks: dict[tuple[str, str], asyncio.Task[None]] = field(default_factory=dict)
@@ -5106,6 +5120,7 @@ class ChatOperatorService:
                     _checkpoint_telegram_attachment_receipt, self.runtime,
                     conversation_id=early_conversation_id, message_id=message_id_local,
                     request_id=request_id, text=text_for_ack, attachments=telegram_attachments,
+                    principal_id=_principal_id_for_telegram_message(message, self.settings),
                 )
             except Exception:
                 logger.exception("Could not persist Telegram attachment input")
@@ -5985,6 +6000,7 @@ class ChatOperatorService:
             if message is not None
             else None
         )
+        approval_progress = None
         try:
             try:
                 acknowledgement, reply = await asyncio.to_thread(
@@ -6046,6 +6062,22 @@ class ChatOperatorService:
                 )
                 try:
                     resume_kwargs = {}
+                    if resume_delivery_channel == "telegram":
+                        from nullion.request_progress import RequestProgressDelivery
+
+                        async def send_progress(text):
+                            formatted, kwargs = format_telegram_text(text)
+                            return await message.reply_text(formatted, do_quote=False,
+                                disable_web_page_preview=True, **kwargs)
+
+                        async def edit_progress(sent, text):
+                            formatted, kwargs = format_telegram_text(text)
+                            await sent.edit_text(formatted, disable_web_page_preview=True, **kwargs)
+                            return True
+
+                        approval_progress = RequestProgressDelivery(loop=asyncio.get_running_loop(),
+                            send=send_progress, edit=edit_progress, remove=lambda sent: sent.delete())
+                        resume_kwargs["activity_callback"] = approval_progress.emit
                     if self.model_client is not None:
                         resume_kwargs["model_client"] = self.model_client
                     if self.agent_orchestrator is not None:
@@ -6064,6 +6096,8 @@ class ChatOperatorService:
                         chat_id_text,
                     )
                     resumed_reply = None
+                if approval_progress is not None:
+                    await approval_progress.freeze()
                 if resumed_reply is not None:
                     # If the resume itself suspended for another approval, show only
                     # the next decision card. Sending the raw "Tool approval
@@ -6132,6 +6166,8 @@ class ChatOperatorService:
                             quote_reply=False,
                         )
         finally:
+            if approval_progress is not None:
+                await approval_progress.finish()
             await _stop_typing_keepalive(typing_keepalive_task)
 
     def build_application(self):
@@ -6191,8 +6227,10 @@ class ChatOperatorService:
             _status_locks = self._status_locks
             _status_typing_tasks = self._status_typing_tasks
             _task_card_store = self._task_card_store
+            _task_card_markers = {}
+            _task_card_async_locks = {}
 
-            def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
+            async def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
                 """Route aggregator output back to the originating Telegram chat."""
                 # conversation_id is "telegram:<chat_id>"
                 chat_id = conversation_id.removeprefix("telegram:")
@@ -6208,72 +6246,43 @@ class ChatOperatorService:
                     group_id = str(kwargs.get("group_id") or "")
                     status_kind = str(kwargs.get("status_kind") or "task_summary")
                     include_activity = activity_trace_enabled_for_chat(_service_ref.runtime, chat_id=chat_id)
-                    if not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id):
-                        return False
-                    if not should_deliver_task_status(
-                        status_kind=status_kind,
-                        planner_feed_enabled=True,
-                        include_activity=include_activity,
-                    ):
-                        return True
-                    update = prepare_platform_task_status_update(
-                        target_id=chat_id,
-                        group_id=group_id,
-                        text=text,
-                        status_kind=status_kind,
-                        activity_id=str(kwargs.get("activity_id") or ""),
-                        activity_label=str(kwargs.get("activity_label") or ""),
-                        task_card_store=_task_card_store,
-                        planner_feed_enabled=True,
-                        include_activity=include_activity,
-                    )
-                    if update is None:
-                        return False
-                    if not update.rendered_text:
+                    planner_enabled = task_planner_feed_enabled()
+                    if not should_deliver_task_status(status_kind=status_kind,
+                            planner_feed_enabled=planner_enabled, include_activity=include_activity):
                         return True
                     async def _deliver_status(use_loop_bound_state: bool) -> bool:
-                        return await _send_or_edit_telegram_task_status_message(
-                            bot_token,
-                            _status_messages,
-                            chat_id=update.target_id,
-                            group_id=update.group_id,
-                            text=update.rendered_text,
-                            runtime=_service_ref.runtime,
-                            bot_token=bot_token,
-                            status_texts=_status_texts,
-                            status_locks=_status_locks,
-                            typing_tasks=_status_typing_tasks if use_loop_bound_state else None,
-                        )
+                        async def publish(_target_id, rendered_text):
+                            delivered = await _send_or_edit_telegram_task_status_message(
+                                bot_token, _status_messages, chat_id=chat_id, group_id=group_id,
+                                text=rendered_text, runtime=_service_ref.runtime, bot_token=bot_token,
+                                status_texts=_status_texts, status_locks=_status_locks,
+                                typing_tasks=_status_typing_tasks if use_loop_bound_state else None)
+                            return True if delivered else None
+                        async def edit(_existing, target_id, rendered_text):
+                            return bool(await publish(target_id, rendered_text))
+                        return await deliver_platform_task_status_update(
+                            target_id=chat_id, group_id=group_id, text=text, status_kind=status_kind,
+                            activity_id=str(kwargs.get("activity_id") or ""),
+                            activity_label=str(kwargs.get("activity_label") or ""),
+                            task_card_store=_task_card_store, status_messages=_task_card_markers,
+                            status_locks=_task_card_async_locks, planner_feed_enabled=planner_enabled,
+                            include_activity=include_activity, terminal=bool(kwargs.get("terminal")),
+                            send_new=publish, edit_existing=edit)
 
-                    is_terminal_status = bool(kwargs.get("terminal"))
-                    # A task-summary card owns the visible planner surface. Do
-                    # not report it as delivered until Telegram has accepted
-                    # the send/edit; otherwise the foreground fallback can be
-                    # suppressed while the user only sees the generic Activity
-                    # card.
-                    confirm_delivery = is_terminal_status or status_kind == "task_summary"
-                    return _schedule_or_run_telegram_status_delivery(
-                        _deliver_status,
-                        confirm=confirm_delivery,
-                    )
+                    return await _deliver_status(True)
                 # Final results and artifacts are awaited so delivery failures
                 # surface to the result aggregator instead of disappearing.
                 group_id = str(kwargs.get("group_id") or "")
                 principal_id = principal_id_for_messaging_identity("telegram", chat_id, _service_ref.settings)
                 outbound_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
                 try:
-                    return _run_confirmed_telegram_delivery(
-                        lambda: _send_operator_telegram_message(
-                            bot_token,
-                            chat_id,
-                            outbound_text,
-                            principal_id=principal_id,
-                        )
-                    )
+                    return await _send_operator_telegram_message(
+                        bot_token, chat_id, outbound_text, principal_id=principal_id)
                 finally:
                     # A send beginning is not a delivery receipt. Keep group
                     # typing alive through the pending final network operation.
                     if group_id:
+                        _task_card_store.clear(target_id=chat_id, group_id=group_id)
                         _cancel_telegram_status_typing_for_group(
                             _status_typing_tasks, chat_id=chat_id, group_id=group_id)
 

@@ -3898,10 +3898,11 @@ def test_message_history_error_and_activity_helpers(monkeypatch) -> None:
     assert web_app._web_activity_events_for_tool_results([]) == []
     monkeypatch.setattr(web_app, "is_untrusted_tool_name", lambda name: False)
     assert web_app._web_tool_result_detail(ToolResult("5", "web_search", "completed", {"summary": "hidden"})) is None
-    assert web_app._web_tool_result_detail(ToolResult("6", "tool", "completed", {"url": "https://example.com/a"})) == "example.com"
-    assert web_app._web_tool_result_detail(ToolResult("7", "tool", "completed", {"summary": "sum"})) == "sum"
-    assert web_app._web_tool_result_detail(ToolResult("8", "tool", "completed", "plain text")) == "plain text"
+    assert web_app._web_tool_result_detail(ToolResult("6", "tool", "completed", {"url": "https://example.com/a"})) is None
+    assert web_app._web_tool_result_detail(ToolResult("7", "tool", "completed", {"summary": "sum"})) is None
+    assert web_app._web_tool_result_detail(ToolResult("8", "tool", "completed", "plain text")) is None
     assert web_app._web_tool_result_detail(ToolResult("9", "tool", "completed", {})) is None
+    assert web_app._web_tool_result_detail(ToolResult("10", "list_crons", "completed", {"crons": [{"task": "private"}]})) == "1 scheduled task"
 
     emitted: list[dict[str, str]] = []
     web_app._emit_activity(None, "none", "None")

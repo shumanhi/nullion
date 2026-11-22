@@ -9,6 +9,7 @@ unless the user explicitly asked for raw output.
 from __future__ import annotations
 
 import ast
+import hashlib
 import html
 import json
 import math
@@ -25,7 +26,7 @@ from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlparse
 
 from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
-from nullion.tools import ToolResult
+from nullion.tools import ToolResult, normalize_tool_status
 
 
 _SENSITIVE_STRUCTURED_KEYS = {
@@ -1426,6 +1427,20 @@ def _format_action_receipt(output: dict[str, object]) -> str | None:
             lines.extend(["", "Details:"])
             lines.extend(f"- {detail}" for detail in clean_details)
     return "\n".join(lines).strip()
+
+
+def native_filesystem_receipt_reply(result: ToolResult) -> str | None:
+    """Render invocation-bound native facts, never fields parsed from stdout."""
+    if result.tool_name != 'terminal_exec' or normalize_tool_status(result.status) not in {'completed','failed'}:
+        return None
+    output = result.output if isinstance(result.output,dict) else {}
+    receipt = output.get('action_receipt')
+    metadata = (result.response_requirements or {}).get('_native_filesystem_action_receipt')
+    if (not isinstance(receipt,dict) or receipt.get('action')!='delete' or receipt.get('object_type')!='filesystem'
+            or not isinstance(metadata,dict) or metadata.get('invocation_id')!=result.invocation_id):
+        return None
+    digest = hashlib.sha256(json.dumps(receipt,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    return _format_action_receipt(output) if metadata.get('sha256')==digest else None
 
 
 def _result_foreground_reply_suppressed(result: ToolResult) -> bool:
@@ -8385,6 +8400,9 @@ def _has_uncompleted_required_account_tool(results: list[ToolResult], family: st
 
 
 def _prefix_account_tool_reply(text: str, results: list[ToolResult]) -> str:
+    # Keep structured producer contracts intact until the shared renderer.
+    if str(text or "").lstrip().startswith("{"):
+        return text
     family = _primary_account_tool_family(results)
     if family is None:
         return text

@@ -1,621 +1,197 @@
-# Nulliøn
+<div align="center">
+  <img src="src/nullion/assets/nullion-assistant-avatar.svg" width="88" alt="Nullion assistant">
+  <h1>Nulliøn</h1>
+  <p><strong>Hand off the work. Keep the controls.</strong></p>
+  <p>Your personal AI assistant for browser research, useful files, and work that keeps running after you ask.</p>
+  <p>
+    <a href="#get-started"><strong>Get started</strong></a> ·
+    <a href="https://www.nullion.ai/#demo">Watch the demo</a> ·
+    <a href="docs/README.md">Read the docs</a> ·
+    <a href="https://github.com/shumanhi/nullion/releases">Latest release</a>
+  </p>
+  <p>Open source · Runs on your computer · Bring your own model · macOS, Windows &amp; Linux</p>
+</div>
 
-![Nullion local operator console with chat, generated artifacts, approvals, tasks, and control center](https://www.nullion.ai/assets/nullion-web-console-real.png)
+Nullion connects the model you choose to your browser, files, and enabled tools.
+Ask from the local Web console, Telegram, Slack, or Discord. Get an answer, a
+file you can use, or an update when a scheduled job or temporary watch has news.
+You choose the capabilities, connected accounts, and approval rules.
 
-Nulliøn is an AI assistant that runs from your own computer, connects to the
-tools and chat apps you use, and keeps you in control of what it can do. It can
-help with work across your files, browser, apps, and messages while keeping
-approvals, settings, and local data under your control.
+## What would you hand off?
 
-Under the hood, Nullion uses LangGraph workflows to route tasks, approvals, file
-delivery, and follow-ups through predictable steps. Its security model keeps
-tool access, workspace boundaries, provider accounts, and human approvals
-separate, so powerful actions stay scoped and reviewable. The primary agent owns
-its answer without a separate AI reviewer; permissions, approvals, file integrity
-and delivery acknowledgements remain enforced by the runtime.
+| You ask | Nullion can help you get |
+| --- | --- |
+| “Compare these three options, explain the tradeoffs, and attach a PDF.” | A comparison with findings, sources, and a downloadable report. |
+| “Turn these attached notes into a project brief.” | A useful document built from the material you supplied. |
+| “Every weekday at 8 AM, send me a briefing on these topics.” | Recurring research delivered to the chat you selected. |
+| “Watch this page for two hours. Tell me once tickets become available.” | A temporary, read-only tracker with a defined end time. |
+| “What did we decide about this earlier?” | Relevant saved conversation history and memory, when available. |
 
-Online docs: https://www.nullion.ai/docs/
+Capabilities depend on the tools and providers you enable. Websites can restrict
+access, and account integrations need their own setup and permission.
 
-## Shared architecture
+<!-- This is the real Web UI with explicitly labeled example data, not a live customer workspace. -->
+![Nullion Web console with an example comparison and a downloadable file](docs/assets/nullion-readme-example.png)
 
-Nullion's architecture requires one execution pipeline and one shared
-presentation layer across every client. Equivalent requests with equivalent
-context, permissions and runtime capabilities follow the same execution policy.
-**The client changes how the result is displayed—not how the work is done.**
+*The actual Web console with sample data. [Watch the product demo](https://www.nullion.ai/#demo).*
 
-```mermaid
-flowchart TD
-    A["Web · Telegram · Slack · Discord"] --> B["Input adapters<br/>Normalize messages, replies and attachments"]
-    C["Scheduled jobs · Live trackers"] --> D
-    B --> D["One common request contract"]
+## Why Nullion?
 
-    D --> E["Shared context<br/>Profile, memory, history and task state"]
-    E --> F["One execution pipeline<br/>Reasoning, tool selection, approvals,<br/>execution, retries and recovery"]
+**Your assistant, wherever you chat.** Start in the Web console or connect
+Telegram, Slack, or Discord. Conversation context, tools, approvals, and results
+use the same shared assistant underneath.
 
-    F --> G["Shared tools<br/>Browser, connectors, files and delegated workers"]
-    G -->|"Structured evidence and receipts"| F
+**Work you can see.** Follow planned tasks and current activity, review requests
+for permission, and receive a clear final result. Planner cards and detailed
+activity have separate controls, so you can choose how much to see.
 
-    F --> H["One result contract<br/>Answer, files, limitations and choices"]
-    H --> I["One shared presentation layer<br/>User preferences, structure, tone and emoji"]
-    I --> J["Client output adapters<br/>Markup, splitting, uploads and transport"]
-    J --> K["Delivered result"]
-    J -->|"Delivery acknowledgement"| F
-```
+**Useful beyond the current message.** Set reminders and recurring jobs, or
+watch a condition for a limited time. Keep your hosting machine running and
+connected for background work and notifications.
 
-Client adapters normalize incoming transport data and render or deliver the
-shared result. Context, reasoning, execution policy, approvals and recovery
-belong to the shared runtime. Platform capabilities are explicit inputs to that
-runtime rather than separate assistant policies.
+**A setup you control.** Choose your model provider, enabled tools, file roots,
+browser, and connected accounts. Repeated workflows can become reusable skills
+through reviewable proposals.
 
-See [Runtime architecture](docs/architecture.md) for the detailed contract.
+## Get started
 
-## Visual browser navigation
+### 1. Install
 
-Nullion 0.9 adds Browser Use for multi-step website navigation with the model you
-already configured. It can inspect rendered pages, compare displayed options,
-and attach screenshots alongside its findings. Useful partial results survive
-an interrupted run, with unavailable details clearly identified.
-Readable-page research can batch navigation and structured extraction in the
-configured browser, including limited parallel reads that preserve its login.
-Adaptive browser interaction remains available when a page needs it.
-
-Fresh installations prepare the isolated browser worker automatically. Existing
-installations can enable it with their app Python:
-`python -m nullion.plugins.browser_plugin.browser_use_setup --home ~/.nullion`.
-[Browser setup and configuration](src/nullion/plugins/browser_plugin/README.md).
-Some sites restrict automated access; navigation time depends on the website and
-model. The feature is intended for reading and comparison, not completing purchases.
-
-## Temporary live tracking
-
-Ask in chat to watch a condition for a limited time, for example:
-
-> Watch this train's platform assignment every 15 seconds for two hours. Alert
-> me once it is assigned, then stop.
-
-A live tracker prepares the source once and repeats only its read-only check;
-it does not restart a cron or full assistant task on each poll. Checks default
-to every 15 seconds and support intervals from 5 seconds to 6 hours. By default,
-they report new changes until the chosen finite duration or future end time;
-you can explicitly request a stop after the first match. If the condition, duration, or recurring-versus-temporary intent
-is unclear, Nullion asks numbered questions first. A readable source and its
-permissions are required.
-
-Manage trackers and their separate parallel-check limit under **Settings →
-Crons → Live trackers**. There is no `/track` slash command. See
-[Live tracking, reminders, and recurring jobs](docs/live-tracking.md).
-
-## Install
-
-**Mac or Linux** — open Terminal and paste:
+**macOS or Linux** — open Terminal:
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/shumanhi/nullion/main/install.sh?$(date +%s)" | bash
 ```
 
-**Windows** — open PowerShell and paste:
+**Windows** — open PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/shumanhi/nullion/main/install.ps1 | iex
 ```
 
-Nullion needs Python 3.11 through 3.13. The installer checks for Python first and
-tries to install it automatically when it is missing:
+You can inspect the [macOS/Linux installer](install.sh) or
+[Windows installer](install.ps1) before running it. Already cloned the repo?
+Run `bash install.sh` on macOS or Linux.
 
-- Windows: installs Python 3.12 with `winget`
-- macOS: installs Python 3.12 with Homebrew
-- Linux: installs Python with `apt`, `dnf`, `pacman`, or `zypper`
+The installer supports Python **3.11–3.13** and attempts to install a compatible
+version when needed. It prepares the browser worker and guides you through
+configuration. Initial downloads and optional capabilities can take several
+minutes. If a dependency cannot be installed automatically, follow the setup
+instructions and rerun the installer.
 
-If the automatic Python install is blocked, install Python manually and rerun
-the Nullion installer:
+### 2. Connect your model and tools
 
-```powershell
-# Windows PowerShell
-winget install --id Python.Python.3.12 --source winget -e
-py -3.12 --version
-```
+Open the console at **[localhost:8742](http://localhost:8742)**, or run:
 
 ```bash
-# macOS
-brew install python@3.12
-python3.12 --version
+nullion --dashboard
 ```
 
-Avoid Python 3.14 for now on Windows; some tray/webview dependencies do not
-publish compatible wheels yet.
+Choose your provider and model in **Settings → Model**. Enable the browser and
+file capabilities you want to use; connect chat apps or accounts when you need
+them. The local Web console works without a Telegram account.
+
+See [Configuration](docs/configuration.md), [Plugins and account connections](docs/plugins.md),
+and [Chat setup](docs/configuration.md#chat-adapters).
+
+### 3. Give it a first task
+
+With browser access enabled, try:
+
+> Open https://example.com in the browser and summarize what the page says.
+
+Then try a file task:
+
+> Create a weekend-trip packing checklist and attach it as a PDF.
+
+If a capability needs an optional package or additional setup, complete its
+reviewable setup request first. Start with a small task and narrowly scoped
+permissions, then add the tools you want to trust.
+
+## Local first, with clear boundaries
+
+- **Local state.** History, memory, schedules, skills, and runtime state are
+  stored on the machine running Nullion. Your selected model and connected
+  services receive the data needed for the work you authorize; local storage
+  does not make cloud processing local.
+- **Explicit access.** Tool permissions are separate from allowed files,
+  destinations, and accounts. Sensitive actions can pause for your approval;
+  you can inspect and revoke grants. Review the approval mode you select.
+- **Workspace ownership.** Member workspaces keep their own context and account
+  connections. Access to one workspace does not automatically grant another
+  member access to your accounts.
+- **Honest costs.** Nullion is open-source software under Apache 2.0. Model
+  providers, APIs, and other connected services may charge for usage.
+
+Chat history and saved provider credentials support local encryption, including
+optional operating-system key storage. This is **not encryption of every file**
+in the instance directory: generated files, logs, runtime records, and browser
+profiles can contain private data. Read [Security and data handling](SECURITY.md)
+before connecting sensitive accounts.
+
+## Make it yours
+
+| Explore | Start here |
+| --- | --- |
+| Browser research and visible browser setup | [Browser guide](src/nullion/plugins/browser_plugin/README.md) |
+| Reminders, recurring jobs, and temporary watches | [Live tracking and scheduled work](docs/live-tracking.md) |
+| Search, files, media, and account connections | [Plugin catalog](docs/plugins.md) |
+| Reusable instructions and optional skill packs | [Skill packs](docs/skill-packs.md) |
+| Models, chat apps, storage, and settings | [Configuration](docs/configuration.md) |
+| Everyday chat and terminal commands | [Command reference](docs/commands.md) |
+
+Email and calendar integrations are **preview features** with provider-specific
+setup. Connecting Telegram, Slack, or Discord as a chat interface does not
+itself grant account-level messaging access.
+
+## Updates and help
+
+Update an installed copy to the latest release:
 
 ```bash
-# Debian/Ubuntu
-sudo apt-get update
-sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
-python3.12 --version
+nullion update
 ```
 
-The installer sets everything else up, walks you through connecting your API keys, and starts Nullion automatically. Initial downloads, browser preparation, and optional local models can take several minutes.
-
-On macOS and Windows, Nullion also includes an optional tray/menu-bar companion:
+Useful commands when you need a closer look:
 
 ```bash
-nullion-tray
+nullion --status
+nullion --logs
+nullion --restart
 ```
 
-It shows the Nullion logo in the menu bar or system tray and gives you quick access to the Web UI, approvals, logs, config, and restart actions. Clicking "Open Web UI" opens a native webview window; "Open in Browser" is still available from the menu.
-
-The tray reuses its local HTTP connection for status checks. Offline checks back
-off to at most once per minute; an explicit refresh checks immediately. See
-[connection troubleshooting](docs/support.md#local-tcp-connection-exhaustion)
-if several unrelated services report network address errors.
-
-To remove the local install later:
-
-```bash
-nullion uninstall
-```
-
-Use `nullion uninstall --dry-run` to preview the cleanup, or `nullion uninstall --keep-data` to remove services while keeping `~/.nullion`.
-
-Useful local commands:
-
-```text
-nullion --dashboard          # open the dashboard; --web is also accepted
-nullion --logs               # tail live logs
-nullion --errors             # tail error logs
-nullion --config             # open ~/.nullion/.env in $EDITOR
-nullion --status             # show service and tray status
-nullion --stop               # stop background service and tray
-nullion --restart            # restart web, chat services, and tray
-nullion --model gpt-5.5      # switch model
-nullion --provider openai    # switch provider
-nullion tray install         # install/start tray companion
-nullion tray status          # inspect tray service
-nullion update               # update to the latest release
-nullion update --hash        # update to the latest repository commit
-nullion update --ignore-checks
-nullion repair windows-install
-nullion-cli --one-shot "Summarize my project"
-nullion-cli update --hash
-nullion-cli skill-pack enable openclaw/local-skills
-nullion-auth --reauth codex
-```
-
-On Windows, use `nullion repair windows-install` after a broken update leaves
-launcher scripts, scheduled tasks, or `~ullion` pip leftovers behind. It repairs
-the installed source pointer and recreates Web, Tray, and Telegram launch tasks
-without rewriting the locked `nullion.exe` launcher.
-
-## License and security
-
-Nullion is released under the Apache License 2.0. See [LICENSE](LICENSE).
-
-This project is provided as-is, without warranties. You are responsible for
-configuring API keys, approvals, third-party integrations, enabled plugins,
-file roots, browser permissions, schedules, model providers, and any actions
-performed by agents or tools.
-
-Please report vulnerabilities privately through GitHub Security Advisories:
-https://github.com/shumanhi/nullion/security/advisories/new
-
-Do not include API keys, bot tokens, OAuth tokens, private file paths, or logs
-with secrets in public issues. See [SECURITY.md](SECURITY.md) for details.
+[Find setup and troubleshooting help](docs/support.md) or
+[report a bug](https://github.com/shumanhi/nullion/issues).
+Include your OS, version, and reproduction steps; keep credentials and private
+data out of public reports.
 
 <details>
-<summary>Already cloned the repo?</summary>
+<summary>Uninstall or recover an installation</summary>
 
 ```bash
-bash install.sh
+nullion uninstall --dry-run
+nullion uninstall --keep-data
 ```
+
+Remove the install and its data with `nullion uninstall`. Use `--dry-run` to
+preview removal or `--keep-data` to retain local data.
+
+If the main app cannot start, `nullion-recovery status` provides a separate
+recovery entry point. For a broken Windows update, see
+[Windows installation repair](docs/support.md#updates-and-rollback).
 
 </details>
 
-## Goals
-
-- Secure by default
-- Easy to install and configure
-- Pluggable chat adapters — Telegram, Slack, Discord, and Web UI
-- Clear everyday wording
-- Parallel mini-agent execution through a warm pool
-- LangChain model/tool adapters for provider-agnostic execution
-- LangGraph-backed routing for parallel turns, dependent follow-ups, approvals,
-  and delivery workflows
-- Deep Agents harness for scoped mini-agent tasks
-- Contract-based file, PDF, image, and document delivery across web and messaging
-- Global Doctor for health checks and safe recovery
-- Global Sentinel for approval, boundary policy, and grant management
-- Workspace-scoped approvals, crons, grants, and member connections
-- Validated planner task cards, separate verbose activity traces, and thinking summaries
-- Builder proposals for reusable skills, compacted memory, and optional
-  capability dependencies
-
-## Launch feature summary
-
-- **LangChain-native integration** — Nullion exposes its scoped tools as
-  LangChain structured tools and wraps configured model clients as LangChain chat
-  models, so orchestration can use standard interfaces without bypassing
-  Sentinel policy.
-- **LangGraph workflows** — turn routing, Telegram delivery planning, artifact
-  finalization, attachment formatting, and approval decisions run through typed
-  state graphs instead of prompt-string branching.
-- **Parallel work** — complex requests can be decomposed into bounded subtasks,
-  dispatched through Deep Agents/warm mini-agents, and merged by a result
-  aggregator.
-- **Two-layer safety** — Sentinel separates tool capability grants from boundary
-  policy for domains, file roots, accounts, workspaces, and other scoped
-  resources.
-- **Workspace ownership** — approvals, scheduled jobs, provider connections,
-  delivery targets, memory, and grants stay attached to the initiating
-  workspace or operator instead of leaking across users.
-- **Visible planning and artifacts** — Planner cards show planned work by default
-  and stay separate from verbose mode. The current runtime keeps task cards
-  enabled. Verbose is only on/off for activity details; when activity is off,
-  the card keeps its request summary and task rows. Requested
-  artifacts are surfaced as the requested format, without dumping intermediate
-  files used to build them.
-- **Faster normal chat** — independent turns can continue in parallel while
-  linked follow-ups wait only when typed task state says they should. Tool
-  results are compacted before returning to the model so large payloads do not
-  swamp the next response.
-- **Delivery as a contract** — message-only tasks finish when the reply is
-  delivered; attachment tasks finish only when the requested file exists and is
-  surfaced as a web download or messaging attachment.
-- **Self-healing runtime** — Doctor probes adapters, plugins, scheduler,
-  database, browser backend, model client, and warm-pool capacity, then retries
-  safe recovery before escalating.
-- **Skills and capabilities that improve with use** — Builder detects repeated
-  workflows and missing optional local packages, then proposes versioned skills
-  or dependency installs for review instead of silently mutating prompts.
-- **Local-first state** — runtime data, history, memory, skills, schedules,
-  grants, and audit records stay under the local Nullion data directory.
-
-## Product philosophy
-
-Nullion is shaped around five layers:
-
-1. **Kernel** — tiny, generic, auditable primitives. Local-first by default. No provider-shaped promises.
-2. **Plugins** — optional installable tool groups (`search_plugin`, `email_plugin`, `calendar_plugin`, `browser_plugin`, …). Provider choice stays explicit and replaceable.
-3. **Skill packs** — optional reference instructions such as `nullion/web-research` or `google/skills` for product/workflow know-how. They do not grant account access by themselves.
-4. **Skills** — reusable procedures for when and how to use tools well. Prefer plugins when present; fall back to generic primitives when absent.
-5. **Policy** — approvals, grants, principal isolation, and side-effect control.
-
-### Agnostic design rules
-
-- Core product behavior stays generic, not domain-shaped
-- No privileged news/weather/provider-specific chat paths
-- No hardcoded vertical workflows in the kernel
-- The runtime only claims support for what is actually installed and allowed
-- When a plugin is missing, Nullion composes generic primitives rather than pretending the plugin exists
-- Core tools remain a universal fallback path; plugins improve efficiency, not basic possibility
-- Shared request checks compare tool results and generated files with the full goal, catch conflicting assumptions before changes, and repair missing work while preserving completed actions.
-
-See [Documentation](docs/README.md) for the complete guide, including
-[Commands](docs/commands.md), [Configuration](docs/configuration.md),
-[Live tracking](docs/live-tracking.md), and [Architecture](docs/architecture.md).
-
-## Plugins
-
-Plugins are optional capability packs. Search, browser automation, workspace
-files, local media tools, email, calendar, and future integrations are enabled
-explicitly and bound to provider adapters deliberately.
-
-Useful commands:
-
-```text
-/plugins
-/plugins available
-/plugin search_plugin
-/tools
-/verbose status
-/thinking status
-/planner <message>
-/stop
-```
-
-Env-based setup:
-
-```bash
-NULLION_ENABLED_PLUGINS=search_plugin,browser_plugin,workspace_plugin,media_plugin
-NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,media_plugin=local_media_provider
-NULLION_BROWSER_ENABLED=true
-NULLION_BROWSER_BACKEND=auto
-NULLION_BROWSER_PREFERRED=brave
-NULLION_BROWSER_CDP_URL=http://127.0.0.1:9222
-NULLION_WORKSPACE_ROOT=/Users/you/Projects
-NULLION_ALLOWED_ROOTS=/Users/you/Projects,/Users/you/.nullion/.nullion-artifacts
-# Recommended audio default: installer-managed whisper.cpp + ffmpeg with
-# ggml-base.en.bin at ~/.nullion/models/ggml-base.en.bin. Leave the command
-# unset unless you need a custom wrapper.
-NULLION_IMAGE_OCR_COMMAND='tesseract {input} stdout'
-```
-
-See `docs/plugins.md` for the catalog, installer UX, disable/reconfigure
-guidance, and plugin-author documentation.
-
-Public web research uses API-backed search only when the configured provider
-has credentials. Without a Brave, Google Custom Search, or Perplexity key,
-Nullion falls back to browser navigation and page extraction; visual capture
-is used only when the task needs it.
-Set `NULLION_DIRECT_WEB_FETCH_ENABLED=true` only when you explicitly want the
-direct fetch path registered.
-
-## Skill Packs
-
-Skill packs are optional reference instructions. They help Nullion understand
-how to work with a product area, while plugins still control real capabilities
-such as browser automation, search, email, calendar, and files.
-
-Installed custom skill packs are available to every workspace when they are
-instruction-only. If a pack's `SKILL.md` declares or implies API keys, OAuth,
-tokens, credentials, or other account access, Nullion treats it as
-auth-required and exposes its provider under Settings -> Users -> Connections
-instead of making it silently usable everywhere.
-
-If a native account provider fails during a request, Nullion also surfaces
-active external connector providers to the agent. That lets the agent try an
-enabled connector skill route before saying account access is unavailable,
-without hardcoding any one gateway or service.
-
-Curated skill packs can be enabled during setup or with:
-
-```bash
-NULLION_ENABLED_SKILL_PACKS=nullion/web-research,nullion/browser-automation,nullion/files-and-docs,nullion/pdf-documents,nullion/productivity-memory
-```
-
-Useful commands:
-
-```text
-/skill-packs
-/skill-packs available
-/skill-pack google/skills
-```
-
-See `docs/skill-packs.md` for the Google Skills integration model and authoring
-guidance for community skill packs.
-
-## Architecture overview
-
-```
-┌─────────────────────────────────────────┐
-│              Chat Adapters              │
-│  Telegram · Slack · Discord · Web UI   │
-└────────────────┬────────────────────────┘
-                 │  ChatAdapter interface
-                 ▼
-┌─────────────────────────────────────────┐
-│            chat_backend.py             │
-│     (platform-agnostic chat core)      │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────┐
-│               Kernel                   │
-│  runtime · tools · policy · audit      │
-└─────────────────────────────────────────┘
-```
-
-Chat adapters handle platform-specific transport and rendering. Shared routing,
-policy, persistence and presentation code keep the request contract consistent.
-A new adapter still needs its own reply, approval and attachment acceptance
-checks; passing on one surface does not prove the others.
-
-## Chat adapters
-
-All clients share compact initial context, indexed session preferences and the
-same completion persistence policy. Current-turn history and deduplication
-receipts use bounded SQLite writes; broader snapshots share one coalescing
-coordinator. Primary actions and approval commits retain their durability rules.
-Reminder creation, edits and cancellation commit only the reminder and its
-scheduled-task record, so they do not rewrite chat history before confirming.
-Adapter-declared read batches can combine adjacent model calls only when the
-plan explicitly marks them independent; dependent work keeps its order.
-
-Large source collections use compact previews with exact retained-record
-inspection, preserving links and quantities without repeatedly sending full
-page payloads to the model. The primary agent considers alternative routes
-when a source fails and distinguishes equivalent options from functional
-alternatives when comparing value.
-Progress notices also reflect saved-history searches, file work and evidence
-inspection through the same shared lifecycle events. Hiding private tool output
-does not hide progress or completion updates.
-Final preparation uses "Preparing your response" for both text and attachments.
-Artifact producers share format-aware generation and rendered-layout guidance;
-switching to a compatible producer does not require an obsolete intermediate
-file-writing step after the requested output has been verified.
-
-Nullion ships with Telegram, Slack, Discord, and Web UI adapters. Telegram remains the reference implementation; Slack and Discord use the same operator/runtime path with platform-specific connection code at the edge.
-
-### Telegram adapter
-
-#### Setup
-
-Create a local env file:
-
-```bash
-cp .env.example .env
-```
-
-Fill in:
-
-```bash
-NULLION_TELEGRAM_BOT_TOKEN=<your-bot-token>
-NULLION_TELEGRAM_OPERATOR_CHAT_ID=<your-telegram-user-or-chat-id>
-NULLION_TELEGRAM_CHAT_ENABLED=false
-```
-
-`NULLION_*` keys are the config surface used by every Nullion service.
-
-#### Run
-
-```bash
-nullion-telegram
-# or
-nullion-operator
-```
-
-Optional overrides:
-
-```bash
-nullion-telegram --checkpoint runtime.db --env-file .env
-```
-
-Runtime state is stored in SQLite by default at `~/.nullion/runtime.db`.
-Legacy `runtime-store.json` checkpoints are still readable as an import fallback.
-Chat-history and saved provider credentials are encrypted locally. By default,
-Nullion stores the local Fernet data keys at `~/.nullion/chat_history.key` and
-`~/.nullion/credentials.key` with owner-only file permissions. Set
-`NULLION_KEY_STORAGE=system` to store those data keys in the operating system
-secret store instead: macOS Keychain, Windows Credential Manager, or the Linux
-Secret Service keyring such as GNOME Keyring or KWallet. The older
-`NULLION_KEY_STORAGE=keychain` value remains supported as a macOS-specific
-alias.
-
-```bash
-nullion-telegram --help   # inspect all CLI flags
-```
-
-Equivalent Python entrypoint:
-
-```bash
-python -m nullion.telegram_app
-```
-
-### Recovery control plane
-
-Nullion also ships a small out-of-band recovery command:
-
-```bash
-nullion-recovery status
-nullion-recovery services
-nullion-recovery restart telegram
-nullion-recovery restart all
-nullion-recovery backups
-nullion-recovery snapshot-config
-nullion-recovery restore runtime 0
-nullion-recovery restore config latest
-nullion-recovery serve --port 8020
-nullion-recovery telegram
-```
-
-`nullion-recovery` is intentionally separate from the main web app and chat
-adapters. It can restart launchd-managed services, list runtime backups, snapshot
-local config, and restore `.env`/credentials snapshots if a bad update or config
-save breaks the main app.
-
-Telegram recovery can use a dedicated recovery bot token, or it can fall back to
-the normal `NULLION_TELEGRAM_BOT_TOKEN` plus
-`NULLION_TELEGRAM_OPERATOR_CHAT_ID`. When it uses the normal bot token, it waits
-until `ai.nullion.telegram` is down before polling so the two processes do not
-consume the same Telegram updates.
-
-#### Operator commands
-
-- plain text — when `NULLION_TELEGRAM_CHAT_ENABLED=true`, routed to the Nullion Assistant
-- `/help` — list available commands
-- `/chat <message>` — send a message through the Nullion Assistant
-- `/verbose [on|off|status]` — show or hide activity details during chat runs
-- `/thinking [on|off|status]` — show or hide provider reasoning summaries separately from final replies
-- `/planner <message>` — run a message through the explicit step-by-step planner path
-- `/approvals [status=pending|approved|denied|all]` — list approval requests
-- `/approve <id>` / `/deny <id>` — approve or deny a request
-- `/grants` — list permission grants
-- `/revoke-grant <id>` — revoke a grant
-- `/proposals` / `/accept-proposal <id>` / `/reject-proposal <id>` — manage Builder skill proposals
-- `/skills` / `/skill <id>` / `/skill-history <id>` — browse saved skills
-- `/stop` — stop active work in the current session
-- `/ping` / `/version` / `/health` / `/uptime` / `/status` — liveness and status
-- `/backups` / `/restore [latest|<generation>]` — checkpoint management
-- `/system-context` / `/codebase` / `/tools` — runtime introspection
-- `/plugins` / `/plugins available` / `/plugin <id>` — plugin catalog and setup details
-
-Telegram mention form (`/help@<bot_username>`) is supported in group chats.
-
-### Web UI adapter
-
-```bash
-nullion-web              # http://localhost:8742
-nullion-webview          # native window wrapper
-```
-
-Provides a browser-based chat interface (left panel) and live dashboard (right panel) with approvals, tasks, skills, and health. No Telegram account required.
-
-### Slack adapter
-
-Slack runs in Socket Mode:
-
-```bash
-NULLION_SLACK_ENABLED=true
-NULLION_SLACK_BOT_TOKEN=xoxb-...
-NULLION_SLACK_APP_TOKEN=xapp-...
-nullion-slack
-```
-
-Authorize Slack users in the Users settings or `~/.nullion/users.json` with `messaging_channel=slack` and their Slack user ID.
-
-### Discord adapter
-
-```bash
-export NULLION_DISCORD_ENABLED=true
-export NULLION_DISCORD_BOT_TOKEN="<bot-token>"
-export NULLION_DISCORD_OPERATOR_USER_ID="<your-numeric-user-id>"
-nullion-discord
-```
-
-For single-user access, set your Discord user ID in Settings -> Messaging or `NULLION_DISCORD_OPERATOR_USER_ID`. Enable Developer Mode in Discord, then choose Copy User ID from your profile. For member access, enable multi-user mode and authorize active members in Settings -> Users with `messaging_channel=discord` and their Discord user IDs.
-
-Enable Message Content Intent under Bot -> Privileged Gateway Intents in the Discord Developer Portal. Invite the bot to your server with View Channel, Send Messages, and Attach Files permissions. Save settings, then restart the Discord adapter. An invalid token or disallowed intent now produces a setup error explaining what to change.
-
-### Multi-user connections
-
-Single-user installs continue using the globally configured provider accounts. Once another user is enabled, member workspaces can declare their own provider connections in Settings -> Users.
-
-The Connections panel lists only providers required by enabled or installed
-auth-required skill packs. Instruction-only skills do not appear there because
-they do not need account credentials.
-
-For Gmail through Himalaya, install Himalaya on the same computer or server that runs Nullion, then create a Himalaya account profile per person. The installer can enable the email/calendar plugins; workspace connections only store the local profile name, not the Gmail password.
-
-Then add a workspace connection with:
-
-```text
-Workspace: workspace_nathan
-Provider: Gmail / Google Workspace
-Profile: nathan
-```
-
-Member tool calls do not fall back to the admin Gmail account by default. If a
-member has no workspace connection, Nullion reports that the provider is not
-connected for that workspace. An admin may intentionally share one credential
-across all workspaces for providers that allow it; the UI requires a
-confirmation and records the connection as an admin-shared credential.
-
-### Adapter status
-
-| Platform | Status    | Notes                          |
-|----------|-----------|--------------------------------|
-| Telegram | Shipped   | Reference implementation       |
-| Web UI   | Shipped   | FastAPI + WebSocket at `:8742` |
-| Slack    | Shipped   | Socket Mode                    |
-| Discord  | Shipped   | `discord.py` bot client        |
-| SMS      | Exploring | Via Twilio plugin              |
-
-## Operator access control and audit logging
-
-- `NULLION_TELEGRAM_OPERATOR_CHAT_ID` restricts who can run operator commands on the Telegram adapter.
-- Unauthorized attempts return `Unauthorized operator chat.` and emit warning logs.
-- Every handled command is logged: `Handled Telegram operator command (chat_id=..., command=..., result=...)`.
-- INFO-level logging must be enabled to see startup, clean-stop, and handled-command logs. Unauthorized attempts and failures are logged at warning/error levels.
-
-## Development checks
-
-The app, unit tests, browser workflows, and installer checks share this checkout.
-Install local test dependencies with `python -m pip install -e '.[test]'`.
-Run `./scripts/test-docker.sh` for unit tests and coverage, and
-`./scripts/e2e-docker.sh` for the complete E2E suite.
-E2E tests refuse to run on the host; they use isolated Docker runtime data.
-See [Testing](docs/e2e-testing.md) for focused checks and installer commands.
-
-GUI, browser, install, and web tests stay inside the container for local checks.
-The macOS installer runs in an isolated CI job. Actual desktop tray visibility
-requires an interactive desktop session and is not proven by headless checks.
-
-The [local operations dashboard](docs/e2e-testing.md#local-operations-dashboard)
-also lives here. Run `python3 scripts/local_ops_dashboard.py`; on macOS use
-`--install-launchagent` to run it at login from this checkout.
+## Build with us
+
+Nullion is open source. Contributions to browser reliability, integrations,
+accessibility, documentation, and everyday workflows are welcome.
+
+The runtime uses LangGraph, LangChain-compatible adapters, and Deep Agents.
+Client adapters share one execution pipeline and presentation contract.
+See [Architecture](docs/architecture.md) for how it fits together and
+[Contributing](docs/e2e-testing.md) to work on the project.
+
+Licensed under [Apache 2.0](LICENSE). Please report vulnerabilities privately
+through [GitHub Security Advisories](https://github.com/shumanhi/nullion/security/advisories/new),
+following the [security policy](SECURITY.md).

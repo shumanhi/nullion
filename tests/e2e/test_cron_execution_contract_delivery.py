@@ -61,6 +61,9 @@ def test_requested_conditional_account_action_finishes_or_pauses_at_real_approva
             if protocol_reply is not None: return protocol_reply
             if not kw.get('tools'):
                 if 'available_structured_write_tools' in kw['messages'][0]['content'][0]['text']:
+                    scope_input = json.loads(kw['messages'][0]['content'][0]['text'])
+                    assert set(scope_input['scheduler_delivery_channels']) == {'web', 'telegram', 'slack', 'discord'}
+                    assert 'delivery outside those channels' in kw['system']
                     # Simulate a provider response beyond the former five-second
                     # cutoff without sleeping or replacing Nullion's scope path.
                     if kw['timeout'] < scope_response_seconds:

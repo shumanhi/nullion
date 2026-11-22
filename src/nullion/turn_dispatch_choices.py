@@ -70,6 +70,34 @@ def dispatch_candidates(store, conversation_id, active_ids, active_texts):
     return tuple(ids), tuple(texts)
 
 
+
+def completed_browser_dispatch_candidates(store, conversation_id, *, now):
+    """Short-lived source-reading turns can anchor a semantic follow-up."""
+    from nullion.connections import workspace_id_for_principal
+    from nullion.conversation_history_tools import _parse_created_at
+
+    reads = {"browser_run_task", "browser_read_pages", "browser_extract_text", "browser_extract_items",
+             "browser_extract_detail"}
+    ids, texts = [], []
+    workspace_id = None
+    for event in reversed(_events(store, conversation_id, "conversation.chat_turn", 6)):
+        if not any(isinstance(row, dict) and row.get("status") == "completed" and row.get("tool_name") in reads
+                   for row in event.get("tool_results") or ()):
+            continue
+        identity = event.get("turn_id")
+        age = (now - _parse_created_at(event.get("created_at"))).total_seconds()
+        if not identity or not 0 <= age <= 600 or not _eligible(store, conversation_id, identity):
+            continue
+        if workspace_id is None:
+            workspace_id = workspace_id_for_principal(conversation_id)
+        if event.get("workspace_id") != workspace_id:
+            continue
+        ids.append(identity)
+        texts.append(str(event.get("user_message") or ""))
+        if len(ids) == 3:
+            break
+    return tuple(ids), tuple(texts)
+
 def dispatch_candidate_contexts(store, conversation_id, ids, active_ids):
     """Bounded, indexed evidence for the existing semantic admission decision."""
     rows = list(reversed(_events(store, conversation_id, "conversation.chat_turn", 8))) if store else []

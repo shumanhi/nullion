@@ -10,7 +10,8 @@ import pytest
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason='container E2E')
 
 
-def test_status_refresh_never_approves_deletion_and_explicit_review_runs_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize('surface', ['web', 'telegram', 'telegram_code_mode'])
+def test_status_refresh_never_approves_deletion_and_explicit_review_runs_once(tmp_path, monkeypatch, surface):
     from fastapi.testclient import TestClient
     from nullion.approval_decisions import approve_request_with_mode
     from nullion.approval_display import approval_display_from_request
@@ -29,12 +30,13 @@ def test_status_refresh_never_approves_deletion_and_explicit_review_runs_once(tm
     runtime.active_tool_registry = registry
     victim = tmp_path / '資料.txt'; victim.write_text('fixture')
     from nullion.policy import permission_scope_principal
+    principal = 'web:review' if surface=='web' else 'telegram:123'
     runtime.store.add_boundary_permit(create_boundary_permit(approval_id='filesystem-fixture',
-        principal_id=permission_scope_principal('web:review'),boundary_kind=BoundaryKind.FILESYSTEM_ACCESS,
+        principal_id=permission_scope_principal(principal),boundary_kind=BoundaryKind.FILESYSTEM_ACCESS,
         selector=str(victim),granted_by='fixture',granted_at=datetime.now(UTC)))
     command = f"set -e\nrm -f '{victim}'\nprintf completed"
     executor = ToolExecutor(store=runtime.store, registry=registry)
-    invocation = ToolInvocation('delete','terminal_exec','web:review',{'command':command})
+    invocation = ToolInvocation('delete','terminal_exec',principal,{'command':command})
     blocked = executor.invoke(invocation)
     aid = blocked.output['approval_id']; runtime.checkpoint(force=True)
     with TestClient(create_app(runtime,orchestrator=None,registry=registry)) as client:
@@ -47,9 +49,84 @@ def test_status_refresh_never_approves_deletion_and_explicit_review_runs_once(tm
         assert victim.exists()
         persisted = bootstrap_persistent_runtime(tmp_path/'runtime.db')
         assert persisted.store.get_approval_request(aid).status.value == 'pending'
-        response = client.post(f'/api/approve/{aid}',json={'mode':'once'})
-        assert response.status_code == 200, response.text
-        assert not victim.exists(),response.text
+        if surface=='web':
+            response = client.post(f'/api/approve/{aid}',json={'mode':'once'})
+            assert response.status_code == 200, response.text
+            visible = response.json().get('resumed_text') or ''
+        else:
+            import asyncio
+            from types import SimpleNamespace
+            from nullion import telegram_app
+            from nullion.agent_orchestrator import AgentOrchestrator
+            from nullion.chat_operator import handle_chat_operator_message
+            from nullion.config import NullionSettings, TelegramSettings
+            from tests.e2e.test_quoted_reply_review_and_cleanup import text, call
+            monkeypatch.setenv('NULLION_CODE_MODE','on' if surface=='telegram_code_mode' else 'off')
+            class Model:
+                phase = 0
+                def create(self, **kwargs):
+                    protocol = workflow_provider_reply(kwargs, completion=True)
+                    if protocol is not None: return protocol
+                    if not kwargs.get('tools'): return text('{}')
+                    self.phase += 1
+                    if self.phase == 1:
+                        return call('request_tool_scope',{'capabilities':['local_shell'],
+                            'tool_names':['terminal_exec'],'required_tool_names':['terminal_exec']})
+                    if self.phase == 2:
+                        if surface=='telegram_code_mode':
+                            return call('code_mode',{'tool_names':['terminal_exec'],
+                                'code':"call_tool('terminal_exec', "+repr({'command':command})+")"})
+                        return call('terminal_exec',{'command':command})
+                    return text('Done.')
+            model = Model()
+            runtime.model_client = model
+            orchestrator = AgentOrchestrator(model_client=model)
+            resumed_results = []
+            original_resume = orchestrator.resume_turn
+            def capture_resume(*args, **kwargs):
+                result = original_resume(*args, **kwargs)
+                resumed_results.append(result)
+                return result
+            monkeypatch.setattr(orchestrator,'resume_turn',capture_resume)
+            messages = []
+            class Message:
+                chat = SimpleNamespace(id=123)
+                message_id = 1
+                async def edit_text(self,text,**kwargs): messages.append(text)
+                async def reply_text(self,text,**kwargs): messages.append(text)
+            class Query:
+                message = Message()
+                from_user = SimpleNamespace(id=123)
+                data = telegram_app._build_callback_data(kind='approval',action='allow_once',record_id=aid)
+                async def answer(self,*args,**kwargs): pass
+            settings = NullionSettings(telegram=TelegramSettings(bot_token='123456:synthetic',operator_chat_id='123',chat_enabled=True))
+            pending_reply = handle_chat_operator_message(runtime,'/chat 選択したファイルを削除してください。',chat_id='123',
+                settings=settings,agent_orchestrator=orchestrator,allow_mini_agents=False)
+            from nullion.approval_markers import split_tool_approval_marker
+            marker = split_tool_approval_marker(pending_reply)
+            assert marker is not None, pending_reply
+            aid = marker.approval_id
+            Query.data = telegram_app._build_callback_data(kind='approval',action='allow_once',record_id=aid)
+            assert runtime.store.get_suspended_turn(aid) is not None, pending_reply
+            service = telegram_app.ChatOperatorService(runtime,'123456:synthetic','123',settings,
+                model_client=model,agent_orchestrator=orchestrator)
+            asyncio.run(service.on_callback_query(SimpleNamespace(callback_query=Query()),None))
+            visible = messages[-1]
+            from nullion.response_sanitizer import native_filesystem_receipt_reply
+            if surface == 'telegram_code_mode':
+                assert any(native_filesystem_receipt_reply(row) for result in resumed_results for row in result.tool_results)
+            else:
+                assert not resumed_results
+                terminal_events = [event for event in runtime.store.list_events()
+                    if event.event_type == 'tool.invocation.completed'
+                    and event.payload.get('tool_name') == 'terminal_exec'
+                    and event.payload.get('status') == 'completed']
+                assert len(terminal_events) == 1
+        assert not victim.exists()
+        assert 'Deleted 1 path.' in visible and '資料.txt' in visible, (visible,
+            [(r.tool_name,r.status,bool((r.output or {}).get('action_receipt')),r.response_requirements)
+             for result in (resumed_results if surface!='web' else []) for r in result.tool_results])
+        assert '```' not in visible and 'completed' not in visible
         # Exact action permission was consumed; a second invocation pauses again.
         repeated=executor.invoke(invocation)
         assert repeated.status == 'denied'

@@ -16,6 +16,8 @@ def validated_observation_setup(registry, source_tool, output):
     from nullion.tools import ToolSideEffectClass
 
     if not isinstance(output, Mapping) or not output.get('observation_setup'):
+        if getattr(registry.get_spec(source_tool), 'observation_requires_setup', False):
+            raise ValueError('This source requires a verified replay recipe before it can be scheduled')
         return []
     allowed = getattr(registry.get_spec(source_tool), 'observation_setup_tools', ())
     if not allowed:

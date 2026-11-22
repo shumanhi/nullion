@@ -4847,6 +4847,15 @@ def _cron_result_leaked_internal_tool_output(result: dict[str, object], text: st
         receipt = output.get("action_receipt")
         if not isinstance(receipt, dict):
             continue
+        if (tool_name not in CRON_INTERNAL_REFERENCE_TOOLS
+                and receipt.get('type') == 'action_receipt'
+                and isinstance(receipt.get('action'), str) and receipt['action']
+                and isinstance(receipt.get('object_type'), str) and receipt['object_type']):
+            # This is the common public action-result contract. Its summary
+            # may be retained without paraphrasing it in another model pass.
+            # Raw source bodies and internal-reference outputs were checked
+            # above; a public receipt never exempts those fields.
+            continue
         for key in ("summary", "message", "text"):
             receipt_text = str(receipt.get(key) or "").strip()
             if receipt_text and (visible_text == receipt_text or receipt_text in visible_text):

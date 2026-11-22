@@ -111,6 +111,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_created_conv
     ON messages (created_at, conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_status
     ON conversations (status, last_message_at);
+CREATE TABLE IF NOT EXISTS history_projection_cursors (
+    source TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    PRIMARY KEY (source, conversation_id)
+);
 """
 
 _POST_MIGRATION_DDL = """
@@ -178,6 +185,14 @@ def _metadata_weight(metadata: Any) -> int:
         return len(json.dumps(metadata, separators=(",", ":"), sort_keys=True))
     except Exception:
         return 1
+
+
+def _history_revision(value: object) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict]:
@@ -491,12 +506,17 @@ class ChatStore:
             )
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        with self._lock, sqlite_connection(str(self._path), timeout=10) as conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            yield conn
+    def _connect(self, *, timeout: float = 10) -> Iterator[sqlite3.Connection]:
+        if not self._lock.acquire(timeout=timeout):
+            raise sqlite3.OperationalError('database is locked')
+        try:
+            with sqlite_connection(str(self._path), timeout=timeout) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                yield conn
+        finally:
+            self._lock.release()
 
     # ── Conversation management ───────────────────────────────────────────────
 
@@ -758,6 +778,9 @@ class ChatStore:
             return -1
         started_at = perf_counter()
         safe_text = redact_text(text)
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            metadata.pop('_runtime_history_projection_at', None)
         metadata_text = None
         if metadata:
             metadata_text = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
@@ -794,6 +817,10 @@ class ChatStore:
                     (conv_id, role, terminal_identity)).fetchone()
                 if owned is not None:
                     previous = self._decrypt_row(owned)['metadata'] or {}
+                    if previous.get('_runtime_history_projection_at'):
+                        # A delayed client save has no native revision authority
+                        # to replace a completed producer's text or package.
+                        return owned['id']
                     merged = {**previous, **metadata}
                     conn.execute('UPDATE messages SET text = ?, metadata = ?, is_error = ? WHERE id = ?',
                         (self._encrypt_text(safe_text), self._encrypt_text(json.dumps(merged,
@@ -868,7 +895,28 @@ class ChatStore:
             _log_chat_sqlite_timing("save_message", started_at, self._path, rows=1)
             return message_id  # type: ignore[return-value]
 
-    def import_runtime_chat_turns(self, turns: Iterable[dict]) -> int:
+    def has_terminal_projection(self, turn: dict) -> bool:
+        with self._connect(timeout=0.1) as conn:
+            row = conn.execute('SELECT metadata FROM messages WHERE conversation_id=? AND role=? '
+                'AND runtime_turn_id=? ORDER BY id LIMIT 1',
+                (turn['conversation_id'], 'bot', turn['turn_id'])).fetchone()
+        metadata = self._decrypt_row(row)['metadata'] if row is not None else {}
+        return bool(metadata and metadata.get('_runtime_history_projection_at') == turn.get('created_at'))
+
+    def terminal_projection_cursor(self, source: str, conversation_id: str) -> tuple[str, str]:
+        with self._connect(timeout=0.1) as conn:
+            row = conn.execute('SELECT created_at,item_key FROM history_projection_cursors '
+                'WHERE source=? AND conversation_id=?', (source, conversation_id)).fetchone()
+        return (row['created_at'], row['item_key']) if row is not None else ('', '')
+
+    def save_terminal_projection_cursor(self, source: str, conversation_id: str, position: tuple[str, str]) -> None:
+        with self._connect(timeout=0.1) as conn:
+            conn.execute('INSERT INTO history_projection_cursors(source,conversation_id,created_at,item_key) VALUES(?,?,?,?) '
+                'ON CONFLICT(source,conversation_id) DO UPDATE SET created_at=excluded.created_at,item_key=excluded.item_key',
+                (source, conversation_id, *position))
+
+    def import_runtime_chat_turns(self, turns: Iterable[dict], *, timeout_seconds: float = 10,
+                                _exact_terminal_identity: bool = False) -> int:
         """Import messaging chat turns from the runtime event log.
 
         Older web/Slack/Discord/Telegram turns may exist in ``runtime-store.json``
@@ -883,7 +931,9 @@ class ChatStore:
             (turn for turn in turns if isinstance(turn, dict)),
             key=lambda turn: str(turn.get("created_at") or ""),
         )
-        with self._connect() as conn:
+        if _exact_terminal_identity and (len(sorted_turns) != 1 or sorted_turns[0].get('history_state') != 'terminal'):
+            raise ValueError('Exact projection requires one native terminal event')
+        with self._connect(timeout=timeout_seconds) as conn:
             conn.execute('BEGIN IMMEDIATE')
             for turn in sorted_turns:
                 conversation_id = str(turn.get("conversation_id") or "").strip()
@@ -906,12 +956,23 @@ class ChatStore:
                         [conversation_id, created_at, user_message, assistant_reply], ensure_ascii=False,
                     ).encode()).hexdigest()
                 if conversation_id not in existing_by_conversation:
-                    rows = conn.execute(
+                    if _exact_terminal_identity:
+                        # Two identity-bound rows plus a small legacy tail,
+                        # never the full transcript on a selected history read.
+                        owned = [row for role in ('user', 'bot') for row in conn.execute(
+                            'SELECT id,role,text,metadata,runtime_turn_id FROM messages '
+                            'WHERE conversation_id=? AND role=? AND runtime_turn_id=? ORDER BY id LIMIT 1',
+                            (conversation_id, role, runtime_identity)).fetchall()]
+                        tail = conn.execute('SELECT id,role,text,metadata,runtime_turn_id FROM messages '
+                            'WHERE conversation_id=? ORDER BY id DESC LIMIT 8', (conversation_id,)).fetchall()
+                        rows = sorted({row['id']:row for row in [*owned,*tail]}.values(), key=lambda row:row['id'])
+                    else:
+                        rows = conn.execute(
                         """SELECT id, role, text, metadata, runtime_turn_id FROM messages
                            WHERE conversation_id = ?
                            ORDER BY id ASC""",
                         (conversation_id,),
-                    ).fetchall()
+                        ).fetchall()
                     existing_by_conversation[conversation_id] = {}
                     existing_by_identity[conversation_id] = {}
                     for row in rows:
@@ -939,6 +1000,10 @@ class ChatStore:
                     safe_text = redact_text(raw_text)
                     key = (role, safe_text)
                     metadata = dict((_artifact_metadata_from_runtime_turn(turn) if role == "bot" else None) or {})
+                    terminal_projection = role == 'bot' and turn.get('history_state') == 'terminal'
+                    if terminal_projection:
+                        metadata.update(history_message_kind='terminal_reply',
+                            _runtime_history_projection_at=created_at)
                     candidates = existing_by_conversation[conversation_id].get(key, [])
                     existing = (existing_by_identity[conversation_id].get((role, runtime_identity))
                         if role == 'bot' else None)
@@ -947,6 +1012,22 @@ class ChatStore:
                     if existing is None:
                         existing = next((row for row in candidates if not row["runtime_turn_id"]), None)
                     if existing is not None:
+                        projected_at = existing['metadata'].get('_runtime_history_projection_at')
+                        if projected_at:
+                            # Native terminal state wins over provisional/older
+                            # imports, including their obsolete artifact package.
+                            if not terminal_projection or _history_revision(created_at) <= _history_revision(projected_at):
+                                continue
+                        if terminal_projection:
+                            conn.execute('UPDATE messages SET text=?,metadata=?,runtime_turn_id=?,created_at=? WHERE id=?',
+                                (self._encrypt_text(safe_text), self._encrypt_text(json.dumps(metadata,
+                                    separators=(',', ':'), sort_keys=True)), runtime_identity, created_at, existing['id']))
+                            existing.update(metadata=metadata, runtime_turn_id=runtime_identity)
+                            existing_by_identity[conversation_id][(role, runtime_identity)] = existing
+                            conn.execute('UPDATE conversations SET last_message_at = CASE '
+                                'WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END WHERE id=?',
+                                (created_at, created_at, conversation_id))
+                            continue
                         # Bind a legacy row to one runtime turn without exposing
                         # internal identity through client artifact metadata.
                         merged = ({**existing["metadata"], **metadata}
@@ -1058,6 +1139,9 @@ class ChatStore:
             if not _include_runtime_identity:
                 for row in results:
                     row.pop("runtime_turn_id", None)
+            for row in results:
+                if isinstance(row.get('metadata'), dict):
+                    row['metadata'].pop('_runtime_history_projection_at', None)
             _log_chat_sqlite_timing("load_messages", started_at, self._path, rows=len(results))
             return results
 

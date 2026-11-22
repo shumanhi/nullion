@@ -25,11 +25,11 @@ def _render(html, path, width, ratio):
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="nullion-image") as pool:
             return pool.submit(_render, html, path, width, ratio).result()
     from playwright.sync_api import sync_playwright
-    from nullion.tools import _pdf_chromium_executable
-    executable = _pdf_chromium_executable()
-    if not executable:
-        raise RuntimeError("The installed Chromium renderer is unavailable")
+    from nullion.tools import _chromium_renderer_executable
     with sync_playwright() as p:
+        executable = _chromium_renderer_executable(p)
+        if not executable:
+            raise RuntimeError("The installed Chromium renderer is unavailable")
         browser = p.chromium.launch(headless=True, executable_path=executable)
         try:
             context = browser.new_context(viewport={"width": width, "height": 900}, device_scale_factor=ratio)

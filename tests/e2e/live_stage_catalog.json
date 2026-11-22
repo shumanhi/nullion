@@ -58,6 +58,10 @@
       "category": "research",
       "kind": "live_workflow"
     },
+    "test_live_stage_browser_capture_reuse.py": {
+      "category": "browser",
+      "kind": "live_workflow"
+    },
     "test_live_stage_chat_contracts.py": {
       "category": "context",
       "kind": "live_workflow"
@@ -240,6 +244,14 @@
     },
     "test_live_stage_absolute_alert.py": {
       "category": "scheduler",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_capture_extent.py": {
+      "category": "browser",
+      "kind": "live_workflow"
+    },
+    "test_live_stage_web_pdf_flow.py": {
+      "category": "artifacts",
       "kind": "live_workflow"
     }
   },
@@ -442,6 +454,9 @@
     "tests/e2e/test_live_stage_web_source_groups.py::test_live_completed_product_reply_keeps_fields_on_reload_without_another_model_call": {
       "category": "presentation",
       "kind": "saved_replay"
+    },
+    "tests/e2e/test_live_stage_web_pdf_flow.py::test_live_web_code_mode_recalls_original_pdf_with_native_reference_receipt": {
+      "category": "context"
     }
   },
   "scenario_categories": {
@@ -603,6 +618,14 @@
         "artifact_followup_retry_guard"
       ],
       "decision": "Shared archive fixture runner, different workbook columns and forbidden-retry assertions. Not duplicates; retain both for the affected paths."
+    },
+    {
+      "id": "explicit-and-implicit-independent-recall",
+      "selectors": [
+        "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_independent_memory_and_history_recall_contract",
+        "tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_native_recall_with_code_mode"
+      ],
+      "decision": "Both seed and archive synthetic context, then verify independent native history retrieval without account reads. The first explicitly requests saved history and checks no artifact delivery; the second uses an implicit recall prompt to cover native recall visibility with Code Mode. Keep both distinct ingress/context contracts; do not treat either receipt as a fresh run of the other."
     }
   ],
   "reviewed_functions": {
@@ -611,6 +634,11 @@
     ],
     "test_live_stage_bounded_comparison.py": [
       "test_live_scoped_recommendation_resolves_real_contenders_without_exhaustive_listing_reads"
+    ],
+    "test_live_stage_browser_capture_reuse.py": [
+      "test_recent_train_results_do_not_reopen_browser",
+      "test_native_sequence_on_stage",
+      "test_adaptive_capture_followup_on_stage"
     ],
     "test_live_stage_chat_contracts.py": [
       "test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf",
@@ -621,6 +649,7 @@
       "test_live_stage_email_to_web_answer_preserves_status_and_tool_evidence",
       "test_live_stage_conceptual_answer_avoids_shell_completion_detour",
       "test_live_stage_independent_memory_and_history_recall_contract",
+      "test_live_stage_native_recall_with_code_mode",
       "test_live_stage_reusable_tool_creation_and_independent_reuse_contract",
       "test_live_stage_existing_source_path_remains_read_only_then_edits_explicitly",
       "test_live_stage_source_comparison_retains_verified_quotes",
@@ -850,6 +879,13 @@
     ],
     "test_live_stage_absolute_alert.py": [
       "test_live_stage_absolute_restoration_alert"
+    ],
+    "test_live_stage_web_capture_extent.py": [
+      "test_live_web_ordinary_capture_is_viewport_and_plain_turns_stay_fast"
+    ],
+    "test_live_stage_web_pdf_flow.py": [
+      "test_live_web_pdf_report_flows_without_clipping_or_large_gaps",
+      "test_live_web_code_mode_recalls_original_pdf_with_native_reference_receipt"
     ]
   },
   "retired_selectors": [

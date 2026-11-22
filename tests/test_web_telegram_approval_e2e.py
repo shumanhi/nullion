@@ -78,12 +78,18 @@ def test_web_turn_backend_persists_bot_reply_to_chat_history(tmp_path, monkeypat
     ]
 
 
-def test_web_request_approved_from_telegram_reappears_in_web_history(tmp_path):
+def test_web_request_approved_from_telegram_reappears_in_web_history(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import nullion.chat_store as chat_store_module
+    from nullion.tools import ToolRegistry
+    from nullion.web_app import create_app
     runtime = PersistentRuntime(
         store=RuntimeStore(),
         checkpoint_path=tmp_path / "runtime.db",
         started_at=datetime(2026, 5, 2, tzinfo=UTC),
     )
+    store = ChatStore(tmp_path / 'chat.db', key_path=tmp_path / 'chat.key')
+    monkeypatch.setattr(chat_store_module, 'get_chat_store', lambda: store)
     approval = create_approval_request(
         requested_by="web:abc123",
         action="allow_boundary",
@@ -156,10 +162,9 @@ def test_web_request_approved_from_telegram_reappears_in_web_history(tmp_path):
     assert updated_frame.status is TaskFrameStatus.COMPLETED
     assert runtime.store.get_active_task_frame_id("web:abc123") is None
 
-    store = ChatStore(tmp_path / "chat.db", key_path=tmp_path / "chat.key")
-    _sync_runtime_chat_history_to_store(runtime, store)
-
-    messages = store.load_messages("web:abc123")
+    response = TestClient(create_app(runtime, orchestrator=None, registry=ToolRegistry())).get('/api/chat/history/web:abc123')
+    assert response.status_code == 200
+    messages = response.json()['messages']
     assert [(message["role"], message["text"]) for message in messages[-2:]] == [
         ("user", "fetch cnn"),
         ("bot", reply),

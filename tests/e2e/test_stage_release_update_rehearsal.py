@@ -5,6 +5,7 @@ The installed source, Git origin, venv and runtime are disposable containers.
 No updater, installer, migration or health implementation is mocked.
 """
 import json
+from hashlib import sha256
 import os
 import re
 from pathlib import Path
@@ -16,9 +17,10 @@ import urllib.request
 
 import pytest
 
-INPUTS = Path('/inputs/app/.e2e-artifacts/update-rehearsal')
+EXPLICIT_INPUTS = os.environ.get('NULLION_UPDATE_REHEARSAL_INPUTS') or ''
+INPUTS = Path(EXPLICIT_INPUTS or '/inputs/app/.e2e-artifacts/update-rehearsal')
 pytestmark = pytest.mark.skipif(
-    os.environ.get('NULLION_RUN_E2E') != '1' or not (INPUTS / 'ready').exists(),
+    os.environ.get('NULLION_RUN_E2E') != '1' or (not EXPLICIT_INPUTS and not (INPUTS / 'ready').exists()),
     reason='Requires the private stage update rehearsal fixture in Docker')
 
 
@@ -26,6 +28,20 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
     from tests.test_updater_release_channel import _git
     from tests.e2e.test_web_surface_contracts import _free_port, _open_page
     from playwright.sync_api import expect
+    assert (INPUTS / 'ready').is_file(), 'Prepare the required update rehearsal inputs before running this gate'
+    manifest = json.loads((INPUTS / 'manifest.json').read_text())
+    expected_revision = os.environ.get('NULLION_TEST_CANDIDATE_REVISION')
+    assert expected_revision and manifest['candidate_commit'] == expected_revision, 'Rebuild stale update rehearsal inputs for this candidate'
+    assert set(manifest['hashes']) == {'old.tar', 'candidate.tar', 'runtime.db'}
+    for name, digest in manifest['hashes'].items():
+        value = sha256()
+        with (INPUTS / name).open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                value.update(block)
+        assert value.hexdigest() == digest, name
+    old_tag, candidate_tag = manifest['old_tag'], manifest['candidate_tag']
+    assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', old_tag)
+    assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', candidate_tag)
     origin = tmp_path / 'origin.git'
     publish = tmp_path / 'publish'
     publish.mkdir()
@@ -36,17 +52,17 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
     _git(publish, 'config', 'user.email', 'release@example.invalid')
     _git(publish, 'add', '.')
     _git(publish, 'commit', '-qm', 'old release')
-    _git(publish, 'tag', 'v0.11.0')
+    _git(publish, 'tag', old_tag)
     with tarfile.open(INPUTS / 'candidate.tar') as archive:
         archive.extractall(publish, filter='data')
     _git(publish, 'add', '.')
     _git(publish, 'commit', '-qm', 'candidate release')
     target = _git(publish, 'rev-parse', 'HEAD')
-    _git(publish, 'tag', 'v0.11.1')
+    _git(publish, 'tag', candidate_tag)
     _git(tmp_path, 'clone', '--bare', str(publish), str(origin))
     installed = tmp_path / 'installed'
     _git(tmp_path, 'clone', str(origin), str(installed))
-    _git(installed, 'checkout', '--detach', 'v0.11.0')
+    _git(installed, 'checkout', '--detach', old_tag)
     home = tmp_path / 'home'
     home.mkdir()
     checkpoint = home / 'runtime.db'
@@ -108,8 +124,8 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
             text = bubble.inner_text()
             (evidence / 'update-reply.txt').write_text(text)
             page.screenshot(path=str(evidence / 'upgrade-result.png'), full_page=True)
-            assert 'Updated successfully: v0.11.0' in text, text
-            assert 'v0.11.1' in text and '[health]' in text, text
+            assert 'Updated successfully: ' + old_tag in text, text
+            assert candidate_tag in text and '[health]' in text, text
             assert 'ignored' not in text.lower() and 'failed' not in text.lower(), text
             elapsed = time.monotonic() - start
             assert _git(installed, 'rev-parse', 'HEAD') == target
@@ -117,8 +133,8 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
             page.screenshot(path=str(evidence / 'successful-upgrade.png'), full_page=True)
             page.locator('#user-input').fill('/update')
             page.locator('#send-btn').click()
-            expect(page.locator('.msg.bot .bubble').last).to_contain_text('Already up to date: v0.11.1', timeout=30000)
-            result = {'from': 'v0.11.0', 'to': 'v0.11.1', 'update_seconds': elapsed,
+            expect(page.locator('.msg.bot .bubble').last).to_contain_text('Already up to date: ' + candidate_tag, timeout=30000)
+            result = {'from': old_tag, 'to': candidate_tag, 'candidate_revision': expected_revision, 'update_seconds': elapsed,
                 'target_commit': target, 'reply': text, 'concurrent_update_rejected': True,
                 'stage_database_bytes': checkpoint.stat().st_size}
             (evidence / 'result.json').write_text(json.dumps(result, indent=2))

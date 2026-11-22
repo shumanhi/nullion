@@ -34,6 +34,7 @@ class RuntimeDouble:
         expires_at: datetime | None = None,
         actor: str,
         reason: str,
+        decision_mode: str | None = None,
     ):
         approval = self.store.get_approval_request(approval_id)
         assert approval is not None
@@ -43,6 +44,7 @@ class RuntimeDouble:
             decided_by=actor,
             decided_at=datetime.now(UTC),
             decision_reason=reason,
+            context={**(approval.context or {}), "decision_mode": decision_mode} if decision_mode else approval.context,
         )
         self.store.add_approval_request(approved)
         for permission in permissions:

@@ -77,6 +77,14 @@ def tracking_deadline(*, duration_seconds=None, expires_at=None, now=None):
     return end
 
 
+class LiveTrackerStateError(ValueError):
+    """A transactional state precondition refused before any tracker mutation."""
+
+    def __init__(self, message, job):
+        super().__init__(message)
+        self.tracker_state = {key: job[key] for key in ('id', 'state', 'expires_at')}
+
+
 class LiveTrackerPlanError(ValueError):
     """A source/condition contract failure with machine-readable repair facts."""
 
@@ -1027,8 +1035,8 @@ class LiveTrackerStore:
             if job["state"] not in {"blocked", "stopped", "matched"} or job[
                 "expires_at"
             ] <= timestamp(now):
-                raise ValueError(
-                    "Only a paused, stopped, or matched, unexpired live tracker can resume"
+                raise LiveTrackerStateError(
+                    "Only a paused, stopped, or matched, unexpired live tracker can resume", job
                 )
             job["resume_count"] = job.get("resume_count", 0) + 1
             if job["state"] == "matched":
@@ -1097,7 +1105,7 @@ class LiveTrackerStore:
                 return job
             end = tracking_deadline(duration_seconds=duration_seconds, expires_at=expires_at, now=now)
             if job["state"] not in {"expired", "blocked", "stopped", "matched"} and job['expires_at'] > timestamp(now):
-                raise ValueError("Only a paused, stopped, matched, or expired tracker can start a new window")
+                raise LiveTrackerStateError("Only a paused, stopped, matched, or expired tracker can start a new window", job)
             if job["state"] == "matched":
                 job["baseline_on_next_match"] = _needs_match_baseline(job)
             count = db.execute("SELECT COUNT(*) FROM live_trackers WHERE workspace_id=? AND state IN ('active','blocked') AND expires_at>? AND id!=?",
@@ -1677,7 +1685,7 @@ class LiveTrackerStore:
 
 
 def public_tracker(job: dict) -> dict:
-    return {
+    result = {
         key: job.get(key, True) if key == 'stop_after_match' else job.get(key)
         for key in (
             "id",
@@ -1699,6 +1707,14 @@ def public_tracker(job: dict) -> dict:
             "condition_revision",
         )
     }
+    if isinstance(result.get('last_problem'), dict):
+        result['last_problem'] = dict(result['last_problem'])
+        result['last_problem']['resume_required'] = job['state'] != 'active'
+        if job['state'] == 'active':
+            result['last_problem']['remedy'] = (
+                "Ask me to recheck and repair the saved source or condition. "
+                "This tracker is still active and does not need to be resumed.")
+    return result
 
 
 class _ProbeState(TypedDict, total=False):

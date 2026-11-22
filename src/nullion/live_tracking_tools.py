@@ -15,6 +15,7 @@ from nullion.live_tracking import (
     tracking_deadline,
     TrackingDeadlineError,
     LiveTrackerPlanError,
+    LiveTrackerStateError,
     STRUCTURED_OPERATORS,
     public_tracker,
     utcnow,
@@ -379,7 +380,11 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                             and observed["session_id"]):
                         source_context["browser_session_id"] = observed["session_id"]
                     from nullion.observation_replay import validated_observation_setup
-                    setup = validated_observation_setup(registry, step["tool_name"], observed)
+                    try:
+                        setup = validated_observation_setup(registry, step["tool_name"], observed)
+                    except ValueError as exc:
+                        raise LiveTrackerPlanError(str(exc), code="source_replay_required",
+                            tool_name=step["tool_name"]) from exc
                     if setup:
                         # A creator's physical tab is process-local. Bind the
                         # recipe, not the creator's handle, to the worker.
@@ -437,6 +442,14 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
             return ToolResult(
                 invocation.invocation_id, invocation.tool_name, "completed", output
             )
+        except LiveTrackerStateError as exc:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, 'failed', {
+                'reason': 'live_tracker_state_conflict', 'executed': False,
+                'tracker_state': exc.tracker_state,
+                'recovery': {'kind': 'correct_arguments',
+                    'required_tool_names': ['list_live_trackers', 'update_live_tracker'],
+                    'instruction': 'Inspect the saved tracker state. Amend an active tracker with update_live_tracker; do not restart its window or replay completed updates.'},
+            }, str(exc))
         except (ValueError, KeyError, TypeError) as exc:
             if isinstance(exc, TrackingDeadlineError):
                 return ToolResult(invocation.invocation_id, invocation.tool_name, 'failed',

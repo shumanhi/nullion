@@ -89,9 +89,23 @@ def _invoke(
     return executor.invoke(ToolInvocation(invocation_id, tool_name, principal_id, args))
 
 
-def test_email_send_approval_required_result_includes_exact_draft_arguments() -> None:
+def test_email_send_approval_required_result_includes_exact_draft_arguments(monkeypatch, tmp_path: Path) -> None:
+    from hashlib import sha256
+    from nullion.artifacts import artifact_root_for_principal
+
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path / "workspace-storage"))
+    principal = "web:stage"
+    artifact_root = artifact_root_for_principal(principal)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    attachments = {
+        artifact_root / "stage.csv": b"day,price\nMonday,12",
+        artifact_root / "notes.txt": b"reviewed notes",
+    }
+    for path, payload in attachments.items():
+        path.write_bytes(payload)
+
     store = RuntimeStore()
-    registry = ToolRegistry()
+    registry = ToolRegistry(filesystem_allowed_roots=[artifact_root])
     calls: list[ToolInvocation] = []
 
     registry.register(
@@ -111,9 +125,9 @@ def test_email_send_approval_required_result_includes_exact_draft_arguments() ->
         "to": ["recipient@example.com"],
         "subject": "Stage QA",
         "body": "Test body",
-        "attachment_paths": ["/tmp/stage.csv", "/tmp/stage.xlsx"],
+        "attachment_paths": [str(path) for path in attachments],
     }
-    result = executor.invoke(ToolInvocation("email-approval", "email_send", "web:stage", arguments))
+    result = executor.invoke(ToolInvocation("email-approval", "email_send", principal, arguments))
 
     assert result.status == "denied"
     assert result.output["reason"] == "approval_required"
@@ -129,6 +143,9 @@ def test_email_send_approval_required_result_includes_exact_draft_arguments() ->
     assert approval.resource == "email_send"
     assert approval.context["tool_arguments"] == arguments
     assert approval.context["tool_side_effect_class"] == "account_write"
+    assert approval.context["reviewed_email_files"] == {
+        str(path): sha256(payload).hexdigest() for path, payload in attachments.items()
+    }
 
 
 def test_workspace_storage_prompt_exposes_internal_scratch_root(monkeypatch, tmp_path: Path) -> None:
@@ -367,15 +384,10 @@ def test_core_tools_run_directly_or_after_permission_grant(monkeypatch, tmp_path
     assert terminal_before.status == "denied"
     assert terminal_before.output["reason"] == "approval_required"
     terminal_approval_id = str(terminal_before.output["approval_id"])
-    store.add_permission_grant(
-        create_permission_grant(
-            approval_id=terminal_approval_id,
-            principal_id=OPERATOR_PERMISSION_PRINCIPAL,
-            permission="tool:terminal_exec",
-            granted_by="test",
-            granted_at=datetime.now(UTC),
-        )
-    )
+    from nullion.runtime import approve_approval_request
+
+    approve_approval_request(store, terminal_approval_id,
+        principal_id=OPERATOR_PERMISSION_PRINCIPAL, permissions=["tool:terminal_exec"])
     terminal_after = _invoke(executor, "terminal-after", "terminal_exec", {"command": "printf core"})
     assert terminal_after.status == "completed"
     assert terminal_after.output["stdout"] == "terminal ok\n"

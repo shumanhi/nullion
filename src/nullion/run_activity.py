@@ -43,26 +43,32 @@ def activity_trace_status_text() -> str:
 
 
 def task_planner_feed_enabled(*, default: bool = True) -> bool:
-    _ = default
-    return True
+    return task_planner_feed_mode(default="task" if default else "off") != "off"
 
 
 def task_planner_feed_mode(*, default: str = "task") -> str:
-    _ = default
-    return "task"
+    raw = str(os.environ.get("NULLION_TASK_PLANNER_FEED_MODE") or "").strip().lower()
+    if raw:
+        return "off" if raw in {"off", "none", "0", "false"} else "task"
+    legacy = str(os.environ.get("NULLION_TASK_PLANNER_FEED_ENABLED") or "").strip().lower()
+    if legacy:
+        return "off" if legacy in {"off", "no", "0", "false"} else "task"
+    return "off" if default in {"off", "none"} else "task"
 
 
 def set_task_planner_feed_enabled(enabled: bool) -> None:
-    _ = enabled
-    set_task_planner_feed_mode("task")
+    set_task_planner_feed_mode("task" if enabled else "off")
 
 
 def set_task_planner_feed_mode(mode: str) -> None:
     normalized = str(mode or "").strip().lower().replace("_", "-")
-    if normalized == "tasks":
+    if normalized in {"tasks", "on"}:
         normalized = "task"
-    if normalized not in {"all", "task", "off"}:
-        raise ValueError("task planner feed mode must be all, task, or off")
+    if normalized == "none":
+        normalized = "off"
+    if normalized not in {"task", "off"}:
+        raise ValueError("task planner feed mode must be task or off")
+    os.environ["NULLION_TASK_PLANNER_FEED_MODE"] = normalized
 
 
 def task_planner_feed_status_text() -> str:

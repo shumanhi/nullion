@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 import html
+from hashlib import sha256
 from html.parser import HTMLParser
 import logging
 import os
@@ -1749,6 +1750,8 @@ def _sanitize_platform_visible_text(
 ) -> str | None:
     if text is None:
         return None
+    from nullion.chat_text import render_report_reply
+    text = render_report_reply(text)
     sanitized = sanitize_user_visible_reply(
         user_message=None,
         reply=text,
@@ -2532,13 +2535,36 @@ def save_messaging_attachment(
         upload_dir, _ = ensure_messaging_storage_roots()
     safe_name = Path(filename or "upload").name or "upload"
     dest = upload_dir / safe_name
-    if dest.exists():
-        dest = upload_dir / f"{dest.stem}-{uuid4().hex[:8]}{dest.suffix}"
-    dest.write_bytes(data)
+    while True:
+        try:
+            descriptor = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            original = Path(safe_name)
+            dest = upload_dir / f"{original.stem}-{uuid4().hex}{original.suffix}"
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name != 'nt':
+            directory = os.open(upload_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+    from nullion.connections import workspace_id_for_principal
     return {
         "name": dest.name,
         "path": str(dest),
         "media_type": image_media_type_from_bytes(data) or media_type or guess_media_type(dest.name),
+        "content_sha256": sha256(data).hexdigest(),
+        "size_bytes": str(len(data)),
+        "principal_id": str(principal_id or "telegram_chat"),
+        "workspace_id": workspace_id_for_principal(principal_id),
     }
 
 

@@ -2178,7 +2178,7 @@ def test_pdf_create_text_pages_use_text_preserving_renderer(tmp_path, monkeypatc
     output_path = tmp_path / "report.pdf"
     captured: dict[str, object] = {}
 
-    def fake_save(path, *, title, text_pages, image_paths, page_size_name):
+    def fake_save(path, *, title, text_pages, image_paths, page_size_name, pagination):
         captured.update(
             {
                 "path": path,
@@ -2186,6 +2186,7 @@ def test_pdf_create_text_pages_use_text_preserving_renderer(tmp_path, monkeypatc
                 "text_pages": text_pages,
                 "image_paths": image_paths,
                 "page_size_name": page_size_name,
+                "pagination": pagination,
             }
         )
         _write_valid_renderer_pdf(path, image_paths=image_paths, page_count=len(text_pages))
@@ -2208,6 +2209,7 @@ def test_pdf_create_text_pages_use_text_preserving_renderer(tmp_path, monkeypatc
 
     assert result.status == "completed"
     assert result.output["text_layer"] is True
+    assert captured["pagination"] == "flow"
     assert result.output["text_pages"] == 1
     assert result.output["quality_profile"] == "report_quality_v1"
     assert "clickable_links" in result.output["layout_features"]
@@ -2222,7 +2224,7 @@ def test_pdf_create_html_pages_use_designed_pdf_renderer(tmp_path, monkeypatch) 
     output_path = tmp_path / "designed.pdf"
     captured: dict[str, object] = {}
 
-    def fake_save(path, *, title, html_pages, image_paths=(), screenshot_paths=(), page_size_name):
+    def fake_save(path, *, title, html_pages, image_paths=(), screenshot_paths=(), page_size_name, pagination):
         captured.update(
             {
                 "path": path,
@@ -2231,6 +2233,7 @@ def test_pdf_create_html_pages_use_designed_pdf_renderer(tmp_path, monkeypatch) 
                 "image_paths": image_paths,
                 "screenshot_paths": screenshot_paths,
                 "page_size_name": page_size_name,
+                "pagination": pagination,
             }
         )
         _write_valid_renderer_pdf(path, page_count=len(html_pages))
@@ -2271,7 +2274,7 @@ def test_pdf_create_inlines_local_html_page_images(tmp_path, monkeypatch) -> Non
     image_path = _write_png(tmp_path / "assets" / "hero.png", color="teal")
     captured: dict[str, object] = {}
 
-    def fake_save(path, *, title, html_pages, image_paths=(), screenshot_paths=(), page_size_name):
+    def fake_save(path, *, title, html_pages, image_paths=(), screenshot_paths=(), page_size_name, pagination):
         captured.update(
             {
                 "path": path,
@@ -2280,6 +2283,7 @@ def test_pdf_create_inlines_local_html_page_images(tmp_path, monkeypatch) -> Non
                 "image_paths": image_paths,
                 "screenshot_paths": screenshot_paths,
                 "page_size_name": page_size_name,
+                "pagination": pagination,
             }
         )
         _write_valid_renderer_pdf(path, image_paths=[image_path], page_count=len(html_pages))
@@ -2312,7 +2316,7 @@ def test_pdf_create_html_pages_include_verified_media_inputs(tmp_path, monkeypat
     screenshot_path = _write_browser_screenshot_artifact(tmp_path)
     captured: dict[str, object] = {}
 
-    def fake_save(path, *, title, html_pages, image_paths=(), screenshot_paths=(), page_size_name):
+    def fake_save(path, *, title, html_pages, image_paths=(), screenshot_paths=(), page_size_name, pagination):
         captured.update(
             {
                 "path": path,
@@ -2321,6 +2325,7 @@ def test_pdf_create_html_pages_include_verified_media_inputs(tmp_path, monkeypat
                 "image_paths": image_paths,
                 "screenshot_paths": screenshot_paths,
                 "page_size_name": page_size_name,
+                "pagination": pagination,
             }
         )
         _write_valid_renderer_pdf(path, image_paths=[*image_paths,*screenshot_paths], page_count=len(html_pages))
@@ -2368,6 +2373,11 @@ def test_html_pdf_renderer_inlines_media_assets_as_data_uris(tmp_path, monkeypat
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
             captured["wait_until"] = wait_until
+
+        def evaluate(self, script, *args):
+            if args and isinstance(args[0], dict) and "size" in args[0]:
+                return {"pageRules": 1, "inaccessible": 0, "truncated": False}
+            return 0
 
         def pdf(self, **kwargs):  # noqa: ANN003
             captured["pdf_kwargs"] = kwargs
@@ -2436,6 +2446,11 @@ def test_html_pdf_renderer_places_primary_media_when_layout_has_no_image(tmp_pat
             captured["html"] = html
             captured["wait_until"] = wait_until
 
+        def evaluate(self, script, *args):
+            if args and isinstance(args[0], dict) and "size" in args[0]:
+                return {"pageRules": 1, "inaccessible": 0, "truncated": False}
+            return 0
+
         def pdf(self, **kwargs):  # noqa: ANN003
             captured["pdf_kwargs"] = kwargs
             Path(kwargs["path"]).write_bytes(b"%PDF-1.4\n% fake\n")
@@ -2499,7 +2514,9 @@ def test_html_pdf_renderer_strips_decorative_emoji_text(tmp_path, monkeypatch) -
             captured["html"] = html
 
         def evaluate(self, script, *args):  # noqa: ANN001, ANN002
-            return 0.92 if args else 0
+            if args and isinstance(args[0], dict) and "size" in args[0]:
+                return {"pageRules": 1, "inaccessible": 0, "truncated": False}
+            return 0
 
         def pdf(self, **kwargs):  # noqa: ANN003
             Path(kwargs["path"]).write_bytes(b"%PDF-1.4\n% fake\n")
@@ -2564,8 +2581,11 @@ def test_html_pdf_renderer_flows_bottom_anchored_elements_before_print(tmp_path,
             captured["html"] = html
             captured["wait_until"] = wait_until
 
-        def evaluate(self, script):  # noqa: ANN001
-            captured["script"] = script
+        def evaluate(self, script, *args):  # noqa: ANN001
+            if args and isinstance(args[0], dict) and "size" in args[0]:
+                return {"pageRules": 1, "inaccessible": 0, "truncated": False}
+            if "nullionFlowSafe" in script:
+                captured["script"] = script
             return 1
 
         def pdf(self, **kwargs):  # noqa: ANN003
@@ -2616,7 +2636,8 @@ def test_html_pdf_renderer_flows_bottom_anchored_elements_before_print(tmp_path,
     assert ".designed-page-inner>:first-child" in html_text
     assert "min-height:auto!important" in html_text
     assert "dataset.nullionFlowSafe" in str(captured["script"])
-    assert ".designed-page-inner>*{break-inside:avoid;page-break-inside:avoid;}" in html_text
+    assert ".designed-page-inner>*{break-inside:avoid;page-break-inside:avoid;}" not in html_text
+    assert "[data-nullion-print-fragment='1']{break-inside:auto!important" in html_text
     assert captured["pdf_kwargs"]["path"] == str(output_path)
 
 
@@ -2640,6 +2661,8 @@ def test_html_pdf_renderer_repairs_broken_image_slots_from_verified_media(tmp_pa
 
         def evaluate(self, script, *args):  # noqa: ANN001
             captured["evaluations"].append((script, args))
+            if args and isinstance(args[0], dict) and "size" in args[0]:
+                return {"pageRules": 1, "inaccessible": 0, "truncated": False}
             if "nullionRepairedMedia" in script:
                 return 1
             return 0
@@ -2694,7 +2717,7 @@ def test_html_pdf_renderer_repairs_broken_image_slots_from_verified_media(tmp_pa
     assert captured["pdf_kwargs"]["path"] == str(output_path)
 
 
-def test_html_pdf_renderer_uses_dynamic_print_scale_for_designed_pages(tmp_path, monkeypatch) -> None:
+def test_html_pdf_renderer_never_globally_shrinks_designed_pages(tmp_path, monkeypatch) -> None:
     import sys
 
     output_path = tmp_path / "fit-page.pdf"
@@ -2712,10 +2735,8 @@ def test_html_pdf_renderer_uses_dynamic_print_scale_for_designed_pages(tmp_path,
 
         def evaluate(self, script, *args):  # noqa: ANN001
             captured["evaluations"].append((script, args))
-            if "maxHeight" in script:
-                return 0.74
-            if "nullionPrintScale" in script:
-                return 1
+            if args and isinstance(args[0], dict) and "size" in args[0]:
+                return {"pageRules": 1, "inaccessible": 0, "truncated": False}
             return 0
 
         def pdf(self, **kwargs):  # noqa: ANN003
@@ -2759,9 +2780,10 @@ def test_html_pdf_renderer_uses_dynamic_print_scale_for_designed_pages(tmp_path,
 
     html_text = str(captured["html"])
     assert 'class="designed-page"><div class="designed-page-inner">' in html_text
-    assert any("nullionPrintScale" in script for script, _ in captured["evaluations"])
-    assert captured["pdf_kwargs"]["scale"] == 0.98
-    assert captured["viewport"] == {"width": 816, "height": 1056}
+    assert not any("nullionPrintScale" in script for script, _ in captured["evaluations"])
+    assert any("nullionPrintFragment" in script for script, _ in captured["evaluations"])
+    assert captured["pdf_kwargs"]["scale"] == 1
+    assert captured["viewport"] == {"width": 816, "height": 975}
     assert captured["media"] == "print"
 
 
@@ -2774,12 +2796,13 @@ def test_pdf_create_splits_single_structured_report_page_to_align_media(tmp_path
     output_path = tmp_path / "catalog.pdf"
     captured: dict[str, object] = {}
 
-    def fake_save(path, *, title, text_pages, image_paths, page_size_name):
+    def fake_save(path, *, title, text_pages, image_paths, page_size_name, pagination):
         captured.update(
             {
                 "text_pages": text_pages,
                 "image_paths": image_paths,
                 "page_size_name": page_size_name,
+                "pagination": pagination,
             }
         )
         _write_valid_renderer_pdf(path, image_paths=image_paths, page_count=len(text_pages))
@@ -2807,6 +2830,7 @@ def test_pdf_create_splits_single_structured_report_page_to_align_media(tmp_path
     )
 
     assert result.status == "completed"
+    assert captured["pagination"] == "pages"
     assert result.output["text_pages"] == 3
     assert result.output["page_count"] == 3
     assert "media_aligned_report_pages" in result.output["layout_features"]
@@ -2826,8 +2850,8 @@ def test_pdf_create_preserves_single_text_page_by_default(tmp_path, monkeypatch)
     output_path = tmp_path / "preserved.pdf"
     captured: dict[str, object] = {}
 
-    def fake_save(path, *, title, text_pages, image_paths, page_size_name):
-        captured.update({"text_pages": text_pages, "image_paths": image_paths})
+    def fake_save(path, *, title, text_pages, image_paths, page_size_name, pagination):
+        captured.update({"text_pages": text_pages, "image_paths": image_paths, "pagination": pagination})
         _write_valid_renderer_pdf(path, image_paths=image_paths, page_count=len(text_pages))
         return True
 

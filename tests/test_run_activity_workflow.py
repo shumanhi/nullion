@@ -668,8 +668,8 @@ def test_platform_tool_activity_compaction_dedupes_repeated_details() -> None:
         "🎯 **PLANNER  SEQUENTIAL MISSION**\n\n"
         "For: Premarket report\n"
         "→ Working on 4 tasks\n\n"
-        "Activity\n"
-        "✓ Tools\n"
+        "ACTIVITY LIVE\n"
+        "Tools\n"
         "✓ connector_request\n"
         "✓ file_write\n"
         "✓ run_cron"
@@ -762,8 +762,8 @@ def test_platform_activity_capabilities_cover_live_editable_surfaces(monkeypatch
             "🎯 **PLANNER  PARALLEL MISSION**\n\n"
             "For: Boston day trip from NYC by train\n"
             "✓ Running 2 tasks\n\n"
-            "Activity\n"
-            "✓ Tools\n"
+            "ACTIVITY LIVE\n"
+            "Tools\n"
             "✓ list_crons"
         )
         task_activity = store.update(
@@ -818,7 +818,7 @@ def test_platform_activity_capabilities_cover_live_editable_surfaces(monkeypatch
         status_kind="task_summary",
         planner_feed_enabled=False,
         include_activity=True,
-    ) is True
+    ) is False
 
 
 def test_task_status_subject_is_compact_and_language_neutral() -> None:
@@ -978,11 +978,16 @@ async def test_telegram_planner_status_serializes_concurrent_first_updates() -> 
 
 
 def test_verbose_mode_documentation_and_website_content_are_current() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert "(docs/commands.md)" in readme
+    assert "(docs/configuration.md)" in readme
     docs = "\n".join(
         path.read_text(encoding="utf-8")
         for path in [
             Path("README.md"),
             Path("docs/README.md"),
+            Path("docs/commands.md"),
+            Path("docs/configuration.md"),
             Path("docs/support.md"),
             Path("website/index.html"),
             Path("website/docs/index.html"),
@@ -990,12 +995,19 @@ def test_verbose_mode_documentation_and_website_content_are_current() -> None:
         if path.exists()
     )
 
-    assert "/verbose [on|off|status]" in docs
-    assert "/verbose [off|planner|full|status]" not in docs
-    assert "/planner-feed" not in docs
+    normalized = " ".join(docs.replace("\\|", "|").split())
+    assert "/verbose [on|off|status]" in normalized
+    assert "/verbose [off|planner|full|status]" not in normalized
+    assert "/planner-feed" not in normalized
+    assert "NULLION_TASK_PLANNER_FEED_MODE" in normalized
+    assert "Settings → Execution → Planner cards" in normalized
+    assert "former planner-feed environment toggles do not change" not in normalized
 
 
 def test_skill_auth_policy_documentation_and_website_content_are_current() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert "(docs/plugins.md)" in readme
+    assert "(docs/skill-packs.md)" in readme
     docs = "\n".join(
         path.read_text(encoding="utf-8")
         for path in [
@@ -1010,12 +1022,14 @@ def test_skill_auth_policy_documentation_and_website_content_are_current() -> No
         if path.exists()
     )
 
-    assert "auth-required skills" in docs
-    assert "instruction-only" in docs
-    assert "Settings -> Users -> Connections" in docs
-    assert "admin-shared" in docs
-    assert "MATON_API_KEY" not in docs
-    assert "Maton, Composio, Nango" not in docs
+    normalized = " ".join(docs.split())
+    assert "auth-required skills" in normalized
+    assert "instruction-only" in normalized
+    assert "Settings -> Users -> Connections" in normalized
+    assert "admin-shared" in normalized
+    assert "explicit confirmation" in normalized
+    assert "MATON_API_KEY" not in normalized
+    assert "Maton, Composio, Nango" not in normalized
 
 
 def test_activity_phase_and_env_toggles(monkeypatch) -> None:
@@ -1037,7 +1051,7 @@ def test_task_planner_feed_modes(monkeypatch) -> None:
     monkeypatch.delenv("NULLION_TASK_PLANNER_FEED_MODE", raising=False)
     monkeypatch.delenv("NULLION_TASK_PLANNER_FEED_ENABLED", raising=False)
     assert task_planner_feed_mode(default="bad") == "task"
-    assert task_planner_feed_enabled(default=False) is True
+    assert task_planner_feed_enabled(default=False) is False
 
     monkeypatch.setenv("NULLION_TASK_PLANNER_FEED_MODE", "tasks")
     assert task_planner_feed_mode() == "task"
@@ -1045,12 +1059,12 @@ def test_task_planner_feed_modes(monkeypatch) -> None:
     assert task_planner_feed_status_text() == "task"
     monkeypatch.setenv("NULLION_TASK_PLANNER_FEED_MODE", "")
     monkeypatch.setenv("NULLION_TASK_PLANNER_FEED_ENABLED", "no")
-    assert task_planner_feed_mode() == "task"
+    assert task_planner_feed_mode() == "off"
 
     set_task_planner_feed_enabled(True)
     assert task_planner_feed_mode() == "task"
     set_task_planner_feed_mode("off")
-    assert task_planner_feed_enabled() is True
+    assert task_planner_feed_enabled() is False
     with pytest.raises(ValueError):
         set_task_planner_feed_mode("maybe")
 

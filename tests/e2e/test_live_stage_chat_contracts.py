@@ -346,6 +346,33 @@ def test_live_stage_independent_memory_and_history_recall_contract():
 
 
 @pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reason='requires authorized live stage provider and tool execution')
+def test_live_stage_native_recall_with_code_mode():
+    from uuid import uuid4
+    from scripts import live_stage_chat_contract_probe as probe
+    base = os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753').rstrip('/')
+    db = Path(os.environ.get('NULLION_LIVE_RUNTIME_DB',str(Path.home()/'.nullion-stage'/'runtime.db')))
+    # Plain/weather latency is measured by the existing shared live baseline;
+    # this probe independently owns the context-retrieval acceptance.
+    token = uuid4().hex[:10]
+    topic, reference = 'Orchard-'+token, 'NB-'+uuid4().hex[:10]
+    seed = f'For the synthetic {topic} comparison we chose notebook {reference}. Acknowledge only; no external lookup.'
+    seed_conversation = 'web:native-recall-seed:'+token
+    probe._post_json(base+'/api/chat', {'text':seed,'conversation_id':seed_conversation}, timeout=180)
+    seed_event = probe._chat_turn_for_user_message_with_poll(db,seed_conversation,seed)
+    assert seed_event and reference in seed_event.get('assistant_reply','')
+    probe._post_json(base+f'/api/chat/history/{seed_conversation}/archive', {}, timeout=30)
+    prompt = f'Which notebook did we choose for {topic}?'
+    conversation = 'web:native-recall-check:'+token
+    reply, elapsed = probe._post_json(base+'/api/chat', {'text':prompt,'conversation_id':conversation}, timeout=180)
+    event = probe._chat_turn_for_user_message_with_poll(db,conversation,prompt)
+    names = probe._tool_names_from_chat_turn(event or {})
+    assert reference in reply.get('text',''), reply
+    assert 'chat_history_search' in names and event.get('response_fulfilled') is True
+    assert not {'email_search','email_read','calendar_list'} & set(names)
+    assert not event.get('parent_turn_id') and elapsed < 90000
+
+
+@pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reason='requires authorized live stage provider and tool execution')
 def test_live_stage_reusable_tool_creation_and_independent_reuse_contract():
     from uuid import uuid4
     from scripts import live_stage_chat_contract_probe as probe

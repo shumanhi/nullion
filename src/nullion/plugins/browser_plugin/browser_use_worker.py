@@ -40,7 +40,7 @@ def _signal_worker(process, *, force=False):
             logger.warning('Exited browser worker group cleanup denied pid=%s', process.pid)
 
 
-def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, python=None, progress_callback=None, browser_mode="configured"):
+def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, python=None, progress_callback=None, browser_mode="configured", browser_connection=None):
     token = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -104,7 +104,7 @@ def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, py
             from uuid import uuid4
             tab_lease_path = nullion_runtime_home() / 'browser-tab-leases' / (uuid4().hex + '.json')
             from nullion.tools import tool_execution_owner
-            job.write_text(json.dumps({'task': task.model_dump(), 'principal_id': principal_id, 'timeout': timeout, 'browser_mode': browser_mode,
+            job.write_text(json.dumps({'task': task.model_dump(), 'principal_id': principal_id, 'timeout': timeout, 'browser_mode': browser_mode, 'browser_connection': browser_connection,
                 'owner': tool_execution_owner(),
                 'fallback_site_packages': site.getsitepackages(), 'model': str(getattr(client, 'model', 'configured-model')), 'bridge_url': f'http://127.0.0.1:{bridge.server_port}/model', 'token': token,
                 'resource_lease': str(Path(scratch) / '.lease'),
@@ -221,7 +221,8 @@ async def _worker(job,result_path=None):
     policy.block_private = job['policy']['block_private']
     try:
         client = BridgeModelClient(job)
-        result=await run_browser_task(BrowserTask.model_validate(job['task']), client=client, principal_id=job['principal_id'], policy=policy, timeout=job['timeout'], progress_callback=client.progress, browser_mode=job.get("browser_mode", "configured"), tab_lease_path=job.get('tab_lease_path'))
+        connection_args = {'browser_connection': job['browser_connection']} if job.get('browser_connection') is not None else {}
+        result=await run_browser_task(BrowserTask.model_validate(job['task']), client=client, principal_id=job['principal_id'], policy=policy, timeout=job['timeout'], progress_callback=client.progress, browser_mode=job.get("browser_mode", "configured"), tab_lease_path=job.get('tab_lease_path'), **connection_args)
     except Exception as exc:
         from nullion.tools import filesystem_error_metadata
         result={'worker_error':{'type':type(exc).__name__,'message':str(exc)[:300],

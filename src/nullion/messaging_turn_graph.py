@@ -81,6 +81,7 @@ class PlatformChatResponse:
     approval_id: str | None = None
     reply_already_sent: bool = False
     mini_agent_dispatch: bool = False
+    mini_agent_dispatch_terminal: bool = False
     task_group_id: str | None = None
     planner_status_text: str | None = None
     progress_status_text: str | None = None
@@ -1261,6 +1262,7 @@ def _delivery_metadata_from_reply(reply: object) -> dict[str, object]:
         metadata["reply_already_sent"] = True
     if bool(getattr(reply, "mini_agent_dispatch", False)):
         metadata["mini_agent_dispatch"] = True
+        metadata["mini_agent_dispatch_terminal"] = bool(getattr(reply, "mini_agent_dispatch_terminal", False))
     for key in (
         "task_group_id",
         "planner_status_text",
@@ -1933,6 +1935,12 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
         if isinstance(stored_reply, str) and stored_reply.strip()
         else text
     )
+    if (delivery_metadata.get("mini_agent_dispatch")
+            and not delivery_metadata.get("mini_agent_dispatch_terminal")):
+        from nullion.run_activity import task_planner_feed_enabled
+        if not task_planner_feed_enabled():
+            from nullion.chat_text import WORKING_ACK_TEXT
+            delivery_text = WORKING_ACK_TEXT
     completed_run_cron_reply = _completed_run_cron_receipt_reply(stored_tool_results)
     if completed_run_cron_reply:
         delivery_text = completed_run_cron_reply
@@ -2199,6 +2207,7 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
         artifact_candidate_paths=artifact_candidate_paths,
         reply_already_sent=bool(delivery_metadata.get("reply_already_sent", False)),
         mini_agent_dispatch=bool(delivery_metadata.get("mini_agent_dispatch", False)),
+        mini_agent_dispatch_terminal=bool(delivery_metadata.get("mini_agent_dispatch_terminal", False)),
         task_group_id=str(delivery_metadata.get("task_group_id") or "") or None,
         planner_status_text=str(delivery_metadata.get("planner_status_text") or "") or None,
         progress_status_text=str(delivery_metadata.get("progress_status_text") or "") or None,

@@ -22,6 +22,8 @@ def test_browser_source_composition_knows_verified_deliverable_exists(tmp_path, 
     monkeypatch.setenv('HOME',str(tmp_path));monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'))
     monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'missing.env'))
     monkeypatch.setenv('NULLION_MEMORY_ENABLED','0');monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off')
+    monkeypatch.setenv('NULLION_BROWSER_BACKEND','playwright')
+    monkeypatch.setenv('NULLION_BROWSER_HEADLESS','true')
     chat_store._store=None
     image=Image.new('RGB',(64,64),'white');ImageDraw.Draw(image).rectangle((8,8,48,48),fill='blue')
     source=tmp_path/'capture.png';image.save(source)

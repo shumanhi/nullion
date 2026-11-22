@@ -16,6 +16,97 @@ its own strategy prompt, execution loop or fallback agent. Required execution
 policy belongs at the shared runtime boundary with typed evidence; advice in a
 tool description alone does not enforce it.
 
+Workspace history and durable-memory reads remain directly visible native tools,
+including when Code Mode is enabled. They are also available inside Code Mode
+programs through the same scoped native boundary. Tool eligibility and native
+visibility are separate adapter metadata; composing a tool must not hide its
+native choice or widen its execution authority. Visibility alone performs no history
+scan, model classification or account read. The primary agent still selects
+retrieval when needed, and saved observations never grant fresh source consent.
+
+Terminal source text can contain paths from old records. Those paths never
+declare a delivery request or replace the primary answer. Native artifact roles
+take precedence; legacy stdout path discovery needs a current structured format
+or exact filename contract. Approval acknowledgements likewise keep the short
+action heading separate from the shared review details, rendering that review
+once instead of treating its whole body as an inline target.
+
+HTML normalization establishes UTF-8 for both fragments and complete documents.
+The shared normalizer preserves body/script/style content while placing the
+encoding declaration at the start of the head and replacing conflicting or late
+declarations. An encoding signature protects documents with an unusually long
+opening prefix. Email previews from inline HTML and source files use this same
+normalization as MIME HTML; source files remain unchanged.
+HTML source previews enforce the same filesystem read boundary as the send.
+Denied paths cannot be copied into preview artifacts before approval; exact
+approved reads authorize only the reviewed invocation and file selectors.
+
+Scheduled destination selection uses the scheduler's actual supported-channel
+metadata. Delivery outside those channels requires the selected connector write
+and its native transport receipt; a scheduler notification cannot stand in for
+that send. Public typed action receipts may be included in a report, while raw
+source bodies and internal scope references remain subject to leak checks.
+Stored producer report contracts are rendered through the same shared presenter
+on Web history restoration and Telegram, Slack and Discord delivery.
+
+Approved terminal deletions produce native before/after observations of the
+selected filesystem targets. Shared action receipts name verified removals,
+already absent paths and unconfirmed targets; stdout flags and exit codes alone
+do not prove deletion. Receipts preserve partial changes after a failed command
+and do not equate file size with reclaimed disk space. Approval resumptions use
+the same receipt presenter across clients without another formatting model call.
+Unlink observations retain the selected final symlink rather than describing
+its referent as deleted; approval canonicalization remains independent.
+Terminal boundary extraction preserves shell quoting and token positions.
+Redirections and adjacent file descriptors are separated from command operands
+before deletion previews are built, including operands after `--`. Output files
+retain write checks; redirecting to the null device never authorizes deleting
+that device. Unsupported syntax and unresolved mutation targets return structured
+correction requirements before approval or execution. Receipts cannot claim an
+unresolved shell expression was already absent or successfully removed.
+Approval review renders the native stored action, kind and scope. Ancillary UI
+turn binding and its checkpoint cannot replace those details with transport
+hints or generic web-access controls. Unchanged bindings perform no write;
+changed bindings use the existing bounded checkpoint and background coordinator.
+Dashboard approval limits bound recent decided history only; every pending
+native decision remains available in the attention panel, even above that cap.
+Approval completion projects the exact native terminal turn, receipts and
+selected artifacts into history under its original conversation and turn
+identity. Older imports and delayed client saves cannot replace that revision.
+If the secondary history write is temporarily unavailable, selected history
+reads repair bounded batches from durable native events using a persistent
+cursor; they never replay the action or start another model request. Explicit
+history clears remain authoritative.
+Optional UI correlation can be recovered from a stored source turn in the
+approval's native context or its exact pending tool event. Later conversation
+heads and reply text never establish that identity. Legacy approvals with
+verified action/source ownership retain a stable continuation identity when
+the original turn is unknown; missing source ownership still stops execution.
+
+
+One-time tool consent binds the native request identity, principal and arguments.
+The decision and its grant are persisted together. A durable execution claim
+consumes the approval before the effect, independently of the continuation claim.
+Independent drafts cannot replace or satisfy one another's approval. Email review
+binds the previewed HTML and attachment bytes and verifies them when building
+the outgoing message. If a source is outside reviewed file access, review its
+read permission before preparing the send approval. A legacy draft with files
+and no review digest requires a fresh draft.
+
+Approval continuation uses the saved action or the exact suspended program.
+An unavailable action is reported as a continuation failure. Shared progress
+reports active work during resume and finalization. Web approval feedback belongs
+to the original response and slow continuation work runs off the event loop.
+Approval labels and targets use stored request facts. Structured report envelopes
+remain undecorated until the shared delivery renderer formats them, including
+older stored reports prefixed with a presentation icon.
+
+Messaging upload receipts bind the original bytes, size, principal and workspace.
+Quoted-input recovery verifies those identities under the workspace upload root,
+otherwise it downloads the quoted native media again. Exclusive durable writes
+prevent same-name concurrent uploads from replacing one another; upload writes
+and receipt hashing run outside the messaging event loop.
+
 The runtime produces one common message/result contract. One presentation layer
 applies saved preferences; client output adapters render supported markup,
 escape, split, upload and transport that result, and return delivery
@@ -275,6 +366,15 @@ three-failure pauses remain independent of match delivery.
 
 ## Browser state
 
+Shared CDP recovery matches native target identities, never URLs, and preserves
+task ownership across transport replacement. A missing original target requires
+explicit recovery instead of adopting another user's tab. Resolved local-browser
+connections cannot fall back to an unrelated environment CDP endpoint.
+The Browser Use adapter installs target ownership before SDK startup and on
+reconnect, blocks startup normalization of unowned tabs, and cleans up partial
+attachments after failure or cancellation. Lost focus may return to a surviving
+owned target; cleanup closes only recorded task targets.
+
 The terminal preparation phase says "Preparing your response" for text and file
 results alike. A phase name inherited from artifact preparation does not prove
 that this request produced a file. Actual producer operations may still show
@@ -300,6 +400,19 @@ The executing tool registry supplies lifecycle metadata before optional verbose
 activity suppression. Dynamically scoped history and runtime-owned inspection
 tools therefore update the same notice without exposing private results or
 depending on a client's base registry. This adds no inference calls.
+Native approval identifiers and approval-required state take precedence over a
+generic denied status when presenting a tool's waiting state. Planner cards obey
+their own saved setting; verbose controls activity details independently.
+Coalesced activity edits publish the latest state under the per-group delivery
+lock, retain a trailing update, and retire pending updates when the group ends.
+Long planner cards retain their complete canonical content and split only at the
+transport boundary. A request-local multipart ledger edits confirmed message
+handles, appends missing parts, and removes only confirmed task-owned surplus
+parts. An uncertain append is retained without automatic resend. Every operation
+checks that its publishing group remains open; terminal delivery is independent
+of status delivery and prevents further parts from being appended.
+Web transport failures and approval transitions retire only their owning turn,
+preserving progress and watchdogs for other concurrent requests.
 History lookup selects chat/reset event types before copying runtime payloads,
 preserving workspace and reset rules while excluding unrelated timing receipts.
 Retained inspection descriptors union overlapping ranges of the same unchanged
@@ -469,9 +582,22 @@ promote research screenshots to the requested final image. Pending recovery cons
 execution. This rule is shared tool execution policy for every client and adds
 no classifier or ordinary-chat model call.
 
+Screenshot extent belongs to the existing structured tool-scope decision and
+survives scope expansion and Code Mode. Automatic captures use a viewport for
+websites and preserve complete local rendered documents. An explicit full-page
+selection carries a quote from the current user request as provenance; the quote
+does not itself prove intent. A screenshot argument cannot expand the selected
+extent. Native receipts retain requested and effective modes and any adjustment;
+completion checks the actual PNG against the selected capture contract.
+
 The optional delegated Browser Use worker performs adaptive multi-step browsing
 when interaction is needed. Auto/CDP mode reuses the configured managed browser;
 explicit Playwright/headless selection uses independent workspace-owned state.
+Borrowed CDP sessions retain the user's permissions, viewport, download behavior
+and pending dialogs. Shared attachment omits global profile mutations and
+automatic dialog handling through supported SDK hooks. Security cleanup checks
+the target lease even before attachment is ready; URL restrictions still apply
+to task-owned navigation. Dedicated browser profiles retain their own policy.
 Neither multi-page research nor delegated browsing is the worker used for
 frequent live polling. The primary retains the original requested dimensions
 and decides when enough evidence has been gathered, without a separate planner
@@ -615,6 +741,12 @@ Browser JavaScript inspections attach independently read local-document
 provenance. Inspecting a generated document does not count as new source
 research or make its own file stale. An arbitrary script return value cannot
 claim that provenance. PDF printing keeps headings with their following content.
+PDF pagination and styling follow the shared [layout guidelines](pdf-layout-guidelines.md).
+Ordinary reports flow across sheets; explicit page contracts retain deliberate
+boundaries. Long content may continue between pages without global shrinking,
+while compact related blocks and heading introductions remain together where
+practical. Exact page counts are verified against the rendered PDF, never met
+by dropping overflow content.
 
 Material-requirements planning also corrects an invalid structured response once,
 without tools or repeated file creation. Diagnostics record the failed schema
@@ -1677,6 +1809,12 @@ The primary's structured scope decision also owns output and media format
 selection. Preparation does not run separate format/media model calls or scan
 all scheduler jobs for ordinary primary-agent turns. Explicit reply/job state
 continues to identify scheduled work.
+
+PDF and local image renderers prefer a configured or installed system browser,
+then use the Playwright-managed Chromium installed by the application installer.
+They verify the managed binary exists and report unavailable rendering when no
+binary is installed; rendering does not download browsers or change browser
+attachment settings or user profiles.
 
 Designed PDF producers expose up to three bounded previews rendered from the
 actual PDF bytes, bound to both PDF and image hashes. These internal previews

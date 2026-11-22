@@ -12,7 +12,7 @@ _SPECS = {
         "Use chat_history_search for earlier conversations and document references; memory is not a file inventory.",
         ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 3,
         input_schema={"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, "additionalProperties": False},
-        capability_tags=("conversation_history",)),
+        capability_tags=("conversation_history",), code_mode_allowed=True, code_mode_keep_native=True),
     "memory_save": ToolSpec(
         "memory_save", "Persist an explicitly requested durable workspace preference or fact. "
         "Quote the current human request as source_quote. Never claim it is saved until persisted is true. "

@@ -634,7 +634,7 @@ def build_cron_connector_scope_decision(
                  "planned_tools": planned_tool_names_tuple, "runtime_path": str(checkpoint_path or "")}
     if resolve_execution_contract:
         from nullion.runtime_cache import get_json, set_json
-        cached = get_json("cron.execution_contract", cache_key, version="v1",
+        cached = get_json("cron.execution_contract", cache_key, version="v2",
                           persistent=checkpoint_path is not None, db_path=checkpoint_path)
         if cached.hit and isinstance(cached.value, dict):
             value = cached.value
@@ -685,12 +685,16 @@ def build_cron_connector_scope_decision(
         "When uncertain, choose false."
     )
     if resolve_execution_contract:
+        from nullion.cron_delivery import SUPPORTED_CRON_DELIVERY_CHANNELS
+        prompt["scheduler_delivery_channels"] = sorted(SUPPORTED_CRON_DELIVERY_CHANNELS)
         system += (
             ' Include write_tool_names and one delivery_mode enum value from response_schema. '
             'Select only exact available structured write tool names needed to carry out actions explicitly '
             'requested by the saved task, including conditional actions. This selects capabilities only; '
-            'normal permission and approval checks still apply. Do not select account writes merely to '
-            'send the scheduled report; the scheduler delivers it. Choose verified_matches_only for '
+            'normal permission and approval checks still apply. The scheduler can deliver only to '
+            'scheduler_delivery_channels. For explicitly requested delivery outside those channels, '
+            'select the connected provider and exact write tools needed to send the report. '
+            'Do not assume scheduler delivery can perform an unsupported delivery action. Choose verified_matches_only for '
             'conditional monitors/reminders that should notify only for new actionable matches; choose '
             'report_each_run for reports requested on every run. Determine these from the full saved task '
             'in any language, never from its title alone. Never invent tool names or provider ids.'
@@ -755,7 +759,7 @@ def build_cron_connector_scope_decision(
             decision = replace(decision, write_tool_names=writes, delivery_mode=mode)
             if mode:  # Do not cache incomplete legacy responses or transient failures.
                 from dataclasses import asdict
-                set_json("cron.execution_contract", cache_key, asdict(decision), version="v1",
+                set_json("cron.execution_contract", cache_key, asdict(decision), version="v2",
                          persistent=checkpoint_path is not None, db_path=checkpoint_path, max_entries=256)
         except (TypeError, ValueError, KeyError):
             return CronConnectorScopeDecision(failure_reason="invalid_execution_contract")

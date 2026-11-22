@@ -191,11 +191,15 @@ def test_original_flyer_html_creates_one_illustrated_pdf_without_source_replacem
         ToolInvocation('original-flyer','pdf_create','web:original-flyer',
             {'output_path':str(output),'html_pages':[html],'expected_page_count':1},
             flow_context={'required_embedded_media_extensions':['.pdf']}))
-    assert result.status=='completed',result
+    # This authored canvas exceeds usable Letter height. Keep all content at
+    # its authored size and report the constraint instead of globally shrinking.
+    assert result.status=='failed' and result.output['reason']=='artifact_page_count_mismatch',result
+    assert not result.output.get('artifact_paths')
     document=PdfReader(output)
-    assert len(document.pages)==1
+    assert len(document.pages)>1
     assert 'Community' in document.pages[0].extract_text()
-    assert len(document.pages[0].images)==1
+    assert 'STAGE FORMAT QA' in '\n'.join(page.extract_text() for page in document.pages)
+    assert sum(len(page.images) for page in document.pages)==1
     assert result.output['embedded_html_images'][0]['kind']=='rasterized_inline_svg'
     assert not result.output['source_image_paths']
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_file())==['poster.pdf']
@@ -276,9 +280,15 @@ def test_responsive_poster_pdf_keeps_title_and_footer_on_the_visible_page(tmp_pa
         ToolInvocation('responsive','pdf_create','web:responsive',
             {'output_path':str(output),'html_pages':[content],'expected_page_count':1,
              'image_paths':image_paths},flow_context={'required_embedded_media_extensions':['.pdf']}))
-    assert result.status=='completed',result
+    if extra_image:
+        # A second illustration prepended to a full-page design must overflow
+        # truthfully, preserving its footer rather than shrinking the document.
+        assert result.status=='failed' and result.output['reason']=='artifact_page_count_mismatch',result
+        assert not result.output.get('artifact_paths')
+    else:
+        assert result.status=='completed',result
     with pdfium.PdfDocument(output) as document:
-        assert len(document)==1
+        assert len(document)==(2 if extra_image else 1)
         page=document[0];text=page.get_textpage()
         try:
             visible=text.get_text_bounded()
@@ -294,8 +304,14 @@ def test_responsive_poster_pdf_keeps_title_and_footer_on_the_visible_page(tmp_pa
                 assert all(sum(count for observed,count in colors.items()
                     if all(abs(a-b)<=2 for a,b in zip(observed,color)))>100 for color in [
                     (255,0,0),(0,0,255),(0,255,0),(255,255,0),(128,0,128)]),colors.most_common(8)
-                assert all(abs(a-b)<=2 for a,b in zip(background,(16,24,39))),background
+                # Reflow changes the point occupied by text. Verify the authored
+                # background survives by native pixels, not a fixed text pixel.
+                assert sum(count for observed,count in colors.items()
+                    if all(abs(a-b)<=2 for a,b in zip(observed,(16,24,39))))>1000,colors.most_common(8)
         finally:text.close();page.close()
+    if extra_image:
+        from pypdf import PdfReader
+        visible = '\n'.join(page.extract_text() for page in PdfReader(output).pages)
     # PDFium preserves letter spacing as spaces between glyphs.
     compact=''.join(visible.split())
     assert 'COMMUNITY' in compact and 'STAGEFORMATQA' in compact,visible

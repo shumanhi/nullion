@@ -16,15 +16,36 @@ _LOCK = threading.Lock()
 
 
 def claim_approval_resume(runtime, approval_id: str) -> bool:
-    path = Path(str(getattr(runtime, "checkpoint_path", "") or ""))
+    return _claim_approved_execution(runtime.store, getattr(runtime, "checkpoint_path", None), approval_id)
+
+
+def claim_approved_tool_use(store, approval_id: str) -> bool:
+    """Consume exact action authority separately from continuation ownership."""
+    return _claim_approved_execution(store, getattr(store, "_memory_checkpoint_path", None), "tool-use:" + approval_id)
+
+
+def _claim_database(checkpoint_path) -> Path | None:
+    if not checkpoint_path:
+        return None
+    path = Path(checkpoint_path)
+    if path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+        return path
+    # JSON checkpoints are replaced atomically. Keep claims in a separate
+    # database so an older in-flight snapshot cannot erase ownership.
+    return path.with_name(path.name + ".approval-claims.sqlite3")
+
+
+def _claim_approved_execution(store, checkpoint_path, approval_id: str) -> bool:
+    path = _claim_database(checkpoint_path)
     with _LOCK:
-        claimed = getattr(runtime.store, "approval_resume_claims", None)
+        claimed = getattr(store, "approval_resume_claims", None)
         if claimed is None:
             claimed = set()
-            runtime.store.approval_resume_claims = claimed
+            store.approval_resume_claims = claimed
         if approval_id in claimed:
             return False
-        if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
             # This independent table is not rewritten by store checkpoints.
             # INSERT's unique key also arbitrates separate adapter processes.
             with sqlite_connection(str(path), timeout=10) as conn:
@@ -44,8 +65,8 @@ def claim_approval_resume(runtime, approval_id: str) -> bool:
 def approval_resume_claimed(runtime, approval_id: str) -> bool:
     if approval_id in getattr(runtime.store, "approval_resume_claims", ()):
         return True
-    path = Path(str(getattr(runtime, "checkpoint_path", "") or ""))
-    if not path.is_file() or path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
+    path = _claim_database(getattr(runtime, "checkpoint_path", None))
+    if path is None or not path.is_file():
         return False
     with sqlite_connection(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='approval_resume_claims'").fetchone():

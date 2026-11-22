@@ -55,6 +55,12 @@ def _page_url(page: object) -> str:
         return ""
 
 
+def cdp_endpoint_port(url: str) -> int:
+    """Respect explicit URL protocol defaults; bare CDP keeps its local port."""
+    parsed = urlparse(url)
+    return parsed.port or {'http': 80, 'https': 443, 'ws': 80, 'wss': 443}.get(parsed.scheme, 9222)
+
+
 def normalized_cdp_url(raw_url: str | None = None) -> str:
     """Use IPv4 loopback for local CDP to avoid localhost resolving to ::1."""
     from nullion.plugins.browser_plugin.browser_config import shared_browser_cdp_url
@@ -63,7 +69,7 @@ def normalized_cdp_url(raw_url: str | None = None) -> str:
         return DEFAULT_CDP_URL
     parsed = urlparse(url)
     if parsed.hostname in {"localhost", "::1"}:
-        port = parsed.port or 9222
+        port = cdp_endpoint_port(url)
         netloc = f"127.0.0.1:{port}"
         return urlunparse(parsed._replace(netloc=netloc))
     return url
@@ -1412,6 +1418,11 @@ class CDPBackend:
     """
 
     BACKEND_NAME = "cdp"
+    _RECONNECT_PROBE_TIMEOUT = 5.0
+    _RECONNECT_PROBE_CONCURRENCY = 8
+
+    async def browser_task_connection(self, session_id):
+        return self._cdp_url, True
 
     def __init__(self) -> None:
         _require_playwright()
@@ -1419,6 +1430,7 @@ class CDPBackend:
         self._playwright = None
         self._browser: "Browser | _RawCDPBrowser | None" = None
         self._pages: dict[str, "Page | _RawCDPPage"] = {}
+        self._page_target_ids: dict[str, str | None] = {}
         self._owned_page_ids: set[int] = set()
         self._closing_page_ids: set[int] = set()
         self._lock = asyncio.Lock()
@@ -1429,6 +1441,12 @@ class CDPBackend:
             owned_page_ids = set()
             self._owned_page_ids = owned_page_ids
         return owned_page_ids
+
+    def _page_targets(self) -> dict[str, str | None]:
+        targets = getattr(self, '_page_target_ids', None)
+        if not isinstance(targets, dict):
+            targets = self._page_target_ids = {}
+        return targets
 
     def _closing_pages(self) -> set[int]:
         pages=getattr(self,'_closing_page_ids',None)
@@ -1481,32 +1499,102 @@ class CDPBackend:
         # Detach only the dead transport; never close the borrowed browser.
         async with self._lock:
             old_urls = dict(getattr(self, "_reconnect_page_urls", {}))
-            old_urls.update({key: _page_url(page) for key, page in self._pages.items()
-                            if _page_url(page) not in {"", "about:blank"}})
+            old_urls.update({key: _page_url(page) for key, page in self._pages.items()})
+            targets = self._page_targets()
+            owned_sessions = set(getattr(self, '_reconnect_owned_sessions', ()))
+            for key, page in self._pages.items():
+                # Raw pages expose their native identity directly. Playwright
+                # identities were captured while the transport was alive.
+                if target := getattr(page, 'target_id', None):
+                    targets[key] = target
+                if id(page) in self._owned_pages():
+                    owned_sessions.add(key)
+            self._reconnect_owned_sessions = owned_sessions
             self._reconnect_page_urls = old_urls
             if self._playwright is not None:
                 await self._stop_failed_playwright_connection(self._playwright)
             self._browser = None
             self._pages.clear()
+            self._owned_pages().clear()
             browser = await self._ensure_browser()
-            for key, old_url in tuple(old_urls.items()):
-                matches = [page for context in browser.contexts for page in context.pages
-                           if _page_url(page) == old_url and not page.is_closed()]
+            current_targets = await self._reconnect_targets(browser)
+            for key in tuple(old_urls):
+                # A URL is not a tab identity: an unrelated user tab can have
+                # the same URL after the original target disappears.
+                matches = current_targets.get(targets.get(key), [])
                 if len(matches) == 1:
                     self._pages[key] = matches[0]
+                    if key in owned_sessions:
+                        self._owned_pages().add(id(matches[0]))
                     self._reconnect_page_urls.pop(key, None)
+                    owned_sessions.discard(key)
             if session_id in self._reconnect_page_urls:
                 raise ConnectionError("The original browser page could not be identified after reconnecting")
 
+    async def _reconnect_targets(self, browser):
+        """Bound total identity discovery even in crowded or stalled browsers."""
+        semaphore = asyncio.Semaphore(self._RECONNECT_PROBE_CONCURRENCY)
+        async def identify(page):
+            async with semaphore:
+                return await self._page_target_id(page), page
+        tasks = {asyncio.create_task(identify(page)) for context in browser.contexts
+                 for page in context.pages if not page.is_closed()}
+        current_targets = {}
+        if not tasks:
+            return current_targets
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=self._RECONNECT_PROBE_TIMEOUT)
+            for task in done:
+                if not task.cancelled():
+                    target, page = task.result()
+                    if target:
+                        current_targets.setdefault(target, []).append(page)
+            return current_targets
+        finally:
+            pending = {task for task in tasks if not task.done()}
+            for task in pending:
+                task.cancel()
+            if pending:
+                # Detach the temporary page sessions concurrently. A broken
+                # external transport cannot extend the whole recovery deadline.
+                _, undrained = await asyncio.wait(pending, timeout=1.1)
+                for task in undrained:
+                    task.add_done_callback(lambda future: None if future.cancelled() else future.exception())
+
+    async def _page_target_id(self, page):
+        target = getattr(page, 'target_id', None)
+        if isinstance(target, str) and target:
+            return target
+        context = getattr(page, 'context', None)
+        create_session = getattr(context, 'new_cdp_session', None)
+        if not callable(create_session):
+            return None
+        session = None
+        try:
+            session = await asyncio.wait_for(create_session(page), timeout=2)
+            info = await asyncio.wait_for(session.send('Target.getTargetInfo'), timeout=2)
+            target = info.get('targetInfo', {}).get('targetId')
+            return target if isinstance(target, str) and target else None
+        except Exception:
+            return None  # Unidentified targets must never be recovered by URL.
+        finally:
+            if session is not None:
+                try:
+                    await asyncio.wait_for(session.detach(), timeout=1)
+                except Exception:
+                    pass
+
     async def _ensure_browser(self) -> "Browser | _RawCDPBrowser":
         if self._browser is None or not self._browser.is_connected():
-            try:
-                await _async_cdp_targets(self._cdp_url)
-            except OSError:
-                from nullion.plugins.browser_plugin.backends.auto_backend import reopen_configured_desktop_browser
-                if not await asyncio.to_thread(reopen_configured_desktop_browser, self._cdp_url):
-                    raise
-                await _async_cdp_targets(self._cdp_url)
+            websocket_endpoint = urlparse(self._cdp_url).scheme in {'ws', 'wss'}
+            if not websocket_endpoint:
+                try:
+                    await _async_cdp_targets(self._cdp_url)
+                except OSError:
+                    from nullion.plugins.browser_plugin.backends.auto_backend import reopen_configured_desktop_browser
+                    if not await asyncio.to_thread(reopen_configured_desktop_browser, self._cdp_url):
+                        raise
+                    await _async_cdp_targets(self._cdp_url)
             pw = await async_playwright().__aenter__()
             self._playwright = pw
             try:
@@ -1517,8 +1605,11 @@ class CDPBackend:
             except asyncio.CancelledError:
                 await self._stop_failed_playwright_connection(pw)
                 raise
-            except Exception:
+            except Exception as error:
                 await self._stop_failed_playwright_connection(pw)
+                if websocket_endpoint:
+                    # REST target discovery is unavailable at a websocket URL.
+                    raise ConnectionError('The configured browser websocket could not be connected') from error
                 return await self._ensure_raw_browser()
         return self._browser
 
@@ -1531,6 +1622,7 @@ class CDPBackend:
             cached = self._pages.get(session_id)
             if cached is not None and (cached.is_closed() or id(cached) in closing_page_ids):
                 self._pages.pop(session_id, None)
+                self._page_targets().pop(session_id, None)
                 if cached.is_closed():
                     owned_page_ids.discard(id(cached))
                     self._forget_raw_context_page(cached)
@@ -1581,6 +1673,8 @@ class CDPBackend:
                             if "Browser context management is not supported" in message:
                                 raise self._new_page_unsupported_error(exc) from exc
                             raise
+            if session_id not in self._page_targets():
+                self._page_targets()[session_id] = await self._page_target_id(self._pages[session_id])
         return self._pages[session_id]
 
     # ── BrowserBackend protocol ───────────────────────────────────────────────
@@ -1812,6 +1906,7 @@ class CDPBackend:
                 async with self._lock:
                     if self._pages.get(session_id) is page:
                         self._pages.pop(session_id, None)
+                        self._page_targets().pop(session_id, None)
                     self._owned_pages().discard(id(page))
                     self._forget_raw_context_page(page)
             finally:
@@ -1859,5 +1954,8 @@ class CDPBackend:
             finally:
                 self._playwright = None
         self._pages.clear()
+        self._page_targets().clear()
+        getattr(self, '_reconnect_page_urls', {}).clear()
+        getattr(self, '_reconnect_owned_sessions', set()).clear()
         owned_page_ids.clear()
         self._browser = None

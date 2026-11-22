@@ -50,10 +50,12 @@ def send_error_replay_safety(exc):
     if any(isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout)) for e in chain):
         return 'retry'
     response = getattr(exc, 'response', None)
-    code = getattr(response, 'status_code', None) or getattr(exc, 'status_code', None)
-    # Slack exposes an explicit HTTP status on its response mapping.
-    if code is None and isinstance(response, dict):
-        code = response.get('status_code')
+    # SDKs expose native HTTP response status through status_code or status;
+    # never interpret string/business state or truthy non-numeric values.
+    candidates = (getattr(response, 'status_code', None), getattr(exc, 'status_code', None),
+        response.get('status_code') if isinstance(response, dict) else None,
+        getattr(response, 'status', None), getattr(exc, 'status', None))
+    code = next((value for value in candidates if type(value) is int and 100 <= value <= 599), None)
     if code in {400, 401, 403, 404, 413, 422}:
         return 'rejected'
     if code == 429:

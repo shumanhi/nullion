@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -39,10 +40,11 @@ def test_quoted_bot_output_or_other_chat_is_not_downloaded(monkeypatch, bot, oth
 def test_exact_attachment_receipt_survives_restart_and_avoids_redownload(tmp_path, monkeypatch, media_group):
     from nullion import telegram_app
     from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.messaging_adapters import save_messaging_attachment
+    monkeypatch.setenv("NULLION_HOME", str(tmp_path / "home"))
     runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
-    image = tmp_path / "original.png"
-    image.write_bytes(b"original bytes")
-    attachment = {"path": str(image), "name": image.name, "media_type": "image/png"}
+    attachment = save_messaging_attachment(filename="original.png", data=b"original bytes",
+        media_type="image/png", principal_id="telegram_chat")
     telegram_app._checkpoint_telegram_attachment_receipt(runtime,
         conversation_id="telegram:123", message_id="telegram-media-group:123:album-a" if media_group else "telegram-message:123:41",
         request_id="telegram-update:1", text="画像", attachments=[attachment])
@@ -79,6 +81,51 @@ def test_missing_or_expired_receipt_recovers_embedded_quoted_media(tmp_path, mon
         return [{"path": "/owned/recovered.png"}]
     monkeypatch.setattr(telegram_app, "_download_telegram_attachments", download)
     assert asyncio.run(telegram_app._telegram_reply_attachments(msg, None, runtime=runtime, settings=None)) == [{"path": "/owned/recovered.png"}]
+
+
+@pytest.mark.parametrize('source', ['history', 'journal'])
+@pytest.mark.parametrize('fault', ['replaced', 'legacy', 'workspace', 'principal', 'outside_uploads'])
+def test_quoted_input_requires_original_bytes_and_current_owner(tmp_path, monkeypatch, source, fault):
+    from nullion import telegram_app
+    from nullion.attachment_receipts import load_attachment_receipt
+    from nullion.messaging_adapters import save_messaging_attachment
+    from nullion.runtime import bootstrap_persistent_runtime
+    monkeypatch.setenv('NULLION_HOME', str(tmp_path/'home'))
+    runtime = bootstrap_persistent_runtime(tmp_path/'runtime.db')
+    saved = save_messaging_attachment(filename='telegram-photo.png', data=b'original',
+        media_type='image/png', principal_id='telegram_chat')
+    if fault == 'legacy':
+        saved.pop('content_sha256')
+    elif fault == 'workspace':
+        saved['workspace_id'] = 'another-workspace'
+    elif fault == 'principal':
+        saved['principal_id'] = 'user:another'
+    elif fault == 'outside_uploads':
+        external = tmp_path/'another-workspace.png'
+        external.write_bytes(Path(saved['path']).read_bytes())
+        saved['path'] = str(external)
+    telegram_app._checkpoint_telegram_attachment_receipt(runtime, conversation_id='telegram:123',
+        message_id='telegram-message:123:41', request_id='update:1', text=None, attachments=[saved])
+    if fault == 'replaced':
+        Path(saved['path']).unlink()
+        replacement = save_messaging_attachment(filename='telegram-photo.png', data=b'replaced',
+            media_type='image/png', principal_id='telegram_chat')
+        assert replacement['path'] == saved['path']
+        assert replacement['size_bytes'] == saved['size_bytes']
+    if source == 'journal':
+        runtime = SimpleNamespace(checkpoint_path=runtime.checkpoint_path,
+            store=SimpleNamespace(list_recent_conversation_events=lambda *a, **kw: []))
+    else:
+        monkeypatch.setattr('nullion.attachment_receipts.load_attachment_receipt', lambda *a: None)
+    message = _message(photo=False)
+    message.reply_to_message = _message()
+    downloads = []
+    async def download(quoted, context, *, settings):
+        downloads.append(quoted.message_id)
+        return [{'path': '/owned/original-from-telegram.png'}]
+    monkeypatch.setattr(telegram_app, '_download_telegram_attachments', download)
+    result = asyncio.run(telegram_app._telegram_reply_attachments(message, None, runtime=runtime, settings=None))
+    assert downloads == [41] and result == [{'path': '/owned/original-from-telegram.png'}]
 
 
 @pytest.mark.parametrize("data,mime", [(b"\xff\xd8\xffjpeg", "image/jpeg"),

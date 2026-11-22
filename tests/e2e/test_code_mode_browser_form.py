@@ -81,6 +81,9 @@ def test_native_form_interactions_compose_without_booking_or_extra_model_turns(t
             program=next(r for r in results if r['tool_name']=='code_mode')
             assert program['status']=='completed',program
             assert '2026-11-15' in str(program['output']['value']) and '6:00 PM' in str(program['output']['value'])
+            from nullion.conversation_history_tools import _recent_browser_snapshot
+            capture = _recent_browser_snapshot(runtime.store, 'web:code-ui', 'workspace_admin', 60, now=time.time())
+            assert '6:00 PM' in capture['page']['text'] and capture['page']['source_url'].startswith(url)
             assert len(program['output']['operations'])==(7 if landing else 5)
             assert [r['tool_name'] for r in program['output']['reads']]==(['browser_navigate','browser_snapshot','browser_navigate','browser_extract_text'] if landing else ['browser_navigate','browser_extract_text'])
             assert sum(r['operation_kind']=='ui_interaction' for r in program['output']['operations'])==3

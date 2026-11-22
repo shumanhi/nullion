@@ -1318,8 +1318,11 @@ def _tool_approval_context_from_invocation(
                 replace(invocation, tool_name=delegated_name, arguments=dict(delegated["tool_arguments"])),
                 tool_registry=tool_registry, result_output={},
             )
-            context["delegated_resume"] = {"tool_name": invocation.tool_name,
-                "tool_arguments": redact_value(dict(invocation.arguments or {}))}
+            context["delegated_resume"] = {
+                "tool_name": invocation.tool_name,
+                "tool_arguments": redact_value(dict(invocation.arguments or {})),
+                "invocation_id": invocation.invocation_id,
+            }
             return context
     spec = None
     get_spec = getattr(tool_registry, "get_spec", None)
@@ -3602,6 +3605,11 @@ def _is_bare_completion_text(text: str | None) -> bool:
 
 
 def _tool_result_completion_text(tool_results: list[ToolResult], *, include_untrusted_fallback: bool = True) -> str | None:
+    from nullion.response_sanitizer import native_filesystem_receipt_reply
+    for result in reversed(tool_results):
+        receipt = native_filesystem_receipt_reply(result)
+        if receipt:
+            return receipt
     for result in reversed(tool_results):
         if result.status != "completed":
             continue
@@ -3653,6 +3661,10 @@ def _tool_result_structured_text(tool_results: list[ToolResult]) -> str | None:
 
 
 def _untrusted_tool_result_safe_fallback_text(result: ToolResult) -> str:
+    from nullion.response_sanitizer import native_filesystem_receipt_reply
+    native_receipt = native_filesystem_receipt_reply(result)
+    if native_receipt:
+        return native_receipt
     output = result.output if isinstance(result.output, dict) else {}
     metadata = safe_untrusted_tool_metadata(result.tool_name, output)
     if result.tool_name in {"web_fetch", "browser_navigate", "web_search"} and result.status == "completed":
@@ -10307,12 +10319,14 @@ def _notify_long_running_tool_loop(
     *,
     conversation_id: str,
     tool_results: list[ToolResult],
+    owner_loop: Any = None,
+    timeout_seconds: float = 2.0,
 ) -> None:
     if deliver_fn is None or not tool_results:
         return
     last = tool_results[-1]
     try:
-        deliver_fn(
+        result = deliver_fn(
             conversation_id,
             (
                 "Doctor is watching this longer request. "
@@ -10324,6 +10338,29 @@ def _notify_long_running_tool_loop(
             last_tool=last.tool_name,
             last_status=last.status,
         )
+        if inspect.isawaitable(result):
+            async def deliver_notice():
+                return await result
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            loop = owner_loop or current_loop
+            if loop is None or loop.is_closed():
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                return
+            if loop is current_loop:
+                task = loop.create_task(deliver_notice())
+                task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+            else:
+                future = asyncio.run_coroutine_threadsafe(deliver_notice(), loop)
+                try:
+                    future.result(timeout=timeout_seconds)
+                except TimeoutError:
+                    future.cancel()
+                    raise
     except Exception:
         logger.debug("Could not deliver long-running tool-loop notice", exc_info=True)
 
@@ -10508,6 +10545,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     thinking_parts: list[str]
     initial_tool_content: list[dict[str, Any]] | None
     pending_tool_receipts: dict[str, dict[str, Any]]
+    pending_approval_invocations: dict[str, dict[str, Any]]
     invocation_metadata: dict[str, dict[str, Any]]
     enable_repeated_failure_guard: bool
     enable_doctor_notifications: bool
@@ -12079,6 +12117,10 @@ def _execute_agent_turn_direct_tool_uses(state, content):
         if isinstance(packaging, dict):
             invocation_context["artifact_packaging_request"] = packaging
         native_invocation_id = f"orchestrator-{uuid4().hex}"
+        pending_approval = (state.get("pending_approval_invocations") or {}).get(tool_use_id)
+        if (pending_approval and pending_approval["tool_name"] == tool_name
+                and pending_approval["arguments"] == tool_input):
+            native_invocation_id = pending_approval["invocation_id"]
         invocation = ToolInvocation(
             invocation_id=native_invocation_id,
             tool_name=tool_name,
@@ -13101,6 +13143,7 @@ def _agent_turn_initial_tools_node(state: _AgentTurnGraphState) -> dict[str, obj
     update.setdefault("invocation_metadata", dict(state.get("invocation_metadata") or {}))
     update["initial_tool_content"] = None
     update["pending_tool_receipts"] = {}
+    update["pending_approval_invocations"] = {}
     if "result" not in update:
         # Approval resumes execute here rather than in the ordinary tools node.
         # Reconcile the original denial before selecting the next graph edge.
@@ -14112,6 +14155,9 @@ def _agent_turn_tools_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 getattr(state["orchestrator"], "_deliver_fn", None),
                 conversation_id=state["conversation_id"],
                 tool_results=tool_results,
+                owner_loop=(state["orchestrator"]._ensure_dispatcher_loop()
+                    if inspect.iscoroutinefunction(getattr(state["orchestrator"], "_deliver_fn", None))
+                    else None),
             )
             update["next_doctor_notice_at"] = next_notice + doctor_threshold
     return update
@@ -15492,7 +15538,10 @@ class AgentOrchestrator:
             ):
                 initial_tool_content = list(content)
 
+        from nullion.approvals import ApprovalStatus, requires_exact_tool_review
+
         pending_tool_receipts: dict[str, dict[str, Any]] = {}
+        pending_approval_invocations: dict[str, dict[str, Any]] = {}
         invocation_metadata: dict[str, dict[str, Any]] = dict(previous_result.invocation_metadata) if previous_result is not None else {}
         retained_results = list(previous_result.tool_results) if previous_result is not None else []
         completion_handoff = getattr(previous_result, "completion_review_handoff", None)
@@ -15516,6 +15565,22 @@ class AgentOrchestrator:
                 if result.status == "completed":
                     pending_tool_receipts[identity] = {"tool_name": result.tool_name,
                         "arguments": arguments, "result": result}
+                elif result.status == "denied" and result.output.get("requires_approval") is True:
+                    approval_id = result.output.get("approval_id")
+                    approval = runtime_store.get_approval_request(approval_id) if isinstance(approval_id, str) else None
+                    if (requires_exact_tool_review(approval) and approval.status is ApprovalStatus.APPROVED
+                            and approval.requested_by == principal_id):
+                        context = approval.context or {}
+                        delegated = context.get("delegated_resume")
+                        native_matches = (approval.resource == result.tool_name
+                            and context.get("approval_invocation_id") == result.invocation_id)
+                        wrapper_matches = (isinstance(delegated, dict)
+                            and delegated.get("tool_name") == result.tool_name
+                            and delegated.get("invocation_id") == result.invocation_id
+                            and delegated.get("tool_arguments") == redact_value(arguments))
+                        if native_matches or wrapper_matches:
+                            pending_approval_invocations[identity] = {"tool_name": result.tool_name,
+                                "arguments": arguments, "invocation_id": result.invocation_id}
 
         from nullion.code_mode_sessions import checkpoint_reference
         cleanup_scope = f"turn-{uuid4().hex}"
@@ -15546,6 +15611,7 @@ class AgentOrchestrator:
                       and isinstance(row.get("work_usage"), dict)), {}),
             "completed_read_results": dict(previous_result.completed_read_results) if previous_result is not None else {},
             "pending_tool_receipts": pending_tool_receipts,
+            "pending_approval_invocations": pending_approval_invocations,
             "code_mode_session_id": previous_result.code_mode_session_id if previous_result is not None else
                 checkpoint_reference(suspended_tool_calls),
             "is_request_recovery": bool(previous_result is not None or suspended_tool_calls),

@@ -4,6 +4,27 @@ import time
 import pytest
 
 
+@pytest.mark.parametrize('output,waiting', [
+    ({'requires_approval': True, 'approval_id': 'native-37'}, True),
+    ({'requires_approval': False, 'approval_id': 'native-37'}, False),
+    ({'requires_approval': 'true', 'approval_id': 'native-37'}, False),
+    ({'requires_approval': True}, False),
+    ({'requires_approval': True, 'approval_id': ' '}, False),
+    ({'requires_approval': True, 'approval_id': 37}, False),
+])
+def test_native_denied_receipt_only_waits_for_a_typed_pending_approval(output, waiting):
+    from nullion.request_progress import RequestProgress, tool_operation_progress
+    from nullion.tools import ToolSpec, ToolResult, ToolRiskLevel, ToolSideEffectClass
+    spec = ToolSpec('不透明', 'PRIVATE /path', ToolRiskLevel.HIGH, ToolSideEffectClass.READ, True, 2)
+    result = ToolResult('native', '不透明', 'denied', {**output, 'message': 'PRIVATE result'})
+    event = tool_operation_progress(result, spec)
+    assert (event['operation_progress']['status'] == 'approval_required') is waiting
+    events = []
+    RequestProgress(events.append).emit(event)
+    assert ('Waiting for your approval' in events[-1]['text']) is waiting
+    assert 'PRIVATE' not in str(events) and 'native-37' not in str(events)
+
+
 def test_same_page_count_shows_changes_between_reading_review_and_evidence_repair():
     from nullion.request_progress import RequestProgress
     events=[];progress=RequestProgress(events.append)

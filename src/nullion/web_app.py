@@ -200,7 +200,7 @@ from nullion.session_stop import (
 from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.scheduler_context_compaction import compact_list_crons_output_for_context
 from nullion.remediation import remediation_buttons_for_recommendation_code
-from nullion.platform_activity import compact_tool_activity_text
+from nullion.platform_activity import compact_tool_activity_text, should_deliver_task_status
 from nullion.run_activity import (
     activity_trace_enabled,
     format_activity_sublist_line,
@@ -289,12 +289,17 @@ def _normalize_browser_cdp_url(raw_url: object | None) -> str:
     raw = str(raw_url or "").strip() or _DEFAULT_BROWSER_CDP_URL
     parsed = urlparse(raw)
     if parsed.hostname in {"localhost", "::1"}:
-        return urlunparse(parsed._replace(netloc=f"127.0.0.1:{parsed.port or 9222}"))
+        from nullion.plugins.browser_plugin.backends.cdp_backend import cdp_endpoint_port
+        return urlunparse(parsed._replace(netloc=f"127.0.0.1:{cdp_endpoint_port(raw)}"))
     return raw
 
 
 def _browser_cdp_url_for_preference(raw_url: object | None, preferred: object | None) -> str:
     cdp_url = _normalize_browser_cdp_url(raw_url)
+    # A saved/operator-supplied endpoint identifies the runtime's browser.
+    # Browser-specific ports are setup defaults, not a reason to rewrite it.
+    if str(raw_url or '').strip():
+        return cdp_url
     preferred_kind = str(preferred or "").strip().lower()
     preferred_port = _PREFERRED_BROWSER_DEFAULT_CDP_PORTS.get(preferred_kind)
     parsed = urlparse(cdp_url)
@@ -5398,6 +5403,13 @@ _HTML = r"""<!DOCTYPE html>
               </div>
               <div class="pref-row">
                 <div>
+                  <div class="pref-row-title">Planner cards</div>
+                  <div class="pref-row-desc">Show the plan and task progress during planned runs.</div>
+                </div>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-planner-enabled"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="pref-row">
+                <div>
                   <div class="pref-row-title">Thinking display</div>
                   <div class="pref-row-desc">Show provider reasoning summaries and structured thinking separately from final replies.</div>
                 </div>
@@ -6844,24 +6856,25 @@ function scrollMessagesToBottom({ force = false } = {}) {
 
 queueMicrotask(installMessagesScrollObserver);
 
-function createBotBubble() {
+function createBotBubble(trackCurrent = true) {
   const messages = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg bot';
   div.innerHTML = '<div class="avatar logo-avatar" aria-hidden="true"></div><div class="bubble"></div>';
   messages.appendChild(div);
-  botMsgEl = div.querySelector('.bubble');
-  botMsgEl.dataset.rawText = '';
-  botMsgEl.dataset.createdAt = messageTimestampIso();
+  const bubble = div.querySelector('.bubble');
+  if (trackCurrent) botMsgEl = bubble;
+  bubble.dataset.rawText = '';
+  bubble.dataset.createdAt = messageTimestampIso();
   scrollMessagesToBottom();
-  return botMsgEl;
+  return bubble;
 }
 
 function ensureBotBubble(turnId = null) {
   if (turnId) {
     const existing = _botTurnBubbles.get(turnId);
     if (existing) return existing;
-    const bubble = createBotBubble();
+    const bubble = createBotBubble(false);
     bubble.dataset.turnId = turnId;
     _botTurnBubbles.set(turnId, bubble);
     return bubble;
@@ -7077,7 +7090,13 @@ function ensureTaskStatusActivityHost(data) {
   const turnId = data.turn_id || _turnIdByTaskGroup.get(groupId) || null;
   let bubble = groupId ? (_taskStatusBubbles.get(groupId) || null) : null;
   if (!bubble && turnId) bubble = _botTurnBubbles.get(turnId) || null;
-  if (!bubble || !bubble.isConnected) return null;
+  if (!bubble || !bubble.isConnected) {
+    if (!groupId || data.status_kind !== 'tool_activity' || data.include_activity !== true) return null;
+    bubble = createBotBubble();
+    bubble.classList.add('task-activity-bubble');
+    bubble.dataset.taskGroupId = groupId;
+    _taskStatusBubbles.set(groupId, bubble);
+  }
   let wrap = bubble.querySelector('.run-activity');
   if (!wrap) {
     wrap = document.createElement('div');
@@ -7188,7 +7207,8 @@ function updateMiniAgentTaskActivity(data) {
   if (turnSkillDetails && turnSkillDetails.size) {
     _miniAgentSkillDetailsByGroup.set(groupId, new Map(turnSkillDetails));
   }
-  _miniAgentStatusByGroup.set(groupId, taskStatusMiniAgentStatus(data.text || ''));
+  _miniAgentStatusByGroup.set(groupId, Object.prototype.hasOwnProperty.call(data, 'terminal')
+    ? (data.terminal ? 'done' : 'running') : taskStatusMiniAgentStatus(data.text || ''));
 }
 
 function updateTaskStatusToolActivity(data) {
@@ -7210,6 +7230,7 @@ function updateTaskStatusToolActivity(data) {
   }
   const detail = lines.join('\n');
   if (groupId) {
+    ensureTaskStatusActivityHost(data);
     const key = String(data.activity_id || data.task_id || label || Date.now());
     const toolDetails = _miniAgentToolDetailsByGroup.get(groupId) || new Map();
     toolDetails.set(key, [label, detail].filter(Boolean).join('\n'));
@@ -7220,7 +7241,8 @@ function updateTaskStatusToolActivity(data) {
   const event = {
     id: String(data.activity_id || data.task_id || `mini-agent-tools:${groupId || Date.now()}`),
     label,
-    status: 'running',
+    status: ({completed:'done', approved:'done', failed:'failed', error:'failed',
+      approval_required:'blocked', blocked:'blocked', denied:'blocked'})[data.tool_status] || 'running',
     detail,
     turn_id: eventTurnId,
   };
@@ -7270,7 +7292,13 @@ function updateTaskStatusCard(data) {
   if (!bubble) bubble = turnId ? ensureBotBubble(turnId) : createBotBubble();
   const existingGroupId = String(bubble.dataset.taskGroupId || '');
   const keepGroupActivity = existingGroupId === groupId;
-  const activity = keepGroupActivity ? detachRunActivity(bubble) : null;
+  const activity = keepGroupActivity && activityEnabledForTaskStatus(data) ? detachRunActivity(bubble) : null;
+  if (!activityEnabledForTaskStatus(data)) {
+    const previousActivity = detachRunActivity(bubble);
+    if (previousActivity) previousActivity.remove();
+    _miniAgentToolDetailsByGroup.delete(groupId);
+    _miniAgentSkillDetailsByGroup.delete(groupId);
+  }
   if (!keepGroupActivity) {
     const staleActivity = detachRunActivity(bubble);
     if (staleActivity) staleActivity.remove();
@@ -7905,7 +7933,7 @@ function setBotStatus(text, turnId = null) {
   bubble.dataset.statusText = text;
   if (turnId) bubble.dataset.turnId = turnId;
   ensureBubbleTimestamp(bubble);
-  botMsgRaw = '';
+  if (!turnId || bubble === botMsgEl) botMsgRaw = '';
   scrollMessagesToBottom();
   return bubble;
 }
@@ -8034,7 +8062,7 @@ async function connect() {
         finishTurnUi(data.turn_id || null);
         resetWebConversation();
       } else if (data.type === 'approval_required') {
-        clearTurnWatchdog();
+        clearTurnWatchdog(data.turn_id || null);
         rememberApprovalActivity(data.approval_id, data.turn_id || null);
         setBotStatus('Waiting for approval...', data.turn_id || null);
         addApprovalBubble(data.approval_id, data.tool_name || 'perform an action', data.tool_detail || '', data.web_session_allow_label, data.trigger_flow_label || '', Boolean(data.is_web_request), data.request_kind || '', data);
@@ -8051,7 +8079,9 @@ async function connect() {
               || _activityElByTaskGroup.has(groupId)
               || Boolean(groupTurnId && _botTurnBubbles.has(groupTurnId))
             );
-            if (!knownGroup) return;
+            // A terminal result belongs to its explicit conversation even if
+            // planner/activity settings prevented creation of a group card.
+            if (!knownGroup && data.conversation_id !== conversationId) return;
             if (!wasRecentlyDisplayedBotReply(data.text || '', artifacts)) addMessage('bot', data.text || '', false, { artifacts });
             if (groupTurnId) finishTurnUi(groupTurnId);
           } else {
@@ -8361,7 +8391,7 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
       conversation_id: conversationId,
       error: e.message || String(e),
     });
-    finishTurnUi();
+    finishTurnUi(turnId);
     setStatus(false, 'Offline');
     scheduleWebsocketReconnect('Offline');
   } finally {
@@ -8744,8 +8774,10 @@ function finalizeBotMsg(fallback = null, isError = false, turnId = null) {
     _activityElByTurn.delete(turnId);
     _activityItemsByTurn.delete(turnId);
   }
-  if (bubble === botMsgEl) botMsgEl = null;
-  botMsgRaw = '';
+  if (!turnId || bubble === botMsgEl) {
+    botMsgEl = null;
+    botMsgRaw = '';
+  }
   return bubble;
 }
 
@@ -8973,8 +9005,15 @@ function approvalTriggerHtml(label) {
   return `<div class="approval-trigger">${NI.task()}<span>Triggered by <strong>${escHtml(value)}</strong></span></div>`;
 }
 
+function approvalWebScopeFromContract(toolName, detail, forceWeb, requestKind) {
+  // A known native kind carries an explicit scope, including a false value.
+  // Prose remains a compatibility hint only for older untyped messages.
+  if (requestKind === 'terminal_destructive_action') return false;
+  return requestKind ? forceWeb === true : Boolean(forceWeb || approvalIsWebRequest(toolName, detail));
+}
+
 function approvalDetailHtml(toolName, detail, forceWeb = false, requestKind = '') {
-  const isWeb = requestKind !== 'terminal_destructive_action' && (forceWeb || approvalIsWebRequest(toolName, detail));
+  const isWeb = approvalWebScopeFromContract(toolName, detail, forceWeb, requestKind);
   const url = approvalTargetUrl(detail);
   if (isWeb && url) {
     const host = approvalTargetHost(url);
@@ -8990,7 +9029,7 @@ function approvalDetailHtml(toolName, detail, forceWeb = false, requestKind = ''
 }
 
 function approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel = 'for all workspaces', forceWeb = false, requestKind = '') {
-  const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);
+  const isWeb = approvalWebScopeFromContract(toolName, detail, forceWeb, requestKind);
   const host = approvalTargetHost(detail);
   if (approvalIsAgentTurnLimitExtension(toolName, requestKind)) {
     return `<div class="approval-actions">
@@ -9034,7 +9073,7 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
   div.className = 'msg bot';
   const title = display.display_title || approvalTitle(toolName);
   const detail = approvalDetail(toolName, toolDetail, approvalId);
-  const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);
+  const isWeb = approvalWebScopeFromContract(toolName, detail, forceWeb, requestKind);
   div.innerHTML = `<div class="avatar logo-avatar" aria-hidden="true"></div>
     <div class="bubble approval-bubble" data-approval-id="${escHtml(approvalId)}">
       <div class="approval-card">
@@ -9207,7 +9246,8 @@ function recoverMissingTerminalReplyFromIdleDashboard(data = {}) {
   ].some(dashboardItemIsOpen);
   if (openWork) return;
   refreshConversationAfterMissingTerminalReply(0, baseline);
-  Array.from(_activeSendTurnIds).forEach(turnId => finishTurnUi(turnId));
+  // Empty background lists do not prove foreground inference has finished.
+  // Recovery retires only the turn named by an actual terminal history reply.
 }
 
 function removeApprovalBubblesEverywhere(approvalId) {
@@ -9243,13 +9283,11 @@ function handleApprovalResume(data, approvalId = null) {
   const text = (resume && resume.text) || (data && data.resumed_text);
   const activity = (resume && Array.isArray(resume.activity)) ? resume.activity : [];
   const activityApprovalId = approvalId || (data && data.approval_id) || '';
-  const activityTurnId = (resume && resume.turn_id) || activityTurnForApproval(activityApprovalId);
+  const activityTurnId = (resume && resume.turn_id) || activityTurnForApproval(activityApprovalId) || `approval:${activityApprovalId}`;
   if (resume && resume.type === 'approval_required') {
     updateApprovalRunActivity(activityApprovalId, { id: 'orchestrate', label: 'Running model and tools', status: 'done', detail: 'Continued after approval' });
     updateApprovalRunActivity(activityApprovalId, { id: 'approval', label: 'Waiting for approval', status: 'done', detail: 'Approved' });
-    if (botMsgEl) {
-      setBotStatus('Waiting for the next approval...');
-    }
+    setBotStatus('Waiting for the next approval...', activityTurnId);
     rememberApprovalActivity(resume.approval_id, activityTurnId);
     addApprovalBubble(resume.approval_id, resume.tool_name || 'perform an action', resume.tool_detail || '', resume.web_session_allow_label, resume.trigger_flow_label || '', Boolean(resume.is_web_request), resume.request_kind || '', resume);
     return;
@@ -9995,26 +10033,40 @@ async function approveRequest(approvalId, btn, mode = 'once', expires = null) {
   const run = mode === 'run';
   const limitExtension = String(mode || '').startsWith('limit_');
   const limitLabel = String(mode || '').replace(/^limit_/, '').toUpperCase();
-  const activityTurnId = activityTurnForApproval(approvalId);
+  const activityTurnId = activityTurnForApproval(approvalId) || `approval:${approvalId}`;
   setApprovalPending(btn, limitExtension ? 'Extending...' : (always ? 'Saving...' : 'Allowing...'), approvalId);
   const pendingText = limitExtension ? `Doctor approved ${limitLabel} budget. Continuing...` : (run ? 'All web domains allowed. Continuing...' : (always ? 'Always allowed. Continuing...' : 'Allowed once. Continuing...'));
   setApprovalStateEverywhere(approvalId, pendingText, 'ok');
-  if (botMsgEl) {
-    setBotStatus(pendingText);
+  setBotStatus(pendingText, activityTurnId);
+  const progressConversation = conversationId;
+  let progressClosed = false;
+  async function pollApprovalProgress() {
+    if (progressClosed || progressConversation !== conversationId) return;
+    try {
+      const params = new URLSearchParams({turn_id: `approval:${approvalId}`, conversation_id: progressConversation});
+      const response = await fetch('/api/chat/progress?' + params, {cache: 'no-store'});
+      if (response.ok) {
+        const progress = await response.json();
+        if (!progressClosed && progressConversation === conversationId && progress.active && progress.text) {
+          setBotProgress(progress.text, activityTurnId);
+        }
+      }
+    } catch (_) { /* Status polling never repeats the approval. */ }
+    if (!progressClosed) setTimeout(pollApprovalProgress, 750);
   }
+  setTimeout(pollApprovalProgress, 250);
   try {
     const r = await fetch(`/api/approve/${approvalId}`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ mode, expires })
+      body: JSON.stringify({ mode, expires, progress_conversation_id: progressConversation })
     });
     const data = await r.json().catch(() => ({}));
     if (r.status === 410 || data.stale) {
       const message = data.error || 'That approval is no longer pending. I refreshed approvals.';
       updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'failed', detail: 'Approval no longer pending' });
       setApprovalStateEverywhere(approvalId, message, 'stale');
-      if (botMsgEl) setBotStatus('Approval no longer pending.');
-      finalizeBotMsg(message, true);
+      finalizeBotMsg(message, true, activityTurnId);
       return;
     }
     if (!r.ok || !data.ok) throw new Error(data.error || 'Approval failed');
@@ -10034,12 +10086,15 @@ async function approveRequest(approvalId, btn, mode = 'once', expires = null) {
   } catch (e) {
     updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'failed', detail: 'Approval failed' });
     setApprovalStateEverywhere(approvalId, `Approval failed: ${e.message || e}`, 'error');
-    finalizeBotMsg(`Approval failed: ${e.message || e}`, true);
+    finalizeBotMsg(`Approval failed: ${e.message || e}`, true, activityTurnId);
+  } finally {
+    progressClosed = true;
   }
   refreshDashboard();
 }
 
 async function rejectRequest(approvalId, btn) {
+  const activityTurnId = activityTurnForApproval(approvalId) || `approval:${approvalId}`;
   setApprovalPending(btn, 'Denying...', approvalId);
   setApprovalStateEverywhere(approvalId, 'Denying request...', '');
   try {
@@ -10049,11 +10104,11 @@ async function rejectRequest(approvalId, btn) {
     const confirmationText = String(data.confirmation_text || '').trim();
     setApprovalStateEverywhere(approvalId, confirmationText || 'Denied. Nullion will wait for your next instruction.', 'error');
     updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'blocked', detail: 'Denied' });
-    finalizeBotMsg(confirmationText || 'Denied. Nullion will wait for your next instruction.');
+    finalizeBotMsg(confirmationText || 'Denied. Nullion will wait for your next instruction.', false, activityTurnId);
   } catch (e) {
     updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'failed', detail: 'Deny failed' });
     setApprovalStateEverywhere(approvalId, `Deny failed: ${e.message || e}`, 'error');
-    finalizeBotMsg(`Deny failed: ${e.message || e}`, true);
+    finalizeBotMsg(`Deny failed: ${e.message || e}`, true, activityTurnId);
   }
   refreshDashboard();
 }
@@ -10062,7 +10117,7 @@ function approvalCardHtml(a) {
   const title = approvalTitleFor(a);
   const detail = approvalDetail(a.tool_name || a.action || 'Tool', approvalDetailFor(a), a.approval_id);
   const toolName = a.display_label || a.tool_name || a.action || 'Tool';
-  const isWeb = Boolean(a.is_web_request) || approvalIsWebApproval(a, detail);
+  const isWeb = typeof a.is_web_request === "boolean" ? a.is_web_request : approvalIsWebApproval(a, detail);
   const requestKind = String(a.request_kind || '');
   const copy = a.display_copy || (isWeb ? 'Nullion may need a few external sites to finish this request. Choose the web access scope to continue.' : approvalCopyFor(toolName, detail, false, requestKind));
   return `
@@ -13475,6 +13530,7 @@ async function loadConfig(options = {}) {
     activityTraceEnabled = cfg.activity_trace === true;
     const verboseToggle = document.getElementById('cfg-verbose-enabled');
     if (verboseToggle) verboseToggle.checked = activityTraceEnabled;
+    document.getElementById('cfg-planner-enabled').checked = cfg.task_planner_feed !== false;
     thinkingDisplayEnabled = cfg.show_thinking === true;
     localStorage.setItem('nullion_show_thinking_enabled', thinkingDisplayEnabled ? 'true' : 'false');
     if (cfg.browser_backend !== undefined) {
@@ -15594,6 +15650,7 @@ async function saveConfig() {
     mini_agent_stale_after_seconds: Number(document.getElementById('cfg-mini-agent-stale-after').value || 600),
     proactive_reminders: document.getElementById('cfg-proactive-reminders').checked,
     activity_trace:   document.getElementById('cfg-verbose-enabled').checked,
+    task_planner_feed: document.getElementById('cfg-planner-enabled').checked,
     show_thinking:    document.getElementById('cfg-show-thinking').checked,
     web_session_allow_duration: document.getElementById('cfg-web-session-allow-duration').value,
     browser_backend: document.getElementById('cfg-browser-backend').value,
@@ -19782,8 +19839,9 @@ def _hydrate_chat_history_media(
     for message in messages:
         item = dict(message)
         if str(item.get("role") or "").lower() == "bot":
-            from nullion.chat_text import render_user_message
-            item["text"] = render_user_message(str(item.get("text") or ""))
+            from nullion.chat_text import render_user_message, render_report_reply
+            raw_text = str(item.get("text") or "")
+            item["text"] = render_user_message(render_report_reply(raw_text) or raw_text)
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         artifacts = _chat_media_payloads_from_metadata(runtime, metadata, "artifacts", principal_id=principal_id)
         attachments = _chat_media_payloads_from_metadata(runtime, metadata, "attachments", principal_id=principal_id)
@@ -21829,6 +21887,7 @@ def create_app(runtime, orchestrator, registry):
             "approval_id": str(getattr(result, "approval_id", "") or ""),
             "reply_already_sent": bool(getattr(result, "reply_already_sent", False)),
             "mini_agent_dispatch": bool(getattr(result, "mini_agent_dispatch", False)),
+            "mini_agent_dispatch_terminal": bool(getattr(result, "mini_agent_dispatch_terminal", False)),
             "task_group_id": str(getattr(result, "task_group_id", "") or ""),
             "planner_status_text": str(getattr(result, "planner_status_text", "") or ""),
             "progress_status_text": str(getattr(result, "progress_status_text", "") or ""),
@@ -22614,7 +22673,7 @@ def create_app(runtime, orchestrator, registry):
         status_text: str,
         terminal: bool,
     ) -> bool:
-        if channel != "web":
+        if channel != "web" or not task_planner_feed_enabled():
             return False
         target = str(target or "").strip()
         group_id = str(group_id or "").strip()
@@ -22629,9 +22688,11 @@ def create_app(runtime, orchestrator, registry):
                     group_id=group_id,
                     status_kind="task_summary",
                     text=status_text,
+                    planner_feed_enabled=task_planner_feed_enabled(), terminal=terminal,
                 )
-                if rendered:
-                    rendered_status = rendered
+                if not rendered:
+                    return False
+                rendered_status = rendered
             except Exception:
                 logger.debug("Could not render web manual cron status card", exc_info=True)
         loop = _WEB_DELIVERY_LOOP
@@ -22644,6 +22705,7 @@ def create_app(runtime, orchestrator, registry):
                         group_id=group_id,
                         is_status=True,
                         status_kind="task_summary",
+                        include_activity=False, terminal=terminal,
                     ),
                     loop,
                 )
@@ -23126,6 +23188,8 @@ def create_app(runtime, orchestrator, registry):
                                     "artifacts": hydrated[0].get("artifacts", []) if hydrated else []})
                 return JSONResponse({"ok": True, "terminal_replies": replies})
             store = _get_chat_store()
+            from nullion.chat_history_projection import repair_selected_terminal_history
+            await asyncio.to_thread(repair_selected_terminal_history, runtime, conv_id, store)
             if str(sync_runtime or "").strip().lower() in {"1", "true", "yes"}:
                 _sync_runtime_chat_history_to_store(runtime, store)
             store.ensure_conversation(conv_id)
@@ -23542,6 +23606,18 @@ def create_app(runtime, orchestrator, registry):
             reverse=True,
         )
         return sorted(newest_first, key=lambda item: _dashboard_task_priority(item)[0])
+
+    def _dashboard_approval_items(items: list[dict[str, object]], history_limit: int) -> list[dict[str, object]]:
+        # Pending consent must remain reachable regardless of decided history
+        # size or the configured history cap. No approval state is changed.
+        pending = [item for item in items if item.get("status") == "pending"]
+        history = sorted(
+            (item for item in items if item.get("status") != "pending"),
+            key=lambda item: (str(item.get("decided_at") or item.get("created_at") or ""),
+                              str(item.get("approval_id") or "")),
+            reverse=True,
+        )
+        return pending + history[:history_limit]
 
     def _latency_mark_ms(event: dict[str, object], name: str) -> float | None:
         for mark in event.get("marks") or []:
@@ -24371,7 +24447,12 @@ def create_app(runtime, orchestrator, registry):
         status_meta = {"cache_ttl_s": cache_ttl_s, "limits": status_limits, "truncated": {}}
         for key, limit in status_limits.items():
             items = payload.get(key)
-            if isinstance(items, list) and limit > 0 and len(items) > limit:
+            if key == "approvals" and isinstance(items, list) and limit > 0:
+                selected = _dashboard_approval_items(items, limit)
+                if len(selected) < len(items):
+                    status_meta["truncated"][key] = {"shown": len(selected), "total": len(items)}
+                payload[key] = selected
+            elif isinstance(items, list) and limit > 0 and len(items) > limit:
                 status_meta["truncated"][key] = {"shown": limit, "total": len(items)}
                 payload[key] = items[:limit]
         payload["status_meta"] = status_meta
@@ -24877,22 +24958,50 @@ def create_app(runtime, orchestrator, registry):
                         "already_handled": True, "resume": None, "resumed_text": None})
                 suspended_turn = store.get_suspended_turn(approval_id)
 
+                @contextmanager
+                def approval_progress(conversation_id):
+                    progress_key = (conversation_id, "approval:" + approval_id)
+                    owner = object()
+
+                    def update_progress(event):
+                        if event.get("status_kind") == "request_progress":
+                            with http_progress_lock:
+                                entry = http_progress.get(progress_key)
+                                if entry and entry["owner"] is owner:
+                                    entry["text"] = event["text"]
+
+                    with http_progress_lock:
+                        http_progress.setdefault(progress_key, {"owner": owner, "text": "", "can_publish": None})
+                    try:
+                        yield update_progress
+                    finally:
+                        with http_progress_lock:
+                            if http_progress.get(progress_key, {}).get("owner") is owner:
+                                http_progress.pop(progress_key, None)
+
                 async def resume_existing_suspended_turn() -> dict[str, Any] | None:
                     if suspended_turn is None:
                         return None
                     try:
                         if _suspended_turn_origin_channel(suspended_turn) == "telegram":
-                            return await _resume_telegram_turn_from_web_approval(
-                                runtime,
-                                approval_id=approval_id,
-                                suspended_turn=suspended_turn,
-                                orchestrator=orchestrator,
-                                bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
+                            progress_conversation = body.get("progress_conversation_id")
+                            if not isinstance(progress_conversation, str) or not progress_conversation.startswith("web:"):
+                                progress_conversation = suspended_turn.conversation_id
+                            with approval_progress(progress_conversation) as update_progress:
+                                return await _resume_telegram_turn_from_web_approval(
+                                    runtime,
+                                    approval_id=approval_id,
+                                    suspended_turn=suspended_turn,
+                                    orchestrator=orchestrator,
+                                    bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
+                                    activity_callback=update_progress,
+                                )
+                        with approval_progress(suspended_turn.conversation_id) as update_progress:
+                            return await asyncio.to_thread(
+                                _resume_web_turn_from_snapshot, runtime,
+                                approval_id=approval_id, orchestrator=orchestrator, registry=registry,
+                                activity_callback=update_progress,
                             )
-                        return await asyncio.to_thread(
-                            _resume_web_turn_from_snapshot, runtime,
-                            approval_id=approval_id, orchestrator=orchestrator, registry=registry,
-                        )
                     except Exception as exc:
                         logger.exception("Failed to resume approval %s", approval_id)
                         return {
@@ -24904,7 +25013,7 @@ def create_app(runtime, orchestrator, registry):
                             ),
                         }
 
-                def resume_approved_tool_from_context() -> dict[str, Any] | None:
+                def resume_approved_tool_from_context(update_progress) -> dict[str, Any] | None:
                     if suspended_turn is not None:
                         return None
                     current_req = store.get_approval_request(approval_id)
@@ -24915,6 +25024,9 @@ def create_app(runtime, orchestrator, registry):
                     requested_by = str(getattr(current_req, "requested_by", "") or "").strip()
                     if not requested_by.startswith("web:"):
                         return None
+                    from nullion.request_progress import approval_resume_progress
+
+                    callbacks, report_saving = approval_resume_progress(update_progress, registry)
                     try:
                         from nullion.chat_operator import execute_approved_tool_call_from_approval_context
 
@@ -24928,6 +25040,9 @@ def create_app(runtime, orchestrator, registry):
                         direct_tool_result = None
                     if direct_tool_result is None:
                         return None
+                    if callbacks:
+                        callbacks["tool_result_callback"](direct_tool_result)
+                    report_saving()
                     if normalize_tool_status(getattr(direct_tool_result, "status", None)) != "approval_required":
                         try:
                             store.remove_suspended_turn(approval_id)
@@ -24944,6 +25059,13 @@ def create_app(runtime, orchestrator, registry):
                         tool_result=direct_tool_result,
                         prior_tool_results=_web_completed_pending_tool_results_from_suspended_turn(suspended_turn),
                     )
+
+                async def resume_approval_context(req):
+                    conversation_id = getattr(req, "requested_by", None)
+                    if suspended_turn is not None or not str(conversation_id).startswith("web:"):
+                        return None
+                    with approval_progress(conversation_id) as update_progress:
+                        return await asyncio.to_thread(resume_approved_tool_from_context, update_progress)
 
                 req = store.get_approval_request(approval_id)
                 if req is None:
@@ -24970,7 +25092,7 @@ def create_app(runtime, orchestrator, registry):
                         )
                 req_status = getattr(getattr(req, "status", None), "value", getattr(req, "status", None))
                 if str(req_status or "").strip().lower() == "approved" and suspended_turn is not None:
-                    resume_payload = resume_approved_tool_from_context()
+                    resume_payload = await resume_approval_context(req)
                     if resume_payload is None:
                         resume_payload = await resume_existing_suspended_turn()
                     if resume_payload is not None:
@@ -24985,7 +25107,7 @@ def create_app(runtime, orchestrator, registry):
                             }
                         )
                 if str(req_status or "").strip().lower() == "approved" and suspended_turn is None:
-                    resume_payload = resume_approved_tool_from_context()
+                    resume_payload = await resume_approval_context(req)
                     if resume_payload is not None:
                         resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
                         return JSONResponse(
@@ -25025,8 +25147,8 @@ def create_app(runtime, orchestrator, registry):
                     mode = normalize_approval_mode(body.get("mode", "once"))
                     expires_at = _permission_memory_expires_at(body.get("expires")) if mode == "always" else None
                     run_expires_at = _web_session_allow_expires_at() if mode == "run" else None
-                decision = approve_request_with_mode(
-                    runtime,
+                decision = await asyncio.to_thread(
+                    approve_request_with_mode, runtime,
                     approval_id,
                     mode=mode,
                     source="web UI",
@@ -25040,12 +25162,12 @@ def create_app(runtime, orchestrator, registry):
                 # Resume the suspended turn (non-fatal). Web-origin tool approvals
                 # with saved arguments should execute the approved tool directly
                 # before any prompt replay path can re-run unrelated work.
-                resume_payload = resume_approved_tool_from_context()
+                resume_payload = await resume_approval_context(req)
                 if resume_payload is None:
                     resume_payload = await resume_existing_suspended_turn()
                 resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
                 if resume_payload is None:
-                    resume_payload = resume_approved_tool_from_context()
+                    resume_payload = await resume_approval_context(req)
                     resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
                 try:
                     if resume_payload is None:
@@ -25054,8 +25176,8 @@ def create_app(runtime, orchestrator, registry):
                         chat_id = None
                         if isinstance(conv_id, str) and conv_id.startswith("telegram:"):
                             chat_id = conv_id.split(":", 1)[1] or None
-                        resumed_text = resume_approved_telegram_request(
-                            runtime,
+                        resumed_text = await asyncio.to_thread(
+                            resume_approved_telegram_request, runtime,
                             approval_id=approval_id,
                             chat_id=chat_id,
                             model_client=None,
@@ -25266,6 +25388,7 @@ def create_app(runtime, orchestrator, registry):
             "browser_backend": browser_backend,
             "browser_tools_available": _tool_registered("browser_navigate"),
             "activity_trace": os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "false").lower() not in ("0", "false", "no", "off"),
+            "task_planner_feed": task_planner_feed_enabled(),
             "show_thinking": os.environ.get("NULLION_SHOW_THINKING_ENABLED", "false").lower() not in ("0", "false", "no", "off"),
         })
 
@@ -25599,6 +25722,7 @@ def create_app(runtime, orchestrator, registry):
             "mini_agent_stale_after_seconds": mini_agent_stale_after,
             "proactive_reminders": proactive_reminders,
             "activity_trace":   activity_trace,
+            "task_planner_feed": task_planner_feed_enabled(),
             "show_thinking":    show_thinking,
             "data_retention_days": data_retention_days,
             "data_retention_types": data_retention_types,
@@ -26441,6 +26565,8 @@ def create_app(runtime, orchestrator, registry):
 
     async def _do_post_config_impl(body: dict):
         import os
+        if "task_planner_feed" in body and type(body["task_planner_feed"]) is not bool:
+            return JSONResponse({"ok": False, "error": "task_planner_feed must be a boolean."}, status_code=400)
         provider_sent = "model_provider" in body
         provider = body.get("model_provider") if provider_sent else os.environ.get("NULLION_MODEL_PROVIDER", "openai")
         api_key  = body.get("api_key", "")
@@ -26896,6 +27022,10 @@ def create_app(runtime, orchestrator, registry):
             os.environ["NULLION_PROVIDER_BINDINGS"] = provider_bindings
 
         # Handle feature toggles
+        if "task_planner_feed" in body:
+            mode = "task" if body["task_planner_feed"] else "off"
+            updates["NULLION_TASK_PLANNER_FEED_MODE"] = mode
+            os.environ["NULLION_TASK_PLANNER_FEED_MODE"] = mode
         for toggle_key, env_name in [
             ("doctor_enabled", "NULLION_DOCTOR_ENABLED"),
             ("smart_cleanup_enabled", "NULLION_SMART_CLEANUP_ENABLED"),
@@ -27472,6 +27602,8 @@ def create_app(runtime, orchestrator, registry):
         activity_id: str | None = None,
         activity_label: str | None = None,
         include_activity: bool | None = None,
+        terminal: bool = False,
+        tool_status: str | None = None,
         artifacts: list[dict[str, object]] | None = None,
         live_notice_id: str | None = None,
     ) -> None:
@@ -27486,6 +27618,8 @@ def create_app(runtime, orchestrator, registry):
             **({"activity_id": activity_id} if activity_id else {}),
             **({"activity_label": activity_label} if activity_label else {}),
             **({"include_activity": include_activity} if include_activity is not None else {}),
+            "terminal": terminal,
+            **({"tool_status": tool_status} if tool_status else {}),
             **({"artifacts": artifacts} if artifacts else {}),
         })
         stale: list[WebSocket] = []
@@ -27700,7 +27834,8 @@ def create_app(runtime, orchestrator, registry):
                 from nullion.chat_operator import activity_trace_enabled_for_chat
                 include_activity = activity_trace_enabled_for_chat(runtime, chat_id=conversation_id)
                 status_kind = str(kwargs.get("status_kind") or "")
-                if status_kind != "task_summary" and not include_activity:
+                if not should_deliver_task_status(status_kind=status_kind,
+                        planner_feed_enabled=task_planner_feed_enabled(), include_activity=include_activity):
                     return True
                 status_text = text
                 if status_kind == "tool_activity":
@@ -27724,6 +27859,8 @@ def create_app(runtime, orchestrator, registry):
                                 activity_id=str(kwargs.get("activity_id") or ""),
                                 activity_label=str(kwargs.get("activity_label") or ""),
                                 include_activity=include_activity,
+                                terminal=bool(kwargs.get("terminal")),
+                                tool_status=str(kwargs.get("tool_status") or ""),
                             ),
                             loop,
                         )
@@ -27836,24 +27973,30 @@ def create_app(runtime, orchestrator, registry):
 
     @app.post("/api/reject/{approval_id}")
     async def reject(approval_id: str):
-        try:
-            store = runtime.store
-            req = store.get_approval_request(approval_id)
-            if req is None:
-                return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-            confirmation_text = _approval_confirmation_text_for_web(req, action="deny")
-            runtime.deny_approval_request(approval_id, actor="operator")
-            return JSONResponse({"ok": True, "confirmation_text": confirmation_text})
-        except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+        with _runtime_turn_guard():
+            try:
+                store = runtime.store
+                req = store.get_approval_request(approval_id)
+                if req is None:
+                    return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+                confirmation_text = _approval_confirmation_text_for_web(req, action="deny")
+                await asyncio.to_thread(runtime.deny_approval_request, approval_id, actor="operator")
+                return JSONResponse({"ok": True, "confirmation_text": confirmation_text})
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     @app.get('/api/chat/progress')
     async def chat_http_progress(turn_id: str, conversation_id: str):
         with http_progress_lock:
             entry = http_progress.get((conversation_id, turn_id))
-            return JSONResponse({'type':'progress', 'turn_id':turn_id,
-                'conversation_id':conversation_id, 'active':entry is not None,
-                'text':entry['text'] if entry is not None and entry['owner'].publication_gate.can_publish() else ''})
+            can_publish = entry["can_publish"] if entry is not None else None
+            return JSONResponse({
+                "type": "progress", "turn_id": turn_id,
+                "conversation_id": conversation_id, "active": entry is not None,
+                "text": entry["text"] if entry is not None and (can_publish is None or can_publish()) else "",
+            })
 
     @app.post("/api/chat")
     async def chat_http(request: Request):
@@ -27913,7 +28056,10 @@ def create_app(runtime, orchestrator, registry):
                 )
                 progress_key = (conv_id, payload['turn_id'])
                 with http_progress_lock:
-                    http_progress.setdefault(progress_key, {'owner':registration, 'text':''})
+                    http_progress.setdefault(progress_key, {
+                        "owner": registration, "text": "",
+                        "can_publish": registration.publication_gate.can_publish,
+                    })
                 await registration.wait_for_dependencies()
 
             async def publish_http_progress(text):
@@ -28018,6 +28164,7 @@ def create_app(runtime, orchestrator, registry):
     @app.websocket("/ws/chat")
     async def chat_ws(websocket: WebSocket):
         from fastapi import WebSocketDisconnect
+        from nullion.chat_operator import activity_trace_enabled_for_chat
         global _WEB_DELIVERY_LOOP
         if not _is_local_websocket(websocket):
             await websocket.close(code=1008)
@@ -28035,6 +28182,11 @@ def create_app(runtime, orchestrator, registry):
         withdrawn_turn_ids: set[str] = set()
 
         async def send_websocket_event(event: dict[str, Any]) -> None:
+            if event.get("type") == "task_status":
+                if event.get("status_kind") == "task_summary" and not task_planner_feed_enabled():
+                    return
+                event.setdefault("include_activity", activity_trace_enabled_for_chat(runtime,
+                    chat_id=str(event.get("conversation_id") or "")))
             registration = turn_registrations.get(str(event.get("turn_id") or ""))
             if registration is not None and event.get("type") in {
                 "chunk", "done", "thinking", "approval_required", "task_status", "error", "progress",
@@ -28202,6 +28354,11 @@ def create_app(runtime, orchestrator, registry):
             async def send_early_reply_payload(payload: dict[str, object]) -> bool:
                 await progress_delivery.freeze()
                 reply = str(payload.get("text") or "(no reply)")
+                if payload.get("mini_agent_dispatch") and not task_planner_feed_enabled():
+                    from nullion.chat_text import WORKING_ACK_TEXT
+                    await send_reply_text(reply if payload.get("mini_agent_dispatch_terminal") else WORKING_ACK_TEXT)
+                    return True
+
                 task_group_id = str(payload.get("task_group_id") or "")
                 background_owns_status = payload.get("planner_status_owned_by_background") is True
                 planner_status_text = str(
@@ -28338,7 +28495,7 @@ def create_app(runtime, orchestrator, registry):
                             "status_kind": "task_summary",
                             "text": reply,
                         }))
-                        task_status_reply_sent = True
+                        task_status_reply_sent = task_planner_feed_enabled()
                     elif (
                         result.get("mini_agent_dispatch")
                         and task_group_id
@@ -28352,7 +28509,7 @@ def create_app(runtime, orchestrator, registry):
                             "status_kind": "task_summary",
                             "text": str(result.get("planner_status_text") or "").strip(),
                         }))
-                        task_status_reply_sent = True
+                        task_status_reply_sent = task_planner_feed_enabled()
                     else:
                         if (
                             not result.get("reply_already_sent")
@@ -28443,7 +28600,7 @@ def create_app(runtime, orchestrator, registry):
                         "status_kind": "task_summary",
                         "text": reply,
                     }))
-                    task_status_reply_sent = True
+                    task_status_reply_sent = task_planner_feed_enabled()
                 elif (
                     result.get("mini_agent_dispatch")
                     and task_group_id
@@ -28458,7 +28615,7 @@ def create_app(runtime, orchestrator, registry):
                         "status_kind": "task_summary",
                         "text": str(result.get("planner_status_text") or "").strip(),
                     }))
-                    task_status_reply_sent = True
+                    task_status_reply_sent = task_planner_feed_enabled()
                 else:
                     if (
                         not result.get("reply_already_sent")
@@ -28623,27 +28780,14 @@ def _web_approval_required_payload(
     display_request_kind = ""
     display_title = ""
     display_copy = ""
+    approval = None
+    store = None
     if approval_id and runtime is not None:
         try:
             store = getattr(runtime, "store", None)
             approval = store.get_approval_request(approval_id) if store is not None else None
-            if store is not None and turn_id:
-                suspended = store.get_suspended_turn(approval_id)
-                if suspended is not None:
-                    token = dict(suspended.resume_token or {})
-                    token["conversation_turn_id"] = turn_id
-                    store.add_suspended_turn(replace(suspended, resume_token=token))
-                    from nullion.runtime import PersistentRuntime
-                    if isinstance(runtime, PersistentRuntime):
-                        from nullion.runtime_persistence import checkpoint_pending_approvals
-                        checkpoint_pending_approvals(store, runtime.checkpoint_path, [approval_id])
-                        _schedule_web_checkpoint(runtime)
-                    else:
-                        checkpoint = getattr(runtime, "checkpoint", None)
-                        if callable(checkpoint):
-                            checkpoint()
-        except Exception:
-            approval = None
+        except Exception as exc:
+            logger.debug("Unable to read approval display (%s)", type(exc).__name__)
         if approval is not None:
             display = approval_display_from_request(approval)
             display_label = display.label
@@ -28653,7 +28797,29 @@ def _web_approval_required_payload(
             display_copy = display.copy
             display_trigger_flow_label = _approval_trigger_flow_label_from_request(approval) or ""
             display_request_kind = str(getattr(approval, "request_kind", "") or "")
-    request_kind = str(result.get("request_kind") or display_request_kind or "")
+        # This UI correlation is ancillary to the native approval's already
+        # committed identity and consent scope. Failure must not erase either.
+        if approval is not None and store is not None and turn_id:
+            try:
+                suspended = store.get_suspended_turn(approval_id)
+                if suspended is not None and (suspended.resume_token or {}).get("conversation_turn_id") != turn_id:
+                    token = dict(suspended.resume_token or {})
+                    token["conversation_turn_id"] = turn_id
+                    store.add_suspended_turn(replace(suspended, resume_token=token))
+                    from nullion.runtime import PersistentRuntime
+                    if isinstance(runtime, PersistentRuntime):
+                        from nullion.runtime_persistence import checkpoint_pending_approvals
+                        try:
+                            checkpoint_pending_approvals(store, runtime.checkpoint_path, [approval_id], timeout_seconds=0.1)
+                        finally:
+                            _schedule_web_checkpoint(runtime)
+                    else:
+                        checkpoint = getattr(runtime, "checkpoint", None)
+                        if callable(checkpoint):
+                            checkpoint()
+            except Exception as exc:
+                logger.debug("Unable to persist approval UI turn binding (%s)", type(exc).__name__)
+    request_kind = display_request_kind if approval is not None else str(result.get("request_kind") or "")
     visible_text = str(result.get("text") or "").strip()
     if not visible_text:
         if display_title or display_copy:
@@ -28671,10 +28837,10 @@ def _web_approval_required_payload(
         **({"turn_id": turn_id} if turn_id else {}),
         "text": visible_text,
         "approval_id": approval_id,
-        "tool_name": result.get("tool_name") or display_label or default_tool_name,
-        "tool_detail": result.get("tool_detail") or display_detail,
-        "trigger_flow_label": result.get("trigger_flow_label") or display_trigger_flow_label,
-        "is_web_request": bool(result.get("is_web_request") or display_is_web_request),
+        "tool_name": (display_label or default_tool_name) if approval is not None else result.get("tool_name") or default_tool_name,
+        "tool_detail": display_detail if approval is not None else result.get("tool_detail") or "",
+        "trigger_flow_label": display_trigger_flow_label if approval is not None else result.get("trigger_flow_label") or "",
+        "is_web_request": display_is_web_request if approval is not None else bool(result.get("is_web_request")),
         "request_kind": request_kind,
         **({"display_title": display_title, "display_copy": display_copy}
            if display_title or display_copy else {}),
@@ -31037,42 +31203,9 @@ def _web_background_memory_start_delay_seconds() -> float:
 
 
 def _web_tool_result_detail(tool_result: ToolResult) -> str | None:
-    error = getattr(tool_result, "error", None)
-    if error:
-        return str(error).strip()[:140]
-    output = getattr(tool_result, "output", None)
-    tool_name = str(getattr(tool_result, "tool_name", "") or "")
-    if is_untrusted_tool_name(tool_name):
-        metadata = safe_untrusted_tool_metadata(tool_name, output)
-        for key in ("url", "title", "path", "query", "status_code", "content_type"):
-            value = metadata.get(key)
-            if value:
-                detail = str(value).strip()
-                if key == "url":
-                    parsed = urlparse(detail)
-                    if parsed.netloc:
-                        detail = parsed.netloc
-                elif key == "path":
-                    detail = Path(detail).name or detail
-                return detail[:140]
-        return "untrusted output withheld"
-    if isinstance(output, dict):
-        if getattr(tool_result, "tool_name", "") == "web_search":
-            return None
-        for key in ("reason", "summary", "message", "path", "url"):
-            value = output.get(key)
-            if value:
-                detail = str(value).strip()
-                if key == "url":
-                    parsed = urlparse(detail)
-                    if parsed.netloc:
-                        detail = parsed.netloc
-                elif key == "path":
-                    detail = Path(detail).name or detail
-                return detail[:140]
-    if isinstance(output, str) and output.strip():
-        return output.strip()[:140]
-    return None
+    # Activity shares the same schema-safe presenter as messaging surfaces.
+    from nullion.run_activity import _short_tool_detail
+    return _short_tool_detail(tool_result) or None
 
 
 def _web_activity_events_for_tool_results(tool_results: list[ToolResult]) -> list[dict[str, str]]:
@@ -31397,18 +31530,20 @@ async def _resume_telegram_turn_from_web_approval(
     orchestrator,
     bot_token: str | None,
     send_telegram_delivery=None,
+    activity_callback=None,
 ) -> dict[str, Any] | None:
     chat_id = _telegram_chat_id_for_suspended_turn(suspended_turn)
     if not chat_id:
         return None
     from nullion.chat_operator import resume_approved_telegram_request
 
-    resumed_text = resume_approved_telegram_request(
-        runtime,
+    resumed_text = await asyncio.to_thread(
+        resume_approved_telegram_request, runtime,
         approval_id=approval_id,
         chat_id=chat_id,
         model_client=None,
         agent_orchestrator=orchestrator,
+        **({"activity_callback": activity_callback} if activity_callback else {}),
     )
     if not resumed_text:
         return None
@@ -31491,7 +31626,11 @@ def _web_direct_tool_result_resume_payload(
         *(str(path).strip() for path in (artifact_paths or ()) if str(path or "").strip()),
         *_web_artifact_paths_from_tool_results(tool_results),
     ]))
-    if (
+    from nullion.response_sanitizer import native_filesystem_receipt_reply
+    native_receipt = native_filesystem_receipt_reply(tool_result)
+    if native_receipt:
+        final_text = native_receipt
+    elif (
         str(getattr(tool_result, "tool_name", "") or "") == "email_send"
         and normalize_tool_status(getattr(tool_result, "status", "")) == "completed"
         and isinstance(getattr(tool_result, "output", None), dict)
@@ -31541,7 +31680,7 @@ def _web_direct_tool_result_resume_payload(
     return payload
 
 
-def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, registry) -> dict[str, Any] | None:
+def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, registry, activity_callback=None) -> dict[str, Any] | None:
     store = getattr(runtime, "store", None)
     if store is None:
         return None
@@ -31610,6 +31749,16 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             "artifacts": artifacts,
         }
 
+    from nullion.code_mode_sessions import checkpoint_reference
+
+    approval = store.get_approval_request(approval_id)
+    context = (approval.context or {}) if approval is not None else {}
+    needs_saved_workflow = checkpoint_reference(suspended_turn.pending_tool_calls) or context.get("delegated_resume")
+    if needs_saved_workflow and (
+        not suspended_turn.messages_snapshot or not callable(getattr(orchestrator, "resume_turn", None))
+    ):
+        return {"type": "message", "text": "The saved program could not be resumed. The approved action was not run."}
+
     # The snapshot can end with a runtime recovery instruction in a user-role
     # message. The suspended request is the durable source of the user's intent.
     user_text = str(suspended_turn.message or "").removeprefix("/chat ").strip()
@@ -31634,6 +31783,8 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             "text": screenshot_payload.get("text", "(no reply)"),
             "artifacts": screenshot_payload.get("artifacts", []),
         }
+    from nullion.request_progress import approval_resume_progress
+    callbacks, report_saving = approval_resume_progress(activity_callback, registry)
     prior_tool_results = _web_completed_pending_tool_results_from_suspended_turn(suspended_turn)
     from nullion.chat_operator import approved_read_needs_continuation
     continue_read = approved_read_needs_continuation(runtime, suspended_turn,
@@ -31663,6 +31814,9 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             logger.exception("Failed to execute approved tool context for approval %s", approval_id)
             direct_tool_result = None
     if direct_tool_result is not None:
+        if callbacks:
+            callbacks["tool_result_callback"](direct_tool_result)
+        report_saving()
         store.remove_suspended_turn(approval_id)
         try:
             runtime.checkpoint()
@@ -31675,6 +31829,10 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             tool_result=direct_tool_result,
             prior_tool_results=prior_tool_results,
         )
+    if not continue_read:
+        from nullion.approvals import requires_exact_tool_review
+        if requires_exact_tool_review(approval):
+            return {"type": "message", "text": "I couldn't restore the approved action. The action was not replayed."}
     if orchestrator is None:
         return None
     history = _resume_history_from_snapshot(suspended_turn.messages_snapshot)
@@ -31696,6 +31854,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 policy_store=store,
                 approval_store=store,
                 max_iterations=resume_max_iterations,
+                **callbacks,
             )
         else:
             result = turn_orchestrator.run_turn(
@@ -31707,7 +31866,9 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 policy_store=store,
                 approval_store=store,
                 max_iterations=resume_max_iterations,
+                **callbacks,
             )
+    report_saving()
     store.remove_suspended_turn(approval_id)
     try:
         runtime.checkpoint()

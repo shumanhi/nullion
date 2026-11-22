@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +17,7 @@ PIXEL = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQV
 @pytest.mark.parametrize("prompt", ["What happened to this?", "¿Qué pasó con esto?", "これはどうなった？"])
 @pytest.mark.parametrize("restart_receipt", [False, True])
 @pytest.mark.parametrize("caption", [None, "Check why this account was blocked"])
-def test_quoted_unanswered_image_reaches_model_instead_of_old_topic(tmp_path, monkeypatch, prompt, restart_receipt, caption):
+def test_quoted_unanswered_image_reaches_model_instead_of_old_topic(tmp_path, monkeypatch, prompt, restart_receipt, caption, receipt_fault=None):
     from nullion import chat_store, telegram_app
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.config import load_settings
@@ -55,8 +56,18 @@ def test_quoted_unanswered_image_reaches_model_instead_of_old_topic(tmp_path, mo
     original = Message(41, caption=caption, photo=[Photo()])
     if restart_receipt:
         attachments = asyncio.run(telegram_app._download_telegram_attachments(original, SimpleNamespace(bot=None), settings=None))
+        if receipt_fault == 'legacy':
+            attachments[0].pop('content_sha256')
+        elif receipt_fault == 'workspace':
+            attachments[0]['workspace_id'] = 'another-workspace'
         telegram_app._checkpoint_telegram_attachment_receipt(runtime, conversation_id="telegram:123",
             message_id="telegram-message:123:41", request_id="telegram-update:1", text=original.caption, attachments=attachments)
+        if receipt_fault == 'replaced':
+            from nullion.messaging_adapters import save_messaging_attachment
+            Path(attachments[0]['path']).unlink()
+            replacement = save_messaging_attachment(filename=attachments[0]['name'],
+                data=b'\x89PNG\r\n\x1a\nother-chat-bytes', media_type='image/png', principal_id='telegram_chat')
+            assert replacement['path'] == attachments[0]['path']
         runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
     requests = []
     class Model:
@@ -83,9 +94,15 @@ def test_quoted_unanswered_image_reaches_model_instead_of_old_topic(tmp_path, mo
     followup = Message(42, text=prompt, reply=original)
     asyncio.run(service.on_message(SimpleNamespace(update_id=2, message=followup), SimpleNamespace(bot=None)))
     assert len(requests) == 1
-    assert downloaded == [True]
+    assert downloaded == ([True, True] if receipt_fault else [True])
     assert any(mid == 42 and "Mandir Shri Govinddevji" in text for mid, text in sent)
     persisted = bootstrap_persistent_runtime(tmp_path / "runtime.db")
     replies = persisted.store.list_recent_conversation_events("telegram:123", event_type="conversation.chat_turn")
     assert replies[-1]["user_message"] == prompt
     assert "Mandir Shri Govinddevji" in replies[-1]["assistant_reply"]
+
+
+@pytest.mark.parametrize('receipt_fault', ['replaced', 'legacy', 'workspace'])
+def test_recovered_telegram_input_delivers_original_bytes_when_receipt_is_unusable(tmp_path, monkeypatch, receipt_fault):
+    test_quoted_unanswered_image_reaches_model_instead_of_old_topic(tmp_path, monkeypatch,
+        'これはどうなった？', True, None, receipt_fault=receipt_fault)

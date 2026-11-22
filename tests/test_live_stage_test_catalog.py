@@ -20,12 +20,26 @@ def policy():
 def test_complete_inventory_preserves_parameterized_cases_and_execution_types():
     result=catalog.build_catalog()
     summary=result['summary']
-    assert summary['expanded_cases']==296
-    assert sum(summary['categories'].values())==sum(summary['kinds'].values())==296
-    assert summary['kinds']==dict(live_workflow=273,saved_replay=14,
+    assert summary['expanded_cases']==303
+    assert sum(summary['categories'].values())==sum(summary['kinds'].values())==303
+    assert summary['kinds']==dict(live_workflow=280,saved_replay=14,
                                  local_harness=9,aggregate_entry_point=0)
     assert len({row['selector'] for row in result['tests']})==len(result['tests'])
     assert summary['api_scenarios']==75 and summary['web_catalogue_scenarios']==48
+    recall=next(row for row in result['tests'] if row['selector']==
+        'tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_native_recall_with_code_mode')
+    assert (recall['category'],recall['kind'],recall['variants'])==('context','live_workflow',1)
+    assert 'NULLION_LIVE_STAGE_E2E' in recall['gates']
+    capture=next(row for row in result['tests'] if row['selector']==
+        'tests/e2e/test_live_stage_web_capture_extent.py::test_live_web_ordinary_capture_is_viewport_and_plain_turns_stay_fast')
+    assert (capture['category'],capture['kind'],capture['variants'])==('browser','live_workflow',1)
+    pdf=next(row for row in result['tests'] if row['selector']==
+        'tests/e2e/test_live_stage_web_pdf_flow.py::test_live_web_pdf_report_flows_without_clipping_or_large_gaps')
+    assert (pdf['category'],pdf['kind'],pdf['variants'])==('artifacts','live_workflow',1)
+    code_recall=next(row for row in result['tests'] if row['selector']==
+        'tests/e2e/test_live_stage_web_pdf_flow.py::test_live_web_code_mode_recalls_original_pdf_with_native_reference_receipt')
+    assert (code_recall['category'],code_recall['kind'],code_recall['variants'])==('context','live_workflow',1)
+    assert 'NULLION_LIVE_CODEMODE_RECALL_SOURCE' in code_recall['gates']
 
 
 def test_inventory_does_not_import_app_probes_or_live_test_modules(monkeypatch):
@@ -34,7 +48,7 @@ def test_inventory_does_not_import_app_probes_or_live_test_modules(monkeypatch):
         assert not name.startswith(('nullion','tests.e2e','scripts.live_stage_chat_contract_probe')),name
         return original(name,*args,**kwargs)
     monkeypatch.setattr(builtins,'__import__',guarded)
-    assert catalog.build_catalog()['summary']['files']==48
+    assert catalog.build_catalog()['summary']['files']==51
 
 
 @pytest.mark.parametrize('change', ['module','scenario','function','override','run_set','duplicate_category'])
@@ -60,6 +74,11 @@ def test_overlap_audit_retains_distinct_boundaries_and_language_variants():
     variants={'browser_screenshot_artifact_delivery','browser_context_capture_recovery',
               'browser_context_capture_recovery_variant'}
     assert variants <= {row.get('scenario') for row in result['tests']}
+    recall_review=next(row for row in result['overlap_reviews']
+        if row['id']=='explicit-and-implicit-independent-recall')
+    assert set(recall_review['selectors'])=={
+        'tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_independent_memory_and_history_recall_contract',
+        'tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_native_recall_with_code_mode'}
 
 
 def test_all_consolidated_workflows_execute_the_extra_assertions_once():
@@ -80,7 +99,7 @@ def test_all_consolidated_workflows_execute_the_extra_assertions_once():
 def test_category_and_smoke_queries_only_print_valid_reviewed_selectors(capsys):
     catalog.main(['--category','browser','--json'])
     data=json.loads(capsys.readouterr().out)
-    assert data['selected_cases']==21
+    assert data['selected_cases']==25
     assert all(row['category']=='browser' for row in data['tests'])
     catalog.main(['--set','smoke','--selectors'])
     selectors=capsys.readouterr().out.splitlines()

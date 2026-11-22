@@ -1296,7 +1296,11 @@ async def test_scheduled_result_aggregator_collapses_unmarked_same_format_artifa
     assert artifact_deliveries == [str(second)]
 
 
-def test_result_aggregator_tool_activity_keeps_task_title_only_in_label() -> None:
+@pytest.mark.parametrize("tool_status", ["", "completed"])
+def test_result_aggregator_tool_activity_keeps_task_title_only_in_label(tool_status: str) -> None:
+    from nullion.run_activity import format_tool_activity_line
+    from nullion.tools import ToolResult
+
     deliveries: list[tuple[str, str, dict]] = []
     research = task("research", TaskStatus.RUNNING)
     research.title = "Research Boston day trip"
@@ -1316,6 +1320,11 @@ def test_result_aggregator_tool_activity_keeps_task_title_only_in_label() -> Non
         task_registry=registry,
         min_progress_interval_s=0,
     )
+    private_output = "Private runtime notes /workspace/private.json secret-token"
+    activity = format_tool_activity_line(ToolResult(
+        "browser-call", "browser_extract_text", "completed", {"text": private_output}))
+    assert activity.endswith("✓ browser_extract_text")
+    assert private_output not in activity
 
     async def run() -> None:
         await aggregator._handle(
@@ -1324,7 +1333,8 @@ def test_result_aggregator_tool_activity_keeps_task_title_only_in_label() -> Non
                 task_id="research",
                 group_id="g-tools",
                 kind="tool_activity",
-                message="✓ browser_extract_text",
+                message=activity,
+                data={"tool_status": tool_status} if tool_status else {},
             )
         )
 
@@ -1341,9 +1351,12 @@ def test_result_aggregator_tool_activity_keeps_task_title_only_in_label() -> Non
                 "task_id": "research",
                 "activity_id": "mini-agent-tools:research",
                 "activity_label": "Research Boston day trip tools",
+                "tool_status": tool_status,
             },
         )
     ]
+    assert research.title not in deliveries[0][1]
+    assert private_output not in str(deliveries)
 
 
 @pytest.mark.asyncio

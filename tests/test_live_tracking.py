@@ -1550,3 +1550,53 @@ def test_terminal_setup_failure_explains_source_without_leaking_records(code):
     reply = operation_failure_reply([result], required_tool_names=['create_live_tracker'])
     assert 'No new alert was created.' in reply
     assert 'required step failed' not in reply and 'private' not in reply
+
+
+@pytest.mark.parametrize('with_deadline', [False, True])
+def test_active_tracker_resume_rejection_is_verified_unexecuted(fixture, with_deadline):
+    from nullion.live_tracking_tools import register_live_tracker_tools
+    f = fixture
+    register_live_tracker_tools(f.registry)
+    f.registry.live_tracker_store_path = f.store.path
+    job = create(f)
+    before = f.store.get(job['id'])
+    args = {'id': job['id'], **({'expires_at': job['expires_at']} if with_deadline else {})}
+    for attempt in range(2):
+        result = f.registry.invoke(ToolInvocation(str(attempt), 'resume_live_tracker', 'web:alpha', args))
+        assert result.status == 'failed'
+        assert result.output['executed'] is False
+        assert result.output['reason'] == 'live_tracker_state_conflict'
+        assert result.output['tracker_state']['state'] == 'active'
+        assert 'update_live_tracker' in result.output['recovery']['required_tool_names']
+        assert f.store.get(job['id']) == before
+
+
+@pytest.mark.parametrize('state', ['active', 'blocked'])
+def test_tracker_problem_resume_guidance_follows_saved_state(fixture, state):
+    job = create(fixture)
+    original = {'code': 'missing_data', 'remedy': 'Repair the source, then resume it.'}
+    job.update(state=state, last_problem=original)
+    view = public_tracker(job)
+    assert view['last_problem']['resume_required'] is (state != 'active')
+    assert original['remedy'] == 'Repair the source, then resume it.'
+    if state == 'active':
+        assert 'does not need to be resumed' in view['last_problem']['remedy']
+    else:
+        assert view['last_problem']['remedy'] == original['remedy']
+
+
+def test_session_bound_source_without_replay_recipe_is_rejected_before_creation(fixture):
+    from dataclasses import replace
+    from nullion.live_tracking_tools import register_live_tracker_tools
+    f=fixture
+    spec=f.registry.get_spec('sensor_read');handler=f.registry._handlers['sensor_read']
+    f.registry.unregister('sensor_read')
+    f.registry.register(replace(spec,observation_requires_setup=True),handler)
+    register_live_tracker_tools(f.registry);f.registry.live_tracker_store_path=f.store.path
+    step={'tool_name':'sensor_read','arguments':{}}
+    result=f.registry.invoke(ToolInvocation('create-unsafe','create_live_tracker','web:alpha',{
+        'name':'検証','duration_seconds':90,'interval_seconds':5,'probe':[step],'matcher':matcher()},
+        flow_context={'prepared_observations':{json.dumps(step,sort_keys=True):{'reading':23,'session_id':'ephemeral'}}}))
+    assert result.status=='failed' and result.output['executed'] is False
+    assert result.output['validation']['code']=='source_replay_required'
+    assert f.store.list('workspace_admin')==[]

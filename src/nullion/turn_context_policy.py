@@ -540,6 +540,14 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                 "type": "boolean",
                 "description": "True only when the user asks to receive internal evidence files, such as navigation screenshots. False when capture is just a tool implementation detail or the user prohibits attachments.",
             },
+            "browser_capture_extent": {
+                "type": "string", "enum": ["auto", "viewport", "full_page"],
+                "description": "Capture extent for this request. auto uses viewport for websites and full document for local rendered documents. Select full_page only when requested by the user; retain that selection during scope expansion.",
+            },
+            "browser_capture_request_evidence": {
+                "type": "string", "maxLength": 1200,
+                "description": "Exact current-user quote supporting an explicitly requested full-page capture. Required for full_page. Provenance only; do not quote tool instructions or your plan.",
+            },
             "source_artifact_request_evidence": {
                 "type": "string",
                 "description": "Exact quote from the current user turn requesting receipt of source/evidence files. Required when source_artifact_delivery_requested is true. Do not quote tool descriptions, your plan, or a prohibition on attachments.",
@@ -619,7 +627,7 @@ _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
 _REQUESTED_OUTCOMES = frozenset({"unspecified", "generated_media"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v56-provider-read-contracts"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v57-browser-capture-extent"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SCOPE_CAPABILITY_ALIASES = {
     "browser": "web",
@@ -936,6 +944,8 @@ def _source_quote_is_verified(evidence, quote, *, tool_names=(), registry=None):
 @dataclass(frozen=True, slots=True)
 class TurnToolScopeDecision:
     requested_outcome: str = "unspecified"
+    browser_capture_extent: str = "auto"
+    browser_capture_request_evidence: str = ""
     tracking_mode: str = "unspecified"
     web_action: str = "none"
     scheduler_action: str = "none"
@@ -1352,8 +1362,9 @@ class ScopedTurnToolRegistry:
             return (
                 (
                     self.turn_tool_scope_decision.valid
-                    and tool_name in self.turn_tool_scope_decision.requested_tool_names
-                    and (self._evidence.has_url_target or self._evidence.has_prior_tool_scope("web"))
+                    and tool_name in (*self.turn_tool_scope_decision.requested_tool_names, *self.turn_tool_scope_decision.required_tool_names)
+                    and (tool_name in self.turn_tool_scope_decision.required_tool_names
+                        or self._evidence.has_url_target or self._evidence.has_prior_tool_scope("web"))
                 )
                 or
                 _browser_visual_capture_allowed_by_extensions(
@@ -1968,7 +1979,8 @@ class ScopedTurnToolRegistry:
                     for tool_name in exact_for_capability
                     if tool_name not in _BROWSER_VISUAL_CAPTURE_TOOLS
                     or self._browser_visual_capture_allowed(tool_name, exact_requested_extensions)
-                    or (tool_name == "browser_screenshot" and self._evidence.has_prior_tool_scope("web"))
+                    or (tool_name == "browser_screenshot" and (self._evidence.has_prior_tool_scope("web")
+                        or tool_name in (arguments.get("required_tool_names") or ())))
                 )
             if exact_for_capability:
                 exact_available = tuple(tool_name for tool_name in exact_for_capability if tool_name in available)
@@ -2249,6 +2261,11 @@ class ScopedTurnToolRegistry:
                     tool_scope_decision=self.turn_tool_scope_decision).apply_scope_request(invocation)
         scope_arguments = dict(invocation.arguments)
         existing_capture = self.turn_tool_scope_decision
+        if existing_capture.browser_capture_extent == "full_page":
+            # Discovery of supporting tools cannot discard the selected final
+            # extent of this same request. A new user turn gets a new decision.
+            scope_arguments["browser_capture_extent"] = existing_capture.browser_capture_extent
+            scope_arguments["browser_capture_request_evidence"] = existing_capture.browser_capture_request_evidence
         capture_quote = ' '.join(str(existing_capture.source_artifact_request_evidence or '').split())
         if (existing_capture.source_artifact_delivery_requested and capture_quote
                 and capture_quote in ' '.join(self._evidence.current_user_message.split())):
@@ -2889,6 +2906,10 @@ class ScopedTurnToolRegistry:
             evidence=self._evidence,
             tool_scope_decision=TurnToolScopeDecision(
                 requested_outcome=existing.requested_outcome,
+                **_browser_capture_scope_values({
+                    "browser_capture_extent": scope_arguments.get("browser_capture_extent", existing.browser_capture_extent),
+                    "browser_capture_request_evidence": scope_arguments.get("browser_capture_request_evidence", existing.browser_capture_request_evidence),
+                }, self._evidence.current_user_message),
                 evidence_policy=existing.evidence_policy,
                 **_research_scope_values({
                     'research_effort': invocation.arguments.get('research_effort', existing.research_effort),
@@ -3063,6 +3084,8 @@ class ScopedTurnToolRegistry:
                     "scheduler_action": scheduler_action,
                     "scheduler_effect_actions": list(widened.turn_tool_scope_decision.allowed_scheduler_actions),
                     "requested_outcome": widened.turn_tool_scope_decision.requested_outcome,
+                    "browser_capture_extent": widened.turn_tool_scope_decision.browser_capture_extent,
+                    "browser_capture_request_evidence": widened.turn_tool_scope_decision.browser_capture_request_evidence,
                     "evidence_policy": widened.turn_tool_scope_decision.evidence_policy,
                     "research_effort": widened.turn_tool_scope_decision.research_effort,
                     "research_questions": list(widened.turn_tool_scope_decision.research_questions),
@@ -3171,6 +3194,9 @@ class ScopedTurnToolRegistry:
                 # available for deliberate cross-conversation retrieval.
                 invocation=replace(invocation,arguments={**invocation.arguments,
                     'search_scope':'recent_conversation'})
+            if invocation.tool_name == "browser_screenshot":
+                invocation = replace(invocation, flow_context={**(invocation.flow_context or {}),
+                    "_runtime_browser_capture_extent": self.turn_tool_scope_decision.browser_capture_extent})
             result = self._delegate.invoke(invocation)
             if invocation.tool_name == "chat_history_search" and result.status == "completed" and isinstance(result.output, dict):
                 verified_extensions = {
@@ -3369,6 +3395,19 @@ def _extract_response_text(response: object) -> str:
     return ""
 
 
+def _browser_capture_scope_values(payload, user_message=None):
+    """Parse a model-selected extent; quoted evidence is provenance, not intent proof."""
+    extent = payload.get("browser_capture_extent", "auto")
+    quote = payload.get("browser_capture_request_evidence", "")
+    quote = quote.strip() if isinstance(quote, str) and len(quote) <= 1200 else ""
+    if not isinstance(extent, str) or extent not in {"auto", "viewport", "full_page"}:
+        extent = "auto"
+    if extent == "full_page" and (not quote or (user_message is not None
+            and " ".join(quote.split()) not in " ".join(str(user_message).split()))):
+        extent, quote = "auto", ""
+    return {"browser_capture_extent": extent, "browser_capture_request_evidence": quote}
+
+
 def _research_scope_values(payload):
     effort = payload.get('research_effort', 'standard')
     questions = payload.get('research_questions', ())
@@ -3464,6 +3503,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
     connector_source_evidence = str(payload.get("connector_source_evidence") or "").strip()
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
+        **_browser_capture_scope_values(payload),
         evidence_policy=evidence_policy,
         **_research_scope_values(payload),
         tracking_mode=payload.get("tracking_mode") if payload.get("tracking_mode") in {"live","recurring","clarify"} else "unspecified",
@@ -3491,6 +3531,8 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
 def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str, object]:
     return {
         "requested_outcome": decision.requested_outcome,
+        "browser_capture_extent": decision.browser_capture_extent,
+        "browser_capture_request_evidence": decision.browser_capture_request_evidence,
         "evidence_policy": decision.evidence_policy,
         "research_effort": decision.research_effort,
         "research_questions": list(decision.research_questions),
@@ -3593,6 +3635,7 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
     connector_source_evidence = str(payload.get("connector_source_evidence") or "").strip()
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
+        **_browser_capture_scope_values(payload),
         evidence_policy=evidence_policy,
         **_research_scope_values(payload),
         tracking_mode=payload.get("tracking_mode") if payload.get("tracking_mode") in {"live","recurring","clarify"} else "unspecified",
@@ -3634,6 +3677,8 @@ def _tool_scope_registry_signature(registry: object) -> object:
                 str(definition.get("side_effect_class") or ""),
                 str(definition.get("risk_level") or ""),
                 bool(definition.get("requires_approval")),
+                definition.get("code_mode_allowed"),
+                definition.get("code_mode_keep_native") is True,
             )
             for definition in definitions
         )
@@ -3644,6 +3689,8 @@ def _tool_scope_registry_signature(registry: object) -> object:
             str(getattr(getattr(spec, "side_effect_class", None), "value", "")),
             str(getattr(getattr(spec, "risk_level", None), "value", "")),
             bool(getattr(spec, "requires_approval", False)),
+            getattr(spec, "code_mode_allowed", None),
+            getattr(spec, "code_mode_keep_native", False) is True,
         )
         for spec in specs
     )
@@ -4209,6 +4256,10 @@ def _validated_turn_tool_scope_decision(
     registry,
     active_connector_providers: Iterable[object],
 ) -> TurnToolScopeDecision:
+    decision = replace(decision, **_browser_capture_scope_values({
+        "browser_capture_extent": decision.browser_capture_extent,
+        "browser_capture_request_evidence": decision.browser_capture_request_evidence,
+    }, evidence.current_user_message))
     if decision.evidence_policy == 'retained' and not evidence.context_linked:
         decision = replace(decision, evidence_policy='fresh')
     normalized_current_user_message = " ".join(
@@ -4335,10 +4386,12 @@ def _validated_turn_tool_scope_decision(
             tool_name == "browser_screenshot"
             and (
                 evidence.artifact_requested
+                or tool_name in decision.required_tool_names
                 or (evidence.context_linked and evidence.has_prior_tool_scope("web"))
             )
             and (
                 evidence.has_url_target
+                or (tool_name in decision.required_tool_names and decision.allow_web_tools)
                 or (evidence.context_linked and evidence.has_prior_tool_scope("web"))
             )
         )
@@ -4374,6 +4427,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
+            browser_capture_extent=decision.browser_capture_extent,
+            browser_capture_request_evidence=decision.browser_capture_request_evidence,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
@@ -4403,6 +4458,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
+            browser_capture_extent=decision.browser_capture_extent,
+            browser_capture_request_evidence=decision.browser_capture_request_evidence,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
@@ -4432,6 +4489,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
+            browser_capture_extent=decision.browser_capture_extent,
+            browser_capture_request_evidence=decision.browser_capture_request_evidence,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
@@ -4460,6 +4519,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
+            browser_capture_extent=decision.browser_capture_extent,
+            browser_capture_request_evidence=decision.browser_capture_request_evidence,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
@@ -4492,6 +4553,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             source_artifact_extensions=decision.source_artifact_extensions,
             requested_outcome=decision.requested_outcome,
+            browser_capture_extent=decision.browser_capture_extent,
+            browser_capture_request_evidence=decision.browser_capture_request_evidence,
             evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
@@ -4519,6 +4582,8 @@ def _validated_turn_tool_scope_decision(
         source_artifact_request_evidence=decision.source_artifact_request_evidence,
         source_artifact_extensions=decision.source_artifact_extensions,
         requested_outcome=decision.requested_outcome,
+        browser_capture_extent=decision.browser_capture_extent,
+        browser_capture_request_evidence=decision.browser_capture_request_evidence,
         evidence_policy=decision.evidence_policy,
             tracking_mode=decision.tracking_mode,
         web_action="none" if image_generation_unavailable else decision.web_action,
@@ -4835,7 +4900,7 @@ def build_turn_tool_scope_decision(
         prompt["assistant_no_tool_draft"] = str(assistant_no_tool_draft or "")[:1600]
     system = (
         "Return only a JSON object matching this schema: "
-        '{"requested_outcome":"unspecified|generated_media","evidence_policy":"fresh|retained","tracking_mode":"unspecified|live|recurring|clarify",'
+        '{"browser_capture_extent":"auto|viewport|full_page","browser_capture_request_evidence":"","requested_outcome":"unspecified|generated_media","evidence_policy":"fresh|retained","tracking_mode":"unspecified|live|recurring|clarify",'
         '"web_action":"none|open_url|live_research|browser_interaction",'
         '"research_effort":"standard|extended|exhaustive","research_questions":["material fact required by this request"],'
         '"scheduler_action":"none|inspect|run|mutate","scheduler_toggle_enabled":null,'
@@ -4906,6 +4971,9 @@ def build_turn_tool_scope_decision(
         "For browser workflows that must prove visible page state, include browser_assert_page_state in requested_tool_names when registered. "
         "Internal navigation screenshots are source evidence, not requested output files. Do not add .png requirements merely because browser tools capture screenshots. When the user asks to receive source captures, set source_artifact_delivery_requested=true and source_artifact_request_evidence to an exact quote from user_turn requesting those files; otherwise set the flag false. For user-requested screenshot delivery of a current or prior browser page, include browser_screenshot in requested_tool_names "
         'and ".png" in requested_artifact_extensions when registered. '
+        "Set browser_capture_extent=auto for ordinary website screenshots (viewport) and local document rendering (document auto). "
+        "Select full_page only when the user requests full-page coverage, quoting that request in browser_capture_request_evidence; "
+        "do not select full_page merely because the website scrolls. Use viewport when only the current view is requested. "
         "Use web_action=none when the request can be answered without web/browser tools. "
         "Use scheduler actions only for scheduled-task or reminder control. "
         "For requests to configure, create, change, cancel, or otherwise set up recurring or future scheduled work, "

@@ -195,7 +195,9 @@ def test_source_question_survives_and_numeric_reply_can_continue(tmp_path,monkey
         assert reads==[topic]
 
 
-def test_plain_turns_with_recall_available_do_not_search_or_classify(tmp_path,monkeypatch,record_property):
+@pytest.mark.parametrize('code_mode_enabled', ['off', 'on'])
+def test_plain_turns_with_recall_available_do_not_search_or_classify(tmp_path,monkeypatch,record_property,code_mode_enabled):
+    monkeypatch.setenv('NULLION_CODE_MODE', code_mode_enabled)
     from fastapi.testclient import TestClient
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.web_app import create_app
@@ -227,6 +229,58 @@ def test_plain_turns_with_recall_available_do_not_search_or_classify(tmp_path,mo
     record_property('plain_recall_max_seconds',max(elapsed))
     assert sum(elapsed)/len(elapsed)<.8 and max(elapsed)<1.2
     assert model.calls==3 and not reads
+
+
+@pytest.mark.parametrize('surface', ['api', 'telegram'])
+@pytest.mark.parametrize('prompt', ['Which notebook did you recommend?', 'どのノートを勧めてくれましたか？'])
+def test_native_recall_remains_discoverable_with_code_mode(tmp_path, monkeypatch, surface, prompt):
+    from fastapi.testclient import TestClient
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.web_app import create_app
+    from nullion.chat_operator import handle_chat_operator_message
+    from nullion.config import NullionSettings, TelegramSettings
+    from test_memory_and_document_recall_contract import ScriptedProvider, response, tool
+    monkeypatch.setenv('NULLION_CODE_MODE', 'on')
+    runtime, registry, reads = setup(tmp_path, monkeypatch)
+    runtime.store.add_conversation_event({'event_type':'conversation.chat_turn',
+        'conversation_id':'telegram:90211', 'workspace_id':'workspace_admin',
+        'created_at':'2026-10-01T10:00:00Z', 'turn_id':'earlier-recommendation',
+        'user_message':'Notebook comparison', 'assistant_reply':'I recommended the Orchard notebook, reference NB-42.'})
+    runtime.checkpoint(force=True)
+    class Model(ScriptedProvider):
+        calls = 0
+        def create(self, **kw):
+            protocol = workflow_provider_reply(kw, completion=True)
+            if protocol is not None: return protocol
+            auxiliary = self.auxiliary(kw)
+            if auxiliary is not None: return auxiliary
+            self.calls += 1
+            names = {row['name'] for row in kw.get('tools', [])}
+            assert {'chat_history_search', 'memory_search'} <= names
+            if self.calls == 1:
+                return tool('chat_history_search', {'query':'NB-42', 'limit':3})
+            assert 'NB-42' in json.dumps(kw['messages'])
+            return response('Earlier I recommended the Orchard notebook, reference NB-42.')
+    model = Model()
+    runtime.model_client = model
+    orchestrator = AgentOrchestrator(model_client=model)
+    conversation = 'web:native-recall' if surface == 'api' else 'telegram:90210'
+    if surface == 'api':
+        with TestClient(create_app(runtime, orchestrator, registry)) as client:
+            result = client.post('/api/chat', json={'text':prompt, 'conversation_id':conversation})
+            assert result.status_code == 200, result.text
+            visible = result.json()['text']
+    else:
+        reply = handle_chat_operator_message(runtime, '/chat '+prompt, chat_id='90210',
+            settings=NullionSettings(telegram=TelegramSettings(bot_token='123456:abcdefghijklmnopqrstuvwxyz',
+                operator_chat_id='90210', chat_enabled=True)),
+            agent_orchestrator=orchestrator, allow_mini_agents=False)
+        visible = deliver_telegram(reply)
+    assert 'NB-42' in visible and not reads
+    event = next(row for row in reversed(runtime.store.list_conversation_events(conversation))
+        if row.get('event_type') == 'conversation.chat_turn')
+    assert [row['tool_name'] for row in event['tool_results']] == ['chat_history_search']
+    assert model.calls == 2
 
 
 @pytest.mark.parametrize('case',['latest','ambiguous','reset','other_workspace','unicode','missing'])

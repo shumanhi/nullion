@@ -98,7 +98,7 @@ def test_background_cards_use_saved_chat_visibility_and_keep_terminal_results(tm
     assert len(sent) == 2, sent
     assert 'PLANNER' in sent[0] and '保存された設定' in sent[0], sent
     assert ('file_read' in sent[0]) is enabled, sent
-    assert ('Activity' in sent[0]) is enabled, sent
+    assert ('ACTIVITY LIVE' in sent[0]) is enabled, sent
     assert 'marker-43' not in sent[0], sent
     assert sent[1] == 'Final result: 43.', sent
     assert runtime.store.get_conversation_session_setting(conversation, 'activity_trace_enabled') is enabled

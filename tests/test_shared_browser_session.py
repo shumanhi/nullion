@@ -137,15 +137,15 @@ async def test_failed_reconnect_offers_choices_without_assuming_login_or_switchi
 
 
 @pytest.mark.asyncio
-async def test_cdp_reconnect_retains_other_task_pages_and_refuses_ambiguous_matches(monkeypatch):
+async def test_cdp_reconnect_retains_exact_task_targets_and_refuses_url_only_matches(monkeypatch):
     from types import SimpleNamespace
     from nullion.plugins.browser_plugin.backends.cdp_backend import CDPBackend
     class Page:
-        def __init__(self, url): self.url = url
+        def __init__(self, url, target_id): self.url, self.target_id = url, target_id
         def is_closed(self): return False
     backend = CDPBackend()
-    backend._pages = {'a': Page('https://a.test'), 'b': Page('https://b.test'), 'ambiguous': Page('https://same.test')}
-    pages = [Page('https://a.test'), Page('https://b.test'), Page('https://same.test'), Page('https://same.test')]
+    backend._pages = {'a': Page('https://a.test', 'a'), 'b': Page('https://b.test', 'b'), 'ambiguous': Page('https://same.test', 'gone')}
+    pages = [Page('https://a.test', 'a'), Page('https://b.test', 'b'), Page('https://same.test', 'user-1'), Page('https://same.test', 'user-2')]
     async def connect(): return SimpleNamespace(contexts=[SimpleNamespace(pages=pages)])
     monkeypatch.setattr(backend, '_ensure_browser', connect)
     await backend.reconnect('a')
