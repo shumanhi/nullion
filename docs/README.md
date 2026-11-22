@@ -20,7 +20,7 @@ This docs folder is written for a mixed audience:
 - For commands and setup, use [Commands](commands.md) and
   [Configuration](configuration.md).
 - For time-sensitive monitoring, use [Live tracking](live-tracking.md).
-- For release highlights, see [v0.10.0 release notes](releases/v0.10.0.md).
+- For release highlights, see [v0.11.2 release notes](releases/v0.11.2.md).
 - For contributors, use [Architecture](architecture.md) and
   [Testing](e2e-testing.md).
 
@@ -224,12 +224,14 @@ The same idea is used across web, Telegram, Slack, and Discord:
 
 ## Planner, activity, and background work
 
-Planner cards and verbose activity are separate. The current runtime keeps
-task planner cards enabled; the former planner-feed environment toggles do not
-change this build's behavior. With verbose activity off, cards show their
-request summary and task rows without tool details. With activity on, they
-include compact, deduped tool and mini-agent activity. Final results and
-requested artifacts must still be delivered.
+Planner cards and verbose activity are separate. Use **Settings → Execution →
+Planner cards** to show or hide planned-task cards. The saved setting maps to
+`NULLION_TASK_PLANNER_FEED_MODE=task` or `off`; the default is `task`.
+With planner cards on and verbose activity off, cards show their request
+summary and task rows without tool details. With activity on, they include
+compact, deduped tool and mini-agent activity. Activity can also be shown when
+planner cards are off. Final results and requested artifacts must still be
+delivered with either setting.
 
 Use `/planner <message>` when you want a request to run through the explicit
 step-by-step planner path. It is not a visibility toggle; it starts a planned

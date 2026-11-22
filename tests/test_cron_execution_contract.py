@@ -34,6 +34,8 @@ def test_scope_selects_exact_writes_and_cache_invalidates_on_task_or_permissions
             self.count += 1
             payload = json.loads(kw['messages'][0]['content'][0]['text'])
             assert payload['available_structured_write_tools'][0]['name'] == 'schedule_add'
+            assert set(payload['scheduler_delivery_channels']) == {'web','telegram','slack','discord'}
+            assert 'delivery outside those channels' in kw['system']
             return {'content':[{'type':'text','text':json.dumps({'requires_account_connector':True,
                 'provider_ids':['skill_pack_connector_records'], 'confidence':0.99,
                 'write_tool_names':['schedule_add'], 'delivery_mode':'report_each_run'})}]}

@@ -13,6 +13,7 @@ import re
 import time
 
 from nullion.chat_attachments import is_supported_chat_file
+from nullion.run_activity import task_planner_feed_enabled
 from nullion.config import NullionSettings, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.events import make_event
@@ -38,8 +39,10 @@ from nullion.messaging_runtime import build_messaging_runtime_service_from_setti
 from nullion.operator_commands import is_stop_command_text
 from nullion.platform_activity import (
     PlatformTaskCardStore,
+    deliver_platform_status_parts,
     deliver_platform_task_status_update,
     platform_activity_capabilities,
+    split_platform_status_text,
 )
 from nullion.chat_operator import activity_trace_enabled_for_chat
 from nullion.session_stop import stop_session_async, stop_session_reply
@@ -307,26 +310,38 @@ async def _deliver_slack_task_status(
     status_locks: dict[tuple[str, str], asyncio.Lock],
     planner_feed_enabled: bool,
     include_activity: bool,
+    terminal: bool = False,
 ) -> bool:
-    async def _send_new(target_id: str, rendered_text: str) -> object | None:
-        formatted = _format_slack_reply(rendered_text)
-        try:
-            response = await client.chat_postMessage(channel=target_id, text=formatted)
+    async def _publish(target_id: str, rendered_text: str) -> bool:
+        async def send_part(part):
+            try:
+                response = await client.chat_postMessage(channel=target_id, text=part)
+            except Exception as exc:
+                if _slack_response_field(getattr(exc, 'response', None), 'ok') is False:
+                    return None  # An explicit SDK rejection did not create a message.
+                raise
             if not _slack_response_ok(response):
                 return None
-            return _slack_response_field(response, "ts")
-        except Exception:
-            logger.debug("Slack task card delivery failed", exc_info=True)
-            return None
+            identity = _slack_response_field(response, 'ts')
+            if identity is None:
+                raise UnconfirmedDelivery()
+            return identity
+        async def edit_part(handle, part):
+            return await _update_slack_message(client, channel=target_id, ts=str(handle), text=part)
+        async def delete_part(handle):
+            response = client.chat_delete(channel=target_id, ts=str(handle))
+            if inspect.isawaitable(response):
+                response = await response
+            return _slack_response_ok(response)
+        return await deliver_platform_status_parts(messages=status_messages, key=(target_id, group_id),
+            parts=[_format_slack_reply(part) for part in split_platform_status_text(rendered_text, limit=39000)],
+            send_part=send_part, edit_part=edit_part, delete_part=delete_part)
+
+    async def _send_new(target_id: str, rendered_text: str) -> object | None:
+        return status_messages.get((target_id, group_id)) if await _publish(target_id, rendered_text) else None
 
     async def _edit_existing(existing: object, target_id: str, rendered_text: str) -> bool:
-        ts = str(existing or "").strip()
-        return bool(ts) and await _update_slack_message(
-            client,
-            channel=target_id,
-            ts=ts,
-            text=_format_slack_reply(rendered_text),
-        )
+        return await _publish(target_id, rendered_text)
 
     return await deliver_platform_task_status_update(
         target_id=channel,
@@ -342,6 +357,7 @@ async def _deliver_slack_task_status(
         include_activity=include_activity,
         send_new=_send_new,
         edit_existing=_edit_existing,
+        terminal=terminal,
     )
 
 
@@ -468,7 +484,7 @@ async def _download_slack_attachments(
             except Exception:
                 logger.warning("Could not download Slack attachment", exc_info=True)
                 continue
-            saved = save_messaging_attachment(
+            saved = await asyncio.to_thread(save_messaging_attachment,
                 filename=filename,
                 data=response.content,
                 media_type=mimetype or response.headers.get("content-type"),
@@ -792,11 +808,15 @@ async def run_slack_app(
                 task_card_store=_task_card_store,
                 status_messages=_status_messages,
                 status_locks=_status_locks,
-                planner_feed_enabled=True,
+                planner_feed_enabled=task_planner_feed_enabled(),
                 include_activity=activity_trace_enabled_for_chat(service.runtime, chat_id=conversation_id),
+                terminal=bool(kwargs.get("terminal")),
             )
         outbound_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
-        return await send_slack_platform_delivery(bot_token=bot_token, channel=channel, text=outbound_text)
+        sent = await send_slack_platform_delivery(bot_token=bot_token, channel=channel, text=outbound_text)
+        if kwargs.get("is_final"):
+            _task_card_store.clear(target_id=channel, group_id=str(kwargs.get("group_id") or ""))
+        return sent
 
     if getattr(service, "agent_orchestrator", None) is not None and hasattr(service.agent_orchestrator, "set_deliver_fn"):
         service.agent_orchestrator.set_deliver_fn(_slack_deliver_fn)

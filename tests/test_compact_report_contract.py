@@ -210,3 +210,14 @@ def test_required_content_title_survives_an_enclosing_delivery_title():
     message,_,_=report_fixture();message.update(title='Exact requested report title',title_is_required=True)
     body=render_report_message(message,include_title=False,preferences=Preferences())
     assert 'Exact requested report title' in body and '$720' in body
+
+@pytest.mark.parametrize('summary', ['HTML report emailed successfully.', 'HTMLレポートを送信しました。', 'Informe HTML enviado.'])
+def test_account_decoration_renders_report_before_adding_icon(summary):
+    from nullion.response_sanitizer import _prefix_account_tool_reply, sanitize_user_visible_reply
+    message, _, _ = report_fixture()
+    message['summary'] = summary
+    raw = json.dumps({'format': REPORT_MESSAGE_FORMAT, 'message': message})
+    assert _prefix_account_tool_reply(raw, []) == raw
+    from nullion.messaging_adapters import _sanitize_platform_visible_text
+    visible = _sanitize_platform_visible_text(raw)
+    assert summary in visible and REPORT_MESSAGE_FORMAT not in visible

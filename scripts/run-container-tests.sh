@@ -43,8 +43,7 @@ if [[ ${#pytest_args[@]} -eq 0 ]]; then
   exit 2
 fi
 if [[ "${NULLION_TEST_COVERAGE:-0}" == 1 ]]; then
-  python -m coverage run --source=src/nullion -m pytest -q "${pytest_args[@]}"
-  python -m coverage report --fail-under=70
+  bash scripts/run-unit-coverage.sh "${pytest_args[@]}"
 else
   if [[ "${NULLION_E2E_BATCH_FILES:-0}" -gt 0 ]]; then
     export NULLION_E2E_BATCH_EVIDENCE=/outputs/batches

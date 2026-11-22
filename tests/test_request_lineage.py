@@ -142,3 +142,27 @@ def test_completion_review_uses_same_verified_goal_as_native_execution(original)
     assert _completion_review_original_request(state)==execution_request(context,state['user_message'])
     assert original in _completion_review_original_request(state)
     assert _completion_review_original_request({'user_message':'new','tool_flow_context':{'user_request':original}})=='new'
+
+
+def test_recent_browser_capture_only_follows_selected_ancestry():
+    from time import time
+    from tests.test_browser_capture_reuse_contract import capture
+    from nullion.source_observation_contract import compact_source_observations
+
+    store, turn, rows = fixture()
+    url = "https://example.com/results"
+
+    def result(identity, price):
+        return {"tool_name": "browser_run_task", "status": "completed", "invocation_id": identity,
+                "output": compact_source_observations(capture(url, time(), price), retain_result_page=True)}
+
+    rows[0]["tool_results"] = [result("selected", "$20")]
+    rows.append({**rows[-1], "turn_id": "unrelated", "tool_results": [result("unrelated", "$70")]})
+    snapshot = selected_request_context(store, turn, "workspace-a")["browser_snapshot"]
+    assert snapshot["source_invocation_id"] == "selected"
+    assert snapshot["page"]["text"] == "$20\nOtra opción $35"
+
+    turn.disposition = D.REVISE
+    assert selected_request_context(store, turn, "workspace-a")["browser_snapshot"]["source_invocation_id"] == "selected"
+    turn.disposition = D.INTERRUPT
+    assert "browser_snapshot" not in (selected_request_context(store, turn, "workspace-a") or {})

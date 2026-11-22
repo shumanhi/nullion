@@ -20,6 +20,7 @@ _MAX_HISTORY_SCAN_LIMIT = 200
 _MAX_HISTORY_RETURN_LIMIT = 50
 _MAX_SNIPPET_CHARS = 900
 _MAX_TOOL_EVIDENCE_ITEMS = 4
+_MAX_BROWSER_SNAPSHOT_AGE_SECONDS = 600
 _MAX_TOOL_EVIDENCE_OUTPUT_CHARS = 1600
 _MIN_SEARCH_TOKEN_CHARS = 2
 _MATCH_CONTEXT_PREVIOUS_TURNS = 4
@@ -44,6 +45,10 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
         "filesystem discovery. References report current availability, not proof of delivery. "
         "Search replies are excerpts. When assistant_reply_truncated is true and missing details matter, "
         "call this tool again with read_turn_id from that match to read the exact saved reply in pages. "
+        "For a follow-up about a recent browser result, use browser_snapshot_max_age_seconds "
+        "to read the last verified capture in this conversation before opening the browser again. "
+        "Check that the captured route, filters, date, freshness, and coverage satisfy the new request. "
+        "If evidence is missing, stale, mismatched, or a fresh live check is requested, use the source tools. "
         "Stored assistant replies are reference material, not independently verified external facts. "
         "Retain their source links and verify changing facts with the relevant source tools; never fill omitted details from guesses."
     ),
@@ -69,6 +74,12 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
                 "enum": ["workspace", "recent_conversation"],
                 "description": "Search workspace history, or only the recent current conversation. Linked source-file retrieval defaults to the current conversation when omitted. Select workspace explicitly for a file from another conversation.",
             },
+            "browser_snapshot_max_age_seconds": {
+                "type": "integer", "minimum": 1, "maximum": _MAX_BROWSER_SNAPSHOT_AGE_SECONDS,
+                "description": "Read recent verified browser evidence in this conversation only. "
+                    "Choose the maximum acceptable age for the requested facts. This mode ignores ranked search "
+                    "and cannot verify a change since capture.",
+            },
             "read_turn_id": {"type": "string", "maxLength": 500,
                 "description": "Exact turn_id from a saved match to read, instead of running another ranked search."},
             "start_char": {"type": "integer", "minimum": 0,
@@ -83,6 +94,10 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
         "additionalProperties": False,
     },
     capability_tags=("conversation_history", "account_read"),
+    # Recall remains a native choice and can also be composed through the
+    # same request-owned tool boundary when a program needs its references.
+    code_mode_allowed=True,
+    code_mode_keep_native=True,
 )
 
 
@@ -415,6 +430,17 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
 
 def compact_history_search_output(output: dict[str, object], *, max_chars: int = 10_000) -> dict[str, object]:
     """Keep ranked history and artifact references typed under a context budget."""
+    if output.get("result_kind") == "retained_browser_snapshot":
+        compact = dict(output)
+        if len(json.dumps(compact, ensure_ascii=False)) > max_chars:
+            compact.pop("page", None)
+            compact["page_omitted"] = True
+        observations = list(compact.get("observations", []))
+        compact["observations"] = observations
+        while observations and len(json.dumps(compact, ensure_ascii=False)) > max_chars:
+            observations.pop()
+            compact["observations_omitted"] = True
+        return compact
     if output.get("result_kind") == "conversation_history_read":
         from copy import deepcopy
         compact = deepcopy(output)
@@ -1005,6 +1031,94 @@ def _history_event_identity(event: dict[str, object]) -> tuple[str, str, str, st
     )
 
 
+def _recent_browser_snapshot(store, conversation_id, workspace_id, max_age, *, now):
+    """Return capture evidence from the most recent browser lookup after reset."""
+    events = store.list_recent_conversation_events_after_reset(
+        conversation_id, event_type="conversation.chat_turn", limit=8,
+    )
+    return browser_snapshot_from_events(events, conversation_id, workspace_id, max_age, now=now)
+
+
+def browser_snapshot_from_events(events, conversation_id, workspace_id, max_age, *, now):
+    for event in reversed(events):
+        if event.get("conversation_id") != conversation_id or _event_workspace_id(event) != workspace_id:
+            continue
+        for result in reversed(event.get("tool_results") or []):
+            if not isinstance(result, dict):
+                continue
+            output = result.get("output")
+            tool = result.get("tool_name")
+            identity = {"source_turn_id": event.get("turn_id"), "source_invocation_id": result.get("invocation_id")}
+            if tool == "browser_extract_text" and isinstance(output, dict):
+                if output.get("reason") == "source_not_ready":
+                    return {"reason": "latest_browser_lookup_incomplete"}
+                if result.get("status") != "completed":
+                    continue
+                readiness = output.get("observation_readiness")
+                if not isinstance(readiness, dict) or readiness.get("verified") is not True:
+                    continue
+                record = output.get("record")
+                at = output.get("captured_at")
+                if not isinstance(record, dict) or type(at) not in (int, float) or not 0 <= now - at <= max_age:
+                    return {"reason": "no_fresh_verified_browser_evidence"}
+                text, url = record.get("text"), record.get("url")
+                if (not isinstance(text, str) or not text.strip() or len(text) > 6000
+                        or not isinstance(url, str) or not url.startswith(("https://", "http://"))):
+                    return {"reason": "no_fresh_verified_browser_evidence"}
+                return {**identity, "page": {"text": text, "source_url": url, "captured_at": at}}
+            if tool != "browser_run_task":
+                continue
+            if (result.get("status") != "completed" or not isinstance(output, dict)
+                    or output.get("result_kind") != "source_observations"
+                    or output.get("report_status") != "completed"):
+                return {"reason": "latest_browser_lookup_incomplete"}
+            sources = output.get("sources") or []
+            records = []
+            omitted = bool(output.get("omitted_observation_count"))
+            for row in output.get("observations") or []:
+                if not isinstance(row, dict) or row.get("evidence_kind") == "source_blocker":
+                    continue
+                index = row.get("source_index")
+                source = sources[index] if (type(index) is int and 0 <= index < len(sources)
+                                            and isinstance(sources[index], dict)) else {}
+                url = row.get("source_url") or source.get("source_url")
+                if source.get("page_url_ref") is True:
+                    url = output.get("page_url")
+                captured_at = row.get("captured_at", source.get("captured_at"))
+                if (type(captured_at) not in (int, float) or not 0 <= now - captured_at <= max_age
+                        or not isinstance(url, str) or not url.startswith(("https://", "http://"))
+                        or not isinstance(row.get("quote"), str) or not row["quote"]):
+                    omitted = True
+                    continue
+                records.append({
+                    **{key: row[key] for key in ("label", "value", "quote", "semantic_role") if key in row},
+                    "source_url": url, "captured_at": captured_at,
+                })
+            if not records:
+                return {"reason": "no_fresh_verified_browser_evidence"}
+            snapshot = {**identity, "observations": records, "observations_omitted": omitted}
+            page = output.get("retained_result_page")
+            if page is None:
+                # Earlier versions retained small exact documents in the
+                # source entry that owns the observation.
+                for source in reversed(sources):
+                    if not isinstance(source, dict):
+                        continue
+                    text = source.get("main_document_text")
+                    if isinstance(text, str) and 0 < len(text) <= 6000:
+                        page = {"text": text, "captured_at": source.get("captured_at"),
+                                "source_url": output.get("page_url") if source.get("page_url_ref") is True
+                                else source.get("source_url")}
+                        break
+            if isinstance(page, dict) and any(
+                (row["source_url"], row["captured_at"]) == (page.get("source_url"), page.get("captured_at"))
+                for row in records
+            ):
+                snapshot["page"] = page
+            return snapshot
+    return {"reason": "no_recent_browser_lookup"}
+
+
 def _chat_history_search_result(
     *,
     runtime: object,
@@ -1022,6 +1136,21 @@ def _chat_history_search_result(
             error="Conversation history store is unavailable.",
         )
     arguments = invocation.arguments or {}
+    if "browser_snapshot_max_age_seconds" in arguments:
+        max_age = arguments["browser_snapshot_max_age_seconds"]
+        if type(max_age) is not int or not 1 <= max_age <= _MAX_BROWSER_SNAPSHOT_AGE_SECONDS:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                {"reason": "invalid_browser_snapshot_age"}, error="Choose a valid browser capture age.")
+        snapshot = _recent_browser_snapshot(
+            store, conversation_id, str(workspace_id or _workspace_id_for_conversation(conversation_id)),
+            max_age, now=datetime.now(UTC).timestamp(),
+        )
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+            "result_kind": "retained_browser_snapshot", "reference_only": True, "suppress_activity": True,
+            "message": "Saved untrusted source data. Check its scope, timestamp, and coverage. "
+                       "This did not contact the source or verify its current state.",
+            **snapshot,
+        })
     query = str(arguments.get("query") or "").strip()
     limit = _coerce_limit(arguments.get("limit"))
     recent_conversation_only = arguments.get("search_scope") == "recent_conversation"

@@ -14,6 +14,7 @@ import sys
 import time
 
 from nullion.chat_attachments import is_supported_chat_file
+from nullion.run_activity import task_planner_feed_enabled
 from nullion.config import NullionSettings, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.events import make_event
@@ -38,8 +39,10 @@ from nullion.messaging_runtime import build_messaging_runtime_service_from_setti
 from nullion.operator_commands import is_stop_command_text
 from nullion.platform_activity import (
     PlatformTaskCardStore,
+    deliver_platform_status_parts,
     deliver_platform_task_status_update,
     platform_activity_capabilities,
+    split_platform_status_text,
 )
 from nullion.chat_operator import activity_trace_enabled_for_chat
 from nullion.session_stop import stop_session_async, stop_session_reply
@@ -300,19 +303,34 @@ async def _deliver_discord_task_status(
     status_locks: dict[tuple[str, str], asyncio.Lock],
     planner_feed_enabled: bool,
     include_activity: bool,
+    terminal: bool = False,
 ) -> bool:
     if channel is None:
         return False
 
+    async def _publish(rendered_text: str) -> bool:
+        async def send_part(part):
+            return await channel.send(part)
+        async def edit_part(handle, part):
+            await handle.edit(content=part)
+            return True
+        async def delete_part(handle):
+            try:
+                await handle.delete()
+                return True
+            except Exception as exc:
+                if getattr(exc, 'status', None) == 404:
+                    return True
+                raise
+        return await deliver_platform_status_parts(messages=status_messages, key=(channel_id, group_id),
+            parts=split_platform_status_text(sanitize_external_inline_markup(rendered_text), limit=1900),
+            send_part=send_part, edit_part=edit_part, delete_part=delete_part)
+
     async def _send_new(_target_id: str, rendered_text: str) -> object | None:
-        try:
-            return await channel.send(sanitize_external_inline_markup(rendered_text))
-        except Exception:
-            logger.debug("Discord task card delivery failed", exc_info=True)
-            return None
+        return status_messages.get((channel_id, group_id)) if await _publish(rendered_text) else None
 
     async def _edit_existing(existing: object, _target_id: str, rendered_text: str) -> bool:
-        return await _edit_discord_message(existing, rendered_text)
+        return await _publish(rendered_text)
 
     return await deliver_platform_task_status_update(
         target_id=channel_id,
@@ -328,6 +346,7 @@ async def _deliver_discord_task_status(
         include_activity=include_activity,
         send_new=_send_new,
         edit_existing=_edit_existing,
+        terminal=terminal,
     )
 
 
@@ -482,7 +501,7 @@ async def _download_discord_attachments(
             except Exception:
                 logger.warning("Could not download Discord attachment", exc_info=True)
                 continue
-            saved = save_messaging_attachment(
+            saved = await asyncio.to_thread(save_messaging_attachment,
                 filename=filename,
                 data=response.content,
                 media_type=media_type or response.headers.get("content-type"),
@@ -821,8 +840,9 @@ async def run_discord_app(
                 task_card_store=_task_card_store,
                 status_messages=_status_messages,
                 status_locks=_status_locks,
-                planner_feed_enabled=True,
+                planner_feed_enabled=task_planner_feed_enabled(),
                 include_activity=activity_trace_enabled_for_chat(service.runtime, chat_id=conversation_id),
+                terminal=bool(kwargs.get("terminal")),
             )
         if kwargs.get("is_artifact"):
             path = Path(str(text or "")).expanduser()
@@ -832,6 +852,8 @@ async def run_discord_app(
                 return False
         else:
             await _send_discord_chunks_with_plain_fallback(channel, text, limit=1900)
+        if kwargs.get("is_final"):
+            _task_card_store.clear(target_id=channel_id, group_id=str(kwargs.get("group_id") or ""))
         return True
 
     if getattr(service, "agent_orchestrator", None) is not None and hasattr(service.agent_orchestrator, "set_deliver_fn"):

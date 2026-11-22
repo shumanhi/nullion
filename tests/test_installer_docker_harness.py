@@ -268,7 +268,10 @@ def test_installer_smokes_cover_update_rollback_on_each_os() -> None:
 
 def test_installer_smoke_documents_desktop_tray_limit() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    normalized = " ".join(readme.split())
+    developer_guide = (ROOT / "docs" / "e2e-testing.md").read_text(encoding="utf-8")
+    normalized = " ".join(developer_guide.split())
 
-    assert "GUI, browser, install, and web tests stay inside the container" in readme
-    assert "desktop tray visibility" in normalized
+    assert "(docs/e2e-testing.md)" in readme
+    assert "checks run in containers or CI runners" in normalized
+    assert "Actual desktop tray visibility requires an interactive desktop session" in normalized
+    assert "not proven by headless checks" in normalized

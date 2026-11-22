@@ -37,6 +37,7 @@ def _make_spec(
     source_artifact_only: bool = False,
     capability_tags: tuple[str, ...] = (),
     observation_setup_tools: tuple[str, ...] = (),
+    observation_requires_setup: bool = False,
     observation_repair_parameters: tuple[str, ...] = (),
     observation_inline_setup_tools: tuple[str, ...] = (),
     context_argument_bindings: tuple[tuple[str, str], ...] = (),
@@ -65,6 +66,7 @@ def _make_spec(
         source_artifact_only=source_artifact_only,
         capability_tags=capability_tags,
         observation_setup_tools=observation_setup_tools,
+        observation_requires_setup=observation_requires_setup,
         observation_repair_parameters=observation_repair_parameters,
         observation_inline_setup_tools=observation_inline_setup_tools,
         context_argument_bindings=context_argument_bindings,
@@ -176,7 +178,7 @@ def register_browser_tools(
         registry.register(
             _make_spec(
                 "browser_run_task",
-                "Delegate adaptive browser interaction and dynamic multi-step forms to Browser Use. Prefer lightweight readers such as browser_read_pages, web_fetch and web_search for known URLs and public-page research. Request browser_run_task in both tool_names and required_tool_names to delegate. Select this tool by exact name in both tool_names and required_tool_names through request_tool_scope only when delegating a full visual workflow. An optional tool_names entry does not launch or expose this several-minute worker; ordinary web research retains lightweight readers. If a dynamic workflow needs delegation later, request its exact required scope then. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. In Auto/CDP mode it uses the configured managed browser and its existing login. If this controller cannot attach, continue with ordinary browser tools on that same session; never replace it with a fresh browser. Explicit Playwright mode uses separate workspace-owned browser state and cannot borrow a managed-browser login. For an explicitly requested visual navigation task with screenshots, scope this tool; do not require a separate capture tool. Reuses the configured model. Use browser_read_pages first for readable pages and comparisons of known URLs. Delegate when captured page state establishes that adaptive interaction is needed; do not turn every comparison into a full visual workflow. Do not duplicate the same form workflow with a long low-level tool sequence before delegating it. For long pages, use captured-text query search to locate required rows. A verified no-result condition within the user's exact constraints is an outcome; do not broaden to different locations or constraints without permission. For readable public pages, use navigation and structured extraction directly; do not start a full visual worker just to read ordinary text or collect image URLs. When a visual workflow genuinely needs multiple sources, use one coherent multi-page objective rather than separate full workers for each source. Stop when the requested observations are captured and avoid optional detail exploration. Delegate only outcomes needed for the original user objective; do not make extra detail or a preferred intermediate source mandatory. For open-ended research, choose accessible, substantiated candidates before deep exploration; replace a blocked optional candidate instead of exhausting full workers on it. Preserve subjects and sources explicitly required by the user. Does not book or purchase. May take several minutes.",
+                "Delegate adaptive browser interaction and dynamic multi-step forms to Browser Use. Prefer lightweight readers such as browser_read_pages, web_fetch and web_search for known URLs and public-page research. Request browser_run_task in both tool_names and required_tool_names to delegate. Select this tool by exact name in both tool_names and required_tool_names through request_tool_scope only when delegating a full visual workflow. An optional tool_names entry does not launch or expose this several-minute worker; ordinary web research retains lightweight readers. If a dynamic workflow needs delegation later, request its exact required scope then. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. In Auto/CDP mode it uses the configured managed browser and its existing login. If this controller cannot attach, continue with ordinary browser tools on that same session; never replace it with a fresh browser. Explicit Playwright mode uses separate workspace-owned browser state and cannot borrow a managed-browser login. For an explicitly requested visual navigation task with screenshots, scope this tool; do not require a separate capture tool. Reuses the configured model. Use browser_read_pages first for readable pages and comparisons of known URLs. When captured page state or a registered recipe establishes stable controls, use a verified code_mode sequence of the scoped native browser tools. Check each prerequisite and the resulting page; stop the sequence at an unknown state. Delegate when captured page state establishes that adaptive interaction is needed; do not turn every comparison into a full visual workflow. Do not duplicate the same form workflow with a long low-level tool sequence before delegating it. For long pages, use captured-text query search to locate required rows. A verified no-result condition within the user's exact constraints is an outcome; do not broaden to different locations or constraints without permission. For readable public pages, use navigation and structured extraction directly; do not start a full visual worker just to read ordinary text or collect image URLs. When a visual workflow genuinely needs multiple sources, use one coherent multi-page objective rather than separate full workers for each source. Stop when the requested observations are captured and avoid optional detail exploration. Delegate only outcomes needed for the original user objective; do not make extra detail or a preferred intermediate source mandatory. For open-ended research, choose accessible, substantiated candidates before deep exploration; replace a blocked optional candidate instead of exhausting full workers on it. Preserve subjects and sources explicitly required by the user. Does not book or purchase. May take several minutes.",
                 risk=ToolRiskLevel.MEDIUM, side_effect=ToolSideEffectClass.WRITE, timeout=650,
                 continuation_tools=("browser_run_task", "web_search", "web_fetch"),
                 source_artifact_extensions=(".png",),
@@ -200,6 +202,7 @@ def register_browser_tools(
                         "description":"Required for adaptive_interaction. Identify the observed control, visual state or native access failure and the requested interaction it requires; more research alone is not sufficient."}},
                     "required": ["task", "url"], "additionalProperties": False},
             ), browser_task_handler(model_client_getter, effective_policy, mode_getter=tools.session_browser_mode,
+                                    connection_getter=tools.session_browser_connection,
                                     read_preflight=tools.browser_task_read_preflight),
         )
 
@@ -347,9 +350,15 @@ def register_browser_tools(
                 "browser_wait_for",
                 "browser_assert_page_state",
             ),
+            observation_setup_tools=("browser_navigate", "browser_wait_for"),
+            observation_inline_setup_tools=("browser_wait_for",),
+            observation_repair_parameters=("ready_selector", "ready_text"),
+            observation_requires_setup=True,
             code_mode_allowed=True,
             input_schema=_object_schema(
                 {
+                    "ready_selector": {"type": "string", "minLength": 1, "maxLength": 500, "description": "Observed source-content selector to wait for before each read and background poll."},
+                    "ready_text": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Observed stable source-content label to wait for before each read and background poll."},
                     "max_elements": {
                         "type": "integer",
                         "minimum": 1,
@@ -379,6 +388,7 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
             observation_setup_tools=("browser_navigate",),
+            observation_requires_setup=True,
             observation_repair_parameters=("selector",),
             context_argument_bindings=(("session_id", "browser_session_id"),),
             continuation_tools=("browser_extract_detail", "browser_run_js", "browser_image_collect"),
@@ -423,9 +433,15 @@ def register_browser_tools(
             timeout=10,
             continuation_tools=("browser_assert_page_state", "browser_snapshot", "browser_find", "browser_navigate",
                 "browser_click_element", "browser_click_id", "browser_image_collect", "browser_screenshot"),
+            observation_setup_tools=("browser_navigate", "browser_wait_for"),
+            observation_inline_setup_tools=("browser_wait_for",),
+            observation_repair_parameters=("ready_selector", "ready_text"),
+            observation_requires_setup=True,
             code_mode_allowed=True,
             input_schema=_object_schema(
                 {
+                    "ready_selector": {"type": "string", "minLength": 1, "maxLength": 500, "description": "Observed source-content selector to wait for before each read and background poll."},
+                    "ready_text": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Observed stable source-content label to wait for before each read and background poll."},
                     "selector": {
                         "type": "string",
                         "description": (
@@ -536,6 +552,7 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
             observation_setup_tools=("browser_navigate", "browser_wait_for"),
+            observation_requires_setup=True,
             observation_inline_setup_tools=("browser_wait_for",),
             observation_repair_parameters=("ready_selector", "ready_text"),
             context_argument_bindings=(("session_id", "browser_session_id"),),
@@ -567,7 +584,9 @@ def register_browser_tools(
             "browser_screenshot",
             "Capture a web page or populated local document as PNG. about:blank is valid after rendering content; untouched empty tabs need content or navigation first. Return the artifact path. "
             "Defaults to auto mode. Use viewport for ordinary chat screenshots; use full_page only when "
-            "the user explicitly asks for the whole page.",
+            "the user explicitly asks for the whole page. Attach the verified image and still answer any "
+            "requested instructions, recommendations, or other text in the final reply. If the PDF viewer is blank, "
+            "retry with the exact pdf_url from the failure receipt to render the source document.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
@@ -579,7 +598,9 @@ def register_browser_tools(
                         "type": "string",
                         "enum": ["auto", "viewport", "full_page"],
                         "description": "Screenshot mode. Defaults to auto.",
-                    }
+                    },
+                    "pdf_url": {"type": "string", "maxLength": 4000,
+                                "description": "Exact already-loaded public PDF URL from a blank-capture receipt. Enables a boundary-checked fetch and local render."},
                 }
             ),
         ),

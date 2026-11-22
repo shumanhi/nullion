@@ -34,6 +34,21 @@ class ApprovalRequest:
     decision_reason: str | None = None
 
 
+def requires_exact_tool_review(approval: ApprovalRequest | None) -> bool:
+    if approval is None or approval.action != "use_tool":
+        return False
+    context = approval.context or {}
+    adapter = context.get("adapter_approval_context")
+    arguments = context.get("tool_arguments")
+    return (
+        approval.resource == "email_send"
+        or (isinstance(arguments, dict) and isinstance(arguments.get("saved_tool"), dict))
+        or context.get("decision_mode") == "once"
+        or context.get("tool_permission_scope") == "exact_invocation"
+        or isinstance(adapter, dict) and adapter.get("tool_permission_scope") == "exact_invocation"
+    )
+
+
 @dataclass(slots=True)
 class PermissionGrant:
     grant_id: str

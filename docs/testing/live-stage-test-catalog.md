@@ -6,13 +6,13 @@ This is a coverage catalogue, not an execution-status record. Redundant entry po
 
 ## Counts
 
-The complete source inventory contains **296 potential parameterized entries** across 48 files and 149 test functions, with all 75 API scenarios explicitly selected.
+The complete source inventory contains **303 potential parameterized entries** across 51 files and 156 test functions, with all 75 API scenarios explicitly selected.
 
 The earlier 276-case combined selection was a particular run selection, not the whole repository inventory. An empty API scenario selection is a skipped placeholder, not a real workflow. A pytest case can contain several requests or scenarios; counts are not model-call counts.
 
 | Execution type | Entries | Meaning |
 | --- | ---: | --- |
-| `live_workflow` | 273 | A running stage workflow that can consume model or tool quota. One case may send multiple chat requests. |
+| `live_workflow` | 280 | A running stage workflow that can consume model or tool quota. One case may send multiple chat requests. |
 | `saved_replay` | 14 | Stage UI/history/byte checks of saved evidence; no new test-initiated model or source work. |
 | `local_harness` | 9 | Deterministic local fixture/control checks; no real stage/provider workflow. |
 | `aggregate_entry_point` | 0 | An alternative multi-scenario entry point; do not combine it with individual scenario cases. |
@@ -22,10 +22,10 @@ The earlier 276-case combined selection was a particular run selection, not the 
 | Category | Entries | Coverage |
 | --- | ---: | --- |
 | `latency` — Plain chat and latency | 14 | First-response timing, model-call counts, startup and ordinary-turn fast paths. |
-| `context` — Context, memory and retained evidence | 33 | Follow-ups, profile facts, history, numbered choices, compaction and exact retained references. |
+| `context` — Context, memory and retained evidence | 35 | Follow-ups, profile facts, history, numbered choices, compaction and exact retained references. |
 | `research` — Research and source accuracy | 47 | Search coverage, bounded research, recommendations, prices, source links and missing facts. |
-| `browser` — Browser lifecycle and recovery | 21 | Desktop attachment, navigation, screenshots, native delegation, owned tabs and recovery. |
-| `artifacts` — Files and generated deliverables | 59 | Document creation, format fidelity, selected versions, downloadable bytes and artifact reuse. |
+| `browser` — Browser lifecycle and recovery | 25 | Desktop attachment, navigation, screenshots, native delegation, owned tabs and recovery. |
+| `artifacts` — Files and generated deliverables | 60 | Document creation, format fidelity, selected versions, downloadable bytes and artifact reuse. |
 | `execution` — Code Mode and terminal execution | 17 | Programs, host modules, projections, reusable tools, unsupported imports and terminal outcomes. |
 | `scheduler` — Scheduled jobs and live trackers | 43 | Owned job changes, cancellation, finite lifetimes, conditions, alert delivery and saved-run recovery. |
 | `consent` — Account access and approvals | 32 | Source consent, read-only account boundaries, explicit choices and action approvals. |
@@ -63,6 +63,7 @@ Historical timing records retain their original test IDs. These migrations do no
 - **missing-public-fact**: API and Web check related incomplete-source behavior. Prefer the affected surface; retain source proof and exactly-once rendering assertions.
 - **capture-language-variants**: Shared runner and setup, distinct English/Japanese/Arabic prompts. Retain multilingual coverage; choose one for routine capture smoke.
 - **archive-transform-and-retry**: Shared archive fixture runner, different workbook columns and forbidden-retry assertions. Not duplicates; retain both for the affected paths.
+- **explicit-and-implicit-independent-recall**: Both seed and archive synthetic context, then verify independent native history retrieval without account reads. The first explicitly requests saved history and checks no artifact delivery; the second uses an implicit recall prompt to cover native recall visibility with Code Mode. Keep both distinct ingress/context contracts; do not treat either receipt as a fresh run of the other.
 
 ## Saved selection policy
 
@@ -141,6 +142,7 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[artifact_context_followup]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_independent_memory_and_history_recall_contract` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_native_recall_with_code_mode` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_code_mode.py::test_live_same_pdf_keeps_its_bytes_and_thread_identity` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_code_mode.py::test_live_stage_recent_production_run_regressions` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_code_mode.py::test_live_stage_large_transfer_after_numeric_choice` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
@@ -159,6 +161,7 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[recent_context_artifact_reuse_chain]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[artifact_context_followup]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[ambiguous_report_reference]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_web_pdf_flow.py::test_live_web_code_mode_recalls_original_pdf_with_native_reference_receipt` | 1 | `live_workflow` | NULLION_LIVE_CODEMODE_RECALL_SOURCE, NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_image_bytes_and_followup_keep_selected_subject` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_checks_contradicted_premise_before_actions` | 2 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 
@@ -217,6 +220,9 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_context_capture_recovery]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_context_capture_recovery_variant]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_page_screenshot_artifact_delivery]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_browser_capture_reuse.py::test_recent_train_results_do_not_reopen_browser` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_browser_capture_reuse.py::test_native_sequence_on_stage` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_browser_capture_reuse.py::test_adaptive_capture_followup_on_stage` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_chat_contracts.py::test_live_stage_text_lookup_keeps_browser_evidence_internal` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_code_mode.py::test_live_stage_read_only_code_mode` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_code_mode.py::test_live_stage_inline_read_recovery_stays_in_one_program` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
@@ -228,6 +234,7 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | `tests/e2e/test_live_stage_repair_budget_contract.py::test_live_stage_keeps_answer_after_two_failed_waits` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_batched_research.py::test_live_visual_page_and_text_use_shared_production_and_generic_preparation` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_batched_research.py::test_live_screenshot_followup_keeps_the_current_page_context` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_web_capture_extent.py::test_live_web_ordinary_capture_is_viewport_and_plain_turns_stay_fast` | 1 | `live_workflow` | NULLION_LIVE_CAPTURE_REPLAY, NULLION_LIVE_CAPTURE_SOURCE, NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_followups.py::test_live_web_stop_releases_owned_browser_and_next_lookup_completes` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_followups.py::test_live_web_single_page_sdk_lookup_returns_verified_values` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[browser_continuation_registry_guard]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
@@ -293,6 +300,7 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[archive_download_extract_manifest]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[archive_tool_fallback_followup_chain]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_output_continuation.py::test_live_web_negotiated_output_keeps_goal_and_delivers_generated_png` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_web_pdf_flow.py::test_live_web_pdf_report_flows_without_clipping_or_large_gaps` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_producer_generation.py::test_live_web_primary_xlsx_has_all_twenty_rows` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_reasoning.py::test_live_stage_web_generated_text_delivers_exact_bytes_once` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_trip_completion.py::test_trip_research_completes_with_source_progress_and_verified_pdf` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E, NULLION_LIVE_TRIP_REPLAY_PROMPT |

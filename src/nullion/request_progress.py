@@ -16,7 +16,8 @@ PROGRESS_KIND = 'request_progress'
 OPERATION_KIND = 'operation_progress'
 _PROGRESS_PHASE_IDS = frozenset({'prepare', 'source', 'operation', 'phase-check-task-state',
     'phase-load-memory', 'phase-check-attachments', 'phase-select-tools', 'phase-build-context',
-    'phase-start-model', 'phase-process-results', 'phase-prepare-artifacts', 'phase-save-conversation'})
+    'phase-start-model', 'phase-process-results', 'phase-prepare-artifacts', 'phase-save-conversation',
+    'phase-resume-approval'})
 SOURCE_ACTIVITY_PHASES = {
     'reading_pages': 'Reading pages.',
     'reviewing_captured_evidence': 'Reviewing captured page details.',
@@ -33,6 +34,7 @@ TOOL_ACTIVITY_PHASES = {
     'browser_click_id': ('Opening the selected page control.', 'Checking the updated page.'),
     'browser_click_element': ('Opening the selected page control.', 'Checking the updated page.'),
     'browser_run_js': ('Working with the current page.', 'Reviewing page results.'),
+    'email_send': ('Sending the approved email.', 'Checking email delivery.'),
     'code_mode': ('Working through the next steps.', 'Reviewing step results.'),
     'browser_navigate': ('Opening a page.', 'Reviewing page details.'),
     'browser_read_pages': ('Reading pages.', 'Reviewing page details.'),
@@ -56,7 +58,11 @@ def tool_operation_progress(result, spec):
     if spec is None:
         return None
     status = normalize_tool_status(result.status)
-    if result.status == 'approval_required':
+    output = result.output if isinstance(result.output, dict) else {}
+    approval_id = output.get('approval_id')
+    pending_approval = (status == 'denied' and output.get('requires_approval') is True
+        and isinstance(approval_id, str) and bool(approval_id.strip()))
+    if result.status == 'approval_required' or pending_approval:
         status = 'approval_required'
     elif status == 'nonterminal':
         status = 'running'
@@ -179,6 +185,7 @@ class RequestProgress:
         from nullion.chat_text import WORKING_ACK_SUMMARY
         phases = {
             'prepare': WORKING_ACK_SUMMARY,
+            'phase-resume-approval': 'Continuing the approved action.',
             'phase-check-task-state': 'Checking task context.',
             'phase-load-memory': 'Loading saved context.',
             'phase-check-attachments': 'Checking attachments.',
@@ -230,6 +237,28 @@ class RequestProgress:
             self.last_text = text
             self.callback({'id': 'request-progress', 'label': 'Progress', 'status_kind': PROGRESS_KIND,
                 'status': 'running', 'text': text, 'completion_scope': 'operation', 'phase_id':self.phase_id})
+
+
+def approval_resume_progress(activity_callback, registry):
+    """Use the same native phase and tool facts as a regular chat turn."""
+    if activity_callback is None:
+        return {}, lambda: None
+    progress = RequestProgress(activity_callback)
+
+    def report_tool(result):
+        try:
+            spec = registry.get_spec(result.tool_name)
+        except KeyError:
+            return
+        event = tool_operation_progress(result, spec)
+        if event:
+            progress.emit(event)
+
+    progress.emit({'id': 'phase-resume-approval', 'label': 'Continuing the approved action', 'status': 'running'})
+    return {
+        'foreground_event_callback': progress.emit,
+        'tool_result_callback': report_tool,
+    }, lambda: progress.emit({'id': 'phase-save-conversation', 'label': 'Finishing your response', 'status': 'running'})
 
 
 class RequestProgressDelivery:

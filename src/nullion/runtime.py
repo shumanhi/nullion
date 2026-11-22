@@ -582,6 +582,7 @@ class PersistentRuntime:
         boundary_kind: BoundaryKind | None = None,
         expires_at: datetime | None = None,
         reason: str | None = None,
+        decision_mode: str | None = None,
     ) -> ApprovalRequest:
         approval = approve_approval_request(
             self.store,
@@ -595,6 +596,7 @@ class PersistentRuntime:
             boundary_kind=boundary_kind,
             expires_at=expires_at,
             reason=reason,
+            decision_mode=decision_mode,
         )
         self.checkpoint()
         return approval
@@ -2073,9 +2075,14 @@ def _add_permission_grant_replacing_active_duplicates(
     actor: str,
     revoked_at: datetime,
 ) -> list[PermissionGrant]:
+    from nullion.approvals import requires_exact_tool_review
+
+    if requires_exact_tool_review(store.get_approval_request(grant.approval_id)):
+        store.add_permission_grant(grant)
+        return []
     replaced: list[PermissionGrant] = []
     for existing in store.list_permission_grants():
-        if existing.grant_id == grant.grant_id:
+        if existing.grant_id == grant.grant_id or requires_exact_tool_review(store.get_approval_request(existing.approval_id)):
             continue
         if existing.principal_id != grant.principal_id or existing.permission != grant.permission:
             continue
@@ -2215,21 +2222,17 @@ def _pending_approval_already_covered(
 ) -> bool:
     if _approval_status_value(getattr(approval, "status", None)) != ApprovalStatus.PENDING.value:
         return False
-    # Reviewed, invocation-specific actions require an explicit decision.
-    # A broad tool grant cannot substitute for the separate deletion review.
-    if approval.request_kind == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
-        return False
-    context = approval.context if isinstance(approval.context, dict) else {}
-    adapter_context = context.get("adapter_approval_context")
-    if context.get("tool_permission_scope") == "exact_invocation" or (
-        isinstance(adapter_context, dict) and adapter_context.get("tool_permission_scope") == "exact_invocation"
-    ):
+    from nullion.approvals import requires_exact_tool_review
+
+    if approval.request_kind == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND or requires_exact_tool_review(approval):
         return False
     permissions = set(_approval_permission_candidates(approval))
     if permissions:
         principal_ids = _principal_aliases_for_permission(approval.requested_by)
         for grant in store.list_permission_grants():
-            if grant.principal_id in principal_ids and grant.permission in permissions and is_permission_grant_active(grant, now=now):
+            if (grant.principal_id in principal_ids and grant.permission in permissions
+                    and not requires_exact_tool_review(store.get_approval_request(grant.approval_id))
+                    and is_permission_grant_active(grant, now=now)):
                 return True
     if approval.request_kind != "boundary_policy" and approval.action != "allow_boundary":
         return False
@@ -2294,6 +2297,7 @@ def reconcile_effectively_approved_pending_approvals(
 
 
 class _ApprovalDecisionState(TypedDict, total=False):
+    decision_mode: str | None
     store: RuntimeStore
     approval_id: str
     actor: str
@@ -2329,6 +2333,8 @@ def _approval_decision_transition_node(state: _ApprovalDecisionState) -> dict[st
         decided_at=datetime.now(UTC),
         reason=state.get("reason"),
     )
+    if updated.status is ApprovalStatus.APPROVED and state.get("decision_mode"):
+        updated = replace(updated, context={**(updated.context or {}), "decision_mode": state["decision_mode"]})
     state["store"].add_approval_request(updated)
     ctx = updated.context if isinstance(updated.context, dict) else {}
     context_tool_name = ctx.get("tool_name") if isinstance(ctx.get("tool_name"), str) else None
@@ -2507,6 +2513,9 @@ def _compiled_approval_decision_graph():
     return graph.compile()
 
 
+_APPROVAL_DECISION_LOCK = threading.RLock()
+
+
 def _approve_or_deny_approval_request(
     store: RuntimeStore,
     approval_id: str,
@@ -2522,24 +2531,27 @@ def _approve_or_deny_approval_request(
     boundary_always_allow_selector: str | None = None,
     boundary_kind: BoundaryKind | None = None,
     expires_at: datetime | None = None,
+    decision_mode: str | None = None,
 ) -> ApprovalRequest:
-    final_state = _compiled_approval_decision_graph().invoke(
-        {
-            "store": store,
-            "approval_id": approval_id,
-            "actor": actor,
-            "transition": transition,
-            "event_type": event_type,
-            "reason": reason,
-            "principal_id": principal_id,
-            "permissions": tuple(permissions),
-            "boundary_allow_once_selector": boundary_allow_once_selector,
-            "boundary_allow_once_uses": boundary_allow_once_uses,
-            "boundary_always_allow_selector": boundary_always_allow_selector,
-            "boundary_kind": boundary_kind,
-            "expires_at": expires_at,
-        }
-    )
+    with _APPROVAL_DECISION_LOCK:
+        final_state = _compiled_approval_decision_graph().invoke(
+            {
+                "store": store,
+                "approval_id": approval_id,
+                "actor": actor,
+                "transition": transition,
+                "event_type": event_type,
+                "reason": reason,
+                "principal_id": principal_id,
+                "permissions": tuple(permissions),
+                "boundary_allow_once_selector": boundary_allow_once_selector,
+                "boundary_allow_once_uses": boundary_allow_once_uses,
+                "boundary_always_allow_selector": boundary_always_allow_selector,
+                "boundary_kind": boundary_kind,
+                "expires_at": expires_at,
+                "decision_mode": decision_mode,
+            }
+        )
     updated = final_state.get("updated")
     if isinstance(updated, ApprovalRequest):
         return updated
@@ -2559,6 +2571,7 @@ def approve_approval_request(
     boundary_kind: BoundaryKind | None = None,
     expires_at: datetime | None = None,
     reason: str | None = None,
+    decision_mode: str | None = None,
 ) -> ApprovalRequest:
     return _approve_or_deny_approval_request(
         store,
@@ -2574,6 +2587,7 @@ def approve_approval_request(
         boundary_always_allow_selector=boundary_always_allow_selector,
         boundary_kind=boundary_kind,
         expires_at=expires_at,
+        decision_mode=decision_mode,
     )
 
 

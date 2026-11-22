@@ -61,7 +61,7 @@ from nullion.plugins.browser_plugin import browser_use_adapter as adapter
 from nullion.plugins.browser_plugin import browser_use_worker as worker
 job=json.loads(Path(sys.argv[-2]).read_text())
 Path(MARKER).write_text(str(os.getpid()))
-async def sdk_read(task,client,principal_id,policy,timeout,progress_callback=None,browser_mode="configured",tab_lease_path=None):
+async def sdk_read(task,client,principal_id,policy,timeout,progress_callback=None,browser_mode="configured",tab_lease_path=None,browser_connection=None):
     async def stubborn():
         while True:
             try:await asyncio.sleep(60)

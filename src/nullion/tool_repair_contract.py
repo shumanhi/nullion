@@ -97,6 +97,14 @@ def tool_repair_kind(result: object) -> str | None:
         tools = recovery.get("required_tool_names")
         if isinstance(tools, list) and tools and all(isinstance(name, str) and name.strip() for name in tools):
             return kind
+    if (kind == "correct_arguments" and output.get("reason") == "blank_browser_capture"
+            and getattr(result, "tool_name", None) == "browser_screenshot"):
+        arguments = recovery.get("retry_arguments")
+        constraints = recovery.get("argument_constraints")
+        if (isinstance(arguments, Mapping) and isinstance(constraints, Mapping)
+                and isinstance(output.get("page_url"), str) and arguments.get("pdf_url") == output["page_url"]
+                and constraints.get("pdf_url") == {"const": output["page_url"]}):
+            return kind
     if kind == "correct_arguments" and output.get("reason") in ("invalid_tool_arguments", "invalid_output_paths", "inventory_changed", "source_not_ready"):
         constraints = recovery.get("argument_constraints")
         if isinstance(constraints, Mapping) and constraints:

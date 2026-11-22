@@ -17,6 +17,7 @@ import errno
 from enum import Enum
 from fnmatch import fnmatch
 import hashlib
+import glob
 import html
 from html import unescape
 from html.parser import HTMLParser
@@ -72,6 +73,8 @@ from nullion.approvals import (
     create_approval_request,
     is_boundary_permit_active,
     is_permission_grant_active,
+    ApprovalStatus,
+    requires_exact_tool_review,
     revoke_permission_grant as revoke_permission_grant_record,
 )
 from nullion.audit import make_audit_record
@@ -571,6 +574,8 @@ class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
     max_redirections = _WEB_FETCH_MAX_REDIRECTS
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if getattr(req, "_nullion_disallow_redirects", False):
+            return None
         old = urlparse(req.full_url)
         parsed = urlparse(newurl)
         if parsed.scheme not in {"http", "https"} or (old.scheme == "https" and parsed.scheme != "https"):
@@ -1242,18 +1247,55 @@ def _email_html_body_from_invocation(invocation: ToolInvocation) -> str:
         trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
     )
     if resolved is None:
-        resolved = Path(_resolve_virtual_workspace_path(html_path, principal_id=invocation.principal_id)).expanduser()
+        # Preview preparation runs before boundary approval. A denied path must
+        # never be copied into an owned artifact and exposed by the review card.
+        raise PermissionError("HTML source is outside the permitted workspace or approved filesystem paths")
     if not resolved.exists() or not resolved.is_file():
         raise FileNotFoundError(f"HTML path does not exist or is not a file: {html_path}")
-    return resolved.read_text(encoding="utf-8", errors="ignore").strip()
+    return _read_email_source(invocation, html_path, resolved).decode("utf-8", "ignore").strip()
 
 
-def _email_html_preview_path_for_invocation(invocation: ToolInvocation) -> str | None:
+
+def _read_email_source(invocation: ToolInvocation, selector: str, path: Path) -> bytes:
+    from hashlib import sha256
+
+    data = path.read_bytes()
+    reviewed = invocation.reviewed_email_files
+    if reviewed is not None and reviewed.get(selector) != sha256(data).hexdigest():
+        raise ValueError("An email source file changed after review. The email was not sent. Review a fresh draft.")
+    return data
+
+
+def _email_source_selectors(invocation: ToolInvocation) -> list[str]:
+    arguments = invocation.arguments
+    html_path = str(arguments.get("html_path") or "").strip()
+    paths = _string_list_argument(arguments.get("attachment_paths"))
+    return ([html_path] if html_path and not str(arguments.get("html_body") or "").strip() else []) + paths
+
+
+def _capture_email_review(invocation: ToolInvocation) -> tuple[dict[str, str], str]:
+    from hashlib import sha256
+
+    paths = _email_source_selectors(invocation)
+    html_path = str(invocation.arguments.get("html_path") or "").strip()
+    inline_html = str(invocation.arguments.get("html_body") or "").strip()
+    html_body = inline_html
+    digests = {}
+    roots = _principal_workspace_file_roots(invocation.principal_id)
+    for selector in dict.fromkeys(paths):
+        resolved = _resolve_local_workspace_file_input(selector, principal_id=invocation.principal_id,
+            effective_roots=roots, trusted_filesystem_selectors=invocation.trusted_filesystem_selectors)
+        if resolved is None:
+            raise PermissionError("Email source needs file access before review.")
+        data = resolved.read_bytes()
+        digests[selector] = sha256(data).hexdigest()
+        if not inline_html and selector == html_path:
+            html_body = data.decode("utf-8", "ignore").strip()
+    return digests, html_body
+
+def _email_html_preview_path_for_invocation(invocation: ToolInvocation, *, reviewed_html: str | None = None) -> str | None:
     try:
-        html_path = str(invocation.arguments.get("html_path") or "").strip()
-        if html_path:
-            return html_path
-        html_body = str(invocation.arguments.get("html_body") or "").strip()
+        html_body = _email_html_body_from_invocation(invocation) if reviewed_html is None else reviewed_html
         if not html_body:
             return None
         from nullion.artifacts import artifact_path_for_generated_workspace_file, normalize_html_document
@@ -1562,6 +1604,7 @@ class ToolSpec:
     # Adapter-declared READ prerequisites for replaying a prepared observation
     # in another process. Tool output alone never grants this authority.
     observation_setup_tools: tuple[str, ...] = ()
+    observation_requires_setup: bool = False
     observation_repair_parameters: tuple[str, ...] = ()
     context_argument_bindings: tuple[tuple[str, str], ...] = ()
     # Committed effects may reuse their receipt during same-request recovery.
@@ -1596,6 +1639,9 @@ class ToolSpec:
     independent_batch: tuple[str, str] | tuple[()] = ()
     batch_item_required_fields: tuple[str, ...] = ()
     independent_batch_validator: Callable[..., bool] | None = None
+    # Presentation only: keep a scoped native choice visible while also
+    # allowing programs to compose it. Execution still uses native policy.
+    code_mode_keep_native: bool = False
 
 
 @dataclass(slots=True)
@@ -1610,6 +1656,7 @@ class ToolInvocation:
     # Runtime-owned progress channel, never serialized into model arguments or
     # approval state. Adapters report counts, not source text or internal notes.
     progress_callback: Callable[[dict[str, object]], None] | None = field(default=None, repr=False, compare=False)
+    reviewed_email_files: dict[str, str] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -2404,6 +2451,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "type": "integer", "minimum": 1, "maximum": 500,
                     "description": "Set when the requested output has an exact page count. The actual PDF is checked; overflow is a repairable failure, never silently truncated.",
                 },
+                "pagination": {
+                    "type": "string", "enum": ["flow", "pages"],
+                    "description": "flow packs sections naturally at readable size (default). pages preserves intentional section/page boundaries. An exact expected_page_count or media_alignment=align_pages defaults to pages. Long content may continue onto extra pages; it is never shrunk to force a fit.",
+                },
                 "output_path": {
                     "type": "string",
                     "description": "Destination .pdf path. If omitted, Nullion creates one in the artifact directory.",
@@ -2412,9 +2463,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Existing content image artifact paths to place into the PDF, one image per page. "
-                        "When paired with text_pages, provide text_pages in the same order so each page's text "
-                        "matches the corresponding image. Browser screenshot artifacts must be supplied through screenshot_paths."
+                        "Existing content image artifact paths. Image-only PDFs place one image per page. "
+                        "With text_pages, match image and text section indices; sections flow unless pagination=pages. "
+                        "For authored HTML that already contains images, explicitly reference every supplied image by local path. "
+                        "Browser screenshot artifacts must be supplied through screenshot_paths."
                     ),
                 },
                 "screenshot_paths": {
@@ -2429,10 +2481,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "minItems": 1,
                     "items": {"type": "string"},
                     "description": (
-                        "Report text or Markdown pages to render into the PDF with extractable text, formatted headings/tables, and clickable URL links. "
+                        "Report text or Markdown sections to render into the PDF with extractable text, formatted headings/tables, and clickable URL links. "
                         "For reports/tables/cards that include names, prices, citations, listing links, or other "
                         "readable content, put that content here; image_paths alone creates an image-only PDF. "
-                        "For multi-item reports with images, prefer one text page per image in matching order. "
+                        "For compact multi-record reports use flowing sections. Match each supplied image to its text section by array order; use media_alignment=align_pages only for intentional separate image pages. "
                         "The generated PDF uses a report-quality layout profile; do not use browser screenshots as a substitute for readable report content."
                     ),
                 },
@@ -2441,13 +2493,13 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "minItems": 1,
                     "items": {"type": "string"},
                     "description": (
-                        "Optional static HTML page fragments for designed PDFs that need custom visual layout, real tables, "
+                        "Optional static HTML section fragments for designed PDFs that need custom visual layout, real tables, "
                         "cards, columns, image grids, or stronger styling than the default report text layout. "
                         "Use semantic HTML/CSS with readable text; scripts are ignored. "
                         "Complete self-contained SVG markup and SVG image data are supported. Reuse the exact "
                         "saved HTML content and artwork when converting an existing HTML design to PDF. "
                         "Use text_pages for plain report PDFs and html_pages for intentionally designed PDFs. "
-                        "Keep CSS compact and use content-driven sizing rather than large fixed-height cards. "
+                        "Sections flow together by default; set pagination=pages only for intentional page boundaries. Keep CSS compact and use content-driven sizing rather than large fixed-height cards. "
                         "Images retain their full frame by default; mark decorative cropped art with data-nullion-crop='true'. "
                         "Rendered previews are returned for visual review in the next normal model pass."
                     ),
@@ -2463,10 +2515,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "type": "string",
                     "enum": ["auto", "align_pages", "preserve_text_pages"],
                     "description": (
-                        "Controls how text_pages and media are paired. Use preserve_text_pages by default. "
-                        "Use align_pages when each image/screenshot should share a page with its matching text section. "
-                        "Use preserve_text_pages when the requested layout intentionally keeps the supplied text pages unchanged, "
-                        "including one-page reports that contain multiple images."
+                        "Controls typed text/media association, separately from physical pagination. preserve_text_pages (default) keeps "
+                        "the supplied text sections grouped, including a section with multiple images. "
+                        "align_pages explicitly pairs media with matching text sections and defaults pagination to pages. "
+                        "Long content may continue onto another page; no content is clipped or shrunk to force alignment."
                     ),
                 },
                 "title": {
@@ -3163,15 +3215,21 @@ def _terminal_filesystem_safety_denial(
     if unknown_workspace_denial is not None:
         return unknown_workspace_denial
 
-    for index, token in enumerate(tokens):
-        if token != "find":
+    from nullion.tool_boundaries import _shell_lexemes, _shell_segments, _shell_command_words, _strip_shell_wrappers
+    for segment in _shell_segments(_shell_lexemes(command)):
+        words, _redirects = _shell_command_words(segment)
+        words = _strip_shell_wrappers(words)
+        if not words or Path(words[0].value).name.lower() != "find":
             continue
-        path_tokens = _find_path_tokens(tokens[index + 1 :])
+        path_tokens = _find_path_tokens(words[1:])
         if not path_tokens:
             path_tokens = ["."]
-        maxdepth = _find_maxdepth(tokens[index + 1 :])
-        for raw_path in path_tokens:
-            normalized_path = _normalize_find_root(raw_path, home=home)
+        maxdepth = _find_maxdepth([word.value for word in words[1:]])
+        for path_token in path_tokens:
+            raw_path = path_token.value if hasattr(path_token, "value") else path_token
+            literal = getattr(path_token, "quoted", False) and not getattr(path_token, "dynamic", False)
+            normalized_path = (str(Path(raw_path).resolve(strict=False)) if literal
+                else _normalize_find_root(raw_path, home=home))
             if normalized_path in broad_root_variants:
                 return {
                     "reason": "filesystem_traversal_denied",
@@ -3299,7 +3357,9 @@ def _terminal_filesystem_mutation_approval_denial(
         if fact.operation not in _TERMINAL_MUTATION_BOUNDARY_OPERATIONS:
             continue
         try:
-            raw_target = Path(str(fact.target)).expanduser()
+            raw_target = Path(str(fact.target))
+            if not fact.attributes.get("shell_quoted_literal"):
+                raw_target = raw_target.expanduser()
             target_path = raw_target if raw_target.is_absolute() else (execution_cwd or Path.cwd()) / raw_target
             resolved_target = target_path.resolve()
         except OSError:
@@ -3323,23 +3383,53 @@ def _terminal_filesystem_mutation_approval_denial(
     return None
 
 
-def _terminal_resolved_filesystem_target(fact, *, execution_cwd: Path | None) -> str:
+def _terminal_resolved_filesystem_target(fact, *, execution_cwd: Path | None, preserve_final_symlink=False) -> str:
+    if fact.attributes.get("target_resolution") in {"shell_expansion_required", "shell_parse_required"}:
+        return str(fact.attributes.get("shell_expression") or fact.target)
     try:
-        raw_target = Path(str(fact.target)).expanduser()
+        raw_target = Path(str(fact.target))
+        if not fact.attributes.get("shell_quoted_literal"):
+            raw_target = raw_target.expanduser()
         target_path = raw_target if raw_target.is_absolute() else (execution_cwd or Path.cwd()) / raw_target
-        return str(target_path.resolve())
+        return str(target_path.parent.resolve() / target_path.name) if preserve_final_symlink else str(target_path.resolve())
     except OSError:
-        return str(Path(str(fact.target)).expanduser())
+        fallback = Path(str(fact.target))
+        return str(fallback if fact.attributes.get("shell_quoted_literal") else fallback.expanduser())
 
 
-def _terminal_resolved_target_text(raw_target: object, *, execution_cwd: Path | None) -> str:
+def _terminal_resolved_target_text(raw_target: object, *, execution_cwd: Path | None, preserve_final_symlink=False, expand_user=True) -> str:
     try:
-        raw_text = str(raw_target or "").strip().strip("'\"")
-        raw_path = Path(raw_text).expanduser()
+        raw_text = str(raw_target or "")
+        raw_path = Path(raw_text)
+        if expand_user:
+            raw_path = raw_path.expanduser()
         target_path = raw_path if raw_path.is_absolute() else (execution_cwd or Path.cwd()) / raw_path
-        return str(target_path.resolve())
+        return str(target_path.parent.resolve() / target_path.name) if preserve_final_symlink else str(target_path.resolve())
     except OSError:
-        return str(Path(str(raw_target or "")).expanduser())
+        fallback = Path(str(raw_target or ""))
+        return str(fallback.expanduser() if expand_user else fallback)
+
+
+def _terminal_shell_preflight_failure(invocation: ToolInvocation, *, execution_cwd: Path | None = None) -> dict[str, object] | None:
+    """Unsupported shell syntax is a correction request, never a path grant."""
+    if invocation.tool_name != "terminal_exec":
+        return None
+    unresolved = [dict(fact.attributes, target=fact.target) for fact in extract_boundary_facts(invocation)
+        if fact.kind is BoundaryKind.FILESYSTEM_ACCESS and fact.attributes.get("target_resolution")
+        in {"shell_expansion_required", "shell_parse_required"}]
+    unresolved.extend(target for target in _terminal_delete_targets_for_invocation(invocation, execution_cwd=execution_cwd)
+        if target.get("target_resolution") in {"shell_expansion_required", "shell_parse_required"}
+        and not any(row.get("shell_expression") == target.get("shell_expression") for row in unresolved))
+    if not unresolved:
+        return None
+    reason = str(unresolved[0].get("failure_reason") or "terminal_target_resolution_required")
+    return {"reason": reason, "executed": False, "command_executed": False,
+        "requires_approval": False, "retryable": True,
+        "unresolved_targets": [str(row.get("shell_expression") or row.get("target")) for row in unresolved],
+        "recovery": {"kind": "correct_arguments", "retry_tool_name": "terminal_exec",
+            "approval_bypass": False, "argument_constraints": {"field": "command",
+                "filesystem_targets": "literal paths or supported selection patterns"},
+            "instruction": "The command did not execute. Resolve dynamic filesystem paths in a separate read-only step, then retry with explicit paths and supported shell syntax. Normal approvals and policy still apply."}}
 
 
 def _terminal_shell_tokens(command: str) -> list[str]:
@@ -3348,43 +3438,56 @@ def _terminal_shell_tokens(command: str) -> list[str]:
 
 
 def _terminal_find_delete_targets(command: str, *, execution_cwd: Path | None) -> tuple[dict[str, object], ...]:
-    tokens = _terminal_shell_tokens(command)
+    from nullion.tool_boundaries import _shell_lexemes, _shell_segments, _shell_command_words, _strip_shell_wrappers, _shell_operands
     targets: list[dict[str, object]] = []
-    control_tokens = {";", "&&", "||", "|"}
-    expression_starters = {"(", "!", "-name", "-iname", "-path", "-ipath", "-type", "-mtime", "-mmin", "-maxdepth", "-mindepth"}
-    for index, token in enumerate(tokens):
-        if Path(str(token).strip("'\"")).name.lower() != "find":
+    expression_starters = {"(", "!"}
+    for segment in _shell_segments(_shell_lexemes(command)):
+        words, _redirects = _shell_command_words(segment)
+        words = _strip_shell_wrappers(words)
+        if not words or Path(words[0].value).name.lower() != "find":
             continue
-        segment: list[str] = []
-        for candidate in tokens[index + 1 :]:
-            if candidate in control_tokens:
-                break
-            segment.append(candidate)
-        if "-delete" not in segment and not any(
-            item == "-exec"
-            and any(Path(str(part).strip("'\"")).name.lower() in {"rm", "rm.exe", "rmdir", "rmdir.exe"} for part in segment[pos + 1 :])
-            for pos, item in enumerate(segment)
-        ):
+        arguments = words[1:]
+        # These native find options precede its starting points, not its
+        # expression. Preserve the actual search scope after them.
+        while arguments and arguments[0].value in {"-H", "-L", "-P"}:
+            arguments = arguments[1:]
+        deleting = any(item.value == "-delete" for item in arguments)
+        for index, item in enumerate(arguments):
+            if item.value not in {"-exec", "-execdir", "-ok", "-okdir"}:
+                continue
+            nested = []
+            for candidate in arguments[index + 1:]:
+                if candidate.value in {";", "+"}:
+                    break
+                nested.append(candidate)
+            nested = _strip_shell_wrappers(nested)
+            if (nested and Path(nested[0].value).name.lower() in {"rm", "rm.exe", "rmdir", "rmdir.exe"}
+                    and any(operand.value == "{}" for operand in _shell_operands(nested[1:]))):
+                deleting = True
+        if not deleting:
             continue
-        raw_roots: list[str] = []
-        for item in segment:
-            if item in expression_starters or item.startswith("-"):
+        roots = []
+        for item in arguments:
+            if item.value in expression_starters or item.value.startswith("-"):
                 break
-            raw_roots.append(item)
-        if not raw_roots:
-            raw_roots = ["."]
-        for raw_root in raw_roots:
+            roots.append(item)
+        selection = " ".join(item.raw for item in arguments[len(roots):])
+        if not roots:
+            targets.append({"target": _terminal_resolved_target_text(".", execution_cwd=execution_cwd),
+                "operation": "delete", "command_family": "find", "target_kind": "search_scope", "selection": selection})
+        for root in roots:
+            dynamic = root.dynamic
             targets.append({
-                "target": _terminal_resolved_target_text(raw_root, execution_cwd=execution_cwd),
-                "operation": "delete",
-                "command_family": "find",
-                "target_kind": "search_scope",
-                "selection": " ".join(segment[len(raw_roots):]),
+                "target": root.raw if dynamic else _terminal_resolved_target_text(root.value,
+                    execution_cwd=execution_cwd, expand_user=False),
+                "operation": "delete", "command_family": "find", "target_kind": "search_scope", "selection": selection,
+                **({"target_resolution": "shell_expansion_required", "shell_expression": root.raw} if dynamic else {}),
+                **({"shell_quoted_literal": True} if root.quoted else {}),
             })
     return tuple(targets)
 
 
-def _terminal_script_delete_targets(command: str, *, execution_cwd: Path | None) -> tuple[dict[str, object], ...]:
+def _terminal_script_delete_targets(command: str, *, execution_cwd: Path | None, preserve_final_symlink=False) -> tuple[dict[str, object], ...]:
     lowered = str(command or "").lower()
     if not any(marker in lowered for marker in _TERMINAL_DESTRUCTIVE_SCRIPT_MARKERS):
         return ()
@@ -3404,7 +3507,8 @@ def _terminal_script_delete_targets(command: str, *, execution_cwd: Path | None)
         raw_paths = [str(execution_cwd)]
     return tuple(
         {
-            "target": _terminal_resolved_target_text(raw_path, execution_cwd=execution_cwd),
+            "target": _terminal_resolved_target_text(raw_path, execution_cwd=execution_cwd,
+                preserve_final_symlink=preserve_final_symlink, expand_user=False),
             "operation": "delete",
             "command_family": "script",
         }
@@ -3416,10 +3520,12 @@ def _terminal_supplemental_delete_targets(
     command: str,
     *,
     execution_cwd: Path | None,
+    preserve_final_symlink=False,
 ) -> tuple[dict[str, object], ...]:
     return (
         *_terminal_find_delete_targets(command, execution_cwd=execution_cwd),
-        *_terminal_script_delete_targets(command, execution_cwd=execution_cwd),
+        *_terminal_script_delete_targets(command, execution_cwd=execution_cwd,
+            preserve_final_symlink=preserve_final_symlink),
     )
 
 
@@ -3427,15 +3533,18 @@ def _terminal_delete_targets_for_invocation(
     invocation: ToolInvocation,
     *,
     execution_cwd: Path | None,
+    preserve_final_symlink=False,
 ) -> tuple[dict[str, object], ...]:
     targets: list[dict[str, object]] = []
     seen: set[str] = set()
     for fact in extract_boundary_facts(invocation):
         if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
             continue
-        if fact.operation != "delete":
+        unresolved = fact.attributes.get("target_resolution") in {"shell_expansion_required", "shell_parse_required"}
+        if fact.operation != "delete" and not unresolved:
             continue
-        target = _terminal_resolved_filesystem_target(fact, execution_cwd=execution_cwd)
+        target = _terminal_resolved_filesystem_target(fact, execution_cwd=execution_cwd,
+            preserve_final_symlink=preserve_final_symlink)
         if target in seen:
             continue
         seen.add(target)
@@ -3443,10 +3552,18 @@ def _terminal_delete_targets_for_invocation(
             "target": target,
             "operation": fact.operation,
             "command_family": fact.attributes.get("command_family"),
+            **({key: fact.attributes[key] for key in ("target_resolution", "shell_expression", "shell_quoted_literal")
+                if key in fact.attributes}),
         })
     raw_command = invocation.arguments.get("command")
     if isinstance(raw_command, str) and raw_command.strip():
-        for target in _terminal_supplemental_delete_targets(raw_command, execution_cwd=execution_cwd):
+        from nullion.tool_boundaries import _ShellParseError
+        try:
+            supplemental = _terminal_supplemental_delete_targets(raw_command, execution_cwd=execution_cwd,
+                preserve_final_symlink=preserve_final_symlink)
+        except _ShellParseError:
+            supplemental = ()  # The typed unresolved fact above owns recovery.
+        for target in supplemental:
             target_path = str(target.get("target") or "")
             if not target_path or target_path in seen:
                 continue
@@ -3469,6 +3586,79 @@ def _terminal_execution_cwd_from_registry(registry: object) -> Path | None:
         if resolved.is_dir():
             return resolved
     return None
+
+
+def _terminal_delete_observations(invocation: ToolInvocation, *, execution_cwd: Path | None) -> list[dict[str, object]]:
+    """Observe approved target identities; never interpret stdout as deletion proof."""
+    observations = []
+    # Consent keeps canonical targets. Unlink observations instead name the
+    # selected directory entry: deleting a symlink does not delete its referent.
+    for target in _terminal_delete_targets_for_invocation(invocation, execution_cwd=execution_cwd,
+            preserve_final_symlink=True):
+        path = str(target.get('target') or '')
+        if not path or target.get('target_kind') == 'search_scope':
+            continue
+        row = {'path':path, 'present_before':None, 'size_bytes_before':None}
+        if target.get('target_resolution') in {'shell_expansion_required', 'shell_parse_required'}:
+            row['target_resolution'] = target['target_resolution']
+            observations.append(row)
+            continue
+        try:
+            metadata = Path(path).lstat()
+            row['present_before'] = True
+            if stat.S_ISREG(metadata.st_mode):
+                row['size_bytes_before'] = metadata.st_size
+        except FileNotFoundError:
+            # A missing literal is observable absence. An unresolved shell
+            # pattern does not establish absence of its possible matches.
+            row['present_before'] = False if target.get('shell_quoted_literal') or glob.escape(path)==path else None
+        except OSError:
+            pass
+        observations.append(row)
+    return observations
+
+
+def _terminal_delete_receipt(observations: list[dict[str, object]]) -> dict[str, object] | None:
+    if not observations:
+        return None
+    changes = []
+    for before in observations:
+        row = dict(before)
+        if row.get('target_resolution') in {'shell_expansion_required', 'shell_parse_required'}:
+            row.update(present_after=None, status='unconfirmed')
+            changes.append(row)
+            continue
+        try:
+            Path(str(row['path'])).lstat()
+            row['present_after'] = True
+        except FileNotFoundError:
+            row['present_after'] = False
+        except OSError:
+            row['present_after'] = None
+        row['status'] = ('deleted' if row['present_before'] is True and row['present_after'] is False
+            else 'already_absent' if row['present_before'] is False and row['present_after'] is False
+            else 'unconfirmed')
+        changes.append(row)
+    deleted = sum(row['status']=='deleted' for row in changes)
+    unconfirmed = sum(row['status']=='unconfirmed' for row in changes)
+    if deleted:
+        summary = f"Deleted {deleted} path{'s' if deleted != 1 else ''}."
+        if unconfirmed:
+            summary += f" Deletion of {unconfirmed} other target{'s' if unconfirmed != 1 else ''} was not confirmed."
+    elif unconfirmed:
+        summary = 'Deletion was not confirmed.'
+    else:
+        summary = 'The selected paths were already absent.'
+    labels = {'deleted':'Deleted', 'already_absent':'Already absent', 'unconfirmed':'Not confirmed deleted'}
+    return _action_receipt(action='delete', object_type='filesystem', summary=summary,
+        details=[labels[row['status']]+': '+str(row['path']) for row in changes], changes=changes)
+
+
+def _terminal_delete_receipt_metadata(invocation: ToolInvocation, receipt: dict[str, object] | None) -> dict[str, object]:
+    if receipt is None:
+        return {}
+    digest = hashlib.sha256(json.dumps(receipt,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    return {'_native_filesystem_action_receipt':{'invocation_id':invocation.invocation_id,'sha256':digest}}
 
 
 def _terminal_destructive_permission_token(command: str, targets: Iterable[dict[str, object]]) -> str:
@@ -3612,11 +3802,11 @@ def _unknown_workspace_storage_denial(tokens: list[str], *, principal_id: str | 
     return None
 
 
-def _find_path_tokens(tokens: list[str]) -> list[str]:
-    paths: list[str] = []
+def _find_path_tokens(tokens):
+    paths = []
     index = 0
     while index < len(tokens):
-        token = tokens[index]
+        token = tokens[index].value if hasattr(tokens[index], "value") else tokens[index]
         if token in {";", "&&", "||", "|"}:
             break
         if token in _FIND_PATH_OPTION_ARITY:
@@ -3624,7 +3814,7 @@ def _find_path_tokens(tokens: list[str]) -> list[str]:
             continue
         if any(token.startswith(prefix) for prefix in _FIND_EXPRESSION_STARTERS):
             break
-        paths.append(token)
+        paths.append(tokens[index])
         index += 1
     return paths
 
@@ -6038,46 +6228,30 @@ class ToolExecutor:
             error=error,
         )
 
-    def _has_active_grant(self, *, principal_id: str, permissions: Iterable[str], excluded_approval_ids: Iterable[str] = ()) -> bool:
+    def _has_active_grant(self, *, principal_id: str, permissions: Iterable[str]) -> bool:
         required = set(permissions)
-        excluded = set(excluded_approval_ids)
         principal_ids = _tool_grant_principal_candidates(principal_id)
         for grant in self._store.list_permission_grants():
-            if grant.approval_id in excluded:
+            if (grant.principal_id not in principal_ids or grant.permission not in required
+                    or not is_permission_grant_active(grant)):
                 continue
-            if grant.principal_id not in principal_ids:
-                continue
-            if grant.permission not in required:
-                continue
-            if not is_permission_grant_active(grant):
-                continue
-            return True
+            approval = self._store.get_approval_request(grant.approval_id)
+            if approval is None or (approval.status is ApprovalStatus.APPROVED and not requires_exact_tool_review(approval)):
+                return True
         return False
 
     def _has_required_tool_grant(self, invocation: ToolInvocation) -> bool:
         if _tool_blocked_for_principal(invocation.principal_id, invocation.tool_name):
             return False
-        if invocation.tool_name == "email_send":
-            return bool(self._matching_email_send_review_grants(invocation))
         if self._matching_exact_tool_review_grants(invocation):
             return True
+        if invocation.tool_name == "email_send":
+            return False
         if invocation.tool_name == "terminal_exec" and self._matching_terminal_destructive_grants(invocation):
             return True
         return self._has_active_grant(
             principal_id=invocation.principal_id,
-            # A reviewed saved-code execution is bound to its exact command,
-            # revision and inputs. It must not become a blanket shell grant.
-            excluded_approval_ids=(
-                approval.approval_id for approval in self._store.list_approval_requests()
-                if isinstance(approval.context, dict)
-                and isinstance(approval.context.get("tool_arguments"), dict)
-                and approval.context["tool_arguments"].get("saved_tool")
-            ) if invocation.tool_name == "terminal_exec" else (),
-            permissions=(
-                f"tool:{invocation.tool_name}",
-                f"tool.{invocation.tool_name}",
-                invocation.tool_name,
-            ),
+            permissions=(f"tool:{invocation.tool_name}", f"tool.{invocation.tool_name}", invocation.tool_name),
         )
 
     def _matching_terminal_destructive_grants(self, invocation: ToolInvocation):
@@ -6124,11 +6298,15 @@ class ToolExecutor:
                 continue
             if approval.requested_by != invocation.principal_id:
                 continue
-            if approval.action != "use_tool":
+            if not requires_exact_tool_review(approval):
                 continue
             context = approval.context if isinstance(approval.context, dict) else {}
             approved_tool = str(context.get("tool_name") or approval.resource or "").strip()
             if approved_tool != invocation.tool_name:
+                continue
+            bound_id = context.get("approval_invocation_id")
+            demands_same_invocation = context.get("decision_mode") != "always" or invocation.tool_name == "email_send"
+            if demands_same_invocation and bound_id and bound_id != invocation.invocation_id:
                 continue
             if context.get("tool_arguments") == current_arguments:
                 matching_approval_ids.add(approval.approval_id)
@@ -6148,45 +6326,18 @@ class ToolExecutor:
                 grants.append(grant)
         return grants
 
-    def _matching_email_send_review_grants(self, invocation: ToolInvocation):
-        if invocation.tool_name != "email_send":
-            return []
-        return self._matching_exact_tool_review_grants(invocation)
-
-    def _revoke_email_send_review_grants(self, invocation: ToolInvocation) -> None:
-        for grant in self._matching_exact_tool_review_grants(invocation):
-            try:
-                self._store.add_permission_grant(
-                    revoke_permission_grant_record(
-                        grant,
-                        revoked_by="runtime",
-                        revoked_at=datetime.now(UTC),
-                        reason="Email send review approval consumed.",
-                    )
-                )
-            except Exception:
-                logger.debug("Could not revoke consumed email_send approval grant", exc_info=True)
-
-    def _find_pending_tool_approval(self, invocation: ToolInvocation):
-        current_arguments = redact_value(dict(invocation.arguments or {})) if (
-            invocation.tool_name == "email_send" or invocation.arguments.get("saved_tool")
-        ) else None
+    def _find_pending_tool_approval(self, invocation: ToolInvocation, *, reviewed_email_files=None):
+        current_arguments = redact_value(dict(invocation.arguments or {}))
         for approval in self._store.list_approval_requests():
-            if approval.status.value != "pending":
+            if approval.status.value != "pending" or approval.requested_by != invocation.principal_id:
                 continue
-            if approval.requested_by != invocation.principal_id:
+            if approval.action != "use_tool" or approval.resource != invocation.tool_name:
                 continue
-            if approval.action != "use_tool":
+            context = approval.context or {}
+            if context.get("tool_arguments") != current_arguments:
                 continue
-            if approval.resource != invocation.tool_name:
+            if invocation.tool_name == "email_send" and context.get("reviewed_email_files") != reviewed_email_files:
                 continue
-            context = approval.context if isinstance(approval.context, dict) else {}
-            if current_arguments is None and isinstance(context.get("tool_arguments"), dict) and context["tool_arguments"].get("saved_tool"):
-                continue
-            if current_arguments is not None:
-                context = approval.context if isinstance(approval.context, dict) else {}
-                if context.get("tool_arguments") != current_arguments:
-                    continue
             return approval
         return None
 
@@ -6278,7 +6429,7 @@ class ToolExecutor:
         self._store.add_approval_request(approval)
         return approval
 
-    def _terminal_destructive_preapproval_result(self, invocation: ToolInvocation) -> ToolResult | None:
+    def _terminal_destructive_preapproval_result(self, invocation: ToolInvocation, *, has_review: bool) -> ToolResult | None:
         if invocation.tool_name != "terminal_exec":
             return None
         raw_command = invocation.arguments.get("command")
@@ -6288,7 +6439,7 @@ class ToolExecutor:
         targets = _terminal_delete_targets_for_invocation(invocation, execution_cwd=execution_cwd)
         if not targets:
             return None
-        if self._matching_terminal_destructive_grants(invocation):
+        if has_review:
             return None
         approval = self._ensure_terminal_destructive_approval_request(
             invocation,
@@ -6308,8 +6459,8 @@ class ToolExecutor:
             },
         )
 
-    def _ensure_tool_approval_request(self, invocation: ToolInvocation):
-        existing = self._find_pending_tool_approval(invocation)
+    def _ensure_tool_approval_request(self, invocation: ToolInvocation, *, reviewed_email_files=None, reviewed_html=None):
+        existing = self._find_pending_tool_approval(invocation, reviewed_email_files=reviewed_email_files)
         if existing is not None:
             return existing
         spec = self._registry.get_spec(invocation.tool_name)
@@ -6338,6 +6489,7 @@ class ToolExecutor:
             "requires_approval": spec.requires_approval,
             "tool_permission_scope": spec.permission_scope,
             "tool_arguments": tool_arguments,
+            "approval_invocation_id": invocation.invocation_id,
         }
         if invocation.tool_name == "delete_cron":
             from nullion.crons import get_cron
@@ -6346,7 +6498,9 @@ class ToolExecutor:
             if job is not None and job.workspace_id == workspace_id:
                 approval_context["scheduler_target"] = {"id": job.id, "name": job.name}
         if invocation.tool_name == "email_send":
-            preview_path = _email_html_preview_path_for_invocation(invocation)
+            approval_context["tool_permission_scope"] = "exact_invocation"
+            approval_context["reviewed_email_files"] = reviewed_email_files or {}
+            preview_path = _email_html_preview_path_for_invocation(invocation, reviewed_html=reviewed_html)
             if preview_path:
                 approval_context["html_preview_path"] = preview_path
         approval = create_approval_request(
@@ -6619,8 +6773,11 @@ class ToolExecutor:
             return None
         return PolicyDecision.ALLOW if self._filesystem_boundary_allowed(fact.target) else PolicyDecision.DENY
 
-    def _preflight_boundary_policy_result(self, invocation: ToolInvocation):
+    def _preflight_boundary_policy_result(self, invocation: ToolInvocation, *, files_only: bool = False):
         facts = extract_boundary_facts(invocation)
+        if files_only:
+            facts = [fact for fact in facts if fact.kind is BoundaryKind.FILESYSTEM_ACCESS]
+
         if invocation.tool_name == "terminal_exec":
             facts = [fact for fact in facts if fact.kind is BoundaryKind.FILESYSTEM_ACCESS]
             if not facts:
@@ -6716,7 +6873,7 @@ class ToolExecutor:
                 return self._deny_invocation(
                     invocation,
                     reason="approval_required",
-                    error="Approval required for outbound network boundary policy",
+                    error=f"Approval required for {fact.kind.value.replace('_', ' ')} boundary policy",
                     output={
                         **approval_context,
                         "reason": "approval_required",
@@ -6737,6 +6894,13 @@ class ToolExecutor:
         policy_principal = permission_scope_principal(invocation.principal_id)
         for fact in extract_boundary_facts(invocation):
             if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
+                continue
+            if (invocation.tool_name != "terminal_exec" and fact.operation == "read"
+                    and self._matching_exact_tool_review_grants(invocation)):
+                # Carry the same exact reviewed-file authority that preflight
+                # already validates into the file adapter. This grants neither
+                # sibling files nor arbitrary preview reads before approval.
+                selectors.append(fact.target)
                 continue
             if self._filesystem_boundary_allowed(fact.target, principal_id=invocation.principal_id):
                 continue
@@ -6835,6 +6999,13 @@ class ToolExecutor:
                 output={"reason": "capability_not_granted", "allowed_tools": list(self._allowed_tool_names)},
             )
 
+        shell_failure = (_terminal_shell_preflight_failure(invocation,
+            execution_cwd=_terminal_execution_cwd_from_registry(self._registry))
+            if invocation.tool_name == "terminal_exec" else None)
+        if shell_failure is not None:
+            return self._deny_invocation(invocation, reason=str(shell_failure["reason"]),
+                error="Resolve the shell command's filesystem targets before retrying", output=shell_failure)
+
         scheduled_terminal_denial = self._scheduled_task_terminal_filesystem_preapproval_result(invocation)
         if scheduled_terminal_denial is not None:
             return scheduled_terminal_denial
@@ -6843,7 +7014,9 @@ class ToolExecutor:
         if scratch_recovery is not None:
             return scratch_recovery
 
-        destructive_terminal_approval = self._terminal_destructive_preapproval_result(invocation)
+        destructive_grants = self._matching_terminal_destructive_grants(invocation)
+        destructive_terminal_approval = self._terminal_destructive_preapproval_result(
+            invocation, has_review=bool(destructive_grants))
         if destructive_terminal_approval is not None:
             return destructive_terminal_approval
 
@@ -6857,8 +7030,30 @@ class ToolExecutor:
             if (spec.requires_approval or self._sentinel_policy.mode.value == "ask_all")
             else PolicyDecision.ALLOW
         )
-        if tool_decision is PolicyDecision.REQUIRE_APPROVAL and not self._has_required_tool_grant(invocation):
-            approval = self._ensure_tool_approval_request(invocation)
+        exact_grants = (self._matching_exact_tool_review_grants(invocation)
+                        if tool_decision is PolicyDecision.REQUIRE_APPROVAL or invocation.tool_name == "email_send"
+                        else [])
+        if (tool_decision is PolicyDecision.REQUIRE_APPROVAL or invocation.tool_name == "email_send") and not (
+            exact_grants or destructive_grants or self._has_required_tool_grant(invocation)
+        ):
+            review_files = review_html = None
+            if invocation.tool_name == "email_send":
+                permitted = self._with_trusted_filesystem_selectors(invocation)
+                try:
+                    review_files, review_html = _capture_email_review(permitted)
+                except PermissionError:
+                    failure = self._preflight_boundary_policy_result(invocation, files_only=True)
+                    if failure is not None:
+                        return failure
+                    return self._deny_invocation(invocation, reason="email_source_not_reviewable",
+                        error="Move the email source to a permitted workspace folder so its contents can be reviewed.",
+                        output={"reason": "email_source_not_reviewable"})
+                except OSError:
+                    return self._deny_invocation(invocation, reason="email_source_unavailable",
+                        error="An email source file is unavailable. The email was not sent.",
+                        output={"reason": "email_source_unavailable"})
+            approval = self._ensure_tool_approval_request(invocation, reviewed_email_files=review_files,
+                reviewed_html=review_html)
             approval_context = approval.context if isinstance(approval.context, dict) else {}
             return self._deny_invocation(
                 invocation,
@@ -6876,6 +7071,40 @@ class ToolExecutor:
         if preflight_result is not None:
             return preflight_result
         invocation = self._with_trusted_filesystem_selectors(invocation)
+
+        if exact_grants:
+            from nullion.approval_resume import claim_approved_tool_use
+
+            approved = self._store.get_approval_request(exact_grants[0].approval_id)
+            context = approved.context or {}
+            if invocation.tool_name == "email_send":
+                reviewed_files = context.get("reviewed_email_files")
+                if not isinstance(reviewed_files, dict):
+                    reviewed_files = {}
+                if not set(_email_source_selectors(invocation)).issubset(reviewed_files):
+                    return self._deny_invocation(invocation, reason="email_source_not_reviewed",
+                        error="The files in this draft were not reviewed. The email was not sent. Request a fresh draft.",
+                        output={"reason": "email_source_not_reviewed"})
+                invocation = replace(invocation, reviewed_email_files=reviewed_files)
+            if invocation.tool_name == "email_send" or context.get("decision_mode") != "always":
+                if not claim_approved_tool_use(self._store, approved.approval_id):
+                    return self._deny_invocation(invocation, reason="approval_already_used",
+                        error="This approval was already used. The action will not run again.",
+                        output={"reason": "approval_already_used"})
+
+        if destructive_grants:
+            from nullion.approval_resume import claim_approved_tool_use
+
+            review = destructive_grants[0]
+            if not claim_approved_tool_use(self._store, review.approval_id):
+                return self._deny_invocation(invocation, reason="approval_already_used",
+                    error="This delete approval was already used. The command will not run again.",
+                    output={"reason": "approval_already_used"})
+            current_grant = self._store.get_permission_grant(review.grant_id)
+            if current_grant is None or not is_permission_grant_active(current_grant):
+                return self._deny_invocation(invocation, reason="approval_no_longer_active",
+                    error="The delete approval is no longer active. Review the request again.",
+                    output={"reason": "approval_no_longer_active"})
 
         egress_attempts = _egress_attempts_for_invocation(invocation)
         self._record_detected_egress_attempts(invocation, egress_attempts)
@@ -6907,8 +7136,6 @@ class ToolExecutor:
         duration_ms = (perf_counter() - started_at) * 1000
         result = normalize_tool_result(result)
         result = _with_default_action_receipt(spec=spec, invocation=invocation, result=result)
-        if invocation.tool_name == "email_send" and result.status != "denied":
-            self._revoke_email_send_review_grants(invocation)
         if invocation.tool_name == "terminal_exec" and result.status != "denied":
             self._revoke_terminal_destructive_grants(invocation)
             if invocation.arguments.get("saved_tool"):
@@ -11079,6 +11306,17 @@ def _pdf_chromium_executable() -> str | None:
     return None
 
 
+def _chromium_renderer_executable(playwright) -> str | None:
+    """Use configured/system Chromium first, then the installed managed build."""
+    preferred = _pdf_chromium_executable()
+    if preferred is not None:
+        return preferred
+    managed = getattr(getattr(playwright, "chromium", None), "executable_path", None)
+    if isinstance(managed, str) and managed and Path(managed).is_file():
+        return managed
+    return None
+
+
 def _normalize_pdf_report_text(text: str) -> str:
     normalized_lines: list[str] = []
     for raw_line in _strip_pdf_text_emoji(str(text or "")).splitlines():
@@ -11244,6 +11482,7 @@ def _save_text_pdf_with_chromium(
     text_pages: list[str],
     image_paths: list[Path],
     page_size_name: str,
+    pagination: str = "flow",
 ) -> bool:
     # Approval continuations can execute a synchronous tool on an async host.
     # Playwright's sync API rejects that host loop; render in a worker instead
@@ -11256,11 +11495,8 @@ def _save_text_pdf_with_chromium(
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="nullion-pdf") as executor:
             return executor.submit(
                 _save_text_pdf_with_chromium, path, title=title, text_pages=text_pages,
-                image_paths=image_paths, page_size_name=page_size_name,
+                image_paths=image_paths, page_size_name=page_size_name, pagination=pagination,
             ).result()
-    executable = _pdf_chromium_executable()
-    if executable is None:
-        return False
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
@@ -11299,34 +11535,43 @@ def _save_text_pdf_with_chromium(
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         f"<title>{html.escape(title or 'PDF')}</title>"
         "<style>"
-        "@page{margin:0.45in;} body{font-family:Arial,Helvetica,sans-serif;color:#111827;margin:0;background:#f8fafc;}"
-        ".page{break-after:page;page-break-after:always;background:white;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;min-height:9.9in;}"
+        "@page{margin:0.45in;} body{font-family:Arial,Helvetica,sans-serif;color:#111827;margin:0;background:white;}"
+        ".page{background:white;border:1px solid #e5e7eb;border-radius:8px;display:flow-root;}"
+        + (".page{break-after:page;page-break-after:always;}" if pagination == "pages" else "") +
         ".page:last-child{break-after:auto;page-break-after:auto;}"
-        "header{background:#111827;color:white;padding:18px 22px;} h1{font-size:20px;line-height:1.15;margin:0;}"
+        "header{background:#111827;color:white;padding:18px 22px;} h1{font-size:20pt;line-height:1.15;margin:0;}"
         "main{padding:22px;} figure{float:right;margin:0 0 16px 22px;padding:8px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;}"
         ".report-image-grid{float:right;width:2.55in;margin:0 0 16px 22px;display:grid;grid-template-columns:1fr;gap:7px;}"
         ".report-image-grid figure{float:none;margin:0;}"
         ".report-image-grid .report-image{max-height:1.38in;}"
         ".report-image{max-width:2.35in;max-height:2.2in;object-fit:contain;display:block;}"
-        ".text{font-size:11.5px;line-height:1.45;} .text h1{font-size:18px;margin:13px 0 8px;}"
-        "h2{font-size:14px;margin:13px 0 7px;color:#1f2937;} h3,h4,h5,h6{font-size:12px;margin:11px 0 6px;}"
-        "p{font-size:11.5px;line-height:1.45;margin:0 0 8px;} ul,ol{padding-left:22px;} li{margin-bottom:5px;}"
+        ".text{font-size:11pt;line-height:1.45;} .text h1{font-size:18pt;margin:13px 0 8px;}"
+        "h2{font-size:14pt;margin:13px 0 7px;color:#1f2937;} h3,h4,h5,h6{font-size:12pt;margin:11px 0 6px;}"
+        "p{font-size:11pt;line-height:1.45;margin:0 0 8px;} ul,ol{padding-left:22px;} li{margin-bottom:5px;}"
         "pre{white-space:pre-wrap;overflow-wrap:anywhere;} blockquote{border-left:3px solid #d1d5db;padding-left:10px;}"
         ".bullet{padding-left:14px;text-indent:-10px;} .bullet:before{content:'• ';color:#2563eb;font-weight:bold;}"
-        ".report-table{width:100%;border-collapse:collapse;margin:10px 0 14px;font-size:10.5px;line-height:1.3;}"
+        ".report-table{width:100%;border-collapse:collapse;margin:10px 0 14px;font-size:10.5pt;line-height:1.3;}"
         ".report-table th{background:#f1f5f9;color:#111827;text-align:left;font-weight:700;}"
         ".report-table th,.report-table td{border:1px solid #d1d5db;padding:5px 6px;vertical-align:top;}"
         "a{color:#0645ad;text-decoration:underline;word-break:break-word;}"
-        "</style></head><body>"
+        + _PDF_FRAGMENTATION_CSS + "</style></head><body>"
         + "".join(page_blocks)
         + "</body></html>"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
+        executable = _chromium_renderer_executable(playwright)
+        if executable is None:
+            return False
         browser = playwright.chromium.launch(headless=True, executable_path=executable)
         try:
-            page = browser.new_page()
+            page = browser.new_page(viewport={
+                "width": round(((8.27 if page_size_name == "a4" else 8.5) - .9) * 96),
+                "height": round(((11.69 if page_size_name == "a4" else 11) - .9) * 96),
+            })
+            page.emulate_media(media="print")
             page.set_content(html_doc, wait_until="load")
+            _prepare_pdf_fragmentation(page, content_height_inches=(11.69 if page_size_name == "a4" else 11) - .9)
             page.pdf(
                 path=str(path),
                 format="A4" if page_size_name == "a4" else "Letter",
@@ -11363,7 +11608,7 @@ _PDF_HTML_PRINT_SAFETY_SCRIPT = """
   let pageRisk = false;
   // A floated, runtime-added illustration must not collapse a following
   // grid/flex layout into the remaining float width (which can be zero).
-  for (const media of document.querySelectorAll('.designed-page-inner > .primary-media')) {
+  for (const media of document.querySelectorAll('.designed-page-inner > .primary-media, .designed-page-inner > .primary-media-group')) {
     const following = media.nextElementSibling;
     if (following && ['grid','inline-grid','flex','inline-flex','table','flow-root']
         .includes(getComputedStyle(following).display)) {
@@ -11420,50 +11665,104 @@ _PDF_HTML_MEDIA_REPAIR_SCRIPT = """
 """
 
 
-_PDF_HTML_PRINT_SCALE_SCRIPT = """
-(limitPx) => {
-  const limit = Number(limitPx) || 0;
-  if (!limit) {
-    return 0.92;
-  }
-  let maxHeight = 0;
-  for (const page of Array.from(document.querySelectorAll('.designed-page'))) {
-    const inner = page.querySelector(':scope > .designed-page-inner') || page;
-    const rect = inner.getBoundingClientRect();
-    maxHeight = Math.max(maxHeight, inner.scrollHeight || 0, rect.height || 0);
-  }
-  if (!maxHeight) {
-    return 0.92;
-  }
-  if (maxHeight > limit * 0.98) {
-    return Math.max(0.55, Math.min(0.88, (limit / maxHeight) * 0.96));
-  }
-  return Math.max(0.55, Math.min(0.92, (limit / maxHeight) * 0.985));
-}
+# Only small semantic units are kept together. A large paragraph, table or
+# container must remain fragmentable; its section is not a physical page.
+_PDF_FRAGMENTATION_CSS = """
+h1,h2,h3,h4,h5,h6{break-after:avoid!important;page-break-after:avoid!important;break-inside:avoid;}
+p{widows:3;orphans:3;}
+table,tbody{break-inside:auto;page-break-inside:auto;}
+thead{display:table-header-group;break-inside:avoid;page-break-inside:avoid;} tfoot{display:table-footer-group;}
+th,td{overflow-wrap:anywhere;}
+[data-nullion-print-keep='1']{break-inside:avoid!important;page-break-inside:avoid!important;}
+[data-nullion-print-fragment='1']{break-inside:auto!important;page-break-inside:auto!important;}
+[data-nullion-print-unclip='1']{height:auto!important;min-height:0!important;max-height:none!important;overflow:visible!important;}
 """
 
-
-_PDF_HTML_APPLY_PRINT_SCALE_SCRIPT = """
-(scale) => {
-  const ratio = Number(scale) || 1;
-  if (ratio >= 0.995) {
-    return 0;
-  }
-  let scaled = 0;
-  for (const page of Array.from(document.querySelectorAll('.designed-page'))) {
-    const inner = page.querySelector(':scope > .designed-page-inner') || page;
-    const originalHeight = Math.max(inner.scrollHeight || 0, inner.getBoundingClientRect().height || 0);
-    inner.style.zoom = String(ratio);
-    inner.dataset.nullionPrintScale = String(Math.round(ratio * 1000) / 1000);
-    if (originalHeight) {
-      page.style.minHeight = `${Math.ceil(originalHeight * ratio)}px`;
+_PDF_FRAGMENTATION_SCRIPT = """
+(limit) => {
+  // A half-page bound avoids moving a nearly full-page card to the next sheet.
+  // Scan is bounded; unmarked ordinary blocks use the browser's natural flow.
+  const blocks = document.querySelectorAll('.designed-page-inner *, .page main *');
+  let marked = 0;
+  for (const el of Array.from(blocks).slice(0, 20000)) {
+    if (el instanceof SVGElement) continue;
+    const style = getComputedStyle(el);
+    if (['absolute', 'fixed', 'sticky'].includes(style.position)) continue;
+    if (el.matches('img:not([data-nullion-crop="true"])')) {
+      el.style.maxHeight = style.maxHeight === 'none' ? `${limit}px` : `min(${style.maxHeight}, ${limit}px)`;
+      el.style.objectFit = 'contain';
+      continue;
     }
-    page.style.overflow = 'visible';
-    scaled += 1;
+    const height = Math.max(el.getBoundingClientRect().height, el.scrollHeight);
+    // A short clipped card is still data loss. Clipping repair is independent
+    // of the threshold used to choose sensible keep-together groups.
+    if (el.scrollHeight > el.clientHeight + 4 && !el.matches('[data-nullion-crop="true"]')) {
+      el.dataset.nullionPrintUnclip = '1';
+    }
+    if (height > limit * .5) {
+      el.dataset.nullionPrintFragment = '1';
+      if (el.scrollHeight > el.clientHeight + 4 || height > limit) {
+        el.dataset.nullionPrintUnclip = '1';
+      }
+      marked++;
+    } else if (height > 0 && el.matches('article,figure,tr,[data-nullion-keep-together]')) {
+      el.dataset.nullionPrintKeep = '1';
+      marked++;
+    }
   }
-  return scaled;
+  return marked;
 }
 """
+
+
+def _prepare_pdf_fragmentation(page: object, *, content_height_inches: float) -> None:
+    # Font readiness makes the bounded measurements stable without introducing
+    # fonts or another network dependency. Failed fonts must not hang a tool.
+    page.evaluate("() => Promise.race([document.fonts.ready, new Promise(resolve => setTimeout(resolve, 1500))])")
+    page.evaluate(_PDF_FRAGMENTATION_SCRIPT, content_height_inches * 96)
+
+
+def _pdf_pagination_mode(arguments: dict[str, object]) -> str:
+    mode = arguments.get("pagination")
+    if mode is None:
+        return "pages" if arguments.get("expected_page_count") is not None or arguments.get("media_alignment") == "align_pages" else "flow"
+    if mode not in ("flow", "pages"):
+        raise ValueError("pagination must be flow or pages")
+    return mode
+
+
+class _PdfPageGeometryError(ValueError):
+    """The authored CSS page boxes could not be reconciled with typed paper."""
+
+
+def _apply_pdf_html_page_contract(page: object, *, page_size_name: str, margin_inches: float) -> None:
+    result = page.evaluate("""({size, margin}) => {
+      let remaining = 10000, pageRules = 0, inaccessible = 0, truncated = false;
+      const visited = new Set();
+      function walk(rules, depth) {
+        if (depth > 32) { truncated = true; return; }
+        for (const rule of rules) {
+          if (--remaining < 0) { truncated = true; return; }
+          if (rule.type === CSSRule.PAGE_RULE) {
+            rule.style.setProperty('size', size, 'important');
+            rule.style.setProperty('margin', margin, 'important');
+            pageRules++;
+          }
+          if (rule.styleSheet) sheet(rule.styleSheet, depth + 1);
+          if (rule.cssRules) walk(rule.cssRules, depth + 1);
+        }
+      }
+      function sheet(styleSheet, depth) {
+        if (visited.has(styleSheet)) return;
+        visited.add(styleSheet);
+        try { walk(styleSheet.cssRules, depth); }
+        catch (_) { inaccessible++; }
+      }
+      for (const styleSheet of document.styleSheets) sheet(styleSheet, 0);
+      return {pageRules, inaccessible, truncated};
+    }""", {"size": "A4" if page_size_name == "a4" else "Letter", "margin": f"{margin_inches}in"})
+    if not isinstance(result, dict) or result.get("inaccessible") or result.get("truncated"):
+        raise _PdfPageGeometryError("Inline the authored print styles; page geometry could not be verified within the CSS rule budget or an inaccessible stylesheet was present.")
 
 
 def _pdf_html_page_contract_dimensions(page_size_name: str) -> tuple[float, float, float]:
@@ -11492,34 +11791,6 @@ def _apply_pdf_html_print_safety(page: object) -> int:
         return 0
     try:
         result = evaluate(_PDF_HTML_PRINT_SAFETY_SCRIPT)
-    except Exception:
-        return 0
-    return result if isinstance(result, int) else 0
-
-
-def _pdf_html_print_scale(page: object, *, page_size_name: str) -> float:
-    evaluate = getattr(page, "evaluate", None)
-    if not callable(evaluate):
-        return 0.92
-    _, content_height_inches, _ = _pdf_html_page_contract_dimensions(page_size_name)
-    limit_px = max(1, int(round(content_height_inches * 96)))
-    try:
-        result = evaluate(_PDF_HTML_PRINT_SCALE_SCRIPT, limit_px)
-    except Exception:
-        return 0.92
-    if isinstance(result, (int, float)):
-        return max(0.55, min(0.92, float(result)))
-    return 0.92
-
-
-def _apply_pdf_html_print_scale(page: object, scale: float) -> int:
-    if scale >= 0.995:
-        return 0
-    evaluate = getattr(page, "evaluate", None)
-    if not callable(evaluate):
-        return 0
-    try:
-        result = evaluate(_PDF_HTML_APPLY_PRINT_SCALE_SCRIPT, scale)
     except Exception:
         return 0
     return result if isinstance(result, int) else 0
@@ -11561,6 +11832,7 @@ def _save_html_pdf_with_chromium(
     image_paths: list[Path] | tuple[Path, ...] = (),
     screenshot_paths: list[Path] | tuple[Path, ...] = (),
     page_size_name: str,
+    pagination: str = "flow",
 ) -> bool:
     try:
         asyncio.get_running_loop()
@@ -11571,10 +11843,8 @@ def _save_html_pdf_with_chromium(
             return executor.submit(
                 _save_html_pdf_with_chromium, path, title=title, html_pages=html_pages,
                 image_paths=image_paths, screenshot_paths=screenshot_paths, page_size_name=page_size_name,
+                pagination=pagination,
             ).result()
-    executable = _pdf_chromium_executable()
-    if executable is None:
-        return False
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
@@ -11602,14 +11872,19 @@ def _save_html_pdf_with_chromium(
             "</figure>"
         )
     if media_data and page_fragments and not any(_PDF_HTML_IMG_RE.search(fragment) for fragment in page_fragments):
-        index, media_path, media_src, media_label = media_data[0]
-        primary_media = (
-            '<figure class="primary-media">'
-            f'<img src="{html.escape(media_src, quote=True)}" alt="{html.escape(media_label)} {index}">'
-            f"<figcaption>{html.escape(media_label)} {index}</figcaption>"
-            "</figure>"
-        )
-        page_fragments[0] = f"{primary_media}{page_fragments[0]}"
+        # Match the typed array indices. Extra media stay with the final
+        # section, as in the text producer; never discard all but image one.
+        grouped_media: list[list[str]] = [[] for _ in page_fragments]
+        for index, media_path, media_src, media_label in media_data:
+            grouped_media[min(index - 1, len(page_fragments) - 1)].append(
+                '<figure class="primary-media">'
+                f'<img src="{html.escape(media_src, quote=True)}" alt="{html.escape(media_label)} {index}">'
+                f'<figcaption>{html.escape(media_label)} {index}</figcaption></figure>')
+        for index, figures in enumerate(grouped_media):
+            media = "".join(figures)
+            if len(figures) > 1:
+                media = '<div class="primary-media-group">' + media + '</div>'
+            page_fragments[index] = media + page_fragments[index]
     page_blocks = [f'<section class="designed-page"><div class="designed-page-inner">{fragment}</div></section>' for fragment in page_fragments]
     if media_blocks and not page_fragments:
         page_blocks.append(
@@ -11625,25 +11900,28 @@ def _save_html_pdf_with_chromium(
         "<style>"
         f"@page{{margin:{page_margin_inches:.2f}in;}}"
         f":root{{--nullion-pdf-content-width:{content_width_inches:.2f}in;--nullion-pdf-content-height:{content_height_inches:.2f}in;}}"
-        "body{font-family:Arial,Helvetica,sans-serif;color:#111827;margin:0;background:white;}"
-        ".designed-page{break-after:page;page-break-after:always;min-height:9.95in;background:inherit;}"
+        "body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;line-height:1.45;color:#111827;margin:0;background:white;}"
+        ".designed-page{background:inherit;display:flow-root;}"
+        + (".designed-page{break-after:page;page-break-after:always;}" if pagination == "pages" else "") +
         ".designed-page:last-child{break-after:auto;page-break-after:auto;}"
-        "h1,h2,h3,p,figure,table,.designed-page-inner>*{break-inside:avoid;page-break-inside:avoid;}"
         "img{max-width:100%;height:auto;} table{width:100%;border-collapse:collapse;}"
         "th,td{border:1px solid #d1d5db;padding:6px 8px;vertical-align:top;} th{background:#f1f5f9;text-align:left;}"
         ".media-appendix h2{margin:0 0 18px;font-size:24px;}.media-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}"
         ".media-grid figure{margin:0;border:1px solid #e5e7eb;padding:10px;background:#f9fafb;break-inside:avoid;}"
         ".media-grid img{width:100%;max-height:3.4in;object-fit:contain;background:white;}.media-grid figcaption{font-size:10px;color:#4b5563;margin-top:6px;}"
         ".primary-media{float:right;width:38%;margin:0 0 14px 20px;border:1px solid #e5e7eb;padding:8px;background:#f9fafb;break-inside:avoid;}"
+        ".primary-media-group{float:right;width:38%;margin:0 0 14px 20px;}"
+        ".primary-media-group .primary-media{float:none;width:auto;margin:0 0 8px;}"
         ".primary-media img{width:100%;max-height:2.25in;object-fit:contain;background:white;}.primary-media figcaption{font-size:9px;color:#4b5563;margin-top:5px;}"
         ".designed-page-inner{transform-origin:top left;}"
         "a{color:#0645ad;text-decoration:underline;word-break:break-word;}"
         "</style>"
         + "".join(f"<style>{style}</style>" for style in custom_styles)
         + "<style>"
-        "h1,h2,h3{break-after:avoid!important;page-break-after:avoid!important;}"
+        + f"@page{{size:{'A4' if page_size_name == 'a4' else 'Letter'}!important;margin:{page_margin_inches:.2f}in!important;}}"
+        + _PDF_FRAGMENTATION_CSS +
         ".designed-page{box-sizing:border-box!important;width:var(--nullion-pdf-content-width)!important;"
-        "max-width:var(--nullion-pdf-content-width)!important;min-height:var(--nullion-pdf-content-height)!important;"
+        "max-width:var(--nullion-pdf-content-width)!important;min-height:0!important;"
         "margin:0 auto!important;overflow:visible!important;}"
         ".designed-page-inner{box-sizing:border-box!important;width:100%!important;max-width:100%!important;"
         "min-height:auto!important;overflow:visible!important;}"
@@ -11664,28 +11942,30 @@ def _save_html_pdf_with_chromium(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
+        executable = _chromium_renderer_executable(playwright)
+        if executable is None:
+            return False
         browser = playwright.chromium.launch(headless=True, executable_path=executable)
         try:
             page = browser.new_page()
-            # Scaling must measure the same media and viewport units as the
-            # final paper, rather than a desktop screen layout that reflows
-            # only when page.pdf switches to print.
+            # Print layout and measurement share the paper width and usable
+            # height. This also bounds authored viewport-height page canvases.
             page.set_viewport_size({
                 "width": round((content_width_inches + 2 * page_margin_inches) * 96),
-                "height": round((content_height_inches + 2 * page_margin_inches) * 96),
+                "height": round(content_height_inches * 96),
             })
             page.emulate_media(media="print")
             page.set_content(html_doc, wait_until="load")
+            _apply_pdf_html_page_contract(page, page_size_name=page_size_name, margin_inches=page_margin_inches)
             _repair_pdf_html_media_sources(page, [media_src for _, _, media_src, _ in media_data])
             _apply_pdf_html_print_safety(page)
-            print_scale = _pdf_html_print_scale(page, page_size_name=page_size_name)
-            applied_print_scale = _apply_pdf_html_print_scale(page, print_scale)
+            _prepare_pdf_fragmentation(page, content_height_inches=content_height_inches)
             page.pdf(
                 path=str(path),
                 format="A4" if page_size_name == "a4" else "Letter",
                 print_background=True,
                 prefer_css_page_size=False,
-                scale=0.98 if applied_print_scale else print_scale,
+                scale=1,
             )
         finally:
             browser.close()
@@ -11815,6 +12095,8 @@ def _validated_pdf_output_handler(handler: ToolHandler) -> ToolHandler:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
                 "reason": "artifact_page_count_mismatch", "path": str(path), "page_count": count,
                 "expected_page_count": expected, "inspection": output["inspection"],
+                **{key: output[key] for key in ("pagination", "pagination_receipt", "embedded_html_images",
+                    "source_image_paths", "source_screenshot_paths") if key in output},
                 "recovery": {"kind": "repair_existing_artifact", "tool_name": "pdf_create",
                     "path": str(path), "expected_page_count": expected}},
                 f"PDF has {count} pages; the required count is {expected}. Repair the layout without dropping content.")
@@ -11891,6 +12173,13 @@ def _build_pdf_create_handler(
                 error="pdf_create requires at least one image_paths, screenshot_paths, text_pages, html_pages, or card_pages entry",
             )
 
+        try:
+            pagination = _pdf_pagination_mode(invocation.arguments)
+        except ValueError as exc:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                "reason": "invalid_tool_arguments", "recovery": {"kind": "correct_arguments",
+                    "retry_tool_name": "pdf_create", "argument_constraints": {
+                        "pagination": {"type": "string", "enum": ["flow", "pages"]}}}}, str(exc))
         title = str(invocation.arguments.get("title") or "Nullion PDF").strip()
         raw_page_size = str(invocation.arguments.get("page_size") or "letter").strip().lower()
         page_size = _PDF_PAGE_SIZES.get(raw_page_size)
@@ -12015,6 +12304,21 @@ def _build_pdf_create_handler(
                     },
                     error=screenshot_source_error,
                 )
+            if any(_PDF_HTML_IMG_RE.search(fragment) for fragment in inlined_html_pages):
+                embedded_paths = {str(Path(item["path"]).resolve()) for item in embedded_html_images
+                                  if isinstance(item.get("path"), str)}
+                unplaced_media = [str(path) for path in [*source_images, *source_screenshots]
+                                  if str(path.resolve()) not in embedded_paths]
+                if unplaced_media:
+                    return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                        "reason": "html_pdf_unplaced_media", "path": str(output_path),
+                        "unplaced_media_paths": unplaced_media,
+                        "embedded_html_images": embedded_html_images,
+                        "source_image_paths": [str(path) for path in source_images],
+                        "source_screenshot_paths": [str(path) for path in source_screenshots],
+                        "recovery": {"kind": "correct_arguments", "retry_tool_name": "pdf_create",
+                            "instruction": "Reference every required supplied image in the authored HTML using its local path. Omit separate media inputs only when they are not required. The authored layout was not rewritten."},
+                    }, "Supplied media are not placed in the authored HTML. No completed PDF is available.")
             try:
                 if _save_html_pdf_with_chromium(
                     output_path,
@@ -12023,6 +12327,7 @@ def _build_pdf_create_handler(
                     image_paths=source_images,
                     screenshot_paths=source_screenshots,
                     page_size_name=raw_page_size,
+                    pagination=pagination,
                 ):
                     size_bytes = output_path.stat().st_size if output_path.exists() else 0
                     has_media = bool(source_images or source_screenshots or embedded_html_images)
@@ -12045,6 +12350,10 @@ def _build_pdf_create_handler(
                             "artifact_paths": [str(output_path)],
                             "bytes_written": size_bytes,
                             "page_count": actual_page_count,
+                            "pagination": pagination,
+                            "pagination_receipt": {"mode": pagination, "scale": 1,
+                                "section_count": len(html_pages) if html_pages else len(text_pages_for_render),
+                                "overflow": "continue_on_next_page", "visual_review_required": True},
                             "html_pages": len(html_pages),
                             "source_image_paths": [str(path) for path in source_images],
                             "source_screenshot_paths": [str(path) for path in source_screenshots],
@@ -12057,6 +12366,12 @@ def _build_pdf_create_handler(
                         },
                         error=None,
                     )
+            except _PdfPageGeometryError as exc:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                    "reason": "html_pdf_page_geometry_unverified", "path": str(output_path),
+                    "recovery": {"kind": "correct_arguments", "retry_tool_name": "pdf_create",
+                        "instruction": "Use bounded, inline print styles. Paper size and margins are controlled by page_size."},
+                }, str(exc))
             except Exception as exc:
                 logger.info("html_pdf_chromium_failed: %s", exc, exc_info=True)
             return ToolResult(
@@ -12133,6 +12448,7 @@ def _build_pdf_create_handler(
                     text_pages=text_pages_for_render,
                     image_paths=[*source_images, *source_screenshots],
                     page_size_name=raw_page_size,
+                    pagination=pagination,
                 ):
                     size_bytes = output_path.stat().st_size if output_path.exists() else 0
                     expected_page_count = (
@@ -12160,6 +12476,10 @@ def _build_pdf_create_handler(
                             "artifact_paths": [str(output_path)],
                             "bytes_written": size_bytes,
                             "page_count": actual_page_count,
+                            "pagination": pagination,
+                            "pagination_receipt": {"mode": pagination, "scale": 1,
+                                "section_count": len(html_pages) if html_pages else len(text_pages_for_render),
+                                "overflow": "continue_on_next_page", "visual_review_required": True},
                             "text_pages": len(text_pages_for_render),
                             "source_image_paths": [str(path) for path in source_images],
                             "source_screenshot_paths": [str(path) for path in source_screenshots],
@@ -12167,12 +12487,19 @@ def _build_pdf_create_handler(
                             "text_layer": True,
                             "quality_profile": "report_quality_v1",
                             "layout_features": layout_features,
+                            **_render_designed_pdf_previews(output_path),
                         },
                         error=None,
                     )
             except Exception as exc:
                 logger.info("text_pdf_chromium_failed: %s", exc, exc_info=True)
-            text_pages = text_pages_for_render
+            # The raster fallback renders a single fixed-height text canvas
+            # and stops at its bottom. It cannot satisfy a paginated text
+            # contract: an honest failure is preferable to a clipped artifact.
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                "path": str(output_path), "reason": "text_pdf_render_failed",
+                "pagination": pagination, "render_backend": "chromium",
+            }, "PDF text rendering failed or Chromium/Playwright is unavailable. No completed PDF is available; repair the rendering runtime before retrying.")
 
         pages, source_images, source_screenshots, page_error = _build_pdf_pages(
             image_paths=image_paths,
@@ -12388,11 +12715,11 @@ def _build_pdf_edit_handler(
                 for page in append_reader.pages:
                     writer.add_page(page)
 
-            if append_image_paths or append_screenshot_paths or append_text_pages:
+            if append_image_paths or append_screenshot_paths:
                 pages, _source_images, _source_screenshots, page_error = _build_pdf_pages(
                     image_paths=append_image_paths,
                     screenshot_paths=append_screenshot_paths,
-                    text_pages=append_text_pages,
+                    text_pages=[],
                     page_size=page_size,
                     roots=effective_roots,
                     invocation=invocation,
@@ -12427,6 +12754,22 @@ def _build_pdf_edit_handler(
                         except Exception:
                             pass
                 append_reader = PdfReader(str(temp_path))
+                for page in append_reader.pages:
+                    writer.add_page(page)
+
+            if append_text_pages:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                text_temp_path = output_path.parent / f".{output_path.stem}-text-{uuid4().hex[:12]}.pdf"
+                temp_paths.append(text_temp_path)
+                if not _save_text_pdf_with_chromium(
+                    text_temp_path, title=title, text_pages=append_text_pages,
+                    image_paths=[], page_size_name=raw_page_size, pagination="flow",
+                ):
+                    return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                        "reason": "text_pdf_render_failed", "input_path": str(input_path),
+                        "render_backend": "chromium",
+                    }, "PDF appendix text rendering failed or Chromium/Playwright is unavailable. The output was not published.")
+                append_reader = PdfReader(str(text_temp_path))
                 for page in append_reader.pages:
                     writer.add_page(page)
 
@@ -12782,6 +13125,11 @@ def _build_terminal_exec_handler(
                 error="Missing required argument: command",
             )
 
+        shell_failure = _terminal_shell_preflight_failure(invocation, execution_cwd=execution_cwd)
+        if shell_failure is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", shell_failure,
+                "Resolve the shell command's filesystem targets before retrying")
+
         # Creation scopes choose a workspace-owned working directory. Plain
         # terminal inspection keeps its original cwd and performs no extra work.
         command_cwd = execution_cwd
@@ -12956,6 +13304,7 @@ def _build_terminal_exec_handler(
                 error="Network egress denied by terminal execution policy",
             )
 
+        deletion_observations = _terminal_delete_observations(invocation, execution_cwd=command_cwd)
         started_at = datetime.now(UTC).timestamp()
         artifact_scan_roots = tuple(dict.fromkeys(
             root for root in (
@@ -13010,6 +13359,9 @@ def _build_terminal_exec_handler(
             if network_mode is not None:
                 output["network_mode"] = network_mode
             output["timeout_seconds"] = timeout_seconds
+            deletion_receipt = _terminal_delete_receipt(deletion_observations)
+            if deletion_receipt is not None:
+                output['action_receipt'] = deletion_receipt
             from nullion.tool_partial_capture import partial_capture_requirements
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -13017,7 +13369,8 @@ def _build_terminal_exec_handler(
                 status="failed",
                 output=output,
                 error=f"Command timed out after {timeout_seconds}s",
-                response_requirements=partial_capture_requirements(invocation.invocation_id, output),
+                response_requirements={**(partial_capture_requirements(invocation.invocation_id, output) or {}),
+                    **_terminal_delete_receipt_metadata(invocation, deletion_receipt)},
             )
 
         output = {
@@ -13027,13 +13380,17 @@ def _build_terminal_exec_handler(
             "shell": completed.shell,
             "timeout_seconds": timeout_seconds,
         }
+        deletion_receipt = _terminal_delete_receipt(deletion_observations)
+        if deletion_receipt is not None:
+            output['action_receipt'] = deletion_receipt
         if network_mode is not None:
             output["network_mode"] = network_mode
         if has_network_egress:
             output["egress_attempts"] = egress_attempts
         if completed.exit_code == 0:
             artifact_paths = ([str(path) for path in declared_paths] if declared_paths else
-                _terminal_deliverable_artifact_paths_since(artifact_scan_roots, since_timestamp=started_at))
+                _terminal_deliverable_artifact_paths_since(artifact_scan_roots, since_timestamp=started_at)
+                if requested_extensions else [])
             recent_signatures.update(declared_signatures)
             if requested_extensions:
                 staged_paths = []
@@ -13142,6 +13499,8 @@ def _build_terminal_exec_handler(
                 error = completed.stderr
             else:
                 error = f"Command failed with exit code {completed.exit_code}"
+        response_requirements = {**(response_requirements or {}),
+            **_terminal_delete_receipt_metadata(invocation, deletion_receipt)} or None
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -13204,7 +13563,7 @@ def _web_fetch_is_textual(content_type: str, data: bytes) -> bool:
         return False
 
 
-def _fetch_web_url_once(url: str, timeout_seconds: int) -> dict[str, object]:
+def _fetch_web_url_once(url: str, timeout_seconds: int, *, allow_redirects: bool = True) -> dict[str, object]:
     resolution = _resolve_web_fetch_resolution(url)
     parsed = urlparse(url)
     host = parsed.hostname
@@ -13227,6 +13586,8 @@ def _fetch_web_url_once(url: str, timeout_seconds: int) -> dict[str, object]:
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
+    if not allow_redirects:
+        request._nullion_disallow_redirects = True
     opener = _build_web_fetch_opener()
     with _pinned_web_fetch_resolution(resolution):
         with opener.open(request, timeout=timeout_seconds) as response:
@@ -14858,7 +15219,7 @@ def _build_kernel_tool_registry(
                 produced_artifact_extensions=('.pdf',),
                 description=(
                     "Create a local PDF. Prefer card_pages for designed infographic, itinerary and card reports: supply content, not CSS. "
-                    "Use text_pages for plain reports or html_pages for custom layout. "
+                    "Use text_pages for plain reports or html_pages for custom layout. Sections flow compactly by default; pagination=pages preserves intentional page boundaries without shrinking content. "
                     "Image-only PDFs are only appropriate when the requested deliverable is image pages. "
                     "Try this before terminal_exec; local shell remains the last-resort fallback when this cannot complete."
                 ),
@@ -15411,6 +15772,7 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
             requires_approval=True,
             timeout_seconds=20,
             capability_tags=("email", "connector"),
+            permission_scope="exact_invocation",
         ),
         _build_connector_email_send_handler(),
     )
@@ -16149,7 +16511,7 @@ def _email_message_for_invocation(invocation: ToolInvocation) -> tuple[EmailMess
         content_type, _encoding = mimetypes.guess_type(str(resolved))
         maintype, subtype = (content_type or "application/octet-stream").split("/", 1)
         msg.add_attachment(
-            resolved.read_bytes(),
+            _read_email_source(invocation, raw_path, resolved),
             maintype=maintype,
             subtype=subtype,
             filename=resolved.name,
@@ -17883,6 +18245,7 @@ def register_email_plugin(
                 requires_approval=True,
                 timeout_seconds=20,
                 capability_tags=("email", "account_write"),
+                permission_scope="exact_invocation",
             ),
             _build_email_send_handler(email_sender),
         )

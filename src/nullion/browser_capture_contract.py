@@ -119,7 +119,7 @@ def completed_capture_paths(decision: object, tool_results: object) -> tuple[str
     required = set(getattr(decision, "required_tool_names", ()) or ())
     if not required <= {r.tool_name for r in results}:
         return ()
-    return verified_capture_paths(results)
+    return verified_capture_paths(results, decision=decision)
 
 
 def delivered_capture_paths(decision: object, tool_results: object, final_text: str) -> tuple[str, ...]:
@@ -131,7 +131,7 @@ def delivered_capture_paths(decision: object, tool_results: object, final_text: 
         return ()
     if set(getattr(decision, "required_tool_names", ()) or ()) - {r.tool_name for r in results}:
         return ()
-    verified = verified_capture_paths(results)
+    verified = verified_capture_paths(results, decision=decision)
     if not verified:
         return ()
     from nullion.artifacts import media_candidate_paths_from_text
@@ -139,7 +139,83 @@ def delivered_capture_paths(decision: object, tool_results: object, final_text: 
     return tuple(path for path in verified if path in declared)
 
 
-def verified_capture_paths(tool_results: object) -> tuple[str, ...]:
+
+def screenshot_has_visible_pixels(image) -> bool:
+    """A uniform or completely transparent raster has no visible source detail."""
+    from PIL import Image
+
+    if "A" in image.getbands() or "transparency" in image.info:
+        with image.convert("RGBA") as foreground, Image.new("RGBA", image.size, "white") as background:
+            with Image.alpha_composite(background, foreground) as flattened, flattened.convert("RGB") as pixels:
+                return any(low != high for low, high in pixels.getextrema())
+    with image.convert("RGB") as pixels:
+        return any(low != high for low, high in pixels.getextrema())
+
+
+
+def screenshot_has_source_pixels(image, output: Mapping) -> bool:
+    """Viewer chrome is not rendered document content."""
+    url = str(output.get("page_url") or "")
+    if urlparse(url).path.lower().endswith(".pdf"):
+        # The viewer can paint chrome, page edges, and placeholders without
+        # rendering document contents. Require an exact-document render.
+        digest = output.get("source_pdf_sha256")
+        if (output.get("capture_method") != "pdf_page_render" or not isinstance(digest, str)
+                or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest)):
+            return False
+    return screenshot_has_visible_pixels(image)
+
+def capture_pixels_required(url: object, has_document_content: object) -> bool:
+    """Enforce pixels for external documents and pages with no populated DOM."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(url or ""))
+    return parsed.scheme in {"http", "https"} and (
+        parsed.path.lower().endswith(".pdf") or has_document_content is False
+    )
+
+def capture_receipt_matches_extent(output: Mapping, extent: object = None, *, image_size=None) -> bool:
+    """Compare native mode/pixels with capture state; legacy rows remain readable."""
+    recorded = output.get("capture_extent_contract")
+    if extent is None:
+        extent = recorded
+    current = isinstance(extent, str) and extent in {"auto", "viewport", "full_page"}
+    actual = output.get("mode")
+    if actual is None and recorded is None:
+        return True  # Persisted receipts from before the extent contract.
+    if not isinstance(actual, str) or actual not in {"viewport", "full_page"}:
+        return False
+    if current:
+        if recorded is not None and recorded != extent:
+            return False
+        remote = urlparse(str(output.get("page_url") or "")).scheme in {"http", "https"}
+        expected = "full_page" if extent == "full_page" else ("viewport" if extent == "viewport" or remote else None)
+        if expected is not None and actual != expected:
+            return False
+    if actual == "viewport" and image_size is not None:
+        width, height = output.get("viewport_width"), output.get("viewport_height")
+        if (isinstance(width, (int, float)) and isinstance(height, (int, float))
+                and (image_size[0] > width + 1 or image_size[1] > height + 1)):
+            return False
+    return True
+
+
+
+def verified_capture_png(path: Path, output: Mapping, extent: object = None) -> bool:
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            if image.format != "PNG" or not capture_receipt_matches_extent(output, extent, image_size=image.size):
+                return False
+            if capture_pixels_required(output.get("page_url"), output.get("has_document_content")):
+                return screenshot_has_source_pixels(image, output)
+            image.verify()
+    except (OSError, ValueError):
+        return False
+    return True
+
+def verified_capture_paths(tool_results: object, *, decision: object = None) -> tuple[str, ...]:
     """Require a real PNG from the last browser operation in a loaded session."""
     browser_results = [r for r in repaired_browser_results(tool_results) if str(getattr(r, "tool_name", "")).startswith("browser_")]
     if not browser_results:
@@ -149,6 +225,9 @@ def verified_capture_paths(tool_results: object) -> tuple[str, ...]:
         return ()
     output = capture.output
     if not isinstance(output, Mapping):
+        return ()
+    extent = getattr(decision, "browser_capture_extent", None)
+    if not capture_receipt_matches_extent(output, extent):
         return ()
     session_id = output.get("session_id")
     parsed_url = urlparse(str(output.get("page_url") or ""))
@@ -171,12 +250,6 @@ def verified_capture_paths(tool_results: object) -> tuple[str, ...]:
     if any(r.status != "completed" or r.tool_name not in CAPTURE_TOOLS for r in preceding):
         return ()
     path = Path(str(output.get("artifact_path") or output.get("path") or ""))
-    try:
-        from PIL import Image
-        with Image.open(path) as image:
-            if image.format != "PNG" or image.width <= 0 or image.height <= 0:
-                return ()
-            image.verify()
-    except (OSError, ValueError):
+    if not verified_capture_png(path, output, extent):
         return ()
     return (str(path),)

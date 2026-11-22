@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import html
+from html.parser import HTMLParser
 import mimetypes
 import os
 from pathlib import Path
@@ -715,18 +716,69 @@ def artifact_path_for_generated_workspace_file(
     return root / f"{stem}-{uuid4().hex[:12]}{normalized_suffix}"
 
 
+class _HTMLDocumentEncoding(HTMLParser):
+    """Locate real encoding tags without rewriting body, script or style text."""
+    def __init__(self, text: str):
+        super().__init__(convert_charrefs=False)
+        self.offsets = [0]
+        for line in text.split('\n')[:-1]:
+            self.offsets.append(self.offsets[-1] + len(line) + 1)
+        self.head_end = self.html_end = self.doctype_end = None
+        self.encoding_tags = []
+        self.feed(text)
+
+    def _offset(self):
+        line, column = self.getpos()
+        return self.offsets[line - 1] + column
+
+    def handle_starttag(self, tag, attrs):
+        start = self._offset()
+        end = start + len(self.get_starttag_text())
+        if tag == 'head' and self.head_end is None:
+            self.head_end = end
+        elif tag == 'html' and self.html_end is None:
+            self.html_end = end
+        if tag == 'meta':
+            attributes = dict(attrs)
+            if 'charset' in attributes or str(attributes.get('http-equiv') or '').lower() == 'content-type':
+                self.encoding_tags.append((start, end))
+
+    def handle_decl(self, decl):
+        if decl.lower().startswith('doctype html') and self.doctype_end is None:
+            self.doctype_end = self._offset() + len(decl) + 3
+
+
+def _normalize_document_encoding(text: str, title: str) -> str:
+    parsed = _HTMLDocumentEncoding(text)
+    for start, end in reversed(parsed.encoding_tags):
+        text = text[:start] + text[end:]
+    parsed = _HTMLDocumentEncoding(text)
+    meta = '<meta charset="utf-8">'
+    if parsed.head_end is not None:
+        insertion, addition = parsed.head_end, meta
+    else:
+        insertion = parsed.html_end or parsed.doctype_end or 0
+        addition = '<head>' + meta + '<title>' + html.escape(title, quote=True) + '</title></head>'
+    result = text[:insertion] + addition + text[insertion:]
+    # A long leading declaration/comment cannot be relocated without changing
+    # source order. A UTF-8 signature makes decoding certain in that case.
+    declaration_end = insertion + addition.index(meta) + len(meta)
+    if len(result[:declaration_end].encode('utf-8')) > 1024 and not result.startswith('\ufeff'):
+        result = '\ufeff' + result
+    return result
+
+
 def normalize_html_document(html_text: str, *, title: str = "Nullion HTML Preview") -> str:
     text = str(html_text or "").strip()
     if not text:
         return ""
     if _HTML_DOCUMENT_RE.search(text[:1024]):
-        return text
+        return _normalize_document_encoding(text, title)
     escaped_title = html.escape(title, quote=True)
-    return (
+    document = (
         "<!doctype html>\n"
         "<html>\n"
         "<head>\n"
-        '  <meta charset="utf-8">\n'
         '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"  <title>{escaped_title}</title>\n"
         "</head>\n"
@@ -735,6 +787,7 @@ def normalize_html_document(html_text: str, *, title: str = "Nullion HTML Previe
         "</body>\n"
         "</html>\n"
     )
+    return _normalize_document_encoding(document.strip(), title)
 
 
 def _looks_like_substantial_html(text: str) -> bool:

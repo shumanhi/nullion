@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
 import re
@@ -36,7 +37,7 @@ _SHELL_COMMAND_FAMILIES = {
     "bash",
     "zsh",
 }
-_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|"}
+_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|", "|&", "&", "(", ")"}
 _SHELL_WRAPPER_COMMANDS = {
     "command",
     "env",
@@ -67,8 +68,33 @@ _TERMINAL_FILESYSTEM_METADATA_MUTATION_COMMANDS = {
     "chmod",
     "chown",
 }
-_TERMINAL_REDIRECT_RE = re.compile(r"^(?:\d+)?>>?$|^&>$")
 _TERMINAL_SAFE_REDIRECT_TARGETS = {"/dev/null"}
+_SHELL_OPERATORS = (';;&', '&>>', '<<<', '<<-', '&&', '||', '|&', ';;', ';&',
+    '>>', '<<', '>&', '<&', '<>', '>|', '&>', ';', '&', '|', '(', ')', '<', '>')
+_SHELL_REDIRECTS = frozenset({'<', '>', '>>', '>&', '<&', '<>', '>|', '&>', '&>>', '<<', '<<-', '<<<'})
+
+
+class _ShellParseError(ValueError):
+    """Syntax that cannot safely be represented without running the shell."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ShellToken:
+    value: str
+    raw: str
+    start: int
+    end: int
+    kind: str = 'word'
+    quoted: bool = False
+    dynamic: bool = False
+    substitutions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ShellRedirect:
+    operator: str
+    target: _ShellToken
+    descriptor: str | None = None
 _HTTP_URL_RE = re.compile(r"https?://[^\s'\"<>()\[\]{}]+", re.I)
 _WEB_SEARCH_TARGET = "https://www.bing.com/*"
 _INTERNAL_LARGE_TOOL_RESULT_RE = re.compile(r"^/large_tool_results/call_[A-Za-z0-9_-]+$")
@@ -153,21 +179,198 @@ def _shell_statement_separators(command: str) -> str:
     return "".join(result)
 
 
+def _shell_group_end(command: str, start: int, opening: str, closing: str) -> int:
+    depth, index, quote = 1, start + 1, None
+    while index < len(command):
+        char = command[index]
+        if char == '\\' and quote != "'":
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            elif quote == '"' and command.startswith('$(', index):
+                index = _shell_group_end(command, index + 1, '(', ')')
+                continue
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if not depth:
+                return index + 1
+        index += 1
+    raise _ShellParseError('Unterminated shell expansion or group')
+
+
+def _shell_lexemes(command: str) -> list[_ShellToken]:
+    """Lex shell words/operators without losing quoting or IO-number adjacency.
+
+    This does not evaluate expansions. Unsupported grammar is rejected by the
+    command reader instead of being reinterpreted as executable filenames.
+    """
+    if '\0' in command:
+        raise _ShellParseError('A shell command cannot contain NUL bytes')
+    tokens = []
+    index = 0
+    group_depth = 0
+    heredocs = []
+    heredoc_operator = None
+    while index < len(command):
+        char = command[index]
+        if char == '\\' and command[index:index + 2] == '\\\n':
+            index += 2
+            continue
+        if char in ' \t':
+            index += 1
+            continue
+        if char == '#':
+            newline = command.find('\n', index)
+            index = len(command) if newline < 0 else newline
+            continue
+        if char == '\n':
+            if not tokens or tokens[-1].value not in {'&&', '||', '|', '|&'} or tokens[-1].kind != 'operator':
+                tokens.append(_ShellToken(';', '\n', index, index + 1, 'operator'))
+            index += 1
+            for delimiter, strip_tabs, quoted in heredocs:
+                found = False
+                while index < len(command):
+                    end = command.find('\n', index)
+                    end = len(command) if end < 0 else end
+                    line = command[index:end]
+                    compared = line.lstrip('\t') if strip_tabs else line
+                    index = min(end + 1, len(command))
+                    if compared == delimiter:
+                        found = True
+                        break
+                    if not quoted and ('$' + '(' in line or '`' in line):
+                        raise _ShellParseError('Substitution in an expandable here-document requires explicit commands')
+                if not found:
+                    raise _ShellParseError('Unterminated here-document')
+            heredocs.clear()
+            continue
+        operator = next((op for op in _SHELL_OPERATORS if command.startswith(op, index)), None)
+        # Process substitutions are words, not ordinary redirection operands.
+        if operator and not command.startswith(('<(', '>('), index):
+            if operator == '(':
+                group_depth += 1
+            elif operator == ')':
+                group_depth -= 1
+                if group_depth < 0:
+                    raise _ShellParseError('Unmatched shell group')
+            tokens.append(_ShellToken(operator, operator, index, index + len(operator), 'operator'))
+            if operator in {'<<', '<<-'}:
+                heredoc_operator = operator
+            index += len(operator)
+            continue
+        start = index
+        value = []
+        quoted = dynamic = False
+        substitutions = []
+        quote = None
+        while index < len(command):
+            char = command[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                else:
+                    value.append(char)
+                index += 1
+                continue
+            if char == '\\':
+                if index + 1 == len(command):
+                    raise _ShellParseError('Trailing shell escape')
+                following = command[index + 1]
+                if following == '\n':
+                    index += 2
+                    continue
+                if quote == '"' and following not in '$`"\\':
+                    value.append('\\')
+                    index += 1
+                    continue
+                quoted = True
+                value.append(following)
+                index += 2
+                continue
+            if char == '"':
+                quoted = True
+                quote = None if quote == '"' else '"'
+                index += 1
+                continue
+            if not quote and char == "'":
+                quoted = True
+                quote = "'"
+                index += 1
+                continue
+            if not quote and command.startswith(("$'", '$"'), index):
+                raise _ShellParseError('Extended shell quoting requires explicit literal arguments')
+            if command.startswith('$(', index) or (not quote and command.startswith(('<(', '>('), index)):
+                end = _shell_group_end(command, index + 1, '(', ')')
+                expression = command[index:end]
+                value.append(expression)
+                dynamic = True
+                if not expression.startswith('$(('):
+                    substitutions.append(expression[2:-1])
+                elif '$(' in expression[3:-2] or '`' in expression[3:-2]:
+                    raise _ShellParseError('Nested arithmetic substitutions require explicit commands')
+                index = end
+                continue
+            if command.startswith('${', index):
+                end = _shell_group_end(command, index + 1, '{', '}')
+                expression = command[index:end]
+                if '$(' in expression or '`' in expression:
+                    raise _ShellParseError('Nested parameter substitutions require explicit commands')
+                value.append(expression)
+                dynamic = True
+                index = end
+                continue
+            if char == '`':
+                end = command.find('`', index + 1)
+                if end < 0 or '\\' in command[index + 1:end]:
+                    raise _ShellParseError('Unsupported or unterminated backtick substitution')
+                substitutions.append(command[index + 1:end])
+                value.append(command[index:end + 1])
+                dynamic = True
+                index = end + 1
+                continue
+            if not quote and (char in ' \t\n' or any(command.startswith(op, index) for op in _SHELL_OPERATORS)):
+                break
+            if char == '$' and index + 1 < len(command) and (
+                    command[index + 1].isalnum() or command[index + 1] in '_?*!$@-#'):
+                dynamic = True
+            if char == '~' and index == start:
+                dynamic = True
+            value.append(char)
+            index += 1
+        if quote:
+            raise _ShellParseError('Unterminated shell quote')
+        token = _ShellToken(''.join(value), command[start:index], start, index,
+            quoted=quoted, dynamic=dynamic, substitutions=tuple(substitutions))
+        tokens.append(token)
+        if heredoc_operator:
+            heredocs.append((token.value, heredoc_operator == '<<-', token.quoted))
+            heredoc_operator = None
+    if group_depth:
+        raise _ShellParseError('Unterminated shell group')
+    if tokens and tokens[-1].kind == 'operator' and tokens[-1].value in {'&&', '||', '|', '|&'}:
+        raise _ShellParseError('Incomplete shell control operator')
+    if heredoc_operator or heredocs:
+        raise _ShellParseError('Missing here-document body or delimiter')
+    return tokens
+
+
 def _shell_syntax_tokens(command: str) -> list[str]:
-    try:
-        lexer = shlex.shlex(_shell_statement_separators(command), posix=True, punctuation_chars=True)
-        lexer.commenters = ""
-        lexer.whitespace_split = True
-        return [";" if token and set(token) == {";"} else token for token in lexer]
-    except Exception:
-        return _command_tokens(command)
+    return [token.value for token in _shell_lexemes(command)]
 
 
-def _shell_segments(tokens: list[str]) -> list[list[str]]:
+def _shell_segments(tokens):
     segments: list[list[str]] = []
     current: list[str] = []
     for token in tokens:
-        if token in _SHELL_CONTROL_TOKENS:
+        value = token.value if isinstance(token, _ShellToken) else token
+        operator = not isinstance(token, _ShellToken) or token.kind == 'operator'
+        if operator and value in _SHELL_CONTROL_TOKENS:
             if current:
                 segments.append(current)
                 current = []
@@ -178,31 +381,80 @@ def _shell_segments(tokens: list[str]) -> list[list[str]]:
     return segments
 
 
-def _strip_shell_wrappers(segment: list[str]) -> list[str]:
+def _shell_command_words(segment: list[_ShellToken]) -> tuple[list[_ShellToken], list[_ShellRedirect]]:
+    words, redirects = [], []
+    index = 0
+    while index < len(segment):
+        token = segment[index]
+        if token.kind != 'operator':
+            words.append(token)
+            index += 1
+            continue
+        if token.value not in _SHELL_REDIRECTS or index + 1 >= len(segment):
+            raise _ShellParseError('Unsupported shell operator or missing redirection target')
+        target = segment[index + 1]
+        if target.kind != 'word':
+            raise _ShellParseError('A redirection requires one shell word')
+        descriptor = None
+        if words and words[-1].end == token.start and not words[-1].quoted:
+            prefix = words[-1].raw.replace('\\\n', '')
+            if prefix.isascii() and prefix.isdigit():
+                descriptor = words.pop().value
+            elif re.fullmatch(r'\{[A-Za-z_][A-Za-z_0-9]*\}', prefix):
+                descriptor = words.pop().value
+        redirects.append(_ShellRedirect(token.value, target, descriptor))
+        index += 2
+    return words, redirects
+
+
+def _strip_shell_wrappers(segment):
     stripped = list(segment)
     while stripped:
-        command = Path(stripped[0].strip("'\"")).name.lower()
+        value = stripped[0].value if isinstance(stripped[0], _ShellToken) else stripped[0].strip("'\"")
+        command = Path(value).name.lower()
         if command not in _SHELL_WRAPPER_COMMANDS:
             break
+        if command == 'xargs' and isinstance(stripped[0], _ShellToken):
+            raise _ShellParseError('Input-generated arguments require an explicit target selection')
         stripped = stripped[1:]
+        if command == 'command':
+            inspect_only = False
+            while stripped:
+                option = stripped[0].value if isinstance(stripped[0], _ShellToken) else stripped[0]
+                if option == '--':
+                    stripped = stripped[1:]
+                    break
+                if not option.startswith('-') or option == '-':
+                    break
+                if option.startswith('--') or any(flag not in 'pVv' for flag in option[1:]):
+                    raise _ShellParseError('Unsupported command builtin option')
+                inspect_only = inspect_only or any(flag in 'Vv' for flag in option[1:])
+                stripped = stripped[1:]
+            if inspect_only:
+                return []  # Names are inspected; none of them is executed.
         if command == "env":
-            while stripped and "=" in stripped[0] and not stripped[0].startswith(("-", "/")):
+            while stripped:
+                value = stripped[0].value if isinstance(stripped[0], _ShellToken) else stripped[0]
+                if '=' not in value or value.startswith(('-', '/')):
+                    break
                 stripped = stripped[1:]
     return stripped
 
 
-def _shell_operands(tokens: list[str]) -> list[str]:
+def _shell_operands(tokens):
     operands: list[str] = []
     skip_next = False
-    for index, token in enumerate(tokens):
+    options = True
+    for token in tokens:
         if skip_next:
             skip_next = False
             continue
-        if token == "--":
-            operands.extend(tokens[index + 1 :])
-            break
-        if token.startswith("-"):
-            if token in {"-o", "-g", "-m", "-t", "-T"}:
+        value = token.value if isinstance(token, _ShellToken) else token
+        if options and value == "--":
+            options = False
+            continue
+        if options and value.startswith("-"):
+            if value in {"-o", "-g", "-m", "-t", "-T"}:
                 skip_next = True
             continue
         operands.append(token)
@@ -216,7 +468,20 @@ def _filesystem_boundary_fact_from_terminal_target(
     raw_path: object,
     command_family: str,
 ) -> BoundaryFact | None:
-    fact = _filesystem_boundary_fact(tool_name=tool_name, operation=operation, raw_path=raw_path)
+    token = raw_path if isinstance(raw_path, _ShellToken) else None
+    value = token.value if token else raw_path
+    if token:
+        if not value:
+            return None
+        # Shell quoting was already removed exactly by the lexer. Do not apply
+        # another quote/tilde interpretation to a literal filename.
+        fact = BoundaryFact(kind=BoundaryKind.FILESYSTEM_ACCESS, tool_name=tool_name,
+            operation=operation, target=value, attributes={'path': value,
+                **({'shell_quoted_literal': True, 'shell_expression': token.raw} if token.quoted else {}),
+                **({'target_resolution': 'shell_expansion_required', 'shell_expression': token.raw}
+                   if token.dynamic else {})})
+    else:
+        fact = _filesystem_boundary_fact(tool_name=tool_name, operation=operation, raw_path=value)
     if fact is None:
         return None
     return BoundaryFact(
@@ -229,32 +494,106 @@ def _filesystem_boundary_fact_from_terminal_target(
 
 
 def _is_safe_terminal_redirect_target(raw_path: object) -> bool:
+    if isinstance(raw_path, _ShellToken):
+        return not raw_path.dynamic and raw_path.value in _TERMINAL_SAFE_REDIRECT_TARGETS
     if not isinstance(raw_path, str) or not raw_path:
         return False
     target = raw_path.strip().strip("'\"")
     return target in _TERMINAL_SAFE_REDIRECT_TARGETS
 
 
-def _terminal_filesystem_mutation_facts(command: str, *, tool_name: str) -> list[BoundaryFact]:
-    tokens = _shell_syntax_tokens(command)
+def _shell_parse_failure_fact(command: str, *, tool_name: str) -> BoundaryFact:
+    return BoundaryFact(kind=BoundaryKind.FILESYSTEM_ACCESS, tool_name=tool_name,
+        operation='parse', target='<unresolved-shell-command>', attributes={
+            'target_resolution': 'shell_parse_required', 'shell_expression': command,
+            'failure_reason': 'shell_syntax_unresolved'})
+
+
+def _terminal_filesystem_mutation_facts(command: str, *, tool_name: str, _depth=0) -> list[BoundaryFact]:
+    try:
+        return _parsed_terminal_filesystem_facts(command, tool_name=tool_name, _depth=_depth)
+    except _ShellParseError:
+        return [_shell_parse_failure_fact(command, tool_name=tool_name)]
+
+
+def _parsed_terminal_filesystem_facts(command: str, *, tool_name: str, _depth: int) -> list[BoundaryFact]:
+    if _depth > 12:
+        raise _ShellParseError('Shell nesting exceeds the supported inspection depth')
+    tokens = _shell_lexemes(command)
     facts: list[BoundaryFact] = []
+    changes_directory = False
+    for token in tokens:
+        for nested in token.substitutions:
+            facts.extend(_terminal_filesystem_mutation_facts(nested, tool_name=tool_name, _depth=_depth + 1))
     for segment in _shell_segments(tokens):
-        stripped = _strip_shell_wrappers(segment)
+        words, redirects = _shell_command_words(segment)
+        for redirect in redirects:
+            operator, target = redirect.operator, redirect.target
+            if operator in {'<<', '<<-', '<<<'}:
+                continue  # Delimiters and here-string data are not file paths.
+            if operator in {'>&', '<&'} and not target.dynamic:
+                if re.fullmatch(r'(?:[0-9]+-?|-)', target.value):
+                    continue  # Duplicate, move or close a file descriptor.
+                if operator == '<&' or redirect.descriptor is not None:
+                    raise _ShellParseError('Invalid file descriptor duplication')
+            operation = 'read' if operator in {'<', '<&'} else 'write'
+            if _is_safe_terminal_redirect_target(target):
+                continue
+            fact = _filesystem_boundary_fact_from_terminal_target(tool_name=tool_name,
+                operation=operation, raw_path=target, command_family='redirect')
+            if fact is not None:
+                facts.append(fact)
+        while words and not words[0].quoted and re.match(r'^[A-Za-z_][A-Za-z_0-9]*=', words[0].raw):
+            words.pop(0)
+        while words and not words[0].quoted and words[0].value in {'then', 'do', 'else', 'elif', '!', '{', '}'}:
+            words.pop(0)
+        stripped = _strip_shell_wrappers(words)
         if not stripped:
             continue
-        for index, token in enumerate(stripped[:-1]):
-            if _TERMINAL_REDIRECT_RE.fullmatch(token):
-                if _is_safe_terminal_redirect_target(stripped[index + 1]):
+        if stripped[0].dynamic or stripped[0].value.startswith('-'):
+            raise _ShellParseError('The executable must be an explicit shell word')
+        command_family = Path(stripped[0].value).name.lower()
+        if command_family in {'cd', 'pushd', 'popd'}:
+            changes_directory = True
+            continue
+        if command_family in {'if', 'for', 'while', 'until', 'case', 'function', 'select', 'eval',
+                'source', '.', '[[', 'time', 'exec', 'builtin'}:
+            raise _ShellParseError('This shell construct requires explicit commands')
+        if command_family in {'sh', 'bash', 'zsh', 'dash', 'ksh'}:
+            command_index = next((index + 1 for index, token in enumerate(stripped[1:], 1)
+                if token.value.startswith('-') and not token.value.startswith('--') and 'c' in token.value), None)
+            if command_index is None or command_index >= len(stripped) or stripped[command_index].dynamic:
+                raise _ShellParseError('Nested shells require an inspectable literal command')
+            facts.extend(_terminal_filesystem_mutation_facts(stripped[command_index].value,
+                tool_name=tool_name, _depth=_depth + 1))
+            continue
+        if command_family == 'find':
+            for index, word in enumerate(stripped[1:], 1):
+                if word.value not in {'-exec', '-execdir', '-ok', '-okdir'}:
                     continue
-                fact = _filesystem_boundary_fact_from_terminal_target(
-                    tool_name=tool_name,
-                    operation="write",
-                    raw_path=stripped[index + 1],
-                    command_family="redirect",
-                )
-                if fact is not None:
-                    facts.append(fact)
-        command_family = Path(stripped[0].strip("'\"")).name.lower()
+                end = next((offset for offset in range(index + 1, len(stripped))
+                    if stripped[offset].value in {';', '+'}), None)
+                if end is None or end == index + 1:
+                    raise _ShellParseError('An executable find expression requires a complete command')
+                nested_words = _strip_shell_wrappers(stripped[index + 1:end])
+                if not nested_words:
+                    raise _ShellParseError('An executable find expression requires a command')
+                nested_family = Path(nested_words[0].value).name.lower()
+                if any('{}' in item.value and item.value != '{}' for item in nested_words):
+                    raise _ShellParseError('Embedded find substitutions require an explicit target selection')
+                nested_command = command[stripped[index + 1].start:stripped[end - 1].end]
+                nested_facts = _terminal_filesystem_mutation_facts(nested_command,
+                    tool_name=tool_name, _depth=_depth + 1)
+                # A standalone find placeholder is the stored search selection,
+                # not a literal cwd/{} file. The shared find permission adapter
+                # retains that native selection scope separately.
+                nested_facts = [fact for fact in nested_facts if not (
+                    fact.target == '{}' and nested_family in {'rm', 'rm.exe', 'rmdir', 'rmdir.exe'})]
+                if word.value in {'-execdir', '-okdir'} and any(
+                        fact.operation in {'delete', 'write', 'metadata_write'}
+                        and not Path(fact.target).is_absolute() for fact in nested_facts):
+                    raise _ShellParseError('Directory-relative find commands require absolute mutation targets')
+                facts.extend(nested_facts)
         operands = _shell_operands(stripped[1:])
         if command_family in _TERMINAL_FILESYSTEM_MUTATION_COMMANDS:
             operation = _TERMINAL_FILESYSTEM_MUTATION_COMMANDS[command_family]
@@ -278,6 +617,9 @@ def _terminal_filesystem_mutation_facts(command: str, *, tool_name: str) -> list
                 )
                 if fact is not None:
                     facts.append(fact)
+    if changes_directory and any(fact.operation in {'delete', 'write', 'metadata_write'}
+            and not Path(fact.target).is_absolute() for fact in facts):
+        raise _ShellParseError('Directory-changing commands require absolute mutation targets')
     return facts
 
 
@@ -452,8 +794,8 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         )
         return facts
 
-    if invocation.tool_name in {"file_download", "web_fetch"}:
-        raw_url = invocation.arguments.get("url")
+    if invocation.tool_name in {"file_download", "web_fetch", "browser_screenshot"}:
+        raw_url = invocation.arguments.get("pdf_url" if invocation.tool_name == "browser_screenshot" else "url")
         if not isinstance(raw_url, str) or not raw_url:
             return []
         return [
@@ -646,6 +988,9 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         raw_paths = invocation.arguments.get("attachment_paths")
         if isinstance(raw_paths, str):
             raw_paths = [raw_paths]
+        html_path = invocation.arguments.get("html_path")
+        if isinstance(html_path, str) and html_path.strip() and not str(invocation.arguments.get("html_body") or "").strip():
+            raw_paths = [*(raw_paths if isinstance(raw_paths, (list, tuple)) else ()), html_path]
         if isinstance(raw_paths, (list, tuple)):
             for raw_path in raw_paths:
                 fact = _filesystem_boundary_fact(

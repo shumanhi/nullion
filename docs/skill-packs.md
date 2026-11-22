@@ -113,6 +113,9 @@ auth-required:
   Connections.
 - Admins choose whether a provider should use per-workspace credentials or, for
   providers that allow it, one shared admin credential across all workspaces.
+  The UI requires explicit confirmation before saving an admin-shared
+  credential. Installing auth-required skills alone never grants account
+  access or shares the admin's connection with members.
 - Active external connector providers are discovered from workspace
   connections. If a native email/calendar provider fails because its own
   credential is missing or unauthorized, the agent should check enabled

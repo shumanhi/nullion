@@ -163,6 +163,20 @@ def selected_request_context(store, turn, workspace_id):
     if not selected:
         return None
     selected.reverse()
-    return {'parent_turn_id':parent, 'original_request':original if not truncated else None,
+    result = {'parent_turn_id':parent, 'original_request':original if not truncated else None,
         'turns':selected, 'truncated':truncated or text_truncated,
         **({'goal_replaced':True} if disposition == 'interrupt' else {})}
+    if disposition in {'continue', 'revise'}:
+        # A linked revision may select a different detail from the same capture.
+        # Retained data is reference-only and cannot replace a required fresh read.
+        from datetime import UTC, datetime
+        from nullion.conversation_history_tools import browser_snapshot_from_events, compact_history_search_output
+
+        selected_events = [indexed[row['turn_id']] for row in selected
+                           if row.get('context_only') is not True and row['turn_id'] in indexed]
+        snapshot = browser_snapshot_from_events(selected_events, turn.conversation_id, workspace_id,
+                                                600, now=datetime.now(UTC).timestamp())
+        if snapshot.get('source_invocation_id'):
+            result['browser_snapshot'] = compact_history_search_output(
+                {'result_kind': 'retained_browser_snapshot', **snapshot}, max_chars=8000)
+    return result

@@ -88,6 +88,7 @@ def test_web_verbose_streaming_parallel_followup_and_planner_feed_contract(tmp_p
 
     assert "fast" in starts
     assert "slow" in starts
+    assert not [event for event in events if event.get("type") == "error"]
     assert starts.index("fast") < starts.index("follow-up")
     assert starts.index("slow") < starts.index("follow-up")
 
@@ -115,6 +116,7 @@ def test_web_verbose_streaming_parallel_followup_and_planner_feed_contract(tmp_p
         and event.get("type") == "task_status"
         and event.get("status_kind") == "task_summary"
         and event.get("group_id") == "group-planner"
+        and event.get("include_activity") is True
         and "Planner: Parallel Mission" in event.get("text", "")
         for event in events
     )

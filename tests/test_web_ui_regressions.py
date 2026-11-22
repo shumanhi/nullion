@@ -5,6 +5,7 @@ import json
 import os
 import re
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 import time
 import pytest
@@ -489,6 +490,10 @@ def test_chat_operator_materializes_tool_arguments_from_approval_required_result
     assert "tool_description" not in approval.context
 
 
+def _reviewed_attachment_digests(arguments):
+    return {path: sha256(Path(path).read_bytes()).hexdigest() for path in arguments["attachment_paths"]}
+
+
 def test_chat_operator_executes_approved_pending_tool_call_without_replaying_prompt(tmp_path) -> None:
     from nullion import chat_operator
     from nullion.approval_decisions import approve_request_with_mode
@@ -537,6 +542,7 @@ def test_chat_operator_executes_approved_pending_tool_call_without_replaying_pro
             "tool_name": "email_send",
             "requires_approval": True,
             "tool_arguments": arguments,
+            "reviewed_email_files": _reviewed_attachment_digests(arguments),
         },
     )
     runtime.store.add_approval_request(approval)
@@ -632,6 +638,7 @@ def test_chat_operator_executes_approved_tool_call_from_context_without_suspende
             "tool_name": "email_send",
             "requires_approval": True,
             "tool_arguments": arguments,
+            "reviewed_email_files": _reviewed_attachment_digests(arguments),
             "trigger_flow": {
                 "capsule_id": "turn-stage",
                 "invocation_id": "email-send-context",
@@ -701,6 +708,7 @@ def test_web_resume_executes_approved_tool_context_before_prompt_replay(tmp_path
             "tool_name": "email_send",
             "requires_approval": True,
             "tool_arguments": arguments,
+            "reviewed_email_files": _reviewed_attachment_digests(arguments),
             "trigger_flow": {
                 "capsule_id": "turn-stage",
                 "invocation_id": "email-send-context",
@@ -794,6 +802,7 @@ def test_web_approval_route_executes_tool_context_before_suspended_replay(tmp_pa
             "tool_name": "email_send",
             "requires_approval": True,
             "tool_arguments": arguments,
+            "reviewed_email_files": _reviewed_attachment_digests(arguments),
             "trigger_flow": {
                 "capsule_id": "turn-stage",
                 "invocation_id": "email-send-context",
@@ -894,6 +903,7 @@ def test_web_approval_route_preserves_preapproval_artifact_evidence(tmp_path, mo
             "tool_name": "email_send",
             "requires_approval": True,
             "tool_arguments": arguments,
+            "reviewed_email_files": _reviewed_attachment_digests(arguments),
             "trigger_flow": {
                 "capsule_id": "turn-stage",
                 "invocation_id": "email-send-context",
@@ -4082,12 +4092,22 @@ def test_task_status_card_ignores_progress_notes(tmp_path,monkeypatch,enabled) -
         assert orchestrator.deliver_fn(cid,'Internal progress update',is_status=True,status_kind='progress_note')
         assert orchestrator.deliver_fn(cid,'PLANNER\nFor: current request\n1 task',
             is_status=True,status_kind='task_summary',group_id='owned-status')
-        if enabled:
-            progress=socket.receive_json()
-            assert progress['status_kind']=='progress_note' and progress['include_activity'] is True
         planner=socket.receive_json()
         assert planner['status_kind']=='task_summary' and planner['group_id']=='owned-status'
         assert planner['include_activity'] is enabled
+        assert 'Internal progress update' not in str(planner)
+        assert orchestrator.deliver_fn(cid,'✓ list_crons',is_status=True,status_kind='tool_activity',
+            group_id='owned-status',activity_id='cron-tools',activity_label='Task tools',tool_status='completed')
+        assert orchestrator.deliver_fn(cid,'PLANNER\nFor: current request\n1 task updated',
+            is_status=True,status_kind='task_summary',group_id='owned-status')
+        if enabled:
+            activity=socket.receive_json()
+            assert activity['status_kind']=='tool_activity' and activity['include_activity'] is True
+            assert 'list_crons' in activity['text']
+            assert 'Internal progress update' not in str(activity)
+        updated=socket.receive_json()
+        assert updated['status_kind']=='task_summary' and updated['text'].endswith('1 task updated')
+        assert updated['include_activity'] is enabled
 
 
 def test_task_status_card_marks_terminal_list_as_finalizing() -> None:
@@ -5065,7 +5085,9 @@ def test_web_approval_card_uses_explicit_web_flag_for_id_only_details() -> None:
         "function approvalActionsHtml(approvalId, toolName, detail, "
         "sessionAllowLabel = 'for all workspaces', forceWeb = false, requestKind = '')"
     ) in _HTML
-    assert "const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);" in _HTML
+    assert "const isWeb = approvalWebScopeFromContract(toolName, detail, forceWeb, requestKind);" in _HTML
+    assert "if (requestKind === 'terminal_destructive_action') return false;" in _HTML
+    assert "return requestKind ? forceWeb === true : Boolean(forceWeb || approvalIsWebRequest(toolName, detail));" in _HTML
     assert "haystack.includes('fetch a web page')" in _HTML
     assert "haystack.includes('allow web access')" in _HTML
 

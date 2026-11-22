@@ -130,7 +130,10 @@ def is_untrusted_tool_output(tool_name: str, output: Any = None) -> bool:
         return True
     if not isinstance(output, Mapping):
         return False
-    return any(key in output for key in UNTRUSTED_OUTPUT_KEYS)
+    # Chat history can replay current-conversation browser captures. Keep the
+    # original webpage's trust classification at the new delivery boundary.
+    return (output.get("result_kind") == "retained_browser_snapshot"
+            or any(key in output for key in UNTRUSTED_OUTPUT_KEYS))
 
 
 def safe_untrusted_tool_metadata(tool_name: str, output: Any) -> dict[str, str]:

@@ -727,8 +727,10 @@ def test_browser_extract_items_script_preserves_url_identity_after_nested_unwrap
 
 
 def test_browser_cdp_url_tracks_known_preferred_browser_defaults() -> None:
-    assert web_app._browser_cdp_url_for_preference("http://localhost:9222", "brave") == "http://127.0.0.1:9223"
-    assert web_app._browser_cdp_url_for_preference("http://127.0.0.1:9223", "chrome") == "http://127.0.0.1:9222"
+    assert web_app._browser_cdp_url_for_preference(None, "brave") == "http://127.0.0.1:9223"
+    assert web_app._browser_cdp_url_for_preference(None, "chrome") == "http://127.0.0.1:9222"
+    assert web_app._browser_cdp_url_for_preference("http://localhost:9222", "brave") == "http://127.0.0.1:9222"
+    assert web_app._browser_cdp_url_for_preference("http://127.0.0.1:9223", "chrome") == "http://127.0.0.1:9223"
     assert web_app._browser_cdp_url_for_preference("http://127.0.0.1:9444", "brave") == "http://127.0.0.1:9444"
 
 

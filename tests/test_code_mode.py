@@ -17,6 +17,27 @@ def registry():
     return reg
 
 
+@pytest.mark.parametrize('mode',['on','read_only','off'])
+def test_context_discovery_stays_native_and_is_also_composable(monkeypatch,mode):
+    from nullion.conversation_history_tools import CHAT_HISTORY_SEARCH_TOOL_SPEC
+    from nullion.memory_tools import _SPECS
+    monkeypatch.setenv('NULLION_CODE_MODE', mode)
+    reg = registry()
+    for spec in (CHAT_HISTORY_SEARCH_TOOL_SPEC, _SPECS['memory_search']):
+        reg.register(spec, lambda _: None)
+    offered = code_mode.offer_code_mode(reg.list_tool_definitions(), reg)
+    names = {row['name'] for row in offered}
+    assert {'chat_history_search', 'memory_search'} <= names
+    if mode=='off':
+        assert 'code_mode' not in names
+        return
+    assert 'code_mode' in names and 'read' not in names
+    program = next(row for row in offered if row['name'] == 'code_mode')
+    allowed = program['input_schema']['properties']['tool_names']['items']['enum']
+    assert 'read' in allowed
+    assert {'chat_history_search', 'memory_search'} <= set(allowed)
+
+
 def execute(state, content):
     from nullion.tools import ToolInvocation
     b = content[0]

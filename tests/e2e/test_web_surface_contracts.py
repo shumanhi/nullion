@@ -613,7 +613,9 @@ def test_browser_settings_repeated_save_preserves_real_tools_and_toolbar(tmp_pat
             playwright.stop()
 
 
-def test_browser_ui_auto_preferred_browser_is_saved_and_used_for_open(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("port", [9222, 19226])
+@pytest.mark.parametrize("selected", ["brave", "chrome"])
+def test_browser_ui_auto_preferred_browser_is_saved_and_used_for_open(tmp_path: Path, monkeypatch, port, selected) -> None:
     from nullion import web_app
     import nullion.auth as auth_module
     import nullion.plugins.browser_plugin as browser_plugin
@@ -631,14 +633,14 @@ def test_browser_ui_auto_preferred_browser_is_saved_and_used_for_open(tmp_path: 
     saved_credentials = {
         "browser_backend": "auto",
         "browser_preferred": "brave",
-        "browser_cdp_url": "http://127.0.0.1:9222",
+        "browser_cdp_url": f"http://127.0.0.1:{port}",
     }
 
     monkeypatch.setenv("NULLION_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("NULLION_ENV_FILE", str(env_path))
     monkeypatch.setenv("NULLION_BROWSER_BACKEND", "auto")
     monkeypatch.setenv("NULLION_BROWSER_PREFERRED", "brave")
-    monkeypatch.setenv("NULLION_BROWSER_CDP_URL", "http://127.0.0.1:9222")
+    monkeypatch.setenv("NULLION_BROWSER_CDP_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setenv("NULLION_BROWSER_ENABLED", "true")
     monkeypatch.setattr(web_app, "_find_env_path", lambda: env_path)
     monkeypatch.setattr(web_app, "_read_credentials_json", lambda: dict(saved_credentials))
@@ -692,9 +694,9 @@ def test_browser_ui_auto_preferred_browser_is_saved_and_used_for_open(tmp_path: 
             cdp_url = page.locator("#cfg-browser-cdp-url")
 
             expect(preferred).to_have_value("brave")
-            expect(cdp_url).to_have_value("http://127.0.0.1:9223")
+            expect(cdp_url).to_have_value(f"http://127.0.0.1:{port}")
             mode.select_option("auto")
-            preferred.select_option("chrome")
+            preferred.select_option(selected)
             _close_settings_tab_after_save(page, "General")
 
             config = page.evaluate("fetch('/api/config').then(r => r.json())")
@@ -704,15 +706,15 @@ def test_browser_ui_auto_preferred_browser_is_saved_and_used_for_open(tmp_path: 
             )
 
             assert config["browser_backend"] == "auto"
-            assert config["browser_preferred"] == "chrome"
-            assert config["browser_cdp_url"] == "http://127.0.0.1:9222"
+            assert config["browser_preferred"] == selected
+            assert config["browser_cdp_url"] == f"http://127.0.0.1:{port}"
             assert opened["ok"] is True
             assert opened["result"]["backend"] == "auto"
-            assert opened["result"]["preferred"] == "chrome"
-            assert saved_credentials["browser_preferred"] == "chrome"
-            assert saved_credentials["browser_cdp_url"] == "http://127.0.0.1:9222"
-            assert 'NULLION_BROWSER_PREFERRED="chrome"' in env_path.read_text()
-            assert 'NULLION_BROWSER_CDP_URL="http://127.0.0.1:9222"' in env_path.read_text()
+            assert opened["result"]["preferred"] == selected
+            assert saved_credentials["browser_preferred"] == selected
+            assert saved_credentials["browser_cdp_url"] == f"http://127.0.0.1:{port}"
+            assert f'NULLION_BROWSER_PREFERRED="{selected}"' in env_path.read_text()
+            assert f'NULLION_BROWSER_CDP_URL="http://127.0.0.1:{port}"' in env_path.read_text()
             assert not errors
         finally:
             browser.close()

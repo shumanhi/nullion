@@ -24,7 +24,7 @@ class BrowserRecoveryRequired(ConnectionError):
 class SessionRecoveryBackend:
     # Repeating a click/submission after transport loss could duplicate an
     # action. Only navigation and observations can be replayed automatically.
-    _REPLAYABLE = frozenset({"open", "navigate", "extract_text", "screenshot", "find", "share_session_context"})
+    _REPLAYABLE = frozenset({"open", "navigate", "extract_text", "screenshot", "find", "share_session_context", "browser_task_connection"})
 
     def __init__(self, configured):
         self._configured = configured
@@ -33,6 +33,13 @@ class SessionRecoveryBackend:
 
     def mode_for_session(self, session_id):
         return "headless" if session_id in self._headless else "configured"
+
+    async def browser_task_connection(self, session_id):
+        backend = self._headless.get(session_id, self._configured)
+        getter = getattr(backend, 'browser_task_connection', None)
+        if getter is not None:
+            return await self._invoke('browser_task_connection', session_id)
+        return (None, False) if str(getattr(backend, 'BACKEND_NAME', '')) == 'playwright' else None
 
     async def share_session_context(self, parent, child):
         if parent in self._headless:

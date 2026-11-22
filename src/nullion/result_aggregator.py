@@ -190,6 +190,7 @@ class ResultAggregator:
             task_id=update.task_id,
             activity_id=f"mini-agent-tools:{update.task_id}",
             activity_label=f"{label} tools",
+            tool_status=str((update.data or {}).get("tool_status") or ""),
         )
 
     async def _deliver_status(

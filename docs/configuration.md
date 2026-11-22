@@ -87,10 +87,12 @@ unchanged; parallel inspections must not erase one another's findings.
 | `NULLION_DIRECT_WEB_FETCH_ENABLED` | Opt in to the direct fetch tool |
 
 `/verbose on`, `/verbose off`, and `/verbose status` control activity details.
-They do not control planner-card visibility. The current runtime keeps task
-planner cards enabled; the old `NULLION_TASK_PLANNER_FEED_MODE` and
-`NULLION_TASK_PLANNER_FEED_ENABLED` switches are not read by this build. `/planner <message>` starts one explicitly
-planned request. `/thinking` and `/streaming` control separate displays.
+They do not control planner-card visibility. **Settings → Execution → Planner
+cards** saves `NULLION_TASK_PLANNER_FEED_MODE=task` or `off`; the default is
+`task`. The legacy `NULLION_TASK_PLANNER_FEED_ENABLED` value is read only when
+the mode is unset. Activity may be enabled independently of planner cards.
+`/planner <message>` starts one explicitly planned request, rather than changing
+card visibility. `/thinking` and `/streaming` control separate displays.
 
 See [Plugins](plugins.md), [Skill packs](skill-packs.md), and
 [Browser tasks](../src/nullion/plugins/browser_plugin/README.md) for exact setup.

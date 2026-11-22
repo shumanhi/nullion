@@ -264,6 +264,9 @@ while implementing, use `NULLION_TEST_COVERAGE=0 ./scripts/e2e-docker.sh tests/t
 run the full unit command with coverage before release. Browser, installer and E2E
 checks run in containers or CI runners. Live-stage probes are opt-in and
 require separately authorized services and credentials.
+Actual desktop tray visibility requires an interactive desktop session and is
+not proven by headless checks. Installer checks establish installation and
+service behavior, rather than the tray icon's appearance on a user's desktop.
 
 Browser history checks wait for the typed terminal-reply save acknowledgement
 before asserting persistence or reloading the page. Visible streamed text is an
@@ -964,3 +967,60 @@ for ordinary pytest, Docker unit/E2E and live-stage Web runs. It retains each
 attempt and its outcome, so later runs can compare medians and observed p95
 without replacing failed or slower results. Use
 `python3 scripts/test_performance.py --lane stage` to inspect stage timings.
+
+## Release update rehearsal
+
+Unit coverage attempts retain their raw data, JSON report and independent test
+and coverage exit codes under `.e2e-artifacts/unit-coverage/<attempt>/`, including
+failed tests and collection errors. The container exports them before removal.
+Tests must pass and coverage must still reach 70%; retained data never changes
+a failed result into a pass. Keep each attempt separate when diagnosing failures.
+
+Prepare a fresh, private snapshot after committing the final candidate. This
+copies the stage database through SQLite's read-only backup API and archives
+the released and candidate source; it never runs the updater against stage or
+production. Keep prior evidence in its original directory.
+
+```bash
+python3 scripts/prepare_update_rehearsal.py \
+  --database "$HOME/.nullion-stage/runtime.db" \
+  --old-ref v0.11.1 --target-tag v0.11.2 \
+  --output .e2e-artifacts/update-rehearsal-v0.11.2
+
+NULLION_UPDATE_REHEARSAL_INPUTS=/inputs/app/.e2e-artifacts/update-rehearsal-v0.11.2 \
+  scripts/e2e-docker.sh tests/e2e/test_stage_release_update_rehearsal.py
+```
+
+The rehearsal starts the released Web UI in a disposable container, runs
+`/update`, checks installation and health, rejects a concurrent update, then
+confirms a repeated update is already current. Explicitly selected missing,
+changed, or stale inputs fail the gate. The same input selection can accompany
+the complete E2E command so the rehearsal runs as part of that gate.
+
+For live verbose-delivery acceptance, set `NULLION_LIVE_VERBOSE_SOURCE_FILE`
+to an owned, disposable text file readable by stage, and run
+`scripts/live-stage-web-docker.sh tests/e2e/test_verbose_final_delivery.py::test_live_verbose_activity_survives_canonical_delivery_and_reload`
+with `NULLION_LIVE_STAGE_E2E=1` and `NULLION_APP_REPO` set. The browser probe
+checks the saved chat setting, visible final reply, native read evidence, and
+reload behavior; the source file must contain synthetic test data only.
+
+For live screenshot and PDF layout acceptance, run the two Web composer probes
+against the installed stage candidate:
+
+```bash
+NULLION_LIVE_STAGE_E2E=1 NULLION_APP_REPO="$PWD" \
+  NULLION_LIVE_CAPTURE_SOURCE=https://example.org/ \
+  scripts/live-stage-web-docker.sh \
+    tests/e2e/test_live_stage_web_capture_extent.py \
+    tests/e2e/test_live_stage_web_pdf_flow.py
+```
+
+Select the affected public URL for an incident replay. The capture probe also
+measures three plain turns and checks their native no-tool path. The PDF probe
+submits one synthetic report without an exact page count, downloads the visible
+artifact, and records page geometry, complete text, native producer receipts and
+rendered pages. Review those images; geometry assertions alone are not visual
+inspection. The normal Docker counterparts use local providers and Chromium,
+including explicit full-page capture and deliberate PDF page boundaries.
+These Web checks do not substitute for a real Telegram app action when that
+surface is part of the reported failure.

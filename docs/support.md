@@ -154,10 +154,12 @@ frame cancelled when one exists.
 
 ### Planner and activity display
 
-- The current runtime keeps task planner cards enabled. Old guides describing
-  a Planner-card off switch or `/verbose planner` and `/verbose full` are stale.
-- `/verbose` accepts only `on`, `off`, or `status`. Activity off keeps cards
-  compact; activity on adds tool/mini-agent details.
+- Use **Settings → Execution → Planner cards** to show or hide task cards.
+  This saves `NULLION_TASK_PLANNER_FEED_MODE=task` or `off` independently of
+  activity details.
+- `/verbose` accepts only `on`, `off`, or `status`. With planner cards on,
+  activity off keeps cards compact; activity on adds tool/mini-agent details.
+  With planner cards off, enabled activity remains visible separately.
 - `/planner <message>` starts one planned request; it does not hide/show cards.
 - Pending, queued or blocked tasks use `☐`; active tasks use `◐`, completed
   tasks `☑`, failed tasks `✕`, and cancelled tasks `⊘`.

@@ -140,11 +140,13 @@ def _cdp_url_for(host: str, port: int) -> str:
 
 
 def _cdp_endpoint() -> tuple[str, int]:
-    parsed = urlparse(_cdp_url())
+    from nullion.plugins.browser_plugin.backends.cdp_backend import cdp_endpoint_port
+    endpoint = _cdp_url()
+    parsed = urlparse(endpoint)
     host = parsed.hostname or _DEFAULT_CDP_HOST
     if host in {"localhost", "::1"}:
         host = _DEFAULT_CDP_HOST
-    return host, parsed.port or _CDP_PORT
+    return host, cdp_endpoint_port(endpoint)
 
 
 def _set_cdp_port(port: int) -> None:
@@ -403,7 +405,8 @@ def reopen_configured_desktop_browser(endpoint: str) -> bool:
             or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
             or os.environ.get("NULLION_BROWSER_HEADLESS", "").lower() == "true"):
         return False
-    host, port = parsed.hostname, parsed.port or 9222
+    from nullion.plugins.browser_plugin.backends.cdp_backend import cdp_endpoint_port
+    host, port = parsed.hostname, cdp_endpoint_port(endpoint)
     if _is_cdp_reachable_at(host, port):
         return False
     executable = _find_chrome()
@@ -470,9 +473,22 @@ class AutoBackend:
         try:
             return await getattr(backend, method_name)(*args, **kwargs)
         except Exception as error:
-            if self._is_cdp_backend(backend) and not _is_cdp_reachable():
-                raise ConnectionError("The configured browser disconnected") from error
+            if self._is_cdp_backend(backend):
+                from nullion.plugins.browser_plugin.backends.cdp_backend import cdp_endpoint_port
+                endpoint = getattr(backend, '_cdp_url', None)
+                parsed = urlparse(endpoint) if endpoint else None
+                reachable = (_is_cdp_reachable_at(parsed.hostname, cdp_endpoint_port(endpoint))
+                    if parsed and parsed.hostname else _is_cdp_reachable())
+                if not reachable:
+                    raise ConnectionError("The configured browser disconnected") from error
             raise
+
+    async def browser_task_connection(self, session_id):
+        backend = await self._ensure_backend()
+        endpoint = getattr(backend, '_cdp_url', None)
+        # A resolved local backend must not be interpreted as an unresolved
+        # connection and rediscovered from the process environment by a worker.
+        return (endpoint, True) if self._is_cdp_backend(backend) and endpoint else (None, False)
 
     async def reconnect(self, session_id=None):
         if self._backend is not None and self._is_cdp_backend(self._backend):

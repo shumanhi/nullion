@@ -301,6 +301,7 @@ async def test_slack_task_status_posts_then_edits_single_planner_card() -> None:
         def __init__(self) -> None:
             self.posts: list[dict[str, str]] = []
             self.updates: list[dict[str, str]] = []
+            self.deletes: list[dict[str, str]] = []
             self.fail_updates = False
 
         async def chat_postMessage(self, **kwargs):
@@ -311,6 +312,10 @@ async def test_slack_task_status_posts_then_edits_single_planner_card() -> None:
             self.updates.append(kwargs)
             if self.fail_updates:
                 return {"ok": False, "error": "cant_update_message"}
+            return {"ok": True}
+
+        async def chat_delete(self, **kwargs):
+            self.deletes.append(kwargs)
             return {"ok": True}
 
     client = SlackStatusClient()
@@ -350,6 +355,7 @@ async def test_slack_task_status_posts_then_edits_single_planner_card() -> None:
         include_activity=False,
     ) is True
     assert client.updates == [{"channel": "C123", "ts": "42.1", "text": "🎯 *PLANNER  PARALLEL MISSION*\n\n✓ Finished 2 tasks"}]
+    assert client.deletes == []
     client.fail_updates = True
     assert await slack_app._deliver_slack_task_status(
         client=client,
@@ -367,6 +373,8 @@ async def test_slack_task_status_posts_then_edits_single_planner_card() -> None:
     ) is True
     assert client.posts[-1] == {"channel": "C123", "text": "🎯 *PLANNER  PARALLEL MISSION*\n\n✓ Replaced status card"}
     assert status_messages == {("C123", "grp-live"): "42.2"}
+    assert client.deletes == [{"channel": "C123", "ts": "42.1"}]
+    assert len(client.posts) == 2
     assert await slack_app._deliver_slack_task_status(
         client=client,
         channel="C123",
@@ -501,16 +509,23 @@ async def test_discord_message_delivery_typing_and_download(tmp_path, monkeypatc
 async def test_discord_task_status_posts_then_edits_single_planner_card() -> None:
     from nullion.platform_activity import PlatformTaskCardStore, platform_activity_capabilities
 
+    class RejectedEdit(RuntimeError):
+        status = 403  # Native HTTP rejection permits delete-before-replacement.
+
     class DiscordStatusMessage:
         def __init__(self, content: str) -> None:
             self.content = content
             self.edits: list[str] = []
             self.fail_edit = False
+            self.deleted = False
 
         async def edit(self, *, content: str) -> None:
             if self.fail_edit:
-                raise RuntimeError("edit failed")
+                raise RejectedEdit("edit rejected")
             self.edits.append(content)
+
+        async def delete(self):
+            self.deleted = True
 
     class DiscordStatusChannel:
         def __init__(self) -> None:
@@ -559,6 +574,7 @@ async def test_discord_task_status_posts_then_edits_single_planner_card() -> Non
     ) is True
     assert len(channel.sent) == 1
     assert channel.sent[0].edits == ["🎯 **PLANNER  PARALLEL MISSION**\n\n✓ Finished 2 tasks"]
+    assert channel.sent[0].deleted is False
     channel.sent[0].fail_edit = True
     assert await discord_app._deliver_discord_task_status(
         channel_id="987654321",
@@ -579,6 +595,7 @@ async def test_discord_task_status_posts_then_edits_single_planner_card() -> Non
         "🎯 **PLANNER  PARALLEL MISSION**\n\n✓ Replaced status card",
     ]
     assert status_messages == {("987654321", "grp-live"): channel.sent[1]}
+    assert channel.sent[0].deleted is True and channel.sent[1].deleted is False
     assert await discord_app._deliver_discord_task_status(
         channel_id="987654321",
         channel=channel,

@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Mapping
 
 
-def compact_source_observations(output: object, *, max_chars: int = 12_000) -> dict | None:
+def compact_source_observations(output: object, *, max_chars: int = 12_000, retain_result_page: bool = False) -> dict | None:
     if not isinstance(output, Mapping) or output.get('result_kind') != 'source_observations':
         return None
     observations = output.get('observations')
@@ -217,6 +217,24 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
             if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars:
                 compact['validation_errors'].pop()
                 break
+    if retain_result_page and compact.get('report_status') == 'completed' and isinstance(captured, list):
+        # Keep one complete result page tied to an accepted quoted observation.
+        # Intermediate pages, controls, screenshots and paths stay out of recall.
+        quoted = {(row.get('source_url'), row.get('captured_at')) for row in observations
+                  if isinstance(row, Mapping) and row.get('quote') and
+                  row.get('semantic_role') in {'entity', 'attribute'}}
+        for document in reversed(captured):
+            if not isinstance(document, Mapping) or document.get('visible_text_verified') is not True:
+                continue
+            url, at = document.get('source_url'), document.get('captured_at')
+            if (url, at) not in quoted:
+                continue
+            text = document.get('main_document_text')
+            if isinstance(text, str) and 0 < len(text) <= 6000:
+                compact['retained_result_page'] = {'source_url': url, 'captured_at': at, 'text': text}
+                if len(json.dumps(compact, ensure_ascii=False, default=str)) > max_chars:
+                    compact.pop('retained_result_page')
+            break
     return compact
 
 

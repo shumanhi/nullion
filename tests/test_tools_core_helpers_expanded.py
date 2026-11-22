@@ -1285,6 +1285,16 @@ def test_terminal_exec_handler_validates_network_policy_and_backend_results() ->
     assert ok_backend.calls[0][4] == "pwsh"
 
 
+def _assert_terminal_deliverable_receipt(result, source: Path) -> None:
+    [delivered] = result.output['artifact_paths']
+    [descriptor] = result.output['artifact_descriptors']
+    assert descriptor['role'] == 'deliverable'
+    assert descriptor['path'] == delivered
+    assert Path(delivered).read_bytes() == source.read_bytes()
+    assert Path(descriptor.get('source_path', delivered)).resolve() == source.resolve()
+    assert result.output.get('artifact_validation', {}).get('ok') is not False
+
+
 def test_terminal_exec_handler_reports_verified_created_artifacts(tmp_path) -> None:
     artifact = tmp_path / "random_cat_names.xlsx"
 
@@ -1293,16 +1303,20 @@ def test_terminal_exec_handler_reports_verified_created_artifacts(tmp_path) -> N
             return TerminalBackendDescriptor("subprocess", (), {})
 
         def run(self, command, *, cwd, timeout, policy, shell=None):
-            artifact.write_bytes(b"PK\x03\x04\x14dummy-xlsx")
+            from openpyxl import Workbook
+            workbook = Workbook()
+            workbook.active.append(['Name'])
+            workbook.active.append(['Milo'])
+            workbook.save(artifact)
             return TerminalExecutionResult(0, "created workbook", "")
 
     result = _build_terminal_exec_handler(
         workspace_root=tmp_path,
         terminal_executor_backend=Backend(),
-    )(ToolInvocation("inv", "terminal_exec", "operator", {"command": "create workbook"}))
+    )(ToolInvocation("inv", "terminal_exec", "operator", {"command": "create workbook", 'output_paths': [str(artifact)]}))
 
     assert result.status == "completed"
-    assert result.output["artifact_paths"] == [str(artifact.resolve())]
+    _assert_terminal_deliverable_receipt(result, artifact)
 
 
 def test_terminal_exec_handler_reports_principal_workspace_artifacts_with_empty_stdout(
@@ -1332,12 +1346,14 @@ def test_terminal_exec_handler_reports_principal_workspace_artifacts_with_empty_
 
     result = _build_terminal_exec_handler(
         workspace_root=workspace,
+        allowed_roots=[workspace, artifact_root],
         terminal_executor_backend=Backend(),
-    )(ToolInvocation("inv", "terminal_exec", "workspace_admin", {"command": "create embedded html"}))
+    )(ToolInvocation("inv", "terminal_exec", "workspace_admin", {
+        "command": "create embedded html", 'output_paths': [str(artifact)]}))
 
     assert result.status == "completed"
     assert result.output["stdout"] == ""
-    assert result.output["artifact_paths"] == [str(artifact.resolve())]
+    _assert_terminal_deliverable_receipt(result, artifact)
 
 
 def test_terminal_exec_handler_reports_runtime_home_artifacts_with_empty_stdout(
@@ -1363,12 +1379,14 @@ def test_terminal_exec_handler_reports_runtime_home_artifacts_with_empty_stdout(
 
     result = _build_terminal_exec_handler(
         workspace_root=workspace,
+        allowed_roots=[workspace, artifact_root],
         terminal_executor_backend=Backend(),
-    )(ToolInvocation("inv", "terminal_exec", "workspace_admin", {"command": "create runtime html"}))
+    )(ToolInvocation("inv", "terminal_exec", "workspace_admin", {
+        "command": "create runtime html", 'output_paths': [str(artifact)]}))
 
     assert result.status == "completed"
     assert result.output["stdout"] == ""
-    assert result.output["artifact_paths"] == [str(artifact.resolve())]
+    _assert_terminal_deliverable_receipt(result, artifact)
 
 
 def test_zip_archives_are_inspected_without_utf8_decoding_or_macos_sidecars(tmp_path) -> None:
@@ -2060,7 +2078,7 @@ def test_terminal_exec_handler_passes_shell_timeout_and_discovers_artifacts(tmp_
 
         def run(self, command, *, cwd, timeout, policy, shell=None):
             self.calls.append((command, cwd, timeout, policy, shell))
-            artifact.write_bytes(b"%PDF-1.4\n")
+            artifact.write_bytes(_minimal_text_pdf_bytes(['Verified terminal report']))
             return TerminalExecutionResult(
                 exit_code=0,
                 stdout="done",
@@ -2075,7 +2093,7 @@ def test_terminal_exec_handler_passes_shell_timeout_and_discovers_artifacts(tmp_
             "inv",
             "terminal_exec",
             "operator",
-            {"command": "make report", "shell": "zsh", "timeout_seconds": 3},
+            {"command": "make report", "shell": "zsh", "timeout_seconds": 3, 'output_paths': [str(artifact)]},
         )
     )
 
@@ -2084,7 +2102,7 @@ def test_terminal_exec_handler_passes_shell_timeout_and_discovers_artifacts(tmp_
     assert backend.calls[0][4] == "zsh"
     assert result.output["shell"] == "zsh"
     assert result.output["timeout_seconds"] == 3
-    assert result.output["artifact_paths"] == [str(artifact.resolve())]
+    _assert_terminal_deliverable_receipt(result, artifact)
 
 
 def test_terminal_exec_handler_falls_back_when_workspace_root_is_missing() -> None:

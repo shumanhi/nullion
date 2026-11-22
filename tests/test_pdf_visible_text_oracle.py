@@ -36,3 +36,25 @@ def test_pdf_oracle_does_not_fuse_or_invent_required_word_boundaries(phrase):
     fused = phrase.replace(' ', '')
     text, _ = _validate_pdf_visual_content('fused.pdf', tracked_pdf(fused))
     assert fused in text and phrase not in text
+
+
+@pytest.mark.parametrize('source,logical,raw',[
+    ('CHECK-01-COMPLETE','CHECK-01- COMPLETE','CHECK-01-\r\n  COMPLETE'),
+    ('確認-完了','確認- 完了','確認-\n完了'),
+    ('código-verificado','código- verificado','código-\n  verificado'),
+    ('確認‐完了','確認‐ 完了','確認‐\n完了'),
+])
+def test_source_dash_token_may_cross_only_a_physical_pdf_line_break(source,logical,raw):
+    from tests.e2e.live_web_artifact_assertions import pdf_source_phrase_visible
+    assert pdf_source_phrase_visible(source,logical,raw)
+
+
+@pytest.mark.parametrize('source,actual',[
+    ('CHECK-01-COMPLETE','CHECK-01- COMPLETE'),
+    ('REGISTRO PUBLICO código-verificado','REGISTROPUBLICO código-\nverificado'),
+    ('NORTH SOUTH CHECK-37','NORTHSOUTH CHECK-\n37'),
+    ('確認 完了 code-37','確認完了 code-\n37'),
+])
+def test_source_dash_wrap_never_erases_literal_space_or_fuses_required_words(source,actual):
+    from tests.e2e.live_web_artifact_assertions import pdf_source_phrase_visible
+    assert not pdf_source_phrase_visible(source,actual,actual)

@@ -1423,13 +1423,14 @@ def guaranteed_user_visible_text(*, subject: object, output: object, kind: str =
     )
 
 
-def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) -> list[str]:
+def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None, *, required_extensions: Iterable[str] = ()) -> list[str]:
+    from nullion.artifacts import normalize_artifact_extensions
     normalized_results = [
         result
         for result in tool_results or ()
         if normalize_tool_status(getattr(result, "status", None)) == "completed"
     ]
-    scoped_required_extensions = _artifact_requested_extensions(normalized_results)
+    scoped_required_extensions = set(_artifact_requested_extensions(normalized_results)) | set(normalize_artifact_extensions(required_extensions))
     consumed_file_write_paths = _consumed_file_write_artifact_paths(normalized_results)
     substantive_tool_names = [
         str(getattr(result, "tool_name", "") or "")
@@ -1453,16 +1454,16 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
                 continue
             if not scoped_required_extensions and not standalone_browser_screenshot:
                 continue
-        if tool_name == "terminal_exec":
-            paths.extend(
-                path
-                for path in _terminal_exec_stdout_artifact_paths(output)
-                if not scoped_required_extensions
-                or artifact_format_extension(path) in scoped_required_extensions
-            )
+        # Native roles take precedence over incidental paths in source text.
         if output_has_artifact_descriptors(output):
             paths.extend(artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES))
             continue
+        if tool_name == "terminal_exec" and scoped_required_extensions:
+            paths.extend(
+                path
+                for path in _terminal_exec_stdout_artifact_paths(output)
+                if artifact_format_extension(path) in scoped_required_extensions
+            )
         if has_deliverable_descriptors and tool_name not in (STRUCTURED_ARTIFACT_PRODUCER_TOOLS - {"file_write"}):
             if not (tool_name == "file_write" and scoped_required_extensions):
                 continue
@@ -2302,7 +2303,9 @@ def evaluate_response_fulfillment(
     }
     combined_artifact_paths = [
         *(artifact_paths or ()),
-        *artifact_paths_from_tool_results(result for result, _status in normalized_results),
+        *artifact_paths_from_tool_results((result for result, _status in normalized_results),
+            required_extensions=(*explicit_required_extensions, *media_required_extensions,
+                *((required_extension,) if required_extension else ()))),
     ]
     combined_artifact_paths = [path for path in combined_artifact_paths if identity(path) not in invalid_generated]
     invalid_plain_media_artifact_paths = {
@@ -2625,7 +2628,7 @@ def evaluate_response_execution_outcome(
     }
     combined_artifacts = [
         *(artifact_paths or ()),
-        *artifact_paths_from_tool_results(tool_results),
+        *artifact_paths_from_tool_results(tool_results, required_extensions=required_attachment_extensions or ()),
         *reply_valid_media_paths,
     ]
     if excluded_paths:

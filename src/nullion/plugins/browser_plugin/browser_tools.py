@@ -4392,22 +4392,20 @@ def _serialized_browser_operation(method):
                             elif urlparse(document_url).scheme in {"http", "https"}:
                                 result.output["page_url"] = document_url
                                 self._read_first_policy.remember(invocation, document_url)
-                                if method.__name__ == "browser_extract_text" and isinstance(result.output.get("text"), str):
-                                    result.output['observation_setup'] = [{'tool_name': 'browser_navigate',
-                                        'arguments': {'url': document_url}}]
-                                    for key in ('ready_selector', 'ready_text'):
-                                        if invocation.arguments.get(key):
-                                            result.output['observation_setup'].append({'tool_name': 'browser_wait_for',
-                                                'arguments': {'selector' if key == 'ready_selector' else 'text': invocation.arguments[key]}})
+                                if method.__name__ in {"browser_extract_text", "browser_extract_detail"}:
+                                    result.output['observation_setup'] = self._source_replay_recipe(invocation, document_url)
                                     result.output['observation_readiness'] = {
                                         'verified': bool(invocation.arguments.get('ready_selector') or invocation.arguments.get('ready_text')),
                                         'supported_parameters': ['ready_selector', 'ready_text']}
+                                if method.__name__ == "browser_extract_text" and isinstance(result.output.get("text"), str):
                                     # Bind native text to the independently observed
                                     # document while the existing session lock is held.
                                     # A prior navigation receipt alone cannot prove
                                     # which document produced this extraction.
                                     result.output["record"] = {"url": document_url,
                                         "text": result.output["text"], "selector": result.output.get("selector")}
+                                    if result.output["observation_readiness"]["verified"]:
+                                        result.output["captured_at"] = time.time()
                                     result.output["source_record_collections"] = [{"path": ["record"],
                                         "identity_fields": ["url"], "cardinality": "one"}]
                     except Exception:
@@ -4453,6 +4451,10 @@ class BrowserTools:
     def session_browser_mode(self, invocation):
         mode_getter = getattr(self._backend, "mode_for_session", None)
         return mode_getter(self._session_id(invocation)) if callable(mode_getter) else "configured"
+
+    def session_browser_connection(self, invocation):
+        getter = getattr(self._backend, 'browser_task_connection', None)
+        return _run(getter(self._session_id(invocation))) if callable(getter) else None
 
     def browser_task_read_preflight(self, invocation):
         from nullion.plugins.browser_plugin.browser_reads import browser_task_read_preflight
@@ -5304,6 +5306,21 @@ class BrowserTools:
                 self._field_failure_output(session_id=session_id, target=target, text=text, error=e),
             )
 
+    def _wait_for_source_readiness(self, invocation, session_id):
+        for key, selector in (("ready_selector", True), ("ready_text", False)):
+            if invocation.arguments.get(key):
+                value = str(invocation.arguments[key])
+                _run(self._backend.wait_for(session_id, value if selector else None,
+                    None, None if selector else value, 5))
+
+    @staticmethod
+    def _source_replay_recipe(invocation, url):
+        steps = [{"tool_name": "browser_navigate", "arguments": {"url": url}}]
+        for key, argument in (("ready_selector", "selector"), ("ready_text", "text")):
+            if invocation.arguments.get(key):
+                steps.append({"tool_name": "browser_wait_for", "arguments": {argument: invocation.arguments[key]}})
+        return steps
+
     @_serialized_browser_operation
     def browser_snapshot(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
@@ -5313,6 +5330,7 @@ class BrowserTools:
             return _fail(invocation, "max_elements must be at least 1")
         max_elements = min(max_elements, 250)
         try:
+            self._wait_for_source_readiness(invocation, session_id)
             result = _run(self._backend.run_js(session_id, _browser_snapshot_script(max_elements=max_elements)))
             if not isinstance(result, dict):
                 return _fail(invocation, "Snapshot returned an invalid result.")
@@ -5323,7 +5341,10 @@ class BrowserTools:
             if isinstance(page_url,str) and urlparse(page_url).scheme in {"http","https"}:
                 self._read_first_policy.remember(invocation,page_url)
             return _ok(invocation, {"snapshot": result, "session_id": session_id,
-                **({"page_url":page_url} if isinstance(page_url,str) else {})})
+                **({"page_url":page_url} if isinstance(page_url,str) else {}),
+                "observation_readiness": {"verified": bool(invocation.arguments.get("ready_selector") or invocation.arguments.get("ready_text")), "supported_parameters": ["ready_selector", "ready_text"]},
+                **({"observation_setup": self._source_replay_recipe(invocation, page_url)}
+                   if isinstance(page_url, str) and urlparse(page_url).scheme in {"http", "https"} else {})})
         except Exception as e:
             return _fail(invocation, f"Snapshot failed: {e}", _browser_failure_output(e))
 
@@ -5420,6 +5441,7 @@ class BrowserTools:
         if normalized_selector is None:
             normalized_selector = self._remembered_page_assertion_selector(invocation, session_id)
         try:
+            self._wait_for_source_readiness(invocation, session_id)
             extraction = self._runtime_dom_detail_extraction(
                 session_id,
                 selector=normalized_selector,
@@ -5651,7 +5673,11 @@ class BrowserTools:
                     invocation_id=invocation.invocation_id,
                     tool_name=invocation.tool_name,
                     status="failed",
-                    output={"result": result, "session_id": session_id},
+                    output={"result": result, "session_id": session_id, "reason": "combobox_commit_unverified",
+                            "recovery": {"kind": "inspect_current_state", "tool_names": ["browser_snapshot", "browser_run_task"],
+                                         "next_step": "Inspect the committed value. If the requested live result still "
+                                                      "needs the form, scope browser_run_task as a required adaptive "
+                                                      "interaction instead of substituting generic listings."}},
                     error="Combobox selection failed: selected value did not verify",
                 )
             return _ok(invocation, {"result": result, "selected": result.get("selected_text"), "session_id": session_id})
@@ -5704,6 +5730,15 @@ class BrowserTools:
                 "recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
                              "argument_constraints": {"mode": {"enum": ["auto", "viewport", "full_page"]}}},
             })
+        requested_mode = mode
+        extent = (invocation.flow_context or {}).get("_runtime_browser_capture_extent")
+        if isinstance(extent, str) and extent in {"viewport", "full_page"}:
+            mode = extent
+        elif extent == "auto" and mode == "full_page":
+            # A capture argument cannot widen the already selected request.
+            # Backend auto preserves complete local rendered documents while
+            # ordinary HTTP(S) pages remain the visible viewport.
+            mode = "auto"
         try:
             screenshot = _run(self._backend.screenshot(session_id, mode=mode))
             if isinstance(screenshot, BrowserScreenshotResult):
@@ -5733,7 +5768,8 @@ class BrowserTools:
                     "document_width": screenshot.document_width,
                     "document_height": screenshot.document_height,
                     "is_clipped": screenshot.is_clipped,
-                    **({"has_document_content":True} if screenshot.has_document_content is True else {}),
+                    **({"has_document_content": screenshot.has_document_content}
+                       if screenshot.has_document_content is not None else {}),
                 }
             else:
                 png_bytes = screenshot
@@ -5742,8 +5778,55 @@ class BrowserTools:
                     "requested_mode": mode,
                     "is_clipped": False,
                 }
+            screenshot_metadata["requested_mode"] = requested_mode
+            screenshot_metadata["effective_requested_mode"] = mode
+            if isinstance(extent, str) and extent in {"auto", "viewport", "full_page"}:
+                screenshot_metadata["capture_extent_contract"] = extent
+            if requested_mode != mode:
+                screenshot_metadata["capture_mode_adjustment_reason"] = "structured_capture_extent"
             if not png_bytes:
                 return _fail(invocation, "Screenshot returned no image data.")
+            from nullion.browser_capture_contract import capture_pixels_required, screenshot_has_source_pixels
+
+            captured_url = screenshot_metadata.get("page_url")
+            if capture_pixels_required(captured_url, getattr(screenshot, "has_document_content", None)):
+                from io import BytesIO
+                from PIL import Image
+
+                with Image.open(BytesIO(png_bytes)) as image:
+                    has_pixels = screenshot_has_source_pixels(image, screenshot_metadata)
+                    captured_size = image.size
+                pdf_document = urlparse(str(captured_url)).path.lower().endswith(".pdf")
+                pdf_url = invocation.arguments.get("pdf_url")
+                if not has_pixels and pdf_document and pdf_url == captured_url:
+                    # Viewer pixels alone cannot verify a PDF. Fetch only the
+                    # exact approved public URL using the pinned resolver.
+                    try:
+                        from hashlib import sha256
+                        from nullion.pdf_preview import render_single_page_pdf_png
+                        from nullion.tools import _fetch_web_url_once
+
+                        self._policy.check_url(captured_url)
+                        result = _fetch_web_url_once(captured_url, 5, allow_redirects=False)
+                        data = result.get("_body_bytes")
+                        if (result.get("status_code") == 200 and not result.get("body_truncated")
+                                and isinstance(data, bytes)):
+                            png_bytes = render_single_page_pdf_png(data, width=captured_size[0], height=captured_size[1])
+                            has_pixels = True
+                            screenshot_metadata.update(capture_method="pdf_page_render",
+                                                       source_pdf_sha256=sha256(data).hexdigest())
+                    except Exception:
+                        pass
+                if not has_pixels:
+                    error = ("The PDF document page could not be verified. No image was saved."
+                             if pdf_document else "The captured page is visually blank. No image was saved.")
+                    return _fail(invocation, error, {
+                        "reason": "blank_browser_capture", "session_id": session_id, **screenshot_metadata,
+                        **({"recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
+                                         "retry_arguments": {"pdf_url": captured_url, "mode": mode, "session_id": session_id},
+                                         "argument_constraints": {"pdf_url": {"const": captured_url}}}}
+                           if pdf_document and not pdf_url else {}),
+                    })
             png_bytes, image_metadata = _resize_browser_screenshot_to_layout_pixels(
                 png_bytes,
                 mode=str(screenshot_metadata.get("mode") or mode),
@@ -5752,6 +5835,14 @@ class BrowserTools:
                 document_width=_int_metadata_value(screenshot_metadata, "document_width"),
                 document_height=_int_metadata_value(screenshot_metadata, "document_height"),
             )
+            from nullion.browser_capture_contract import capture_receipt_matches_extent
+            if ("capture_extent_contract" in screenshot_metadata
+                    and not capture_receipt_matches_extent(screenshot_metadata, image_size=(
+                        image_metadata.get("image_width", 0), image_metadata.get("image_height", 0)))):
+                return _fail(invocation, "The browser capture did not match the selected extent.", {
+                    "reason": "capture_extent_mismatch", "session_id": session_id,
+                    **screenshot_metadata, **image_metadata,
+                })
             artifact_path = artifact_path_for_generated_workspace_file(
                 principal_id=invocation.principal_id,
                 suffix=".png",
