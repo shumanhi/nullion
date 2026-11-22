@@ -187,12 +187,15 @@ def test_large_page_projection_preserves_destination_control_facts(forms,control
 
 def test_browser_snapshot_projection_keeps_destinations_and_control_state():
     from nullion.agent_orchestrator import _compact_tool_output_for_model_context
+    heading_links = [{"title": "商品", "url": "https://example.test/item"}]
     source = {'snapshot': {'url': 'https://example.test/start', 'element_count': 1,
+        'heading_links': heading_links,
         'elements': [{'element_id': 'n-1', 'tag': 'a', 'role': 'link',
             'text': '連絡先', 'href': 'https://example.test/form'}]}}
     view = _compact_tool_output_for_model_context('browser_snapshot', source)
     assert view['url'] == 'https://example.test/start'
     assert view['elements'][0]['href'] == 'https://example.test/form'
+    assert view['heading_links'] == heading_links
     assert view['captured_editable_control_count'] == 0
     source['snapshot']['elements'].append({'element_id': 'n-2', 'tag': 'input',
         'editable': True, 'name': 'mensaje', 'value': '', 'form_action': 'https://example.test/send'})

@@ -9,6 +9,28 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker product boundary')
 
 
+def observe_render_counts(monkeypatch):
+    from nullion import agent_orchestrator
+
+    visuals, payloads = [], []
+    render_visual = agent_orchestrator._tool_result_visual_reference_blocks
+    render_payload = agent_orchestrator._tool_result_message_payload
+
+    def visual(receipt):
+        if receipt.tool_name == 'file_read':
+            visuals.append(receipt.invocation_id)
+        return render_visual(receipt)
+
+    def payload(receipt):
+        if receipt.tool_name == 'code_mode':
+            payloads.append(receipt.invocation_id)
+        return render_payload(receipt)
+
+    monkeypatch.setattr(agent_orchestrator, '_tool_result_visual_reference_blocks', visual)
+    monkeypatch.setattr(agent_orchestrator, '_tool_result_message_payload', payload)
+    return visuals, payloads
+
+
 @pytest.mark.parametrize('mode',['off','on'])
 def test_image_read_reaches_primary_as_pixels_without_attachment_or_repeat(tmp_path,monkeypatch,record_property,mode):
     from datetime import UTC,datetime
@@ -54,6 +76,7 @@ def test_image_read_reaches_primary_as_pixels_without_attachment_or_repeat(tmp_p
                 assert left[0]>200 and left[1]<50 and left[2]<50,left
                 assert right[2]>80 and right[0]<50 and right[1]<50,right
             return text('Left: red. Right: navy.')
+    visuals, payloads = observe_render_counts(monkeypatch)
     model=Provider();samples=[]
     with TestClient(create_app(runtime,AgentOrchestrator(model_client=model),registry)) as client:
         for i,prompt in enumerate(['Read the local reference image and describe its two colors. Do not attach files.',
@@ -70,6 +93,8 @@ def test_image_read_reaches_primary_as_pixels_without_attachment_or_repeat(tmp_p
             reads=[r for r in turn['tool_results'] if r['tool_name']=='file_read']
             assert len(reads)==1 and reads[0]['output']['visual_preview_delivered'] is True
             assert all(r['status']=='completed' for r in turn['tool_results'])
+    assert visuals == calls
+    assert len(payloads) == (len(calls) if mode == 'on' else 0)
     assert sum(samples)/len(samples)<3 and max(samples)<5,samples
     record_property('mean_visual_reference_seconds',sum(samples)/len(samples))
 
@@ -97,6 +122,7 @@ async def test_langchain_tool_images_reach_the_bound_model_with_real_sqlite(tmp_
     tool=next(t for t in tools if t.name==('code_mode' if mode=='on' else 'file_read'))
     args=({'code':"call_tool('file_read', {'path':"+repr(str(path))+"})",'tool_names':['file_read']}
         if mode=='on' else {'path':str(path)})
+    visuals, payloads = observe_render_counts(monkeypatch)
     payload=await tool.ainvoke(args)
     received=[]
     class Model:
@@ -112,5 +138,13 @@ async def test_langchain_tool_images_reach_the_bound_model_with_real_sqlite(tmp_
         AIMessage(content='',tool_calls=[{'id':'image-read','name':tool.name,'args':args}]),
         ToolMessage(content=payload,tool_call_id='image-read')])
     assert answer.content=='Navy reference verified.' and len(received)==1
-    assert len([r for r in native if r.tool_name=='file_read'])==1
+    reads = [r for r in native if r.tool_name == 'file_read']
+    assert len(reads) == 1 and reads[0].output['visual_preview_delivered'] is True
+    assert visuals == [reads[0].invocation_id]
+    assert len(payloads) == (1 if mode == 'on' else 0)
     assert all(r.status=='completed' for r in native)
+
+    if mode == 'on':
+        repeated = await tool.ainvoke(args)
+        assert isinstance(repeated, str), 'The same authorized preview should only appear once per run'
+        assert visuals.count(reads[0].invocation_id) == 1

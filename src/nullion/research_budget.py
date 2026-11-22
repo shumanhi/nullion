@@ -54,6 +54,9 @@ class ResearchBudget:
     cache_hits: int = 0
     writer_forced_stop: bool = False
     source_names: set = field(default_factory=set)
+    required_sources: set[str] = field(default_factory=set)
+    attempted_sources: set[str] = field(default_factory=set)
+    completed_sources: set[str] = field(default_factory=set)
     reads: dict = field(default_factory=dict)
     local_operations: set = field(default_factory=set)
     paused_at: float | None = None
@@ -78,6 +81,19 @@ class ResearchBudget:
                         continue
             if self.active:
                 self.register_sources(registry)
+                if getattr(decision, 'valid', False):
+                    self.required_sources.update(set(getattr(decision, 'required_tool_names', ())) & self.source_names)
+
+    def source_reservation(self, tool_name):
+        if len(self.required_sources) < 2:
+            return [], 0.0
+        outstanding = (self.required_sources - self.attempted_sources) - {tool_name}
+        reserved = self.limits()['seconds'] * .3 if outstanding else 0.0
+        if tool_name in self.required_sources and tool_name not in self.completed_sources:
+            # A first or still unsuccessful required read may be the
+            # prerequisite for another. Never reserve away its entire attempt.
+            reserved = min(reserved, self.remaining() * .4)
+        return sorted(outstanding), reserved
 
     def register_sources(self, registry):
         specs = _specs(registry)
@@ -136,12 +152,15 @@ class ResearchBudget:
             'phase': 'writing' if writing else 'research', 'effort': self.effort,
             'native_calls': self.native_calls, 'model_calls': self.model_calls,
             'remaining_seconds': round(self.writing_remaining() if writing else self.remaining(), 1),
-            'limits': self.limits(), 'required_questions': list(self.questions), 'reason': self.reason}) +
+            'limits': self.limits(), 'required_questions': list(self.questions), 'reason': self.reason,
+            'unattempted_required_source_tools': sorted(self.required_sources - self.attempted_sources)}) +
             ('\nResearch is closed. Compose the answer from completed evidence. State unresolved required facts explicitly; '
              'do not claim complete coverage from a budget limit. Retained inspection and requested local artifacts/actions '
              'remain available, but do not search, fetch or widen research again.' if writing else
              '\nResolve only material questions of the original request. Return a useful supported answer as soon as they '
-             'are resolved. Additional alternatives, media or background are optional unless the user required them.'))
+             'are resolved. Start independently callable required source tools before repeated reads of one source; '
+             'honor data dependencies when a later tool needs an earlier result. '
+             'Additional alternatives, media or background are optional unless the user required them.'))
 
     def usage(self):
         if not self.active:
@@ -264,6 +283,15 @@ def before_tool(spec, invocation):
             batch = getattr(spec, 'independent_batch', ())
             entries = invocation.arguments.get(batch[0]) if batch else None
             units = len(entries) if isinstance(entries, list) else 1
+            outstanding, reserve = budget.source_reservation(spec.name)
+            priority_read = spec.name in budget.required_sources and spec.name not in budget.completed_sources
+            if (outstanding and not priority_read and not budget.writing()
+                    and (budget.remaining() <= reserve
+                         or budget.native_calls + units + len(outstanding) > budget.limits()['native_calls'])):
+                return ToolResult(invocation.invocation_id, invocation.tool_name, 'failed', {
+                    'reason': 'research_reserved_for_required_sources', 'executed': False,
+                    'unattempted_required_source_tools': outstanding},
+                    error='The remaining research allowance is reserved for required source tools that have not run.')
             if budget.native_calls + units > budget.limits()['native_calls']:
                 budget.finish_research('native_call_limit')
             if budget.writing():
@@ -272,6 +300,7 @@ def before_tool(spec, invocation):
                     'research': budget.usage(), 'next_phase': 'writing'},
                     error='Research is closed; compose the answer from retained evidence and disclose remaining gaps.')
             budget.native_calls += units
+            budget.attempted_sources.add(spec.name)
         elif budget.active:
             if not budget.local_operations:
                 budget.paused_at = time.monotonic()
@@ -300,6 +329,8 @@ def after_tool(spec, invocation, result):
                 budget.writing_started = time.monotonic()
                 if budget.local_operations:
                     budget.paused_at = time.monotonic()
+        if result.status == 'completed' and spec.name in budget.source_names:
+            budget.completed_sources.add(spec.name)
         if spec.same_request_read_cache and result.status == 'completed':
             key = _cache_key(spec, invocation)
             budget.reads[key] = deepcopy(result)
@@ -307,7 +338,11 @@ def after_tool(spec, invocation, result):
 
 def source_timeout(spec):
     budget = current_budget()
-    return budget.remaining() if budget is not None and budget.active and is_research_tool(spec) else None
+    if budget is None or not budget.active or not is_research_tool(spec):
+        return None
+    with budget.lock:
+        _, reserved = budget.source_reservation(spec.name)
+        return max(0.0, budget.remaining() - reserved)
 
 
 class _FixedResearchScope:
@@ -327,13 +362,18 @@ class _FixedResearchScope:
             from nullion.turn_context_policy import _SCOPE_REQUEST_TOOL_SPEC
             schema = deepcopy(_SCOPE_REQUEST_TOOL_SPEC.input_schema)
             schema['required'] = list(dict.fromkeys([*schema.get('required', ()), 'research_effort']))
+            if getattr(self._delegate, 'scheduled_task_execution_registry', False):
+                from nullion.scheduled_artifact_contract import deliverables_schema
+                schema['properties']['artifact_deliverables'] = deliverables_schema()
             available = sorted(spec.name for spec in _specs(self._delegate))
             for key in ('tool_names', 'required_tool_names'):
                 schema['properties'][key]['items'] = {'type':'string', 'enum':available}
             return replace(_SCOPE_REQUEST_TOOL_SPEC, input_schema=schema, description=
                 'Configure the research allowance over this workflow\'s already selected tools. '
                 'Declare research_effort and material research_questions before '
-                'the first source read. This control cannot expose additional tools or change permissions.')
+                'the first source read. In scheduled runs, declare final artifact_extensions and '
+                'artifact_deliverables separately from supporting files. '
+                'This control cannot expose additional tools or change permissions.')
         return self._delegate.get_spec(name)
 
     def all_specs(self):
@@ -355,6 +395,10 @@ class _FixedResearchScope:
         from jsonschema import validate, ValidationError
         from nullion.tools import ToolResult
         from nullion.turn_context_policy import TurnToolScopeDecision, _research_scope_values
+        from nullion.artifacts import normalize_artifact_extensions
+        from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
+        from nullion.response_fulfillment_contract import normalize_artifact_media_required_extensions
+        from nullion.scheduled_artifact_contract import extension_requirements, normalize_deliverables
         try:
             validate(invocation.arguments, self.get_spec('request_tool_scope').input_schema)
             names = tuple(invocation.arguments.get('tool_names') or ())
@@ -362,11 +406,26 @@ class _FixedResearchScope:
             available = {spec.name for spec in _specs(self._delegate)}
             if not set(names).union(required).issubset(available):
                 raise ValueError('This workflow cannot expose additional tools')
+            requested_extensions = normalize_artifact_extensions(invocation.arguments.get('artifact_extensions', ()))
+            excluded = normalize_artifact_extensions(invocation.arguments.get('excluded_artifact_extensions', ()))
+            if not set(requested_extensions + excluded).issubset(VALID_ATTACHMENT_EXTENSIONS):
+                raise ValueError('The workflow declared an unsupported artifact format')
+            rows = (normalize_deliverables(invocation.arguments['artifact_deliverables'])
+                    if 'artifact_deliverables' in invocation.arguments else None)
+            if rows is not None and any(row['extension'] in excluded for row in rows):
+                raise ValueError('A deliverable cannot use an excluded format')
+            requested_extensions = tuple(dict.fromkeys((*requested_extensions, *extension_requirements(rows or ()))))
+            requested_extensions = tuple(extension for extension in requested_extensions if extension not in excluded)
+            embedded = normalize_artifact_media_required_extensions([
+                *(invocation.arguments.get('embedded_media_artifact_extensions') or ()),
+                *(invocation.arguments.get('required_embedded_media_extensions') or ())])
+            embedded = tuple(extension for extension in embedded if extension in requested_extensions)
         except (ValidationError, ValueError, TypeError) as error:
             return ToolResult(invocation.invocation_id, invocation.tool_name, 'failed',
                 {'reason':'invalid_tool_arguments','executed':False}, error=str(error)), self
         decision = TurnToolScopeDecision(valid=True, requested_tool_names=names, required_tool_names=required,
-            **_research_scope_values(invocation.arguments))
+            requested_artifact_extensions=requested_extensions, excluded_artifact_extensions=excluded,
+            required_embedded_media_extensions=embedded, **_research_scope_values(invocation.arguments))
         view = _FixedResearchScope(self._delegate, decision)
         if (budget := current_budget()) is not None:
             budget.configure(view, decision)
@@ -375,7 +434,10 @@ class _FixedResearchScope:
         return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed', {
             'scope_requested':True, 'research_effort':decision.research_effort,
             'research_questions':list(decision.research_questions), 'available_tools':sorted(available),
-            'required_tool_names':list(required), 'fixed_tool_set':True}), view
+            'required_tool_names':list(required), 'fixed_tool_set':True,
+            'artifact_extensions':list(requested_extensions), 'excluded_artifact_extensions':list(excluded),
+            'embedded_media_artifact_extensions':list(embedded),
+            **({'artifact_deliverables':list(rows)} if rows is not None else {})}), view
 
     def invoke(self, invocation):
         if invocation.tool_name == 'request_tool_scope':
@@ -392,13 +454,15 @@ def ensure_research_scope(registry):
     return _FixedResearchScope(registry) if any(is_research_tool(spec) for spec in _specs(registry)) else registry
 
 
-def call_model(create, kwargs, *, cancellation_checker=None, production=False):
+def call_model(create, kwargs, *, cancellation_checker=None, production=False, time_limit=None):
     """Bound active research even when a provider ignores its timeout option."""
     budget = current_budget()
     if budget is None or not budget.active:
         return create(**kwargs)
     remaining = budget.writing_remaining() if budget.writing() else budget.remaining()
     limit = float(kwargs.get('timeout') or remaining)
+    if time_limit is not None:
+        limit = min(limit, time_limit) if kwargs.get('timeout') else time_limit
     deadline = max(.001, limit if production else min(limit, remaining))
     started = time.monotonic()
     done, values = threading.Event(), []

@@ -3493,7 +3493,7 @@ def test_connector_email_search_caps_metadata_detail_fetches(monkeypatch) -> Non
 
     assert result.status == "completed"
     assert [item["id"] for item in result.output["results"]] == ["msg-1", "msg-2", "msg-3", "msg-4"]
-    detail_calls = [url for url, _params in calls if "/messages/msg-" in url]
+    detail_calls = sorted(url for url, _params in calls if "/messages/msg-" in url)
     assert detail_calls == [
         "https://api.maton.ai/google-mail/gmail/v1/users/me/messages/msg-1",
         "https://api.maton.ai/google-mail/gmail/v1/users/me/messages/msg-2",
@@ -4368,8 +4368,13 @@ def test_cron_schema_generation_does_not_depend_on_private_helper(monkeypatch) -
     assert options["type"] == "object"
     assert options["properties"]["requires_attachment_delivery"]["type"] == "boolean"
     assert options["properties"]["required_artifact_extensions"]["items"]["type"] == "string"
+    roles = options["properties"]["artifact_deliverables"]["items"]["properties"]["role"]["enum"]
+    assert {"embedded_html", "linked_html"} <= set(roles)
     options["properties"]["requires_attachment_delivery"]["type"] = "changed"
-    assert update_schema["properties"]["artifact_delivery_options"]["properties"]["requires_attachment_delivery"]["type"] == "boolean"
+    roles.clear()
+    update_options = update_schema["properties"]["artifact_delivery_options"]["properties"]
+    assert update_options["requires_attachment_delivery"]["type"] == "boolean"
+    assert {"embedded_html", "linked_html"} <= set(update_options["artifact_deliverables"]["items"]["properties"]["role"]["enum"])
 
 
 def test_required_plugin_dependencies_fail_loudly(tmp_path) -> None:

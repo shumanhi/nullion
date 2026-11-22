@@ -39,7 +39,7 @@ from nullion.agent_turn_limits import (
     max_iterations_from_resume_token,
 )
 from nullion.approval_markers import ORPHAN_APPROVAL_REQUEST_REPLY
-from nullion.approvals import ApprovalStatus, create_approval_request
+from nullion.approvals import ApprovalRequest, ApprovalStatus, create_approval_request
 from nullion.artifacts import (
     ARTIFACT_DELIVERY_ROLES,
     artifact_descriptor_for_path,
@@ -2491,6 +2491,62 @@ def execute_approved_tool_call_from_approval_context(
         )
 
 
+def recover_approved_scheduled_email(runtime, suspended_turn, turn_result, *, tool_registry):
+    """Continue an exact terminal email approval if its program journal is absent."""
+    if getattr(turn_result, "approval_checkpoint_missing", False) is not True:
+        return None
+    approval_id = suspended_turn.approval_id
+    invocation = _approved_tool_invocation_from_approval_context(runtime, approval_id)
+    if invocation is None or invocation.tool_name != "email_send":
+        return None
+    flow = invocation.flow_context or {}
+    if (flow.get("scheduled_task_run") is not True
+            or flow.get("conversation_id") != suspended_turn.conversation_id
+            or flow.get("planned_action_tool_names") != ["email_send"]
+            or flow.get("requires_artifact_delivery")):
+        return None
+    if not any(isinstance(row, Mapping) and row.get("invocation_id") == invocation.invocation_id
+               and row.get("tool_name") == invocation.tool_name and normalize_tool_status(row.get("status")) == "denied"
+               for row in suspended_turn.pending_tool_calls or ()):
+        return None
+    # Both callers own the resume claim. Native execution independently
+    # claims the reviewed action once before calling the mail provider.
+    return execute_approved_tool_call_from_approval_context(
+        runtime, approval_id, tool_registry=tool_registry, resume_claim_owned=True)
+
+
+def completed_scheduled_email_approval_reply(
+    approval: ApprovalRequest | None,
+    suspended_turn: SuspendedTurn,
+    tool_results: Iterable[ToolResult],
+) -> str | None:
+    """Confirm the reviewed send when the scheduled plan calls only for email delivery."""
+    if (
+        approval is None
+        or approval.status is not ApprovalStatus.APPROVED
+        or approval.approval_id != suspended_turn.approval_id
+        or approval.resource != "email_send"
+    ):
+        return None
+    context = approval.context or {}
+    flow = context.get("trigger_flow")
+    invocation_id = context.get("approval_invocation_id")
+    if (
+        not invocation_id
+        or not isinstance(flow, Mapping)
+        or flow.get("scheduled_task_run") is not True
+        or flow.get("conversation_id") != suspended_turn.conversation_id
+        or flow.get("planned_action_tool_names") != ["email_send"]
+        or flow.get("requires_artifact_delivery") is not False
+        or flow.get("scheduled_chat_delivery_mode") != "confirmation_only"
+    ):
+        return None
+    summaries = _completed_email_send_summaries([
+        result for result in tool_results if result.invocation_id == invocation_id
+    ])
+    return summaries[0] if summaries else None
+
+
 def _approved_pending_tool_resume_reply(result: ToolResult) -> str:
     summaries = _completed_email_send_summaries([result])
     if summaries:
@@ -2598,14 +2654,16 @@ def _resume_turn_from_snapshot(
     from nullion.request_progress import approval_resume_progress
     from nullion.code_mode_sessions import checkpoint_reference
 
-    snapshot = suspended_turn.messages_snapshot
+    snapshot = suspended_turn.messages_snapshot or []
     registry = runtime.active_tool_registry or ToolRegistry()
     callbacks, _ = approval_resume_progress(activity_callback, registry)
     approval = runtime.store.get_approval_request(suspended_turn.approval_id)
     exact_review = requires_exact_tool_review(approval)
     context = (approval.context or {}) if approval is not None else {}
-    needs_saved_workflow = checkpoint_reference(suspended_turn.pending_tool_calls) or context.get("delegated_resume")
-    if needs_saved_workflow and (not snapshot or not callable(getattr(agent_orchestrator, "resume_turn", None))):
+    saved_program = checkpoint_reference(suspended_turn.pending_tool_calls)
+    if (saved_program or context.get("delegated_resume")) and (
+        (not snapshot and not saved_program) or not callable(getattr(agent_orchestrator, "resume_turn", None))
+    ):
         return _ApprovalResumeOutcome(
             "The saved program could not be resumed. The approved action was not run.", TurnOutcome.PARTIAL)
     # The last user-role message may be a runtime recovery nudge, not the
@@ -2641,7 +2699,8 @@ def _resume_turn_from_snapshot(
             else TurnOutcome.PARTIAL,
             (direct_tool_result,),
         )
-    if agent_orchestrator is None or not snapshot or not user_msg_content or (exact_review and not continue_read):
+    if (agent_orchestrator is None or (not snapshot and not saved_program) or not user_msg_content
+            or (exact_review and not continue_read)):
         if exact_review:
             return _ApprovalResumeOutcome(
                 "I couldn't restore the approved action. The action was not replayed.", TurnOutcome.PARTIAL)
@@ -2746,6 +2805,13 @@ def _resume_turn_from_snapshot(
             return _ApprovalResumeOutcome(
                 "The approved action could not finish. Check its result before requesting it again.", TurnOutcome.PARTIAL)
         return None
+    recovered_send = recover_approved_scheduled_email(runtime, suspended_turn, result, tool_registry=registry)
+    if recovered_send is not None:
+        if callbacks:
+            callbacks["tool_result_callback"](recovered_send)
+        return _ApprovalResumeOutcome(_approved_pending_tool_resume_reply(recovered_send),
+            TurnOutcome.SUCCESS if normalize_tool_status(recovered_send.status) == "completed" else TurnOutcome.PARTIAL,
+            (recovered_send,))
     if result.suspended_for_approval:
         approval_id = result.approval_id
         reply, is_suspended = _approval_marker_reply_if_actionable(runtime, approval_id)
@@ -2790,6 +2856,19 @@ def _resume_turn_from_snapshot(
             return _ApprovalResumeOutcome(*_turn_limit_continuation_persistence_failure())
     elif getattr(result, "response_fulfilled", None) is False:
         result_reply, result_outcome = _unfulfilled_turn_reply(result)
+    elif not result.artifacts:
+        email_receipt = completed_scheduled_email_approval_reply(approval, suspended_turn, result.tool_results)
+        if email_receipt is not None:
+            return _ApprovalResumeOutcome(
+                append_activity_trace_to_reply(
+                    email_receipt,
+                    tool_results=result.tool_results,
+                    suspended_for_approval=False,
+                    enabled=activity_trace_enabled_for_chat(runtime, chat_id=suspended_turn.chat_id),
+                ),
+                TurnOutcome.SUCCESS,
+                tuple(result.tool_results),
+            )
     resumed_reply = _append_chat_artifacts_to_reply(
         runtime,
         reply=result_reply,
@@ -2810,6 +2889,13 @@ def _resume_turn_from_snapshot(
     )
     if getattr(result, "response_fulfilled", None) is False:
         resumed_reply, result_outcome = _unfulfilled_turn_reply(result)
+        if getattr(result, "model_timed_out", False) and approval is not None and approval.resource == "email_send":
+            invocation_id = context.get("approval_invocation_id")
+            summaries = _completed_email_send_summaries([
+                receipt for receipt in result.tool_results if receipt.invocation_id == invocation_id
+            ])
+            if summaries:
+                resumed_reply = "\n\n".join([*summaries, "The follow-up response timed out."])
     return _ApprovalResumeOutcome(
         append_activity_trace_to_reply(
             resumed_reply,
@@ -16700,18 +16786,26 @@ def _terminal_exec_structured_filesystem_summary(results: Iterable[ToolResult]) 
         lines.append(f"- ...and {remaining} more candidate{'s' if remaining != 1 else ''}.")
     return "\n".join(lines)
 
+def _terminal_exec_native_receipt_reply(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    from nullion.response_sanitizer import native_filesystem_receipt_reply
+
+    for result in reversed(tool_results or ()):
+        if receipt := native_filesystem_receipt_reply(result):
+            return receipt
+    return None
+
+
 def _terminal_exec_outcome_reply(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> str | None:
-    # Completed/partial filesystem observations are stronger than command prose
-    # or a success exit code. Reuse the shared action-receipt presentation.
-    from nullion.response_sanitizer import native_filesystem_receipt_reply
-    for result in reversed(tool_results or ()):
-        if result.tool_name != 'terminal_exec' or normalize_tool_status(result.status) not in {'completed', 'failed'}:
-            continue
-        receipt_reply = native_filesystem_receipt_reply(result)
-        if receipt_reply:
-            return receipt_reply
+    return _terminal_exec_native_receipt_reply(tool_results) or _terminal_exec_output_reply(tool_results)
+
+
+def _terminal_exec_output_reply(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
     terminal_results = _substantive_terminal_exec_results(tool_results)
     if not terminal_results:
         return None
@@ -18454,6 +18548,12 @@ def _append_chat_artifacts_to_reply(
             ]
         )
     )
+    if not required_attachment_extensions and _reply_media_candidate_paths(reply):
+        from nullion.artifacts import UNVERIFIED_ARTIFACT_PUBLICATION_REPLY, filter_message_scope_media_reply
+        reply = filter_message_scope_media_reply(reply, tool_results=tool_results, approved_paths=[
+            *artifact_paths, *_artifact_paths_from_tool_results(tool_results, include_file_write=False)])
+        if reply == UNVERIFIED_ARTIFACT_PUBLICATION_REPLY and not artifact_paths:
+            return reply
     can_resolve_reply_named_artifacts = bool(required_attachment_extensions or source_attachment_paths
                                            or (infer_attachment_from_prompt and principal_id))
     reply_named_artifact_paths = (
@@ -18666,12 +18766,16 @@ def _append_chat_artifacts_to_reply(
             if not _path_matches_identity_set(path, requested_file_search_delivery_identities)
         )
     terminal_stdout_discovery_paths = _terminal_stdout_discovery_paths_from_tool_results(tool_results)
-    terminal_outcome_reply = _terminal_exec_outcome_reply(tool_results)
+    terminal_receipt_reply = _terminal_exec_native_receipt_reply(tool_results)
+    terminal_outcome_reply = terminal_receipt_reply or _terminal_exec_output_reply(tool_results)
+    # Give verified action results precedence over the draft. Use command
+    # output to fill an empty reply or replace the runtime's own inventory.
     if (
         terminal_outcome_reply
         and discovery_paths
         and not requested_file_search_delivery_paths
         and not _merge_required_attachment_extensions(required_attachment_extensions, tool_results)
+        and (terminal_receipt_reply or not reply.strip() or reply.strip() == _local_discovery_results_reply("", discovery_paths))
     ):
         return terminal_outcome_reply
     local_discovery_only = _completed_tools_are_only_local_discovery(tool_results)
@@ -27118,7 +27222,7 @@ def _render_chat_turn(
                 artifact_paths=locals().get("turn_result", SimpleNamespace(artifacts=[])).artifacts,
                 response_presentation=getattr(locals().get("turn_result"), "response_presentation", None),
                 response_fulfilled=False if _turn_is_suspended else getattr(locals().get('turn_result'), 'response_fulfilled', None),
-                history_state=('suspended' if _turn_is_suspended else 'terminal') if terminal_history_projection else None,
+                history_state='suspended' if _turn_is_suspended else ('terminal' if terminal_history_projection else None),
                 approval_resume_projection=approval_resume_projection,
             )
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
@@ -27792,6 +27896,7 @@ def handle_chat_operator_message(
             message,
             service=service,
             memory_owner=_memory_owner_for_chat(chat_id, settings),
+            activity_callback=activity_callback,
         )
         approval_id = _approval_id_from_command(message)
         if approval_id is not None and _classify_command_result(message, reply) == "ok":

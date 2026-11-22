@@ -5279,6 +5279,7 @@ class ChatOperatorService:
             await sent.delete()
         progress_delivery = RequestProgressDelivery(loop=telegram_loop,
             send=send_progress, edit=edit_progress, remove=remove_progress,
+            delay=0 if command_head == "/update" else 2.5,
             can_publish=turn_registration.publication_gate.can_publish,
             on_published=lambda fact: _mark_timing('progress_'+fact['operation']+'_'+fact['phase_id']))
 

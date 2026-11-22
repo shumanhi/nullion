@@ -49,9 +49,12 @@ def test_unknown_named_task_is_not_declared_absent_from_an_empty_live_inventory(
             if self.phase==1:return tool('request_tool_scope',{'capabilities':['live_tracking'],'tool_names':['list_live_trackers']})
             assert {'list_crons','list_reminders','list_live_trackers'}<=names,names
             assert not names.intersection({'toggle_cron','run_cron','create_live_tracker','stop_live_tracker'}),names
-            if self.phase==2:return tool('list_live_trackers',{'query':'観測甲'})
+            if self.phase==2:
+                return tool('list_live_trackers', {'query': target.id if kind == 'cron' and surface == 'api' else '観測甲'})
             if self.phase==3:
                 assert 'single_kind_only' in json.dumps(kwargs['messages'])
+                if kind == 'cron' and surface == 'api':
+                    return response('No matching tracker.')
                 return tool('list_crons',{'query':'観測甲'}) if kind=='cron' else tool('list_reminders',{})
             assert self.phase==4
             return response(expected)

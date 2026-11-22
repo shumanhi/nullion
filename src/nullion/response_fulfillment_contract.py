@@ -943,7 +943,8 @@ def _completed_media_artifact_paths_matching_collected_image(
             for path in _artifact_result_embedded_source_image_paths(result)
         ):
             continue
-        paths.extend(_artifact_result_paths_matching_extension(result, extension))
+        paths.extend(path for path in _embedded_media_paths_for_result(result)
+                     if artifact_format_extension(path) == extension)
     return tuple(dict.fromkeys(paths))
 
 
@@ -1087,14 +1088,34 @@ def artifact_completed_embedded_media_paths(tool_results: Iterable[ToolResult] |
             continue
         if normalize_tool_status(getattr(result, "status", None)) != "completed":
             continue
-        if _artifact_result_media_count(
-            result,
+        paths.extend(_embedded_media_paths_for_result(result,
             known_browser_screenshot_identities=browser_screenshot_identities,
-            verified_browser_screenshot_identities=verified_browser_screenshot_identities,
-        ) <= 0:
-            continue
-        paths.extend(_artifact_result_paths(result))
+            verified_browser_screenshot_identities=verified_browser_screenshot_identities))
     return tuple(dict.fromkeys(paths))
+
+
+def _embedded_media_paths_for_result(result: ToolResult, **screenshot_evidence) -> tuple[str, ...]:
+    """An aggregate producer receipt cannot prove media in every output."""
+    from nullion.artifacts import (
+        ARTIFACT_DELIVERY_ROLES, artifact_paths_from_output_descriptors, output_has_artifact_descriptors,
+    )
+
+    output = result.output if isinstance(result.output, dict) else {}
+    paths = (tuple(artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES))
+             if output_has_artifact_descriptors(output) else _artifact_result_paths(result))
+    if len(paths) < 2:
+        return paths if _artifact_result_media_count(result, **screenshot_evidence) > 0 else ()
+
+    from nullion.artifact_evidence import artifact_structure_evidence
+
+    def has_embedded_media(path: str) -> bool:
+        if artifact_format_extension(path) == ".html":
+            facts = artifact_structure_evidence(Path(path))
+            return bool(facts.get("decoded_embedded_raster_image_count") or facts.get("inline_svg_count")
+                        or facts.get("svg_image_count"))
+        return artifact_file_embedded_media_count(path) > 0
+
+    return tuple(path for path in paths if has_embedded_media(path))
 
 
 def _artifact_result_paths_matching_extension(result: ToolResult, extension: str) -> tuple[str, ...]:
@@ -1223,7 +1244,12 @@ def artifact_media_plain_replacement_guard_result(
         and isinstance(r.output,dict) and r.output.get('source_artifact_delivery_requested') is True for r in prior_results)
     creative_image_output = bool(source_delivery is False and not prior_source_delivery
         and declared and declared.issubset(IMAGE_ATTACHMENT_EXTENSIONS))
-    if invocation.tool_name == "image_generate" and not creative_image_output and (
+    # The scheduled manifest can require a sourced image and a separately
+    # produced image. The latter cannot satisfy the former's receipt slot.
+    slots = context.get("scheduled_artifact_deliverables") or ()
+    separate_derived_image = bool(context.get("scheduled_task_run") and any(
+        row.get("role") == "derived_image" for row in slots if isinstance(row, dict)))
+    if invocation.tool_name == "image_generate" and not (creative_image_output or separate_derived_image) and (
         any(_browser_image_collection_failed(result) for result in prior_results)
         or any(_browser_page_context_used(result) for result in prior_results)
     ):
@@ -2158,7 +2184,18 @@ def operation_failure_reply(tool_results: Iterable[ToolResult], *, required_tool
                         and r.output.get("validation_kind") == "live_tracker_invalid_plan"
                         and r.output.get("executed") is False]
     if tracker_failures:
-        code = (tracker_failures[-1].output.get("validation") or {}).get("code")
+        validation = tracker_failures[-1].output.get("validation") or {}
+        code = validation.get("code")
+        coverage_gaps = validation.get("coverage_gaps")
+        if code == "incomplete_observation" and isinstance(coverage_gaps, list):
+            for gap in coverage_gaps:
+                if not isinstance(gap, dict):
+                    continue
+                returned, total = gap.get("returned_count"), gap.get("candidate_count")
+                if type(returned) is int and type(total) is int and 0 <= returned < total:
+                    return (f"One source check captured {returned} of {total} records. "
+                            "I need a complete read of the requested source before starting the alert. "
+                            "No new alert was created.")
         detail = {
             "observation_too_large": "the source read was too large for repeated checks",
             "semantic_condition_unresolved": "the source did not provide enough information to evaluate the alert condition",
@@ -2404,6 +2441,10 @@ def evaluate_response_fulfillment(
         or bool(valid_reply_media)
     )
     if media_required:
+        from nullion.artifact_lifecycle import manifest_delivery_paths
+        selected = manifest_delivery_paths((*existing_deliverables, *valid_reply_media),
+            (result for result, _status in normalized_results))
+        selected_ids = _path_identity_set(selected) if selected is not None else None
         embedded_media_paths = artifact_completed_embedded_media_paths(result for result, _status in normalized_results)
         existing_embedded_media_artifacts = _existing_deliverable_paths(
             embedded_media_paths,
@@ -2427,7 +2468,8 @@ def evaluate_response_fulfillment(
                     existing_embedded_media_artifacts,
                     media_extension,
                 )
-            if not valid_embedded_media_artifacts:
+            if not any(selected_ids is None or _path_matches_identities(path, selected_ids)
+                       for path in valid_embedded_media_artifacts):
                 missing.append(f"attachment_with_embedded_media:{media_extension}")
     if requires_artifact and not has_deliverable:
         requirement_kind = artifact_kind
@@ -2603,6 +2645,7 @@ def evaluate_response_execution_outcome(
 ) -> ExecutionOutcomeEvaluation:
     """Return fulfillment and normalized outcome without adding a model hop."""
     tool_results = list(tool_results or ())
+    artifact_paths = tuple(artifact_paths or ())
     decision = evaluate_response_fulfillment(
         store=store,
         conversation_id=conversation_id,
@@ -2675,19 +2718,17 @@ def evaluate_response_execution_outcome(
         reviewed_execution=review,
     )
     reply = decision.reply
-    required_delivered_artifacts: list[str] = []
-    if decision.satisfied and required_attachment_extensions:
+    # Keep the primary's caption when its selected paths or MEDIA bindings
+    # identify a current file. Legacy callers may infer files solely from tool
+    # history: retain their native receipt fallback without inspecting prose.
+    if (decision.satisfied and required_attachment_extensions
+            and outcome.status is ExecutionStatus.PARTIALLY_SUCCEEDED and outcome.failed_tools
+            and not any(_path_matches_identities(path, selected_ids)
+                        for path in (*artifact_paths, *reply_valid_media_paths))):
         required_extensions = _normalize_required_extensions(required_attachment_extensions)
-        existing_artifacts = _existing_deliverable_paths(combined_artifacts, artifact_roots=artifact_roots)
-        required_delivered_artifacts = [
-            path for path in existing_artifacts if Path(path).suffix.lower() in required_extensions
-        ]
-    if (
-        required_delivered_artifacts
-        and outcome.status is ExecutionStatus.PARTIALLY_SUCCEEDED
-        and outcome.failed_tools
-    ):
-        reply = _artifact_package_delivery_reply(required_delivered_artifacts)
+        inferred_files = [path for path in selected if Path(path).suffix.lower() in required_extensions]
+        if inferred_files:
+            reply = _artifact_package_delivery_reply(inferred_files)
     if outcome.status is ExecutionStatus.NEEDS_USER_ACTION and outcome.failure_reason:
         notice = _needs_user_action_reply(outcome.failure_reason, outcome.next_action)
         # Native state records the blocker without replacing the primary

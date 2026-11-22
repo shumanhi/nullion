@@ -38,7 +38,9 @@ def test_existing_file_export_keeps_requested_name_source_edit_and_download_byte
     content = {'.csv': 'Region,Value\nNorth,12\nSouth,19\n',
         '.html': '<!doctype html><html><body><h1>値 31</h1><p>Verified report contents.</p></body></html>',
         '.svg': '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><text x="1" y="20">31</text></svg>'}.get(suffix)
-    expected=content.encode()
+    expected_content = content.replace('<html>',
+        '<html><head><meta charset="utf-8"><title>比較 final</title></head>', 1) if suffix == '.html' else content
+    expected=expected_content.encode()
     registry=ToolRegistry(filesystem_allowed_roots=[tmp_path])
     writer=_build_file_write_handler(tmp_path,allowed_roots=[tmp_path]);writes=[]
     def write(invocation):

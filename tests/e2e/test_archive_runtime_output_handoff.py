@@ -13,7 +13,7 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Doc
 
 @pytest.mark.parametrize('mode',['off','on'])
 @pytest.mark.parametrize('prompt',['Create and attach the requested ZIP.','Crea y adjunta el ZIP solicitado.','指定された ZIP を作成して添付してください。'])
-def test_archive_repair_rehomes_new_runtime_output_and_delivers_consistent_receipt(tmp_path,monkeypatch,mode,prompt):
+def test_archive_repair_rehomes_new_runtime_output_and_delivers_consistent_receipt(tmp_path,tmp_path_factory,monkeypatch,mode,prompt):
     from fastapi.testclient import TestClient
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.artifacts import artifact_root_for_principal,nullion_data_home
@@ -30,6 +30,12 @@ def test_archive_repair_rehomes_new_runtime_output_and_delivers_consistent_recei
     monkeypatch.setenv('NULLION_FILE_ACCESS_ENABLED','1')
     root=artifact_root_for_principal('web:archive-handoff');root.mkdir(parents=True,exist_ok=True)
     source=root/'north.csv';source.write_text('Region,Value\nNorth,12\n')
+    private_file = tmp_path_factory.mktemp("private-archive-input") / "canary.csv"
+    private_file.write_bytes(b"private archive fixture")
+    unsafe_dir = root / "mixed-inputs"
+    unsafe_dir.mkdir()
+    (unsafe_dir / "public.csv").write_bytes(source.read_bytes())
+    (unsafe_dir / "linked.csv").symlink_to(private_file)
     wrong=nullion_data_home()/'uploads'/'source-37.zip'
     expected=root/'source-37.zip'
     class Provider:
@@ -53,7 +59,11 @@ def test_archive_repair_rehomes_new_runtime_output_and_delivers_consistent_recei
             if self.rounds==1:return call('request_tool_scope',{'capabilities':['local_files'],
                 'tool_names':['archive_create'],'required_tool_names':['archive_create'],'artifact_extensions':['.zip']})
             if self.rounds in {2,3}:
-                args={'output_path':str(wrong),'source_paths':[str(root/'absent.csv' if self.rounds==2 else source)]}
+                args = {'output_path': str(wrong)}
+                if self.rounds == 2:
+                    args['source_dir'] = str(unsafe_dir)
+                else:
+                    args['source_paths'] = [str(source)]
                 return (call('code_mode',{'tool_names':['archive_create'],
                     'code':"call_tool('archive_create', "+repr(args)+")"}) if mode=='on' else call('archive_create',args))
             return text('Archivo listo.\n\nMEDIA:'+str(expected))
@@ -87,5 +97,6 @@ def test_archive_repair_rehomes_new_runtime_output_and_delivers_consistent_recei
     assert final['text']==canonical
     receipts=[r for r in turn['tool_results'] if r['tool_name']=='archive_create']
     assert [r['status'] for r in receipts]==['failed','completed']
+    assert receipts[0]['output']['reason'] == 'archive_source_outside_workspace'
     assert receipts[-1]['output']['artifact_path']==str(expected)
     assert turn['response_fulfilled'] is True

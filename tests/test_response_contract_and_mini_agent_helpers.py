@@ -3255,6 +3255,38 @@ def test_terminal_exec_generic_json_output_is_summarized_without_raw_code_block(
     assert "debug_path" not in sanitized
     assert "```text" not in sanitized
 
+
+def test_shell_discovery_does_not_replace_a_composed_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nullion.chat_operator import _append_chat_artifacts_to_reply
+    from nullion.runtime import bootstrap_persistent_runtime
+
+    monkeypatch.setenv("NULLION_DATA_DIR", str(tmp_path / "data"))
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    answer = "Nullionには4人のユーザーが登録されています。"
+    results = [
+        ToolResult("discover", "terminal_exec", "completed", {
+            "stdout": "/tmp/test-config.json\n/tmp/test-settings.json",
+            "exit_code": 0,
+        }),
+        ToolResult("inspect", "terminal_exec", "completed", {
+            "stdout": "dict;\nTOP_KEYS ['multi_user_enabled', 'users'];\nLIST users 4;",
+            "exit_code": 0,
+        }),
+    ]
+
+    assert _append_chat_artifacts_to_reply(
+        runtime,
+        reply=answer,
+        artifact_paths=(),
+        prompt="登録済みのユーザーは何人ですか？",
+        principal_id="telegram:test-chat",
+        tool_results=results,
+        required_attachment_extensions=(),
+    ) == answer
+
+
 def test_terminal_exec_outcome_wins_when_file_search_also_found_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

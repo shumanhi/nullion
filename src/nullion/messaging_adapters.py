@@ -1893,6 +1893,7 @@ def prepare_reply_for_platform_delivery(
     allow_attachments: bool | None = None,
     delivery_contract: DeliveryContract | None = None,
     artifact_paths: list[str] | tuple[str, ...] | None = None,
+    exact_artifact_paths: tuple[str, ...] | None = None,
     max_attachment_bytes: int | None = None,
     tool_results=None,
 ) -> PlatformDelivery:
@@ -1910,6 +1911,34 @@ def prepare_reply_for_platform_delivery(
     text = sanitize_external_inline_markup(render_user_message(reply))
     text = _strip_platform_internal_markers(text)
     text = _rewrite_sandbox_artifact_links_for_delivery(text, principal_id=principal_id)
+    # Authored directives alone cannot expand a validated message-only plan.
+    if (exact_artifact_paths is None and tool_results
+            and not (delivery_contract and delivery_contract.required_attachment_extensions)
+            and media_candidate_paths_from_text(text)):
+        from nullion.artifacts import UNVERIFIED_ARTIFACT_PUBLICATION_REPLY, filter_message_scope_media_reply
+        from nullion.response_fulfillment_contract import artifact_paths_from_tool_results
+        text = filter_message_scope_media_reply(text, tool_results=tool_results,
+            approved_paths=[*(artifact_paths or ()), *artifact_paths_from_tool_results(tool_results)])
+        if text == UNVERIFIED_ARTIFACT_PUBLICATION_REPLY and not artifact_paths:
+            return PlatformDelivery(text=text, attachments=())
+    if (exact_artifact_paths is not None and allow_attachments is not False
+            and (delivery_contract is None or delivery_contract.allow_attachment_delivery)):
+        caption, _ = split_reply_for_platform_delivery(text, principal_id=principal_id)
+        candidates = tuple(dict.fromkeys(_resolve_messaging_attachment_path(Path(path), principal_id=principal_id)
+                                         for path in exact_artifact_paths))
+        if (any(not _is_deliverable_messaging_attachment(path, principal_id=principal_id) for path in candidates)
+                or set(_expand_linked_html_assets(candidates)) != set(candidates)):
+            return PlatformDelivery(text=unavailable_attachment_reply(), attachments=(),
+                media_directive_count=len(candidates), unavailable_attachment_count=len(candidates))
+        oversized = _hold_large_attachments_for_confirmation(candidates, max_attachment_bytes=max_attachment_bytes)
+        if oversized is not None:
+            return oversized
+        limit = _max_automatic_attachment_batch()
+        if len(candidates) > limit:
+            return PlatformDelivery(text=sanitize_visible(_attachment_batch_confirmation_text(candidates, batch_limit=limit)),
+                attachments=(), media_directive_count=len(candidates), pending_attachment_count=len(candidates))
+        return PlatformDelivery(text=sanitize_visible(caption), attachments=candidates,
+            media_directive_count=len(candidates))
     if delivery_contract is None:
         if allow_attachments is False:
             delivery_contract = DeliveryContract.message_only()
@@ -2199,6 +2228,7 @@ async def execute_platform_reply_delivery(
     principal_id: str | None = None,
     delivery_contract: DeliveryContract | None = None,
     artifact_paths: list[str] | tuple[str, ...] | None = None,
+    exact_artifact_paths: tuple[str, ...] | None = None,
     request_id: str | None = None,
     message_id: str | None = None,
     reply_already_sent: bool = False,
@@ -2224,6 +2254,7 @@ async def execute_platform_reply_delivery(
                 reply, channel=channel, target_id=target_id, principal_id=principal_id,
                 tool_results=tool_results,
                 delivery_contract=delivery_contract, artifact_paths=artifact_paths,
+                exact_artifact_paths=exact_artifact_paths,
                 request_id=request_id, message_id=message_id, reply_already_sent=reply_already_sent,
                 send_text=publication_gate.guard(send_text),
                 send_attachments=publication_gate.guard(send_attachments) if send_attachments else None,
@@ -2240,9 +2271,15 @@ async def execute_platform_reply_delivery(
         principal_id=principal_id,
         delivery_contract=delivery_contract,
         artifact_paths=artifact_paths,
+        exact_artifact_paths=exact_artifact_paths,
         tool_results=tool_results,
     )
     target = None if target_id is None else str(target_id)
+    if exact_artifact_paths and not delivery.attachments:
+        receipt = build_platform_delivery_receipt(channel=channel, target_id=target,
+            delivery=delivery, transport_ok=False, request_id=request_id, message_id=message_id)
+        record_platform_delivery_receipt(receipt)
+        return PlatformDeliveryResult(delivery=delivery, receipt=receipt)
     if delivery.text and not delivery.attachments and finalize_stream is not None:
         try:
             # The adapter owns the transport acknowledgement. Reuse its existing

@@ -305,3 +305,24 @@ async def test_delegated_writer_limit_cannot_be_reported_as_success(monkeypatch)
     result = await runner.run(config, tool_registry=tools)
     assert result.status == 'failure'
     assert result.report_presentation['fulfillment_satisfied'] is False
+
+
+def test_first_required_read_retains_time_when_other_sources_are_unattempted(monkeypatch):
+    from nullion.research_budget import source_timeout
+
+    clock = [0.0]
+    monkeypatch.setattr('nullion.research_budget.time.monotonic', lambda: clock[0])
+    monkeypatch.setenv('NULLION_RESEARCH_SECONDS', '75')
+    tools, _ = registry()
+    spec = tools.get_spec('source_read')
+
+    with research_context() as budget:
+        budget.activate()
+        budget.required_sources = {'source_read', 'message_detail', 'calendar_source'}
+        clock[0] = 63.0
+        assert source_timeout(spec) == pytest.approx(7.2)
+        result = invoke(tools, 1)
+        assert result.status == 'completed'
+        repeated = invoke(tools, 2)
+        assert repeated.output['reason'] == 'research_reserved_for_required_sources'
+        assert repeated.output['unattempted_required_source_tools'] == ['calendar_source', 'message_detail']

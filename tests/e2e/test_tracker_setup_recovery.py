@@ -32,9 +32,13 @@ def objects(value):
             yield from objects(decoded)
 
 
-@pytest.mark.parametrize('label,prompt', [('見出し', '15分ごとに4時間、このページの新しい記事を通知してください。'),
-    ('Titular', 'Avísame de nuevos artículos de esta página cada 15 minutos durante 4 horas.')])
-def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tracker(live_fixture, monkeypatch, label, prompt):
+@pytest.mark.parametrize('label,prompt,publish_before_first_poll', [
+    ('見出し', '15分ごとに4時間、このページの新しい記事を通知してください。', True),
+    ('Titular', 'Avísame de nuevos artículos de esta página cada 15 minutos durante 4 horas.', False),
+])
+def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tracker(
+    live_fixture, monkeypatch, label, prompt, publish_before_first_poll,
+):
     from fastapi.testclient import TestClient
     from nullion.web_app import create_app
     from nullion.plugins.browser_plugin import register_browser_tools
@@ -52,6 +56,9 @@ def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tr
             cards = ''.join(f'<div><a class="visual" href="/entry/{i}"><img width="96" height="96" src="/image.svg">Credit {i}</a>'
                 f'<a href="/entry/{i}"><span class="entry-name">{label} {i}</span></a></div>'
                 for i in range(56 if state.fresh else 55))
+            if not state.fresh:
+                cards += (f'<div style="opacity:0"><a class="visual" href="/entry/55">'
+                          f'<img width="96" height="96" src="/image.svg">{label} 55</a></div>')
             self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers()
             self.wfile.write(f'<header><nav>{nav}</nav></header><div><h2>{label}</h2>{cards}</div>'.encode())
         def log_message(self, *_):
@@ -88,7 +95,11 @@ def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tr
             out = packet['observations'][0]
             assert out['coverage']['truncated'] is False and 55 <= len(out['items']) <= 56
             assert all(row['title'].startswith(label) for row in out['items'])
-            fresh = next((r for r in packet['observation_history']['records'] if r['status'] == 'new'), None)
+            history = packet['observation_history']
+            if publish_before_first_poll and not history['baseline_established']:
+                assert len(out['items']) == 55
+                state.fresh = True
+            fresh = next((r for r in history['records'] if r['status'] == 'new'), None)
             if fresh:
                 item = out['items'][int(fresh['pointer'].rsplit('/', 1)[1])]
                 return text(json.dumps({'status': 'matched', 'summary': item['title']+' — '+item['canonical_url'],
@@ -111,16 +122,19 @@ def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tr
             return use('browser_extract_items', {'selector': 'main#not-present'})
         if state.phase == 4:
             hints = [row for obj in objects(kw['messages']) for row in obj.get('available_scopes', [])]
-            assert any('entry-name' in row['selector'] for row in hints), hints
-            return use('browser_extract_items', {'max_items': 40, 'fields': ['title', 'canonical_url']})
-        if state.phase == 5:
-            hints = [row for obj in objects(kw['messages']) for row in obj.get('available_scopes', [])]
             state.selector = next(row['selector'] for row in hints if row['visible_link_count'] == 55
                 and all(sample.startswith(label) for sample in row['sample_text']))
             state.probe = [{'tool_name': 'browser_extract_items', 'arguments': {
-                'max_items': 40, 'fields': ['title', 'canonical_url']}}]
+                'max_items': 40, 'fields': ['title', 'canonical_url'], 'ready_selector': state.selector}}]
+            return use('browser_extract_items', state.probe[0]['arguments'])
+        if state.phase == 5:
             return create_tracker()
         if state.phase == 6:
+            repair = next(obj for obj in objects(kw['messages']) if obj.get('code') == 'incomplete_observation'
+                          and obj.get('coverage_gaps'))
+            gap, = repair['coverage_gaps']
+            assert gap['returned_count'] == 40 and gap['candidate_count'] == 197
+            assert any(row['selector'] == state.selector for row in gap['available_scopes'])
             state.probe = [{'tool_name': 'browser_extract_items', 'arguments': {
                 'selector': state.selector, 'max_items': 100, 'fields': ['title', 'canonical_url']}}]
             return use('browser_extract_items', state.probe[0]['arguments'])
@@ -146,13 +160,18 @@ def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tr
             assert crons.list_crons() == [] and state.reviews == 0
             wait_for(lambda: store.get(job['id'])['checks'] >= 1, timeout=20)
             saved = store.get(job['id'])
-            assert saved['last_outcome'] == 'no_match' and saved['observation_baseline_set']
+            assert saved['observation_baseline_set']
+            assert saved['last_outcome'] == ('matched' if publish_before_first_poll else 'no_match'), saved
+            if publish_before_first_poll:
+                assert saved['last_evaluation']['observation_history']['new_records'] == 1
+                wait_for(lambda: store.get(job['id'])['notification_status'] == 'sent', timeout=12)
             due = datetime.fromisoformat(saved['next_check_at'])
             assert store.claim(4, now=due-timedelta(seconds=1)) is None
             state.fresh = True
             claimed, token = store.claim(4, now=due+timedelta(seconds=1))
             app.state.live_tracker_engine.check_once(claimed, token)
             wait_for(lambda: store.get(job['id'])['notification_status'] == 'sent', timeout=12)
+            assert store.get(job['id'])['last_outcome'] == ('no_match' if publish_before_first_poll else 'matched')
             assert store.get(job['id'])['state'] == 'active'
             assert store.get(job['id'])['stop_after_match'] is False
             from nullion.chat_store import get_chat_store
@@ -165,6 +184,8 @@ def test_missing_scope_and_invalid_review_recover_to_a_working_fifteen_minute_tr
                 (r.get('output') or {}).get('coverage', {}).get('candidate_count') == 197 and
                 (r.get('output') or {}).get('coverage', {}).get('returned_count') == 40 for r in results), results
             assert any(r['tool_name'] == 'browser_extract_items' and r['status'] == 'failed' for r in results)
+            assert any(r['tool_name'] == 'create_live_tracker' and
+                (r.get('output') or {}).get('validation', {}).get('code') == 'incomplete_observation' for r in results)
             assert sum(r['tool_name'] == 'create_live_tracker' and r['status'] == 'completed' for r in results) == 1
             reviews = [r for r in f.runtime.store.list_conversation_events(cid) if r.get('event_type') == 'conversation.action_review']
             assert reviews == []

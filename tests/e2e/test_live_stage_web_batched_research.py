@@ -1,8 +1,9 @@
 """Small real-provider Web UI latency/quality acceptance for rendered research."""
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -109,9 +110,13 @@ def test_live_comparison_uses_visible_quantities_without_an_extra_tool_round(liv
 def test_live_availability_reconsiders_sources_before_giving_up(live_web, record_property):
     page, frames, errors, database, conversation, base = live_web
     started = datetime.now(timezone.utc).isoformat()
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    monday = today + timedelta(days=7 - today.weekday())
+    month_day = f"{monday:%B} {monday.day}"
     response, turn, elapsed = _submit(live_web,
         'Find available dinner reservation times at Sala Thai in Manhattan for 2 people on '
-        'Monday November 16, 2026 around 6 PM. Only check availability; do not reserve or book anything.', timeout=240)
+        f'Monday {month_day}, {monday.year} around 6 PM. '
+        'Only check availability; do not reserve or book anything.', timeout=240)
     results = turn.get('tool_results', [])
     assert any(row['status']=='completed' and row['tool_name'].startswith(('browser_', 'web_'))
         for row in results), turn
@@ -123,7 +128,7 @@ def test_live_availability_reconsiders_sources_before_giving_up(live_web, record
     )), response
     source_text = json.dumps([r.get('output', {}) for r in results], ensure_ascii=False)
     assert any(value in source_text for value in ('6:00', '5:30', '6:30')), source_text[-2000:]
-    assert 'November 16' in source_text and 'for a party of 2' in source_text, source_text[-2000:]
+    assert month_day in source_text and 'for a party of 2' in source_text, source_text[-2000:]
     assert 'https://' in response['text'] and not response.get('artifacts'), response
     timings = [row for row in catalogue._conversation_event_payloads(
         database, conversation, event_type='conversation.model_timing') if row.get('created_at', '') >= started]

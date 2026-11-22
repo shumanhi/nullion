@@ -140,22 +140,39 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_read_pages",
-            "Read rendered pages in the configured real browser without an inner AI loop. "
-            "Prefer this for known URLs and source comparisons: navigation, observed readiness conditions "
+            "Read rendered pages without an inner model loop. Use read_kind=text for a general read. "
+            "Set expected_heading only for read_kind=detail. Batch independent URLs with independent_pages=true. "
+            "For known URLs and source comparisons, navigation, observed readiness conditions "
             "and structured item/detail or text extraction run together. Omit url for a single read of "
-            "the current task tab. Multiple URLs require independent_pages=true: at most two independent "
-            "read-only tabs run together, sharing the configured profile/login and leaving the user's tab intact. "
+            "the current task tab. Multiple explicit URLs run in order by default. Set independent_pages=true "
+            "to read two independent pages at a time, sharing the browser profile without closing the user's tab. "
             "Do not batch pages that change shared search/account state or depend on each other's actions. "
             "For independent URLs, prefer one pages batch; independent_pages=true also allows the runtime "
             "to combine adjacent independent read calls without another model round. "
-            "Use observed readiness selectors/text for dynamic results. A read without a readiness criterion "
+            "For a comparison of specific products or listings, batch their observed detail URLs with "
+            "read_kind=detail and each expected_heading as shown in the listing. This verifies the rendered "
+            "detail identity and surfaces title, price, and observed_text from the matched record. "
+            "Use observed_text to verify selected options and distinguish the displayed price from other offers. "
+            "In code_mode return title, price if present, observed_text and source_page_url from each detail. "
+            "Use observed readiness selectors/text for dynamic results. When collecting directly reportable rows, "
+            "set verify_records on a scoped item read. Verify the requested values in visible page controls, "
+            "such as origin, destination, and date, and choose the required item fields. Use title and price_text "
+            "when reading priced options. Verified rows can be delivered even if a later source fails. "
+            "A read without a readiness criterion "
             "is an observation, not proof that filters were applied or results are absent. If a page needs "
             "interaction, inspect the returned data and request native controls or browser_run_task then. "
+            "When a text read exposes a link to a more specific result page, read its captured URL. "
+            "If only the visible label was retained, use follow_link_text with the observed source URL to open "
+            "that exact link. Use this for reading destinations, not submitting forms. "
+            "Use retain_link_source with follow_link_text to verify and keep useful overview rows as part "
+            "of the same read. If the destination fails, those confirmed facts still remain available. "
             "Keep the original user requirements; do not invent mandatory counts or extra research fields. "
             "Once the requested evidence is sufficient, compose the answer rather than starting optional exploration. "
             "Text reads include document_title, visible headings, links and coverage. A complete heading_coverage with zero "
             "headings verifies their absence in that DOM scope; distinguish the document title from a visible heading "
             "instead of repeatedly waiting for a heading that is absent. "
+            "When a unique visible detail heading matches the page title, a text read also returns observed_title "
+            "and observed_text. Use those record facts before inspecting the full document. "
             "Returns exact source URLs, structured records, coverage and per-page failures. No screenshots or files.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
@@ -178,7 +195,7 @@ def register_browser_tools(
         registry.register(
             _make_spec(
                 "browser_run_task",
-                "Delegate adaptive browser interaction and dynamic multi-step forms to Browser Use. Prefer lightweight readers such as browser_read_pages, web_fetch and web_search for known URLs and public-page research. Request browser_run_task in both tool_names and required_tool_names to delegate. Select this tool by exact name in both tool_names and required_tool_names through request_tool_scope only when delegating a full visual workflow. An optional tool_names entry does not launch or expose this several-minute worker; ordinary web research retains lightweight readers. If a dynamic workflow needs delegation later, request its exact required scope then. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. In Auto/CDP mode it uses the configured managed browser and its existing login. If this controller cannot attach, continue with ordinary browser tools on that same session; never replace it with a fresh browser. Explicit Playwright mode uses separate workspace-owned browser state and cannot borrow a managed-browser login. For an explicitly requested visual navigation task with screenshots, scope this tool; do not require a separate capture tool. Reuses the configured model. Use browser_read_pages first for readable pages and comparisons of known URLs. When captured page state or a registered recipe establishes stable controls, use a verified code_mode sequence of the scoped native browser tools. Check each prerequisite and the resulting page; stop the sequence at an unknown state. Delegate when captured page state establishes that adaptive interaction is needed; do not turn every comparison into a full visual workflow. Do not duplicate the same form workflow with a long low-level tool sequence before delegating it. For long pages, use captured-text query search to locate required rows. A verified no-result condition within the user's exact constraints is an outcome; do not broaden to different locations or constraints without permission. For readable public pages, use navigation and structured extraction directly; do not start a full visual worker just to read ordinary text or collect image URLs. When a visual workflow genuinely needs multiple sources, use one coherent multi-page objective rather than separate full workers for each source. Stop when the requested observations are captured and avoid optional detail exploration. Delegate only outcomes needed for the original user objective; do not make extra detail or a preferred intermediate source mandatory. For open-ended research, choose accessible, substantiated candidates before deep exploration; replace a blocked optional candidate instead of exhausting full workers on it. Preserve subjects and sources explicitly required by the user. Does not book or purchase. May take several minutes.",
+                "Delegate adaptive browser interaction and dynamic multi-step forms to Browser Use. Prefer lightweight readers such as browser_read_pages, web_fetch and web_search for known URLs and public-page research. Request browser_run_task in both tool_names and required_tool_names to delegate. Select this tool by exact name in both tool_names and required_tool_names through request_tool_scope only when delegating a full visual workflow. An optional tool_names entry does not launch or expose this several-minute worker; ordinary web research retains lightweight readers. If a dynamic workflow needs delegation later, request its exact required scope then. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. In Auto/CDP mode it uses the configured managed browser and its existing login. If this controller cannot attach, continue with ordinary browser tools on that same session; never replace it with a fresh browser. When the current capture includes an observed link to the intended results, read its exact URL directly with browser_read_pages before trying adaptive interaction or clicking its label. Explicit Playwright mode uses separate workspace-owned browser state and cannot borrow a managed-browser login. For an explicitly requested visual navigation task with screenshots, scope this tool; do not require a separate capture tool. Reuses the configured model. Use browser_read_pages first for readable pages and comparisons of known URLs. When captured page state or a registered recipe establishes stable controls, use a verified code_mode sequence of the scoped native browser tools. Check each prerequisite and the resulting page; stop the sequence at an unknown state. Delegate when captured page state establishes that adaptive interaction is needed; do not turn every comparison into a full visual workflow. Do not duplicate the same form workflow with a long low-level tool sequence before delegating it. For long pages, use captured-text query search to locate required rows. A verified no-result condition within the user's exact constraints is an outcome; do not broaden to different locations or constraints without permission. For readable public pages, use navigation and structured extraction directly; do not start a full visual worker just to read ordinary text or collect image URLs. When a visual workflow genuinely needs multiple sources, use one coherent multi-page objective rather than separate full workers for each source. Stop when the requested observations are captured and avoid optional detail exploration. Delegate only outcomes needed for the original user objective; do not make extra detail or a preferred intermediate source mandatory. For open-ended research, choose accessible, substantiated candidates before deep exploration; replace a blocked optional candidate instead of exhausting full workers on it. Preserve subjects and sources explicitly required by the user. Does not book or purchase. May take several minutes.",
                 risk=ToolRiskLevel.MEDIUM, side_effect=ToolSideEffectClass.WRITE, timeout=650,
                 continuation_tools=("browser_run_task", "web_search", "web_fetch"),
                 source_artifact_extensions=(".png",),
@@ -222,7 +239,7 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_navigate",
-            "Navigate the configured agent browser backend to an HTTP/HTTPS URL, or to a local HTML file generated inside this workspace. Returns when the page has loaded.",
+            "Use the configured agent browser backend to open an HTTP/HTTPS URL or a local HTML file in this workspace. A successful navigation confirms the document opened. Dynamic results may still be loading; use ready_selector or ready_text on the read.",
             risk=ToolRiskLevel.MEDIUM,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
@@ -335,6 +352,8 @@ def register_browser_tools(
         _make_spec(
             "browser_snapshot",
             "Inspect the current page and return visible interactive elements with stable element_id values for reliable follow-up actions. "
+            "heading_links are exact URLs from visible linked headings. When reading multiple independent details, "
+            "batch their captured URLs with browser_read_pages before considering click and back navigation. "
             "A link to a destination is not evidence that the destination is open. Follow observed links and verify the destination URL "
             "and actual controls before claiming a requested form or control is ready. If elements are omitted, inspect retained evidence "
             "or use browser_find rather than assuming the missing controls exist or are absent.",
@@ -342,6 +361,7 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
             continuation_tools=(
+                "browser_read_pages",
                 "browser_click_id",
                 "browser_type_id",
                 "browser_screenshot",
@@ -377,6 +397,8 @@ def register_browser_tools(
                 "Extract compact structured item rows from the current rendered page, including direct hrefs, "
                 "visible title/text, image URLs, numeric snippets, enclosing section labels, and coverage. "
                 "For section-based monitoring, scope to that verified region and inspect coverage; a ranked subset does not prove absence. "
+                "A complete, nonempty collection in a visible selector or section_heading verifies readiness. "
+                "For dynamic results or a collection that can legitimately be empty, wait on an observed results landmark with ready_selector or ready_text. "
                 "When a scope is missing or truncated, available_scopes contains selectors observed in this DOM with example text. "
                 "Select a relevant observed scope and test it; do not guess a page landmark or save a truncated collection as complete. "
                 "For bounded live observations use fields to return only needed titles and stable URLs, without rich image/price data. "
@@ -387,14 +409,19 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
-            observation_setup_tools=("browser_navigate",),
+            observation_setup_tools=("browser_navigate", "browser_wait_for"),
+            observation_inline_setup_tools=("browser_wait_for",),
             observation_requires_setup=True,
-            observation_repair_parameters=("selector",),
+            observation_repair_parameters=("selector", "ready_selector", "ready_text"),
             context_argument_bindings=(("session_id", "browser_session_id"),),
             continuation_tools=("browser_extract_detail", "browser_run_js", "browser_image_collect"),
             code_mode_allowed=True,
             input_schema=_object_schema(
                 {
+                    "ready_selector": {"type": "string", "minLength": 1, "maxLength": 500,
+                        "description": "Observed results-content selector that must become visible before extracting rows."},
+                    "ready_text": {"type": "string", "minLength": 1, "maxLength": 200,
+                        "description": "Observed stable results-content text to wait for before extracting rows."},
                     "fields": {
                         "type": "array", "minItems": 1, "maxItems": len(BROWSER_ITEM_FIELDS), "uniqueItems": True,
                         "items": {"type": "string", "enum": list(BROWSER_ITEM_FIELDS)},

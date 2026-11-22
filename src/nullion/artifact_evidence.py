@@ -604,6 +604,32 @@ def artifact_structure_evidence(path: Path) -> dict[str, object]:
         return {"inspection_complete": False, "reason": "unreadable_html"}
 
 
+def verified_html_delivery_variant(path: str | Path) -> str | None:
+    """Classify a prepared HTML file or portable linked HTML archive by bytes."""
+    source = Path(path)
+    if source.suffix.lower() not in {".html", ".htm", ".zip"}:
+        return None
+    facts = artifact_structure_evidence(source)
+    if facts.get("inspection_complete") is not True:
+        return None
+    if source.suffix.lower() == ".zip":
+        if any(doc.get("portable") is True and doc.get("linked_asset_members")
+               for doc in facts.get("portable_html_documents", ())):
+            return "linked"
+        return None
+    assets = facts.get("linked_local_image_assets") or ()
+    linked_count = facts.get("linked_image_count")
+    if (assets and facts.get("linked_local_image_assets_complete") and linked_count == len(assets)
+            and all(asset.get("portable_reference") and asset.get("available_in_artifact_directory") for asset in assets)):
+        return "linked"
+    if linked_count == 0 and not facts.get("invalid_embedded_image_count"):
+        if (facts.get("decoded_embedded_raster_image_count") or facts.get("inline_svg_count")
+                or facts.get("svg_image_count")):
+            return "embedded"
+        return "self_contained"
+    return None
+
+
 def artifact_review_records(paths, results, *, registry, allowed_roots, include_unselected=False):
     """Bind each real output file to its producer; never promote read/search data."""
     roots = tuple(Path(root).expanduser().resolve() for root in allowed_roots)

@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from tests.e2e.test_live_stage_web_matrix import live_web,_submit,catalogue
+from tests.e2e.test_live_stage_web_matrix import approve_owned_cron_delete,live_web,_submit,catalogue
 
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reason='Authorized live stage only')
 
@@ -61,18 +61,23 @@ def test_live_stage_completed_scheduler_followup_and_adjacent_edit(live_web):
         other_jobs=unrelated()
         before=len(frames);page.locator('#user-input').fill('Cancel it');page.locator('#user-input').press('Enter')
         deadline=time.monotonic()+150;approved=False;chose=False;cancelled=None
+        approval_turn_id = None
         while time.monotonic()<deadline:
             page.wait_for_timeout(150)
             approvals=[r for r in frames[before:] if r.get('type')=='approval_required']
             if approvals and not approved:
                 pending=approvals[-1]
-                assert ident in json.dumps(pending) or renamed in json.dumps(pending),pending
-                page.get_by_role('button',name='Allow once',exact=True).last.click();approved=True
+                approval_turn_id = pending.get('turn_id')
+                cancelled = approve_owned_cron_delete(page, pending, base, ident, deadline=deadline)
+                approved=True
+                break
             terminals=[r for r in frames[before:] if r.get('type')=='done']
-            if job() is None:
-                cancelled=terminals[-1] if terminals else None
-                if cancelled:break
-            if terminals and job() is not None and not approved and not chose:
+            if terminals and not chose:
+                # Check inventory only after a terminal frame. Polling this
+                # endpoint while the action runs can load the same service.
+                if job() is None:
+                    cancelled = terminals[-1]
+                    break
                 reply=terminals[-1].get('text') or ''.join(r.get('text','') for r in frames[before:]
                     if r.get('type')=='chunk' and r.get('turn_id')==terminals[-1].get('turn_id'))
                 assert '1.' in reply and '2.' in reply,reply
@@ -80,7 +85,9 @@ def test_live_stage_completed_scheduler_followup_and_adjacent_edit(live_web):
         assert cancelled and job() is None,page.locator('#messages').inner_text()
         assert unrelated()==other_jobs,'Cancellation changed an unrelated scheduled task'
         from playwright.sync_api import expect
-        bubble=page.locator('#messages .msg.bot .bubble[data-turn-id='+json.dumps(cancelled['turn_id'])+']')
+        turn_id = cancelled.get('turn_id') or approval_turn_id
+        assert turn_id
+        bubble=page.locator('#messages .msg.bot .bubble[data-turn-id='+json.dumps(turn_id)+']')
         expect(bubble).to_have_count(1);expect(bubble).to_be_visible()
         assert not errors,errors
         out=Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])/'scheduler-followup-cancellation';out.mkdir(parents=True,exist_ok=True)

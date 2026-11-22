@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 
 import pytest
 
@@ -108,20 +109,38 @@ def test_live_stage_readonly_deadline_summary_keeps_account_findings(live_web, r
     response, turn, elapsed = _submit(live_web,
         'Check my recent email for upcoming dated obligations and compare them with my calendar. '
         'Read up to ten relevant messages and give a concise summary with the dates, amounts when present, '
-        'and whether matching calendar entries already exist. This is read-only: do not create or change '
-        'calendar entries, send email, or create files.', timeout=180)
+        'and whether matching calendar entries already exist. For each dated obligation, include an ISO date '
+        'and its CALENDAR: MATCH or CALENDAR: NO MATCH result. End with a separate line exactly '
+        'COMPARISON: COMPLETE, COMPARISON: NO DATED OBLIGATIONS if you completed the check and found none, '
+        'or COMPARISON: INCOMPLETE if you could not complete the comparison. This is read-only: do not create '
+        'or change calendar entries, send email, or create files.', timeout=180)
     results = turn.get('tool_results') or []
-    assert any(r['tool_name'] in {'email_read','connector_request'} and r['status']=='completed' for r in results), results
-    assert any(r['tool_name'] in {'calendar_list','connector_request'} and r['status']=='completed' for r in results), results
-    assert not any(r['tool_name'] in {'calendar_create','calendar_update','email_send'} for r in results), results
-    assert response['text'].strip() and turn.get('response_fulfilled') is True, {
-        'reply':response['text'][:1500], 'fulfilled':turn.get('response_fulfilled'),
-        'tools':[(r['tool_name'],r['status']) for r in results]}
-    assert not response.get('artifacts')
     target = Path(os.environ['NULLION_LIVE_EVIDENCE_DIR'])
     (target/'deadline-summary.json').write_text(json.dumps({'elapsed_ms':elapsed,'response':response,'turn':turn,
         'research_budget':_research_budget(live_web)},ensure_ascii=False,indent=2))
     live_web[0].screenshot(path=str(target/'deadline-summary.png'),full_page=True)
+    completed = {r['invocation_id'] for r in results if r['status'] == 'completed'}
+    for name in ('email_read', 'calendar_list'):
+        assert any(r['tool_name'] == name and r['status'] == 'completed' for r in results), name
+        assert not any(r['tool_name'] == name and r['status'] != 'completed'
+            and completed.isdisjoint(r.get('recovered_by') or ()) for r in results), name
+    for result in results:
+        output = result.get('output') or {}
+        if output.get('result_kind') != 'email_message_batch':
+            continue
+        rows = output.get('messages') or []
+        assert output.get('complete') is True and len(rows) == output.get('requested_messages') == output.get('completed_messages')
+        assert rows and len({row['id'] for row in rows}) == len(rows) and all(row['status'] == 'completed' for row in rows)
+    assert not any(r['tool_name'] in {'calendar_create','calendar_update','email_send'} for r in results), results
+    reply = response['text'].strip()
+    outcome = re.findall(r'^COMPARISON: (COMPLETE|NO DATED OBLIGATIONS|INCOMPLETE)$', reply, re.MULTILINE)
+    assert outcome in (['COMPLETE'], ['NO DATED OBLIGATIONS']) and turn.get('response_fulfilled') is True, {
+        'reply':response['text'][:1500], 'fulfilled':turn.get('response_fulfilled'),
+        'tools':[(r['tool_name'],r['status']) for r in results]}
+    if outcome == ['COMPLETE']:
+        assert any(re.search(r'\b\d{4}-\d{2}-\d{2}\b', line) and re.search(r'\bCALENDAR: (?:NO )?MATCH\b', line)
+            for line in reply.splitlines()), reply
+    assert not response.get('artifacts')
     assert elapsed < 150000, elapsed
     record_property('deadline_summary_seconds',elapsed/1000)
 

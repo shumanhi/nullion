@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 
-def test_read_batch_requires_explicit_independence_and_validates_before_navigation(monkeypatch):
+def test_invalid_read_batch_is_rejected_before_navigation():
     from nullion.plugins.browser_plugin.browser_reads import read_pages
     from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy
     from nullion.tools import ToolInvocation
@@ -11,7 +11,6 @@ def test_read_batch_requires_explicit_independence_and_validates_before_navigati
         _policy = BrowserPolicy()
         def _session_id(self, invocation): raise AssertionError('Invalid batches must not open a browser')
     for arguments in [
-        {'pages': [{'url':'https://a.test'}, {'url':'https://b.test'}]},
         {'pages': [{'url':'https://a.test'}, {}], 'independent_pages':True},
         {'pages': [{'url':'https://a.test'}, {'url':'file:///etc/passwd'}], 'independent_pages':True},
         {'pages': [{'url':'https://a.test'}], 'independent_pages':'yes'},

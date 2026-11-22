@@ -1,4 +1,5 @@
 """Exact approvals through the real Web action endpoint and SQLite runtime."""
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -358,3 +359,312 @@ def test_telegram_approval_shows_progress_before_exact_email_delivery(tmp_path, 
     assert any("email sent" in text.lower() for text in views)
     assert any("email" in text.lower() for text in card_edits)
     assert not any("Approved web access" in text for text in card_edits)
+
+
+@pytest.mark.parametrize("mode", ["native", "compacted", "missing_and_timeout", "web_missing",
+    "missing_journal", "web_missing_journal", "foreign_journal", "used_journal",
+    "telegram_report", "web_report", "telegram_mixed", "web_mixed"])
+def test_scheduled_email_approval_sends_the_original_draft_once(tmp_path, monkeypatch, mode):
+    import json
+
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.chat_operator import resume_approved_telegram_request
+    from nullion import cron_execution_tools
+    from nullion.crons import CronJob
+    from nullion.runtime import bootstrap_persistent_runtime
+    from test_scheduled_report_completion import run_scheduled, telegram_boundary, text_response, tool_response
+    from tests.workflow_provider_protocol import workflow_provider_reply
+
+    sent = []
+
+    def sender(message, attachments):
+        sent.append((message["Subject"], message.get_body(preferencelist=("html",)).get_content()))
+        return {"message_id": "scheduled-email-receipt"}
+
+    channel = "web" if mode.startswith("web_") else "telegram"
+    use_code_mode = mode != "native"
+    receipt_only = mode in {"telegram_report", "web_report"}
+    mixed_delivery = mode in {"telegram_mixed", "web_mixed"}
+    report_reply = receipt_only or mixed_delivery
+    telegram_callback = mode in {"telegram_report", "telegram_mixed"}
+    runtime, registry, _, invocation, _ = email_fixture(tmp_path, monkeypatch, sender, channel)
+    alter_journal = mode in {"missing_journal", "web_missing_journal", "foreign_journal", "used_journal"}
+    if alter_journal or report_reply:
+        registry.get_spec("email_send").capability_tags = ("connector", "email", "account_write")
+    monkeypatch.setenv("NULLION_CODE_MODE", "on" if use_code_mode else "off")
+    monkeypatch.setenv("NULLION_MODEL_TOOL_INPUT_HISTORY_MAX_CHARS", "2000")
+    monkeypatch.setattr(cron_execution_tools, "_connected_connector_provider_summaries", lambda _: ({
+        "provider_id": "fixture-mail",
+        "display_name": "Fixture Mail",
+        "permission_mode": "write",
+    },))
+    body = ('<!doctype html><html><head><meta charset="utf-8"><title>日次レポート</title></head>'
+        '<body><p>承認された日次レポート</p><p>確認済みの記録 ' + 'x' * 3000 + '</p></body></html>')
+    draft = {"to": "reader@example.test", "subject": "日次レポート", "html_body": body}
+    job = CronJob(id="daily-email", name="日次レポート", schedule="0 * * * *",
+        task="確認済みの日次レポートをメールで送信してください。"
+        + ("このチャットにも要点を表示してください。" if mixed_delivery else ""),
+        delivery_channel=channel, delivery_target=invocation.principal_id if channel == "web" else "123")
+
+    class StartModel:
+        def create(self, **kwargs):
+            system = str(kwargs.get("system") or "")
+            if "available_connector_providers" in system and "response_schema" in system:
+                return text_response(json.dumps({"requires_account_connector": True,
+                    "provider_ids": ["fixture-mail"], "confidence": 1,
+                    "write_tool_names": ["email_send"], "delivery_mode": "report_each_run",
+                    **({"chat_delivery_mode": "confirmation_only" if receipt_only else "report"}
+                       if report_reply else {})}))
+            protocol = workflow_provider_reply(kwargs, completion=True)
+            if protocol is not None:
+                return protocol
+            if use_code_mode:
+                return tool_response("code_mode", {"tool_names": ["email_send"],
+                    "code": f"call_tool('email_send', {draft!r})"})
+            return tool_response("email_send", draft)
+
+    deliveries, send = telegram_boundary(monkeypatch)
+    pending = run_scheduled(job, StartModel(), runtime, registry, send,
+        agent_conversation_id=invocation.principal_id)
+    assert pending.get("suspended_for_approval"), pending
+    approval_id = pending["approval_id"]
+    approval = runtime.store.get_approval_request(approval_id)
+    assert approval.requested_by == invocation.principal_id
+    assert approval.context["tool_arguments"] == draft
+    if report_reply:
+        assert approval.context["trigger_flow"]["scheduled_chat_delivery_mode"] == (
+            "confirmation_only" if receipt_only else "report"
+        )
+    preview = Path(approval.context["html_preview_path"]).read_text(encoding="utf-8")
+    assert body in preview
+    assert not sent and not deliveries
+    if use_code_mode:
+        suspended = runtime.store.get_suspended_turn(approval_id)
+        block = suspended.messages_snapshot[-1]["content"][-1]
+        assert block["input"]["history_compaction"]["original_json_chars"] > 2000
+        if mode in {"missing_and_timeout", "web_missing"}:
+            runtime.store.add_suspended_turn(replace(suspended, messages_snapshot=None))
+    runtime.checkpoint(force=True)
+    if alter_journal:
+        import sqlite3
+        from nullion.code_mode_sessions import checkpoint_reference
+
+        flow = approval.context["trigger_flow"]
+        assert flow["scheduled_task_run"] is True
+        assert flow["conversation_id"] == suspended.conversation_id
+        assert flow["planned_action_tool_names"] == ["email_send"], flow["planned_action_tool_names"]
+        assert flow["requires_artifact_delivery"] is False
+        assert any(row.get("invocation_id") == approval.context["approval_invocation_id"]
+                   and row.get("status") == "denied" for row in suspended.pending_tool_calls), [
+            (row.get("tool_name"), row.get("status"), row.get("invocation_id")) for row in suspended.pending_tool_calls]
+        identity = checkpoint_reference(suspended.pending_tool_calls)
+        assert identity
+        with sqlite3.connect(runtime.checkpoint_path) as db:
+            if mode == "foreign_journal":
+                cursor = db.execute("UPDATE code_mode_sessions SET payload=json_set(payload,'$.owner[0]',?) WHERE id=?",
+                    ("another-owner", identity))
+            else:
+                cursor = db.execute("DELETE FROM code_mode_sessions WHERE id=?", (identity,))
+            assert cursor.rowcount == 1
+    restarted = bootstrap_persistent_runtime(runtime.checkpoint_path)
+    restarted.active_tool_registry = registry
+    if channel == "telegram" and not telegram_callback:
+        restarted.approve_approval_request(approval_id, principal_id=invocation.principal_id,
+            permissions=["tool:email_send"])
+    if mode == "used_journal":
+        from nullion.approval_resume import claim_approved_tool_use
+        assert claim_approved_tool_use(restarted.store, approval_id)
+
+    emitted_reports = []
+
+    class ResumeModel:
+        def create(self, **kwargs):
+            assert not alter_journal
+            assert sent, "The exact reviewed send must run before any model call"
+            protocol = workflow_provider_reply(kwargs, completion=True)
+            if protocol is not None:
+                return protocol
+            if mode == "missing_and_timeout":
+                raise TimeoutError("Synthetic timeout after acknowledged send")
+            if report_reply:
+                emitted_reports.append(True)
+                return text_response(json.dumps({"format": "nullion.report.v1",
+                    "text": "確認済みの航空券レポート",
+                    "message": {"summary": "確認済みの航空券レポート", "detail_level": "compact",
+                        "sections": [], "sources": [], "shared_details": [],
+                        "footer": "比較結果と運賃の内訳。 Message ID: scheduled-email-receipt"}}, ensure_ascii=False))
+            return text_response("Email sent.")
+
+    runner = AgentOrchestrator(model_client=ResumeModel())
+    if channel == "web":
+        from nullion.web_app import create_app
+
+        with TestClient(create_app(restarted, runner, registry)) as client:
+            result = client.post(f"/api/approve/{approval_id}", json={"mode": "once"})
+            assert result.json()["ok"], result.text
+            reply = result.json()["resumed_text"]
+            if receipt_only:
+                assert result.json()["resume"]["artifacts"] == []
+            duplicate = client.post(f"/api/approve/{approval_id}", json={"mode": "once"})
+            assert duplicate.json()["already_handled"] is True
+    elif telegram_callback:
+        import asyncio
+        from types import SimpleNamespace
+        from nullion import telegram_app
+        from nullion.config import NullionSettings, TelegramSettings
+
+        class Message:
+            chat = SimpleNamespace(id=123, send_action=lambda **_: asyncio.sleep(0))
+            message_id = 7
+
+            async def edit_text(self, text, **kwargs):
+                pass
+
+            async def reply_text(self, text, **kwargs):
+                deliveries.append(text)
+                return self
+
+            async def delete(self):
+                pass
+
+        async def answer(*args, **kwargs):
+            pass
+
+        query = SimpleNamespace(message=Message(), from_user=SimpleNamespace(id=123), answer=answer,
+            data=telegram_app._build_callback_data(kind="approval", action="allow_once", record_id=approval_id))
+        settings = NullionSettings(telegram=TelegramSettings(
+            bot_token="123456:synthetic", operator_chat_id="123", chat_enabled=True))
+        service = telegram_app.ChatOperatorService(restarted, "123456:synthetic", "123", settings,
+            agent_orchestrator=runner)
+        asyncio.run(service.on_callback_query(SimpleNamespace(callback_query=query), None))
+        asyncio.run(service.on_callback_query(SimpleNamespace(callback_query=query), None))
+        reply = deliveries[-1]
+        if receipt_only:
+            assert sum("Email sent to" in text for text in deliveries) == 1, deliveries
+    else:
+        reply = resume_approved_telegram_request(restarted, approval_id=approval_id, chat_id="123",
+            agent_orchestrator=runner)
+    if mode == "foreign_journal":
+        assert "couldn’t resume the saved program" in reply
+        assert not sent
+        return
+    if mode == "used_journal":
+        assert "already used" in reply
+        assert not sent
+        return
+    if mode == "missing_and_timeout":
+        assert "The follow-up response timed out." in reply
+    if report_reply:
+        assert emitted_reports
+    if receipt_only:
+        from html import unescape
+
+        assert unescape(reply).strip().removeprefix("✉️ ") == (
+            'Email sent to reader@example.test with subject "日次レポート".'
+        )
+    if mixed_delivery:
+        assert "比較結果と運賃の内訳" in reply
+    else:
+        assert "email sent" in reply.lower()
+    assert [(subject, html.strip()) for subject, html in sent] == [(draft["subject"], preview.strip())]
+    assert any(event.payload.get("tool_name") == "email_send" and event.payload.get("status") == "completed"
+        and event.payload.get("invocation_id") == approval.context["approval_invocation_id"]
+        for event in restarted.store.list_events())
+    assert len(restarted.store.list_approval_requests()) == 1
+    if channel == "telegram":
+        assert resume_approved_telegram_request(restarted, approval_id=approval_id, chat_id="123",
+            agent_orchestrator=runner) is None
+    assert len(sent) == 1
+
+
+def test_email_approval_is_claimed_before_provider_call_across_runtime_instances(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from nullion.approval_decisions import approve_request_with_mode
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.tools import ToolExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    sent = []
+
+    def sender(message, attachments):
+        sent.append(message["Subject"])
+        entered.set()
+        assert release.wait(8)
+        return {"message_id": "single-delivery"}
+
+    runtime, registry, executor, invocation, _ = email_fixture(tmp_path, monkeypatch, sender)
+    approval_id = executor.invoke(invocation).output["approval_id"]
+    approve_request_with_mode(runtime, approval_id, source="web", mode="once")
+    runtime.checkpoint(force=True)
+    second = bootstrap_persistent_runtime(runtime.checkpoint_path)
+    second_executor = ToolExecutor(store=second.store, registry=registry)
+
+    with ThreadPoolExecutor() as pool:
+        winner = pool.submit(executor.invoke, invocation)
+        try:
+            assert entered.wait(5)
+            duplicate = second_executor.invoke(invocation)
+            assert duplicate.output.get("reason") == "approval_already_used"
+            assert sent == ["レポート"]
+        finally:
+            release.set()
+        assert winner.result(timeout=8).status == "completed"
+
+    unrelated = second_executor.invoke(replace(invocation, invocation_id="unrelated-email-action"))
+    assert unrelated.output["reason"] == "approval_required"
+    assert unrelated.output["approval_id"] != approval_id
+    assert sent == ["レポート"]
+
+
+@pytest.mark.asyncio
+async def test_deep_agent_exact_email_resumes_once_after_restart(tmp_path, monkeypatch):
+    from nullion.deep_agent_runner import _pending_approval_from_tool_results
+    from nullion.langchain_adapters import nullion_tools_as_langchain_tools
+    from nullion.runtime import bootstrap_persistent_runtime
+
+    sent = []
+
+    def sender(message, _attachments):
+        sent.append(message.get_body(preferencelist=("html",)).get_content())
+        return {"message_id": "fixture-deep-agent-email"}
+
+    runtime, registry, _, invocation, _ = email_fixture(tmp_path, monkeypatch, sender)
+    monkeypatch.setenv("NULLION_CODE_MODE", "on")
+    flow = {"conversation_id": invocation.principal_id, "original_user_message": "確認してメールを送信"}
+    observed = []
+
+    def harness(store, session=None):
+        return nullion_tools_as_langchain_tools(registry, allowed_tools=["email_send"],
+            principal_id=invocation.principal_id, cleanup_scope="exact-email-fixture",
+            policy_store=store, tool_result_callback=observed.append,
+            tool_flow_context={**flow, "code_mode_session_id": session})[0]
+
+    program = harness(runtime.store)
+    with pytest.raises(ValueError, match="Unexpected Code Mode arguments"):
+        await program.ainvoke({"tool_names": ["email_send"], "code": "1",
+            "_approved_call": {"tool_name": "email_send", "invocation_id": invocation.invocation_id}})
+    assert not runtime.store.list_approval_requests() and not sent
+    arguments = {**invocation.arguments, "to": ("reader@example.test",)}
+    response = await program.ainvoke({"tool_names": ["email_send"],
+        "code": f"call_tool('email_send', {arguments!r})"})
+    assert json.loads(response)["output"]["reason"] == "code_mode_awaiting_approval"
+    pending = _pending_approval_from_tool_results(observed)
+    assert pending and not sent
+    approval_id = pending["approval_id"]
+    approval = runtime.store.get_approval_request(approval_id)
+    session = json.loads(response)["output"]["session_id"]
+    runtime.checkpoint(force=True)
+    restarted = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    restarted.approve_approval_request(approval_id, principal_id=invocation.principal_id,
+        decision_mode="once", permissions=["tool:email_send"])
+    observed.clear()
+    resumed = harness(restarted.store, session)
+    await resumed.coroutine._nullion_code_mode_resume()
+    assert len(sent) == 1 and "承認された本文" in sent[0]
+    assert [a.approval_id for a in restarted.store.list_approval_requests()] == [approval_id]
+    assert _pending_approval_from_tool_results(observed) is None
+    assert any(r.status == "completed" and r.invocation_id == approval.context["approval_invocation_id"] for r in observed)
+    with pytest.raises(RuntimeError, match="not resumable"):
+        await resumed.coroutine._nullion_code_mode_resume()
+    assert len(sent) == 1

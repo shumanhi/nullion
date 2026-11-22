@@ -21,6 +21,18 @@ def response(value):
     return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': value}]}
 
 
+def _read_state_from_provider_input(messages):
+    marker = "<read_state_0>\n"
+    for message in messages:
+        content = message["content"]
+        blocks = content if isinstance(content, list) else [{"text": content}]
+        for block in blocks:
+            text = block.get("text", "")
+            if marker in text:
+                return json.loads(text.split(marker, 1)[1].split("\n</read_state_0>", 1)[0])
+    raise AssertionError("The prior captured page read must reach the next provider request")
+
+
 from tests.source_answer_fixture import source_presentation_response
 
 
@@ -30,7 +42,11 @@ from tests.source_answer_fixture import source_presentation_response
     [(retry,isolated,direct,False,False) for retry in (False,) for isolated in (False,True) for direct in (False,True)]
     +[(retry,isolated,True,True,False) for retry in (False,) for isolated in (False,True)]
     +[(False,isolated,True,False,True) for isolated in (False,True)])
-def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path, monkeypatch, record_property, isolated, retry_summary, source_summary_model_reply, direct_evidence, carry_prior, query_deep_page, answered_record=False):
+def test_visual_browser_task_delivers_observations_and_png_through_real_chat(
+    tmp_path, monkeypatch, record_property, isolated, retry_summary, source_summary_model_reply,
+    direct_evidence, carry_prior, query_deep_page, answered_record=False, batch_page_query=False,
+    terminal_evidence_repair=False,
+):
     if not isolated:
         pytest.importorskip('browser_use')
     if isolated and os.environ.get('NULLION_BROWSER_USE_TEST_PYTHON'):
@@ -67,7 +83,23 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                 self.send_header('Set-Cookie', cookie)
             self.end_headers()
             filler="".join("<div>Unrelated row "+str(i)+"</div>" for i in range(1000)) if query_deep_page else ""
-            self.wfile.write(('<html><body style="background:#102b42;color:white;font-size:24px;min-height:2400px"><h1>Rental results</h1>'+filler+'<article><h2>Sedan A</h2><p>$80 Total</p></article><article><h2>Sedan B</h2><p>$88 Total</p></article></body></html>').encode())
+            gap = filler if batch_page_query else ""
+            controls = "".join(f'<button aria-label="Unrelated control {index} {"x"*240}">Other</button>'
+                               for index in range(20)) if batch_page_query else ""
+            disabled_and_hidden = (
+                '<fieldset disabled><button aria-label="Sedan A disabled fieldset">Other</button></fieldset>'
+                '<div aria-disabled="true"><button aria-label="Sedan A aria disabled">Other</button></div>'
+                '<div aria-hidden="true"><button aria-label="Sedan A aria hidden">Other</button></div>'
+                '<div style="opacity:0"><button aria-label="Sedan A transparent">Other</button></div>'
+            ) if batch_page_query else ""
+            first = '<button aria-label="Sedan A $80 Total">$80 Total</button>' if batch_page_query else '<p>$80 Total</p>'
+            second = '<button aria-label="Sedan B $88 Total">$88 Total</button>' if batch_page_query else '<p>$88 Total</p>'
+            selected_control = (
+                '<select aria-label="Selected duration"><option value="2" selected>2</option></select>'
+            ) if terminal_evidence_repair else ''
+            self.wfile.write(('<html><body style="background:#102b42;color:white;font-size:24px;min-height:2400px">'
+                '<h1>Rental results</h1>'+controls+filler+'<article><h2>Sedan A</h2>'+first+'</article>'+gap+
+                '<article><h2>Sedan B</h2>'+second+'</article>'+disabled_and_hidden+selected_control+'</body></html>').encode())
         def log_message(self, *_): pass
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Page)
@@ -90,7 +122,9 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
     samples = []
     try:
         for index, prompt in enumerate(['価格を比較して', 'Compara los precios', 'قارن الأسعار']):
-            request_visual = bool(direct_evidence and not carry_prior and not query_deep_page and index == 0)
+            request_visual = bool(direct_evidence and not carry_prior and not query_deep_page
+                                  and not terminal_evidence_repair and index == 0)
+            batch_trace = []
             class Model:
                 model = 'external-fake-provider'
                 outer_calls = 0
@@ -120,17 +154,80 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                         actions = ({'done': {'data': report, 'success': True}} if direct_evidence else {'record_observations': report} if self.browser_calls == 1 else {'scroll': {'down': True, 'pages': 0.8}} if self.browser_calls == 2 else {'done': {'data': report, 'success': True}})
                         if request_visual and self.browser_calls == 1:
                             actions = {'screenshot':{}}
-                        if query_deep_page:
+                        if terminal_evidence_repair:
+                            if self.browser_calls == 1:
+                                observations = [
+                                    {"label": "Sedan A total", "source_id": 0, "quote": "$80 Total"},
+                                    {"label": "Sedan B total", "source_id": 0, "value": "$88 Total"},
+                                    {"label": "Selected duration", "source_id": 0, "control_index": 0,
+                                     "control_property": "value", "value": "2",
+                                     "quote": "Selected duration\nvalue: 2"},
+                                ]
+                                actions = {"done": {"data": {**report, "observations": observations}, "success": True}}
+                            else:
+                                time.sleep(3)  # Simulate an unnecessary provider round for exact evidence.
+                        elif batch_page_query:
+                            batch_available = any("queries" in node.get("properties", {})
+                                for node in schema.get("$defs", {}).values())
+                            batch_trace.append({"call": self.browser_calls, "batch_schema": batch_available})
+                            if self.browser_calls == 1:
+                                assert '$80 Total' not in current_capture and '$88 Total' not in current_capture
+                                request = {"source_id": 0, "queries": ["Sedan A", "Sedan B"]} if batch_available else {"query": "Sedan A"}
+                                actions = {"read_page_state": request}
+                            elif self.browser_calls == 2 and not batch_available:
+                                actions = {"read_page_state": {"query": "Sedan B"}}
+                            elif self.browser_calls == 2:
+                                try:
+                                    captured = _read_state_from_provider_input(kwargs["messages"])
+                                except (AssertionError, ValueError) as error:
+                                    batch_trace[-1]["read_state_error"] = str(error)
+                                    raise
+                                batch_trace[-1]["result_keys"] = list(captured)
+                                batch_trace[-1]["matches"] = captured.get("query_matches")
+                                batch_trace[-1]["source_id"] = captured["source_id"]
+                                batch_trace[-1]["controls"] = [
+                                    (row["control_index"], row.get("label"), row.get("visible"), row.get("disabled"))
+                                    for row in captured["controls"]]
+                                # The SDK can abbreviate URLs in provider context. The runtime
+                                # owns the exact URL behind this indexed capture.
+                                assert captured["source_id"] == 0
+                                controls_by_index = {item["control_index"]: item for item in captured["controls"]}
+                                native_observations = []
+                                for term, price, match in zip(("Sedan A", "Sedan B"), ("$80", "$88"), captured["query_matches"], strict=True):
+                                    assert match["query"] == term
+                                    assert len(match["matched_line_indices"]) == 1
+                                    controls = [controls_by_index[index] for index in match["matched_control_indices"]]
+                                    control, = [item for item in controls if item["disabled"] is False and item["visible"] is True]
+                                    assert control["label"] == f"{term} {price} Total"
+                                    assert all(item["visible"] for item in controls)
+                                    if term == "Sedan A":
+                                        assert {item["label"] for item in controls if item["disabled"]} == {
+                                            "Sedan A disabled fieldset", "Sedan A aria disabled"}
+                                    native_observations.append({"label": f"{term} total", "semantic_role": "attribute",
+                                        "source_id": captured["source_id"], "control_index": control["control_index"],
+                                        "control_property": "label"})
+                                actions = {"record_observations": {**report, "observations": native_observations}}
+                            else:
+                                time.sleep(3)  # Simulate the former extra browser inference for a second field.
+                                actions = {"done": {"data": report, "success": True}}
+                        elif query_deep_page:
                             if self.browser_calls==1:
                                 assert '$80 Total' not in current_capture
                                 actions={'read_page_state':{'query':'Sedan A'}}
-                            else:
-                                assert self.browser_calls==2
-                                captured_search=json.dumps(kwargs['messages'])
+                            elif self.browser_calls == 2:
+                                captured_search = json.dumps(kwargs['messages'])
                                 assert 'matched_line_indices' in captured_search and '$80 Total' in captured_search and '$88 Total' in captured_search
-                                actions={'done':{'data':report,'success':True}}
+                                actions = {'find_text': {'text': 'Rental results'}}
+                            else:
+                                assert self.browser_calls == 3
+                                captured_search = json.dumps(kwargs['messages'])
+                                assert 'matched_line_indices' not in captured_search
+                                assert 'Captured page source_id=' in captured_search
+                                actions = {'done': {'data': report, 'success': True}}
                         if blocked_step:actions={'done':{'data':{'goal_status':'blocked','next_action':'alternative_source','observations':[], 'unknowns':['First source could not be read'],'blocker':'HTTP 403 from first source'},'success':False}}
                         value = {'evaluation_previous_goal': 'Page captured', 'memory': 'Observed both prices', 'next_goal': 'Return partial findings', 'action': [actions]}
+                        if batch_page_query:
+                            batch_trace[-1]["action"] = list(actions)
                         if 'thinking' in schema.get('properties', {}): value['thinking'] = 'Use captured evidence'
                         # Fill optional planning fields only when present in the versioned schema.
                         for key in ('current_plan_item', 'plan_update'):
@@ -200,11 +297,15 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                     if answered_record:
                         assert model.browser_calls==1, f'Worker made {model.browser_calls} decisions after an answered/report handoff'
                     progress = [event for event in events if event.get('id') == 'source-progress']
-                    assert progress and progress[0]['detail'] == 'Pages checked: 1 · Findings: 0', events
-                    assert progress[0]['activity_phase']=='reading_pages'
+                    opening = next((e for e in progress if e.get('activity_phase') == 'opening_browser'), None)
+                    reading = next((e for e in progress if e.get('activity_phase') == 'reading_pages'
+                                    and e.get('detail') == 'Pages checked: 1 · Findings: 0'), None)
+                    assert opening and opening.get('detail') == 'Pages checked: 0 · Findings: 0', progress
+                    assert reading, progress
                     if answered_record:
                         assert any(e.get('activity_phase')=='finishing_source_review' for e in progress),progress
-                    assert events.index(progress[0]) < next(i for i,e in enumerate(events) if e['type'] == 'chunk')
+                    first_chunk = next(i for i, e in enumerate(events) if e['type'] == 'chunk')
+                    assert events.index(opening) < events.index(reading) < first_chunk
                     result = httpx.Response(200, json={'text': ''.join(e.get('text','') for e in events if e['type'] == 'chunk'),
                         'artifacts':events[-1].get('artifacts',[])})
                 else:
@@ -235,7 +336,8 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
             assert outputs[0]['report_status']=='partial',outputs
             if direct_evidence and not carry_prior and not query_deep_page:
                 assert outputs[0]['captured_document_count'] <= 3 + int(request_visual), 'Do not recapture around every SDK inference'
-            assert len(outputs[0]['observations']) == len({row['quote'] for row in report['observations']}), 'Relabeling an identical quote must not create more findings'
+            expected_observations = len({row['quote'] for row in report['observations']})
+            assert len(outputs[0]['observations']) == expected_observations + int(terminal_evidence_repair), outputs
             assert len(json.dumps(outputs[0], ensure_ascii=False)) < 12_000
             assert outputs[0]['sources'] and 'preview' not in outputs[0]
             paths = outputs[0]['artifact_paths']
@@ -245,7 +347,29 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
             assert (not delivered.attachments) if carry_prior else delivered.attachments, result.json()
             assert all(Path(attachment).read_bytes().startswith(b'\x89PNG') for attachment in delivered.attachments)
             if query_deep_page:assert 'read_page_state' in outputs[0]['execution_audit']['action_names']
-            assert model.browser_calls == (1 if answered_record else 2 if carry_prior or query_deep_page else 1 + int(request_visual) if direct_evidence else 1) and model.outer_calls == (4 if retry_summary else 3)
+            expected_browser_calls = 2 if batch_page_query else 3 if query_deep_page else 2 if carry_prior else 1 + int(request_visual)
+            if batch_page_query:
+                native = outputs[0]
+                assert native["performance"]["model_calls"] == 2, json.dumps(
+                    {"trace": batch_trace, "rejected": native["rejection_counts"]}, ensure_ascii=False)
+                assert native["performance"]["model_ms"] < 2500
+                record_property("batched_browser_model_ms", native["performance"]["model_ms"])
+                assert [item["quote"] for item in native["observations"]] == ["Sedan A $80 Total", "Sedan B $88 Total"]
+                assert native["page_url"] == url
+                for item in native["observations"]:
+                    assert native["sources"][item["source_index"]]["page_url_ref"] is True
+                    assert item["control_state"]["observed_property"] == "label"
+                assert not native["rejected_observations"]
+            if terminal_evidence_repair:
+                native = outputs[0]
+                assert native["performance"]["model_calls"] == 1
+                assert native["performance"]["model_ms"] < 2500
+                assert native["evidence_value_repair_count"] == 2 and not native["rejected_observations"]
+                assert [row["quote"] for row in native["observations"]] == [
+                    "$80 Total", "$88 Total", "Selected duration\nvalue: 2"]
+                record_property("terminal_evidence_model_ms", native["performance"]["model_ms"])
+            assert model.browser_calls == expected_browser_calls
+            assert model.outer_calls == (4 if retry_summary else 3)
             timings = [e for e in runtime.store.list_conversation_events(conversation)
                 if e.get('event_type') == 'conversation.tool_timing' and e.get('tool_name') == 'browser_run_task']
             assert timings and timings[-1]['performance']['model_calls'] >= 1
@@ -270,6 +394,18 @@ def test_answered_record_handoff_ends_worker_without_redundant_inference(tmp_pat
         record_property,source_summary_model_reply,isolated):
     test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path,monkeypatch,
         record_property,isolated,False,source_summary_model_reply,False,False,False,answered_record=True)
+
+
+def test_browser_batches_deep_page_and_visible_control_evidence_in_two_decisions(
+        tmp_path, monkeypatch, record_property, source_summary_model_reply):
+    test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path, monkeypatch,
+        record_property, True, False, source_summary_model_reply, True, False, True, batch_page_query=True)
+
+
+def test_browser_finishes_on_first_report_when_captured_evidence_supplies_redundant_fields(
+        tmp_path, monkeypatch, record_property, source_summary_model_reply):
+    test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path, monkeypatch,
+        record_property, True, False, source_summary_model_reply, True, False, False, terminal_evidence_repair=True)
 
 
 def test_plain_chat_never_enters_slow_optional_browser_agent(tmp_path, monkeypatch, record_property):

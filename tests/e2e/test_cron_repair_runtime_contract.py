@@ -280,7 +280,10 @@ def test_real_cron_runner_recovers_saved_design_and_delivers_html_bytes(tmp_path
         return
     assert result["artifact_delivery_satisfied"] is True
     paths = cron_delivery_artifact_paths_from_result(result)
-    assert len(paths) == 1 and Path(paths[0]).read_text() == html
+    assert len(paths) == 1
+    published = Path(paths[0]).read_text(encoding="utf-8")
+    assert '<meta charset="utf-8">' in published
+    assert '<article style="background:green">AAA 20 +2%</article>' in published
     rendered_delivery = cron_delivery_text_from_result(result)
     assert "MEDIA:" in rendered_delivery and paths[0] in rendered_delivery
     assert result['response_fulfilled'] is True

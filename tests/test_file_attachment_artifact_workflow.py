@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from nullion.artifacts import (
     artifact_descriptor_for_path,
     artifact_descriptors_for_paths,
+    is_deliverable_explicit_media_path,
     is_safe_artifact_path,
     media_candidate_paths_from_text,
     split_media_reply_attachments,
@@ -31,6 +32,19 @@ from nullion.messaging_adapters import (
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
+
+
+def test_compact_html_documents_and_renderer_fragments_have_distinct_delivery(tmp_path):
+    complete = tmp_path / "result.html"
+    complete.write_bytes(b'<!--r--><!DOCTYPE html><html><title>Report</title>42</html>')
+    fragment = tmp_path / "render-source.html"
+    fragment.write_bytes(b'<html><body>Renderer input</body></html>')
+    assert max(complete.stat().st_size, fragment.stat().st_size) < 64
+
+    assert artifact_descriptor_for_path(complete, artifact_root=tmp_path) is not None
+    assert artifact_descriptor_for_path(fragment, artifact_root=tmp_path) is None
+    assert is_deliverable_explicit_media_path(complete)
+    assert not is_deliverable_explicit_media_path(fragment)
 
 
 def test_chat_attachment_normalization_filters_missing_files_and_inlines_images(tmp_path) -> None:

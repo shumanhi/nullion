@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 import asyncio
 import bz2
 import csv
@@ -44,7 +44,7 @@ import tempfile
 import tarfile
 import textwrap
 import threading
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Callable, Iterable, Mapping, Protocol
 import base64
 import unicodedata
@@ -96,6 +96,7 @@ from nullion.policy import (
 from nullion.prompt_injection import scan_tool_output
 from nullion.redaction import redact_value
 from nullion.runtime_store import RuntimeStore
+from nullion.scheduled_artifact_contract import deliverables_schema
 from nullion.tips import MEDIA_PROVIDER_SETUP_TIP, format_setup_tip
 from nullion.tool_boundaries import extract_boundary_facts
 
@@ -297,8 +298,8 @@ def _email_search_input_schema(*, supports_pagination: bool = False) -> dict[str
     }
 
 
-def _email_read_input_schema() -> dict[str, object]:
-    return {
+def _email_read_input_schema(*, supports_batch: bool = False) -> dict[str, object]:
+    schema = {
         "type": "object",
         "properties": {
             "id": {
@@ -314,6 +315,20 @@ def _email_read_input_schema() -> dict[str, object]:
         "required": ["id"],
         "additionalProperties": False,
     }
+    if supports_batch:
+        schema["properties"].update({
+            "ids": {"type": "array", "minItems": 1, "maxItems": 10, "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                "description": "Exact, already selected message ids from email_search, in the order to return."},
+            "independent_messages": {"type": "boolean", "const": True,
+                "description": "Each selected message can be read without another message's body."},
+        })
+        schema.pop("required")
+        schema["oneOf"] = [
+            {"required": ["id"], "not": {"anyOf": [{"required": ["ids"]}, {"required": ["independent_messages"]}]}},
+            {"required": ["ids", "independent_messages"], "not": {"required": ["id"]}},
+        ]
+    return schema
 
 
 def _email_attachment_read_input_schema() -> dict[str, object]:
@@ -564,6 +579,15 @@ _SCHEDULER_CREATION_CAPSULE_LIMIT = 2048
 _SCHEDULER_CREATION_CAPSULES: dict[str, float] = {}
 
 
+def _connector_read_timeout(timeout=None):
+    remaining = tool_execution_remaining_seconds()
+    if tool_execution_cancelled() or remaining == 0:
+        raise TimeoutError("Connector read budget expired before dispatch.")
+    if remaining is not None:
+        return min(timeout, remaining) if isinstance(timeout, (int, float)) else remaining
+    return timeout
+
+
 class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow redirects, but only to HTTP/HTTPS URLs (blocks data:, file:, etc).
 
@@ -583,12 +607,26 @@ class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
         bases = getattr(req, "_nullion_allowed_base_urls", ())
         if bases and not any(_url_is_under_base(newurl, base) for base in bases):
             return None
-        if not bases and _resolve_web_fetch_resolution(newurl) is None and not _is_global_literal_ip(parsed.hostname or ""):
-            return None
+        connector_read = getattr(req, "_nullion_connector_read", False)
+        if connector_read:
+            try:
+                _connector_read_timeout()
+            except TimeoutError:
+                fp.close()
+                raise
+        # Keep a vetted address for the same hostname across redirects. A new
+        # hostname needs its own approved resolution before a public fetch.
+        resolution = getattr(req, "_nullion_web_fetch_resolution", None) if old.hostname == parsed.hostname else None
+        if not bases and resolution is None:
+            resolution = _resolve_web_fetch_resolution(newurl)
+            if resolution is None and not _is_global_literal_ip(parsed.hostname or ""):
+                return None
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is None:
             return None
         redirected._nullion_allowed_base_urls = bases
+        redirected._nullion_web_fetch_resolution = resolution
+        redirected._nullion_connector_read = connector_read
         origin = lambda value: (value.scheme, value.hostname, value.port or (443 if value.scheme == "https" else 80))
         if origin(old) != origin(parsed):
             for name in tuple(redirected.headers):
@@ -597,32 +635,61 @@ class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-@contextmanager
-def _checked_web_fetch_connection(request):
+def _checked_web_fetch_resolution(request):
     """Validate and pin each connection, including every redirected hostname."""
     bases = getattr(request, "_nullion_allowed_base_urls", ())
     if bases and not any(_url_is_under_base(request.full_url, base) for base in bases):
         raise urllib.error.URLError("Redirect is outside the configured connector endpoint.")
-    resolution = _resolve_web_fetch_resolution(request.full_url)
-    if resolution is None and not _is_global_literal_ip(urlparse(request.full_url).hostname or "") and not bases:
+    host = urlparse(request.full_url).hostname or ""
+    resolution = getattr(request, "_nullion_web_fetch_resolution", None)
+    if resolution is None or resolution.host != host.strip().lower():
+        resolution = _resolve_web_fetch_resolution(request.full_url)
+    if resolution is None and not _is_global_literal_ip(host) and not bases:
         raise urllib.error.URLError("URL resolves to an unavailable or private network address.")
-    with _pinned_web_fetch_resolution(resolution):
-        yield
+    request._nullion_web_fetch_resolution = resolution
+    return resolution
 
 
-class _PinnedWebFetchHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, request):
-        with _checked_web_fetch_connection(request):
-            return super().http_open(request)
+class _PinnedWebFetchConnection:
+    def do_open(self, http_class, request, **kwargs):
+        connector_read = getattr(request, "_nullion_connector_read", False)
+        if connector_read:
+            request.timeout = _connector_read_timeout(request.timeout)
+        resolution = _checked_web_fetch_resolution(request)
+        if resolution is None and not connector_read:
+            return super().do_open(http_class, request, **kwargs)
+
+        def dial(address, timeout, source):
+            if connector_read:
+                timeout = _connector_read_timeout(timeout)
+            if resolution is not None:
+                sock = _open_web_fetch_socket(resolution, address[1], timeout, source, connector_read=connector_read)
+            else:
+                sock = socket.create_connection(address, timeout, source)
+            if connector_read:
+                try:
+                    sock.settimeout(_connector_read_timeout(sock.gettimeout()))
+                except OSError:
+                    sock.close()
+                    raise
+            return sock
+
+        def factory(host, **connection_kwargs):
+            connection = http_class(host, **connection_kwargs)
+            # CPython's HTTP connection uses this instance callable to dial;
+            # HTTPS still negotiates TLS with the original URL hostname.
+            connection._create_connection = dial
+            return connection
+
+        return super().do_open(factory, request, **kwargs)
 
 
-class _PinnedWebFetchHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, request):
-        with _checked_web_fetch_connection(request):
-            return super().https_open(request)
+class _PinnedWebFetchHTTPHandler(_PinnedWebFetchConnection, urllib.request.HTTPHandler):
+    pass
 
 
-_WEB_FETCH_RESOLUTION_LOCK = threading.RLock()
+class _PinnedWebFetchHTTPSHandler(_PinnedWebFetchConnection, urllib.request.HTTPSHandler):
+    pass
 
 
 @dataclass(frozen=True)
@@ -631,43 +698,31 @@ class _WebFetchResolution:
     address_infos: tuple[tuple[int, int, int, str, tuple], ...]
 
 
-@contextmanager
-def _pinned_web_fetch_resolution(resolution: _WebFetchResolution | None):
-    if resolution is None:
-        yield
-        return
-
-    with _WEB_FETCH_RESOLUTION_LOCK:
-        original_getaddrinfo = socket.getaddrinfo
-
-        def pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-            if isinstance(host, str) and host.strip().lower() == resolution.host:
-                adjusted: list[tuple[int, int, int, str, tuple]] = []
-                for info_family, info_type, info_proto, info_canonname, sockaddr in resolution.address_infos:
-                    if family not in {0, info_family}:
-                        continue
-                    if type not in {0, info_type}:
-                        continue
-                    if proto not in {0, info_proto}:
-                        continue
-                    if not isinstance(sockaddr, tuple) or not sockaddr:
-                        continue
-                    if info_family == socket.AF_INET and len(sockaddr) >= 2:
-                        adjusted_sockaddr = (sockaddr[0], port or sockaddr[1])
-                    elif info_family == socket.AF_INET6 and len(sockaddr) >= 4:
-                        adjusted_sockaddr = (sockaddr[0], port or sockaddr[1], sockaddr[2], sockaddr[3])
-                    else:
-                        adjusted_sockaddr = sockaddr
-                    adjusted.append((info_family, info_type, info_proto, info_canonname, adjusted_sockaddr))
-                if adjusted:
-                    return adjusted
-            return original_getaddrinfo(host, port, family, type, proto, flags)
-
-        socket.getaddrinfo = pinned_getaddrinfo
+def _open_web_fetch_socket(resolution: _WebFetchResolution, port, timeout, source_address, *, connector_read=False):
+    deadline = perf_counter() + timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+    last_error = None
+    for family, socktype, proto, _, address in resolution.address_infos:
+        sock = None
         try:
-            yield
-        finally:
-            socket.getaddrinfo = original_getaddrinfo
+            if connector_read:
+                _connector_read_timeout()
+            sock = socket.socket(family, socktype, proto)
+            if deadline is not None:
+                remaining = deadline - perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError("Pinned connection timed out.")
+                sock.settimeout(remaining)
+            elif timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect((address[0], port, *address[2:]))
+            return sock
+        except OSError as error:
+            last_error = error
+            if sock is not None:
+                sock.close()
+    raise last_error or OSError("No approved socket addresses are available.")
 
 
 def _resolve_web_fetch_resolution(raw_url: str) -> _WebFetchResolution | None:
@@ -1252,7 +1307,9 @@ def _email_html_body_from_invocation(invocation: ToolInvocation) -> str:
         raise PermissionError("HTML source is outside the permitted workspace or approved filesystem paths")
     if not resolved.exists() or not resolved.is_file():
         raise FileNotFoundError(f"HTML path does not exist or is not a file: {html_path}")
-    return _read_email_source(invocation, html_path, resolved).decode("utf-8", "ignore").strip()
+    from nullion.artifacts import decode_html_document
+
+    return decode_html_document(_read_email_source(invocation, html_path, resolved)).strip()
 
 
 
@@ -1275,6 +1332,7 @@ def _email_source_selectors(invocation: ToolInvocation) -> list[str]:
 
 def _capture_email_review(invocation: ToolInvocation) -> tuple[dict[str, str], str]:
     from hashlib import sha256
+    from nullion.artifacts import decode_html_document
 
     paths = _email_source_selectors(invocation)
     html_path = str(invocation.arguments.get("html_path") or "").strip()
@@ -1290,7 +1348,7 @@ def _capture_email_review(invocation: ToolInvocation) -> tuple[dict[str, str], s
         data = resolved.read_bytes()
         digests[selector] = sha256(data).hexdigest()
         if not inline_html and selector == html_path:
-            html_body = data.decode("utf-8", "ignore").strip()
+            html_body = decode_html_document(data).strip()
     return digests, html_body
 
 def _email_html_preview_path_for_invocation(invocation: ToolInvocation, *, reviewed_html: str | None = None) -> str | None:
@@ -1754,6 +1812,14 @@ def _invoke_tool_handler_with_timeout(
     remaining_research = source_timeout(spec)
     if remaining_research is not None:
         timeout_seconds = max(.001, min(timeout_seconds, remaining_research)) if timeout_seconds is not None else max(.001, remaining_research)
+    recovery_deadline = (invocation.flow_context or {}).get("scheduled_artifact_recovery_deadline")
+    if isinstance(recovery_deadline, (int, float)):
+        remaining = recovery_deadline - monotonic()
+        if remaining <= 0:
+            return ToolResult(invocation.invocation_id, spec.name, "failed",
+                {"reason": "scheduled_artifact_recovery_expired", "executed": False},
+                "The scheduled file recovery window closed.")
+        timeout_seconds = min(timeout_seconds, remaining) if timeout_seconds is not None else remaining
     deadline = perf_counter() + timeout_seconds if timeout_seconds is not None else None
     cancellation_checker = _TOOL_EXECUTION_CANCEL_CHECK.get()
     authority = _TOOL_EXECUTION_AUTHORITY.get()
@@ -1859,6 +1925,7 @@ _CRON_TOOL_PROPERTIES: dict[str, dict[str, object]] = {
             "required_artifact_extensions": {"type": "array", "items": {"type": "string"}},
             "required_artifact_content_tokens": {"type": "array", "items": {"type": "string"}},
             "deliver_required_extensions_only": {"type": "boolean"},
+            "artifact_deliverables": deliverables_schema(),
         },
         "additionalProperties": False,
     },
@@ -1874,13 +1941,11 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
     if tool_name == "image_render":
         from nullion.image_render import input_schema
         return input_schema()
-    def cron_tool_properties() -> dict[str, object]:
-        return copy.deepcopy(_CRON_TOOL_PROPERTIES)
 
     schemas: dict[str, dict[str, object]] = {
         "create_cron": {
             "type": "object",
-            "properties": cron_tool_properties(),
+            "properties": copy.deepcopy(_CRON_TOOL_PROPERTIES),
             "required": ["name", "schedule", "task"],
             "additionalProperties": False,
         },
@@ -1891,6 +1956,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum inventory rows per page (default 100)."},
                 "inventory_version": {"type": "string", "description": "Copy the previous page's inventory_version when continuing; a changed inventory requires restarting at offset 0."},
                 "query": {"type": "string", "description": "Optional case-insensitive substring to find in stored cron names or task instructions. Use a distinctive term from the requested task; omit for all jobs."},
+                "target_id": {"type": "string", "description": "Return only this exact scheduled task ID."},
                 "workspace_id": {"type": "string", "description": "Workspace id to list. Defaults to the current workspace."},
                 "include_all_workspaces": {"type": "boolean", "description": "Whether to include crons from every workspace."},
             },
@@ -1898,7 +1964,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         },
         "update_cron": {
             "type": "object",
-            "properties": cron_tool_properties(),
+            "properties": copy.deepcopy(_CRON_TOOL_PROPERTIES),
             "required": ["id"],
             "additionalProperties": False,
         },
@@ -4791,6 +4857,10 @@ class ToolRegistry:
         result = _invoke_tool_handler_with_timeout(spec, handler, invocation)
         metadata = dict(result.response_requirements) if isinstance(result.response_requirements, dict) else {}
         metadata.pop('_native_unavailable_file_producer_formats',None)
+        metadata.pop('_native_scheduled_source_artifact', None)
+        if ((invocation.flow_context or {}).get("scheduled_task_run") and result.status == "completed"
+                and (spec.source_artifact_only or spec.name == "file_download")):
+            metadata['_native_scheduled_source_artifact'] = True
         facts=result.output if isinstance(result.output,dict) else {}
         if (normalize_tool_status(result.status)=='failed' and facts.get('failure_scope')=='tool'
                 and facts.get('terminal_user_action_required') is True
@@ -6059,9 +6129,17 @@ def _build_archive_create_handler(
             if not source_path.exists():
                 continue
             for file_path, arcname in _iter_source_files(source_path, include_metadata=include_metadata):
-                if file_path.resolve() == output_identity:
+                resolved_file = file_path.resolve()
+                if not _path_within_any_root(resolved_file, effective_roots):
+                    return _archive_create_error_result(
+                        invocation,
+                        path=output_path,
+                        error="An archive member resolves outside the allowed workspace roots.",
+                        reason="archive_source_outside_workspace",
+                    )
+                if resolved_file == output_identity:
                     continue
-                entries.append((file_path, arcname))
+                entries.append((resolved_file, arcname))
                 if len(entries) > _ARCHIVE_EXTRACT_ENTRY_LIMIT:
                     return _archive_create_error_result(
                         invocation,
@@ -7052,6 +7130,10 @@ class ToolExecutor:
                     return self._deny_invocation(invocation, reason="email_source_unavailable",
                         error="An email source file is unavailable. The email was not sent.",
                         output={"reason": "email_source_unavailable"})
+                except (LookupError, UnicodeError):
+                    return self._deny_invocation(invocation, reason="email_source_encoding_invalid",
+                        error="The HTML source could not be decoded. Save it as UTF-8 and request a fresh draft.",
+                        output={"reason": "email_source_encoding_invalid"})
             approval = self._ensure_tool_approval_request(invocation, reviewed_email_files=review_files,
                 reviewed_html=review_html)
             approval_context = approval.context if isinstance(approval.context, dict) else {}
@@ -7858,6 +7940,10 @@ def _build_file_write_handler(
                     path.write_bytes(image_bytes)
                     binary_image_decoded = True
         if not binary_image_decoded:
+            if path.suffix.lower() in {".html", ".htm"}:
+                from nullion.artifacts import ensure_utf8_html_encoding
+
+                content = ensure_utf8_html_encoding(content, title=path.stem)
             path.write_text(content, encoding="utf-8")
         bytes_written = path.stat().st_size if path.exists() else len(content.encode("utf-8"))
         output: dict[str, object] = {"path": str(path), "bytes_written": bytes_written}
@@ -13588,12 +13674,12 @@ def _fetch_web_url_once(url: str, timeout_seconds: int, *, allow_redirects: bool
     )
     if not allow_redirects:
         request._nullion_disallow_redirects = True
+    request._nullion_web_fetch_resolution = resolution
     opener = _build_web_fetch_opener()
-    with _pinned_web_fetch_resolution(resolution):
-        with opener.open(request, timeout=timeout_seconds) as response:
-            status_code = getattr(response, "status", 200)
-            content_type = response.headers.get_content_type()
-            data = response.read(_WEB_FETCH_MAX_BODY_BYTES + 1)
+    with opener.open(request, timeout=timeout_seconds) as response:
+        status_code = getattr(response, "status", 200)
+        content_type = response.headers.get_content_type()
+        data = response.read(_WEB_FETCH_MAX_BODY_BYTES + 1)
     truncated = len(data) > _WEB_FETCH_MAX_BODY_BYTES
     if truncated:
         data = data[:_WEB_FETCH_MAX_BODY_BYTES]
@@ -13886,13 +13972,13 @@ def _fetch_browser_image_binary(url: str, timeout_seconds: int) -> dict[str, obj
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
+    request._nullion_web_fetch_resolution = resolution
     opener = _build_web_fetch_opener()
-    with _pinned_web_fetch_resolution(resolution):
-        with opener.open(request, timeout=timeout_seconds) as response:
-            status_code = getattr(response, "status", 200)
-            content_type = response.headers.get_content_type()
-            data = response.read(_BROWSER_IMAGE_MAX_BYTES + 1)
-            final_url = getattr(response, "url", None) or getattr(response, "geturl", lambda: url)()
+    with opener.open(request, timeout=timeout_seconds) as response:
+        status_code = getattr(response, "status", 200)
+        content_type = response.headers.get_content_type()
+        data = response.read(_BROWSER_IMAGE_MAX_BYTES + 1)
+        final_url = getattr(response, "url", None) or getattr(response, "geturl", lambda: url)()
     if len(data) > _BROWSER_IMAGE_MAX_BYTES:
         raise ValueError("image response exceeded maximum size")
     return {
@@ -14347,110 +14433,110 @@ def _build_file_download_handler(
         )
         try:
             opener = _build_web_fetch_opener()
-            with _pinned_web_fetch_resolution(resolution):
-                socket_timeout = min(10.0, max(1.0, timeout_seconds))
-                with opener.open(request, timeout=socket_timeout) as response:
-                    status_code = int(getattr(response, "status", 200) or 200)
-                    final_url = response.geturl()
-                    content_type = response.headers.get_content_type()
-                    content_length = response.headers.get("Content-Length")
-                    try:
-                        expected_bytes = int(content_length) if content_length else None
-                    except ValueError:
-                        expected_bytes = None
-                    if expected_bytes is not None and expected_bytes > max_bytes:
-                        return _file_download_error_result(
-                            invocation,
-                            error=f"Download is too large: {expected_bytes} bytes exceeds {max_bytes} bytes",
-                            reason="download_too_large",
-                            output={
-                                "url": url,
-                                "final_url": final_url,
-                                "content_type": content_type,
-                                "content_length": expected_bytes,
-                                "max_bytes": max_bytes,
-                            },
-                        )
-                    if output_path is None:
-                        header_name = _filename_from_content_disposition(response.headers.get("Content-Disposition"))
-                        safe_name = _safe_download_filename(
-                            invocation.arguments.get("filename") or header_name,
-                            url=final_url or url,
-                            content_type=content_type,
-                        )
-                        from nullion.artifacts import artifact_path_for_generated_workspace_file
+            request._nullion_web_fetch_resolution = resolution
+            socket_timeout = min(10.0, max(1.0, timeout_seconds))
+            with opener.open(request, timeout=socket_timeout) as response:
+                status_code = int(getattr(response, "status", 200) or 200)
+                final_url = response.geturl()
+                content_type = response.headers.get_content_type()
+                content_length = response.headers.get("Content-Length")
+                try:
+                    expected_bytes = int(content_length) if content_length else None
+                except ValueError:
+                    expected_bytes = None
+                if expected_bytes is not None and expected_bytes > max_bytes:
+                    return _file_download_error_result(
+                        invocation,
+                        error=f"Download is too large: {expected_bytes} bytes exceeds {max_bytes} bytes",
+                        reason="download_too_large",
+                        output={
+                            "url": url,
+                            "final_url": final_url,
+                            "content_type": content_type,
+                            "content_length": expected_bytes,
+                            "max_bytes": max_bytes,
+                        },
+                    )
+                if output_path is None:
+                    header_name = _filename_from_content_disposition(response.headers.get("Content-Disposition"))
+                    safe_name = _safe_download_filename(
+                        invocation.arguments.get("filename") or header_name,
+                        url=final_url or url,
+                        content_type=content_type,
+                    )
+                    from nullion.artifacts import artifact_path_for_generated_workspace_file
 
-                        suffix = Path(safe_name).suffix or _web_fetch_binary_suffix(final_url or url, content_type)
-                        output_path = artifact_path_for_generated_workspace_file(
-                            principal_id=invocation.principal_id,
-                            suffix=suffix,
-                            stem=Path(safe_name).stem or "download",
-                        )
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    bytes_written = 0
-                    with output_path.open("wb") as target:
-                        while True:
-                            remaining_seconds = deadline - perf_counter()
-                            if remaining_seconds <= 0:
-                                target.close()
-                                try:
-                                    output_path.unlink()
-                                except OSError:
-                                    pass
-                                return _file_download_error_result(
-                                    invocation,
-                                    error=f"Download timed out after {timeout_seconds:g}s",
-                                    reason="download_timeout",
-                                    output={
-                                        "url": url,
-                                        "final_url": final_url,
-                                        "content_type": content_type,
-                                        "bytes_read": bytes_written,
-                                        "timeout_seconds": timeout_seconds,
-                                    },
-                                )
-                            _try_set_response_socket_timeout(response, min(socket_timeout, remaining_seconds))
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            bytes_written += len(chunk)
-                            if perf_counter() > deadline:
-                                target.close()
-                                try:
-                                    output_path.unlink()
-                                except OSError:
-                                    pass
-                                return _file_download_error_result(
-                                    invocation,
-                                    error=f"Download timed out after {timeout_seconds:g}s",
-                                    reason="download_timeout",
-                                    output={
-                                        "url": url,
-                                        "final_url": final_url,
-                                        "content_type": content_type,
-                                        "bytes_read": bytes_written,
-                                        "timeout_seconds": timeout_seconds,
-                                    },
-                                )
-                            if bytes_written > max_bytes:
-                                target.close()
-                                try:
-                                    output_path.unlink()
-                                except OSError:
-                                    pass
-                                return _file_download_error_result(
-                                    invocation,
-                                    error=f"Download exceeded {max_bytes} bytes",
-                                    reason="download_too_large",
-                                    output={
-                                        "url": url,
-                                        "final_url": final_url,
-                                        "content_type": content_type,
-                                        "bytes_read": bytes_written,
-                                        "max_bytes": max_bytes,
-                                    },
-                                )
-                            target.write(chunk)
+                    suffix = Path(safe_name).suffix or _web_fetch_binary_suffix(final_url or url, content_type)
+                    output_path = artifact_path_for_generated_workspace_file(
+                        principal_id=invocation.principal_id,
+                        suffix=suffix,
+                        stem=Path(safe_name).stem or "download",
+                    )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                bytes_written = 0
+                with output_path.open("wb") as target:
+                    while True:
+                        remaining_seconds = deadline - perf_counter()
+                        if remaining_seconds <= 0:
+                            target.close()
+                            try:
+                                output_path.unlink()
+                            except OSError:
+                                pass
+                            return _file_download_error_result(
+                                invocation,
+                                error=f"Download timed out after {timeout_seconds:g}s",
+                                reason="download_timeout",
+                                output={
+                                    "url": url,
+                                    "final_url": final_url,
+                                    "content_type": content_type,
+                                    "bytes_read": bytes_written,
+                                    "timeout_seconds": timeout_seconds,
+                                },
+                            )
+                        _try_set_response_socket_timeout(response, min(socket_timeout, remaining_seconds))
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        bytes_written += len(chunk)
+                        if perf_counter() > deadline:
+                            target.close()
+                            try:
+                                output_path.unlink()
+                            except OSError:
+                                pass
+                            return _file_download_error_result(
+                                invocation,
+                                error=f"Download timed out after {timeout_seconds:g}s",
+                                reason="download_timeout",
+                                output={
+                                    "url": url,
+                                    "final_url": final_url,
+                                    "content_type": content_type,
+                                    "bytes_read": bytes_written,
+                                    "timeout_seconds": timeout_seconds,
+                                },
+                            )
+                        if bytes_written > max_bytes:
+                            target.close()
+                            try:
+                                output_path.unlink()
+                            except OSError:
+                                pass
+                            return _file_download_error_result(
+                                invocation,
+                                error=f"Download exceeded {max_bytes} bytes",
+                                reason="download_too_large",
+                                output={
+                                    "url": url,
+                                    "final_url": final_url,
+                                    "content_type": content_type,
+                                    "bytes_read": bytes_written,
+                                    "max_bytes": max_bytes,
+                                },
+                            )
+                        target.write(chunk)
         except Exception as exc:
             return _file_download_error_result(
                 invocation,
@@ -15611,8 +15697,12 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
             ToolSpec(
                 name="email_read",
                 description=(
-                    "Read one full message through an active Google Mail connector. The id must be exactly one "
-                    "email_search.results[].id value; do not infer ids or pass placeholders. Use this whenever "
+                    "Read full messages through an active Google Mail connector. Use id for one exact "
+                    "email_search.results[].id value. When several observed IDs are independently needed, pass ids "
+                    "with independent_messages=true in one call, including inside Code Mode. Check each message status "
+                    "before claiming coverage. In Code Mode use on_error=\"return\" to preserve successful items if "
+                    "one selected read fails. Reuse successful child receipts and retry only unresolved IDs when needed. "
+                    "Do not infer IDs or pass placeholders. Use this whenever "
                     "the user asks to read, summarize, inspect, or act on message body content. HTML links are "
                     "returned as structured message.links entries when present, including hidden href targets. "
                     "Attachments are returned as structured message.attachments entries with attachmentId values."
@@ -15622,9 +15712,10 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=email_tool_timeout_seconds,
-                input_schema=_email_read_input_schema(),
+                input_schema=_email_read_input_schema(supports_batch=True),
                 capability_tags=("email", "connector", "account_read"),
                 same_request_read_cache=True,
+                independent_batch=("ids", "independent_messages"),
             ),
             _build_connector_email_read_handler(),
         )
@@ -15802,6 +15893,25 @@ def _connector_request_headers(connection: object | None, provider_id: str) -> d
         "User-Agent": "Nullion connector_request/0.1",
     }
     return headers
+
+
+@dataclass(frozen=True, repr=False)
+class _EmailReadBatchBinding:
+    principal_id: str
+    provider_id: str
+    connection_identity: tuple[object, ...]
+    endpoint: str
+    allowed_bases: tuple[str, ...]
+    headers: tuple[tuple[str, str], ...]
+
+
+_EMAIL_READ_BATCH_BINDING: ContextVar[_EmailReadBatchBinding | None] = ContextVar(
+    "email_read_batch_binding", default=None)
+
+
+def _connector_connection_identity(connection: object | None) -> tuple[object, ...]:
+    return tuple(getattr(connection, field, None) for field in ("connection_id", "workspace_id", "provider_id",
+        "provider_profile", "credential_ref", "credential_scope", "active", "permission_mode"))
 
 
 _CONNECTOR_READ_METHODS = {"GET", "HEAD"}
@@ -16435,24 +16545,41 @@ def _connector_json_request(
     json_payload: object | None = None,
     max_response_bytes: int = _CONNECTOR_JSON_MAX_BODY_BYTES,
 ) -> dict[str, object]:
-    connection = _connector_connection_for_invocation(invocation, provider_id)
     normalized_method = _connector_request_method(method)
+    binding = _EMAIL_READ_BATCH_BINDING.get()
+    if binding is not None and (invocation.principal_id != binding.principal_id or provider_id != binding.provider_id
+            or normalized_method != "GET" or not url.startswith(binding.endpoint + "/")):
+        raise RuntimeError("The connector request is outside the selected mail batch.")
+    connection = _connector_connection_for_invocation(invocation, provider_id)
     if normalized_method not in _CONNECTOR_READ_METHODS and not _connector_connection_allows_write(connection):
         raise RuntimeError(f"{provider_id} is configured as read-only for connector_request.")
-    request_url = _connector_request_url(url, params or {}, connection, provider_id)
-    resolution = _resolve_web_fetch_resolution(request_url)
-    headers = _connector_request_headers(connection, provider_id)
+    connector_read = normalized_method in _CONNECTOR_READ_METHODS
+    if connector_read:
+        _connector_read_timeout()
+    allowed_bases = _connector_allowed_base_urls(connection, provider_id)
+    if binding is not None:
+        current_headers = _connector_request_headers(connection, provider_id)
+        if (binding.connection_identity != _connector_connection_identity(connection)
+                or binding.headers != tuple(current_headers.items()) or binding.allowed_bases != allowed_bases):
+            raise RuntimeError("The mail connection changed during the batch. Retry the unresolved messages.")
+        allowed_bases = binding.allowed_bases
+    request_url, resolution = _connector_request_target(url, params or {}, connection, provider_id, allowed_bases=allowed_bases)
+    headers = _connector_request_headers(connection, provider_id) if binding is None else dict(binding.headers)
     data = None
     if json_payload is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(json_payload).encode("utf-8")
     request = urllib.request.Request(request_url, data=data, headers=headers, method=normalized_method)
-    request._nullion_allowed_base_urls = _connector_allowed_base_urls(connection, provider_id)
+    request._nullion_allowed_base_urls = allowed_bases
+    request._nullion_web_fetch_resolution = resolution
+    request._nullion_connector_read = connector_read
     opener = _build_web_fetch_opener()
+    timeout = _connector_request_timeout_seconds()
+    if connector_read:
+        timeout = _connector_read_timeout(timeout)
     try:
-        with _pinned_web_fetch_resolution(resolution):
-            with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
-                return _connector_json_payload_from_response(response, max_body_bytes=max_response_bytes)
+        with opener.open(request, timeout=timeout) as response:
+            return _connector_json_payload_from_response(response, max_body_bytes=max_response_bytes)
     except urllib.error.HTTPError as exc:
         _output, error = _connector_http_error_output(
             exc,
@@ -16692,8 +16819,15 @@ def _url_is_under_base(url: str, base_url: str) -> bool:
 
 
 def _connector_request_url(raw_url: str, raw_params: object, connection: object | None = None, provider_id: str = "") -> str:
+    return _connector_request_target(raw_url, raw_params, connection, provider_id)[0]
+
+
+def _connector_request_target(raw_url: str, raw_params: object, connection: object | None = None,
+                              provider_id: str = "", *, allowed_bases: tuple[str, ...] | None = None
+                              ) -> tuple[str, _WebFetchResolution | None]:
     url = raw_url.strip()
-    allowed_bases = _connector_allowed_base_urls(connection, provider_id)
+    if allowed_bases is None:
+        allowed_bases = _connector_allowed_base_urls(connection, provider_id)
     parsed = urlparse(url)
     host = parsed.hostname
     if (
@@ -16730,7 +16864,7 @@ def _connector_request_url(raw_url: str, raw_params: object, connection: object 
     resolution = _resolve_web_fetch_resolution(url)
     if resolution is None and not _is_global_literal_ip(host) and not is_under_configured_base:
         raise ValueError(f"Blocked URL for connector_request: {url}")
-    return url
+    return url, resolution
 
 
 def _build_connector_request_handler() -> ToolHandler:
@@ -16768,8 +16902,10 @@ def _build_connector_request_handler() -> ToolHandler:
                         "before using POST, PUT, PATCH, or DELETE."
                     ),
                 )
-            url = _connector_request_url(raw_url, invocation.arguments.get("params"), connection, provider_id)
-            resolution = _resolve_web_fetch_resolution(url)
+            connector_read = method in _CONNECTOR_READ_METHODS
+            if connector_read:
+                _connector_read_timeout()
+            url, resolution = _connector_request_target(raw_url, invocation.arguments.get("params"), connection, provider_id)
             payload, payload_headers = _connector_request_payload(invocation, method)
             headers = _connector_request_headers(connection, provider_id)
             headers.update(payload_headers)
@@ -16780,12 +16916,13 @@ def _build_connector_request_handler() -> ToolHandler:
                 method=method,
             )
             request._nullion_allowed_base_urls = _connector_allowed_base_urls(connection, provider_id)
+            request._nullion_web_fetch_resolution = resolution
+            request._nullion_connector_read = connector_read
             opener = _build_web_fetch_opener()
-            with _pinned_web_fetch_resolution(resolution):
-                with opener.open(request, timeout=20) as response:
-                    status_code = getattr(response, "status", 200)
-                    content_type = response.headers.get_content_type()
-                    body = response.read(1_000_000).decode("utf-8", "ignore")
+            with opener.open(request, timeout=20) as response:
+                status_code = getattr(response, "status", 200)
+                content_type = response.headers.get_content_type()
+                body = response.read(1_000_000).decode("utf-8", "ignore")
             output: dict[str, object] = {
                 "url": url,
                 "provider_id": provider_id,
@@ -16879,6 +17016,7 @@ def _build_connector_email_search_handler() -> ToolHandler:
             messages = raw_messages if isinstance(raw_messages, list) else []
             results: list[dict[str, object]] = []
             detail_fetch_limit = _email_search_detail_fetch_limit()
+            metadata_candidates = []
             for index, item in enumerate(messages[:limit]):
                 if not isinstance(item, dict):
                     continue
@@ -16886,21 +17024,33 @@ def _build_connector_email_search_handler() -> ToolHandler:
                 if not message_id:
                     continue
                 if index < detail_fetch_limit:
-                    try:
-                        detail = _connector_json_request(
-                            invocation,
-                            provider_id=provider_id,
-                            url=f"{endpoint}/{quote(message_id, safe='')}",
-                            params={
-                                "format": "metadata",
-                                "fields": "id,threadId,labelIds,snippet,payload(headers)",
-                            },
-                        )
-                    except Exception:
-                        detail = item
-                    results.append(_compact_gmail_message(detail, include_body=False))
-                else:
-                    results.append(_compact_gmail_message(item, include_body=False))
+                    metadata_candidates.append((len(results), message_id))
+                results.append(_compact_gmail_message(item, include_body=False))
+
+            def hydrate(message_id):
+                if tool_execution_cancelled() or tool_execution_remaining_seconds() == 0:
+                    return None
+                try:
+                    detail = _connector_json_request(
+                        invocation,
+                        provider_id=provider_id,
+                        url=f"{endpoint}/{quote(message_id, safe='')}",
+                        params={"format": "metadata", "fields": "id,threadId,labelIds,snippet,payload(headers)"},
+                    )
+                    return _compact_gmail_message(detail, include_body=False)
+                except Exception:
+                    return None
+
+            if len(metadata_candidates) == 1:
+                index, message_id = metadata_candidates[0]
+                results[index] = hydrate(message_id) or results[index]
+            elif metadata_candidates:
+                with ThreadPoolExecutor(max_workers=min(3, len(metadata_candidates)),
+                                        thread_name_prefix="nullion-email-metadata") as pool:
+                    pending = [(index, pool.submit(copy_context().run, hydrate, message_id))
+                               for index, message_id in metadata_candidates]
+                    for index, future in pending:
+                        results[index] = future.result() or results[index]
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
@@ -16996,11 +17146,19 @@ def _email_attachment_text_preview(data: bytes, *, mime_type: str, filename: str
         ".md",
         ".xml",
     }:
-        text = data.decode("utf-8", "replace")
+        from email.message import Message
+        from nullion.artifacts import decode_html_document
+
         if normalized_type == "text/html" or suffix in {".html", ".htm"}:
-            text = _plain_text_from_email_html(text)
+            text = _plain_text_from_email_html(decode_html_document(data, content_type=mime_type, errors="replace"))
         else:
-            text = _clean_email_body_text(text)
+            message = Message()
+            message["Content-Type"] = mime_type
+            try:
+                decoded = data.decode(message.get_content_charset() or "utf-8-sig", errors="replace")
+            except (LookupError, UnicodeError):
+                decoded = data.decode("utf-8-sig", errors="replace")
+            text = _clean_email_body_text(decoded)
         return text[:limit]
     return ""
 
@@ -17164,7 +17322,26 @@ def _email_message_evidence_scope(message: object) -> dict[str, object]:
 
 
 def _build_connector_email_read_handler() -> ToolHandler:
+    def prepare_batch(invocation, provider_id):
+        connection = _connector_connection_for_invocation(invocation, provider_id)
+        binding = _EmailReadBatchBinding(invocation.principal_id, provider_id,
+            _connector_connection_identity(connection), _email_messages_endpoint_for_provider(connection, provider_id),
+            _connector_allowed_base_urls(connection, provider_id), tuple(_connector_request_headers(connection, provider_id).items()))
+
+        def read(child):
+            token = _EMAIL_READ_BATCH_BINDING.set(binding)
+            try:
+                return handler(child)
+            finally:
+                _EMAIL_READ_BATCH_BINDING.reset(token)
+
+        return read
+
     def handler(invocation: ToolInvocation) -> ToolResult:
+        if isinstance(invocation.arguments.get("ids"), list):
+            from nullion.email_read_batch import read_independent_messages
+
+            return read_independent_messages(invocation, handler, prepare_read=prepare_batch)
         raw_id = invocation.arguments.get("id")
         if not isinstance(raw_id, str) or not raw_id.strip():
             return _invalid_email_message_id_result(invocation, raw_id)
@@ -17174,8 +17351,12 @@ def _build_connector_email_read_handler() -> ToolHandler:
         try:
             if not provider_id:
                 provider_id = _default_email_connector_provider_id(invocation.principal_id)
-            connection = _connector_connection_for_invocation(invocation, provider_id)
-            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            binding = _EMAIL_READ_BATCH_BINDING.get()
+            if binding is None:
+                connection = _connector_connection_for_invocation(invocation, provider_id)
+                endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            else:
+                endpoint = binding.endpoint
             message = _connector_json_request(
                 invocation,
                 provider_id=provider_id,
@@ -17655,18 +17836,17 @@ def _build_connector_email_send_handler() -> ToolHandler:
             message, attached_paths = _email_message_for_invocation(invocation)
             raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
             endpoint = _email_send_endpoint_for_provider(connection, provider_id)
-            url = _connector_request_url(endpoint, None, connection, provider_id)
-            resolution = _resolve_web_fetch_resolution(url)
+            url, resolution = _connector_request_target(endpoint, None, connection, provider_id)
             payload = json.dumps({"raw": raw_message}).encode("utf-8")
             headers = _connector_request_headers(connection, provider_id)
             headers["Content-Type"] = "application/json"
             request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            request._nullion_web_fetch_resolution = resolution
             opener = _build_web_fetch_opener()
-            with _pinned_web_fetch_resolution(resolution):
-                with opener.open(request, timeout=20) as response:
-                    status_code = getattr(response, "status", 200)
-                    content_type = response.headers.get_content_type()
-                    body = response.read(1_000_000).decode("utf-8", "ignore")
+            with opener.open(request, timeout=20) as response:
+                status_code = getattr(response, "status", 200)
+                content_type = response.headers.get_content_type()
+                body = response.read(1_000_000).decode("utf-8", "ignore")
             output: dict[str, object] = {
                 "url": url,
                 "provider_id": provider_id,
@@ -18572,20 +18752,22 @@ def _image_generation_http_failure(error: BaseException) -> dict[str, object]:
     """Retain adapter HTTP facts without inferring failure policy from prose."""
     from urllib.error import HTTPError
 
+    import httpx
+
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, HTTPError):
-            status = current.code
-            if isinstance(status, int):
-                facts = {"http_status_code": status, "retryable": status in {408, 429} or status >= 500}
-                if status in {401, 402}:
-                    # Authentication/payment refusals describe provider
-                    # availability, rather than a prompt that can be repaired.
-                    facts.update(failure_scope="tool", terminal_user_action_required=True)
-                return facts
-            return {}
+        response = getattr(current, "response", None)
+        status = current.code if isinstance(current, HTTPError) else (
+            response.status_code if isinstance(response, httpx.Response) else None
+        )
+        if type(status) is int and 400 <= status < 600:
+            facts = {"http_status_code": status, "retryable": status in {408, 429} or status >= 500}
+            if status in {401, 402}:
+                # A fresh image request cannot repair an account refusal.
+                facts.update(failure_scope="tool", terminal_user_action_required=True)
+            return facts
         current = current.__cause__
     return {}
 
@@ -19820,8 +20002,11 @@ def _build_list_crons_handler():
             return denial
         jobs = list_crons(workspace_id=None if include_all else workspace_id, refresh_next_runs=False)
         total_count = len(jobs)
+        target_id = str(args.get("target_id") or "").strip()
         query = str(args.get("query") or "").strip().casefold()
-        if query:
+        if target_id:
+            jobs = [job for job in jobs if job.id == target_id]
+        elif query:
             # This is retrieval over a model-supplied tool argument, never
             # classification or decomposition of the user's message.
             jobs = [job for job in jobs if query in str(job.id).casefold() or query in str(job.name).casefold()

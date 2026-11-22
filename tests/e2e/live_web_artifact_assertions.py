@@ -151,3 +151,8 @@ def capture_web(request):
 @pytest.fixture
 def pdf_web(request):
     with artifact_web_session(request,'NULLION_LIVE_PDF_REPLAY') as state:yield state
+
+
+@pytest.fixture
+def raster_web(request):
+    with artifact_web_session(request,'NULLION_LIVE_RASTER_REPLAY') as state:yield state

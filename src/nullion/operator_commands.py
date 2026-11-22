@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -284,6 +285,8 @@ def operator_command_reference(*, platform: str = '', full: bool = False) -> str
     return _render_command_reference('Nullion — full command reference' if full else 'Nullion operator commands',
         _OPERATOR_COMMAND_SPECS, platform=platform)
 
+
+logger = logging.getLogger(__name__)
 
 _UNKNOWN_COMMAND = (
     "Unknown command.\n\n"
@@ -2053,11 +2056,13 @@ def _update_web_port(service: object = None) -> int:
     return 8742
 
 
-def _run_update_flow(*, web_port: int, ignore_check_failures: bool = False, checkpoint_path: str | Path | None = None):
+def _run_update_flow(*, web_port: int, ignore_check_failures: bool = False,
+                     checkpoint_path: str | Path | None = None, emit=None):
     from nullion.updater import run_update
 
     return asyncio.run(
         run_update(
+            emit=emit,
             web_port=web_port,
             ignore_check_failures=ignore_check_failures,
             checkpoint_path=checkpoint_path,
@@ -2078,13 +2083,36 @@ def _update_app(
     *,
     service: object = None,
     ignore_check_failures: bool = False,
+    activity_callback=None,
 ) -> str:
-    runtime.checkpoint()
+    from nullion.request_progress import PROGRESS_KIND
+
+    phases = {
+        "prepare": "Preparing the update…",
+        "fetch": "Checking for an update…",
+        "snapshot": "Backing up the current version…",
+        "apply": "Installing the update…",
+        "migrate": "Migrating local data…",
+        "health": "Checking that the new version can start…",
+        "rollback": "Restoring the previous version…",
+    }
+
+    def publish(step: str) -> None:
+        if activity_callback is not None and step in phases:
+            try:
+                activity_callback({"status_kind": PROGRESS_KIND, "status": "running",
+                                   "phase_id": "operation", "text": phases[step]})
+            except Exception:
+                logger.debug("Update progress could not be published", exc_info=True)
+
+    publish("prepare")
     try:
+        runtime.checkpoint()
         result = _run_update_flow(
             web_port=_update_web_port(service),
             ignore_check_failures=ignore_check_failures,
             checkpoint_path=getattr(runtime, "checkpoint_path", None),
+            emit=(lambda progress: publish(progress.step)) if activity_callback is not None else None,
         )
     except Exception as exc:
         return f"Update failed before it could complete: {exc}"
@@ -2438,6 +2466,7 @@ def _dispatch_operator_command(
     now: datetime | None = None,
     service: object = None,
     memory_owner: str | None = None,
+    activity_callback=None,
 ) -> str:
     command = text.strip()
     if not command:
@@ -2636,7 +2665,8 @@ def _dispatch_operator_command(
         if any(arg not in allowed_flags for arg in extra_args):
             return "Usage: /update [--ignore-checks|--force]"
         ignore_check_failures = any(arg in allowed_flags for arg in extra_args)
-        return _update_app(runtime, service=service, ignore_check_failures=ignore_check_failures)
+        return _update_app(runtime, service=service, ignore_check_failures=ignore_check_failures,
+                           activity_callback=activity_callback)
 
     if head == "/restart":
         return _restart_bot(runtime, service=service)
@@ -2684,6 +2714,7 @@ class _OperatorCommandState(TypedDict, total=False):
     now: datetime | None
     service: Any
     memory_owner: str | None
+    activity_callback: Any
     command: str
     parts: list[str]
     head: str
@@ -2714,6 +2745,7 @@ def _operator_command_dispatch_node(state: _OperatorCommandState) -> dict[str, o
             now=state.get("now"),
             service=state.get("service"),
             memory_owner=state.get("memory_owner"),
+            activity_callback=state.get("activity_callback"),
         )
     }
 
@@ -2736,6 +2768,7 @@ def handle_operator_command(
     now: datetime | None = None,
     service: object = None,
     memory_owner: str | None = None,
+    activity_callback=None,
 ) -> str:
     command = str(text or "").strip()
     head = _normalize_command_head(command.split()[0]) if command else "empty"
@@ -2746,6 +2779,7 @@ def handle_operator_command(
             "now": now,
             "service": service,
             "memory_owner": memory_owner,
+            "activity_callback": activity_callback,
         },
         config={"configurable": {"thread_id": f"operator-command:{head}"}},
     )

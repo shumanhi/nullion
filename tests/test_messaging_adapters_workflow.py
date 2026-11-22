@@ -1922,3 +1922,24 @@ async def test_discord_delivery_retries_plain_text_after_send_failure() -> None:
 
 class _FormattingRejected(RuntimeError):
     status_code = 400
+
+
+@pytest.mark.parametrize('role, delivered', [('source', False), ('deliverable', True)])
+def test_message_only_scope_requires_native_attachment_evidence(tmp_path, role, delivered):
+    from nullion.messaging_adapters import prepare_reply_for_platform_delivery
+    from nullion.tools import ToolResult
+
+    output = tmp_path / 'article.json'
+    output.write_text('{"status":"ready"}')
+    results = [
+        ToolResult('scope', 'request_tool_scope', 'completed',
+                   {'artifact_extensions': [], 'source_artifact_delivery_requested': False}),
+        ToolResult('read', 'terminal_exec', 'completed',
+                   {'stdout': str(output), 'artifact_descriptors': [{'path': str(output), 'role': role}]}),
+    ]
+    unrelated = tmp_path / 'unrelated.json'
+    unrelated.write_text('{"status":"private"}')
+    reply = f'Files ready.\n\nMEDIA:{output}\nMEDIA:{unrelated}'
+    delivery = prepare_reply_for_platform_delivery(reply, tool_results=results)
+    assert delivery.attachments == ((output,) if delivered else ())
+    assert delivery.pending_attachment_count == 0

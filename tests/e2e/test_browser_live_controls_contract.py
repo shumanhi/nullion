@@ -112,7 +112,10 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
                             assert '"selected_value": "18:00"' in '\n'.join(texts)
                             report['goal_status'] = 'answered'
                             report['pending_controls'] = []
-                            report['observations'].append({'label': '時刻', 'value': '18:00', 'quote': '18:00', 'control_index': 2})
+                            observation = {'label': '時刻', 'value': '18:00', 'quote': '18:00', 'control_index': 2}
+                            if number == 1:
+                                observation.update(control_property='value', semantic_role='attribute')
+                            report['observations'].append(observation)
                             action = {'record_observations': report}
                         else:
                             pytest.fail('A grounded terminal report must not need a redundant done call')
@@ -168,6 +171,10 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
             assert output['rejection_counts'] == {'source_not_captured': 3}, output
             assert output['report_status'] == 'completed', output
             assert {row['value'] for row in output['observations']} == {value, '2026-10-10', '2', '18:00'}, output
+            hidden_settings = [row for row in output['observations'] if row.get('control_state', {}).get('visible') is False]
+            assert {row['value'] for row in hidden_settings} == {'2', '18:00'}, output
+            assert all(row['semantic_role'] == 'interface_control' and
+                       row['control_state']['observed_property'] == 'value' for row in hidden_settings), output
             assert len(output['page_url']) > 6000 and len(json.dumps(output)) < 12000, output
             assert all(descriptor['role'] == 'source' for descriptor in output['artifact_descriptors'])
             assert model.browser_calls == 7 and model.outer_calls == 3

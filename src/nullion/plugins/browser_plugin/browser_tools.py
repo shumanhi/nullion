@@ -150,6 +150,11 @@ _BROWSER_LOOP_LOCK = threading.Lock()
 # fails fast instead of starving the worker thread pool.
 _MAX_CONCURRENT_BROWSER_OPS = 8
 _BROWSER_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_BROWSER_OPS)
+_PRIVATE_CONTROL_SELECTOR = (
+    'input[type="password" i], input[type="hidden" i], '
+    '[autocomplete~="current-password" i], [autocomplete~="new-password" i], '
+    '[autocomplete~="one-time-code" i]'
+)
 _LOCAL_PREVIEW_SUFFIXES = frozenset({".html", ".htm", ".pdf"})
 _ACTIVE_BROWSER_SESSION_TTL_SECONDS = 10 * 60
 
@@ -232,13 +237,15 @@ def _browser_snapshot_script(*, max_elements: int = 120) -> str:
     if (!isVisible && !(isEditable && includeHiddenEditable(el))) continue;
     if (!el.dataset.nullionEid) el.dataset.nullionEid = `n-${{++window.__nullionBrowserElementSeq}}`;
     const rect = el.getBoundingClientRect();
+    const canReadValue = isVisible && !el.matches({json.dumps(_PRIVATE_CONTROL_SELECTOR)})
+      && (!el.checkVisibility || el.checkVisibility({{opacityProperty: true, visibilityProperty: true}}));
     elements.push({{
       element_id: el.dataset.nullionEid,
       tag: el.tagName.toLowerCase(),
       role: roleFor(el),
       label: labelFor(el),
-      text: textOf(el.innerText || el.textContent).slice(0, 240),
-      value: 'value' in el ? String(el.value || '') : '',
+      text: canReadValue ? textOf(el.innerText || el.textContent).slice(0, 240) : '',
+      value: canReadValue && 'value' in el ? String(el.value || '') : '',
       placeholder: el.getAttribute('placeholder') || '',
       name: el.getAttribute('name') || '',
       type: el.getAttribute('type') || '',
@@ -290,7 +297,23 @@ def _browser_snapshot_script(*, max_elements: int = 120) -> str:
   const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
     .filter(visible).slice(0, 30).map(el => ({{selector: locator(el), tag: el.tagName.toLowerCase(),
       text: textOf(el.innerText || el.textContent).slice(0, 200)}}));
-  return {{url: location.href, title: document.title, active_element_id: active, element_count: elements.length, elements, regions, headings}};
+  // Keep linked record headings visible even when menus fill the control budget.
+  const headingLinks = new Map();
+  for (const heading of document.querySelectorAll('h1,h2,h3,[role="heading"]')) {{
+    if (!visible(heading) || heading.closest('header,nav,footer,[role="navigation"]')) continue;
+    const anchors = [...heading.querySelectorAll('a[href]')];
+    const parentLink = heading.closest('a[href]');
+    if (parentLink) anchors.push(parentLink);
+    const links = anchors.filter(anchor => visible(anchor) && !anchor.hasAttribute('download')
+      && ['https:', 'http:'].includes(anchor.protocol) && anchor.href.length <= 1024);
+    const title = textOf(heading.innerText).slice(0, 220);
+    if (title && links.length === 1 && !headingLinks.has(links[0].href)) {{
+      headingLinks.set(links[0].href, {{title, url: links[0].href}});
+    }}
+    if (headingLinks.size >= 6) break;
+  }}
+  return {{url: location.href, title: document.title, active_element_id: active, element_count: elements.length,
+    elements, regions, headings, heading_links: Array.from(headingLinks.values())}};
 }})()
 """
 
@@ -305,9 +328,17 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
   const textOf = (value, limit = 360) => (value || '').replace(/\\s+/g, ' ').trim().slice(0, limit);
   const visible = (el) => {{
     if (!el) return false;
-    const style = window.getComputedStyle(el);
     const rect = el.getBoundingClientRect();
-    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    if (el.checkVisibility) {{
+      return el.checkVisibility({{opacityProperty: true, visibilityProperty: true}});
+    }}
+    if (window.getComputedStyle(el).visibility !== 'visible') return false;
+    for (let node = el; node; node = node.parentElement) {{
+      const style = window.getComputedStyle(node);
+      if (Number(style.opacity) === 0 || style.contentVisibility === 'hidden') return false;
+    }}
+    return true;
   }};
   const absoluteUrl = (value) => {{
     if (!String(value || '').trim()) return '';
@@ -601,7 +632,7 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
   const candidates = [];
   let sourceIndex = 0;
   for (const anchor of anchors) {{
-    if (!visible(anchor) && !anchor.querySelector('img, source')) continue;
+    if (!visible(anchor) && !Array.from(anchor.querySelectorAll('img')).some(visible)) continue;
     const url = absoluteUrl(anchor.getAttribute('href') || anchor.href);
     if (!url) continue;
     const root = bestRootFor(anchor);
@@ -712,7 +743,8 @@ _BROWSER_DOM_DETAIL_KIND = "browser_dom_detail"
 _BROWSER_DOM_DETAIL_ORIGIN = "runtime_owned_dom_extractor"
 
 
-def _browser_extract_detail_script(*, selector: str | None = None) -> str:
+def _browser_extract_detail_script(*, selector: str | None = None, expected_heading: str | None = None,
+                                   match_document_title: bool = False) -> str:
     """Build the fixed, runtime-owned current-page detail extractor.
 
     The model may choose a CSS scope, but it cannot provide or alter the
@@ -723,6 +755,8 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     return f"""
 (() => {{
   const rootSelector = {json.dumps(selector or "")};
+  const expectedHeading = {json.dumps(expected_heading or "")};
+  const matchDocumentTitle = {json.dumps(match_document_title)};
   const compact = (value, limit = 1200) => String(value || '')
     .replace(/\\s+/g, ' ')
     .trim()
@@ -1090,18 +1124,24 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
   }}
   const headingSelectors = '[itemprop="name"], h1, [role="heading"][aria-level="1"]';
   const priceSelectors = '[itemprop~="price"], [data-price], [class*="price" i], [id*="price" i]';
-  const candidateRoots = Array.from(initialRoot.querySelectorAll(
-    'article, [role="article"], [role="listitem"], [itemscope]'
-  )).filter((element) => {{
-    if (!visible(element)) return false;
-    const heading = element.querySelector(headingSelectors);
-    const link = element.querySelector('a[href]');
-    const price = element.querySelector(priceSelectors);
-    return Boolean(heading && (link || price));
-  }});
-  const primaryHeadings = Array.from(initialRoot.querySelectorAll(
+  const visibleHeadings = Array.from(initialRoot.querySelectorAll(
     'h1, [role="heading"][aria-level="1"]'
   )).filter(visible);
+  const headingTokens = (value) => compact(value, 800).normalize('NFKC').toLowerCase()
+    .match(/[\\p{{L}}\\p{{M}}\\p{{N}}]+/gu)?.join(' ') || '';
+  let normalizedHeading = headingTokens(expectedHeading);
+  if (!expectedHeading && matchDocumentTitle && visibleHeadings.length > 1) {{
+    const pageTitle = ` ${{headingTokens(document.title)}} `;
+    const headingMatches = visibleHeadings.map((heading) => headingTokens(heading.innerText))
+      .filter((heading) => heading.length >= 24 && pageTitle.includes(` ${{heading}} `));
+    if (headingMatches.length === 1) normalizedHeading = headingMatches[0];
+  }}
+  const primaryHeadings = normalizedHeading ? visibleHeadings.filter((element) => {{
+    return ` ${{headingTokens(element.innerText)}} `.includes(` ${{normalizedHeading}} `);
+  }}) : visibleHeadings;
+  if (expectedHeading && (!normalizedHeading || !primaryHeadings.length)) {{
+    return {{ok: false, reason: 'expected_detail_heading_missing'}};
+  }}
   if (primaryHeadings.length > 1) {{
     return {{
       ok: false,
@@ -1111,6 +1151,15 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
       page: {{url: location.href, title: document.title}},
     }};
   }}
+  const candidateRoots = Array.from(initialRoot.querySelectorAll(
+    'article, [role="article"], [role="listitem"], [itemscope]'
+  )).filter((element) => {{
+    if (!visible(element)) return false;
+    const heading = element.querySelector(headingSelectors);
+    const link = element.querySelector('a[href]');
+    const price = element.querySelector(priceSelectors);
+    return Boolean(heading && (link || price));
+  }});
   const titleElement = primaryHeadings[0]
     || Array.from(initialRoot.querySelectorAll('[itemprop="name"]')).find(visible)
     || null;
@@ -1157,6 +1206,21 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     }}
   }}
   const root = containingCandidate || primaryContainer || initialRoot;
+  const isCompetingHeading = (heading) => {{
+    if (heading === titleElement || !root.contains(heading)) return false;
+    if (heading.matches('a[href]') || heading.closest('a[href]') || heading.querySelector('a[href]')) return true;
+    // A same-level section title is common on detail pages. Treat it as a
+    // separate record only if its own branch has independent price evidence.
+    let branch = heading.parentElement;
+    while (branch && root.contains(branch) && !branch.contains(titleElement)) {{
+      if (Array.from(branch.querySelectorAll(priceSelectors)).some(visible)) return true;
+      branch = branch.parentElement;
+    }}
+    return false;
+  }};
+  if (normalizedHeading && visibleHeadings.some(isCompetingHeading)) {{
+    return {{ok: false, reason: 'ambiguous_detail_scope'}};
+  }}
   const availabilitySelectors = [
     '[itemprop="availability"]',
     '[class*="availability" i]',
@@ -1948,7 +2012,7 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
       )
     );
     const numericLeaves = Array.from(element.querySelectorAll('*')).filter((candidate) => {{
-      if (!semanticallyExposed(candidate, element)) return false;
+      if (!paintVisible(candidate)) return false;
       if (!/^\\p{{Nd}}+$/u.test(String(candidate.textContent || '').trim())) return false;
       return !Array.from(candidate.children).some(
         (child) => /\\p{{Nd}}/u.test(String(child.textContent || ''))
@@ -2794,6 +2858,7 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     selector: rootSelector || null,
     record_scope: containingCandidate ? 'semantic_record' : 'selected_root',
     page: {{url: location.href, title: document.title}},
+    ...(normalizedHeading ? {{observed_text: String(root.innerText || '').trim().slice(0, 2000)}} : {{}}),
     record,
   }};
 }})()
@@ -4402,6 +4467,7 @@ def _serialized_browser_operation(method):
                                     # document while the existing session lock is held.
                                     # A prior navigation receipt alone cannot prove
                                     # which document produced this extraction.
+                                    result.output["result_kind"] = "browser_rendered_text"
                                     result.output["record"] = {"url": document_url,
                                         "text": result.output["text"], "selector": result.output.get("selector")}
                                     if result.output["observation_readiness"]["verified"]:
@@ -4814,13 +4880,14 @@ class BrowserTools:
         session_id: str,
         *,
         selector: str | None,
+        match_document_title: bool = False,
     ) -> dict[str, object] | None:
         """Return only a record produced by Nullion's fixed DOM extractor."""
 
         result = _run(
             self._backend.run_js(
                 session_id,
-                _browser_extract_detail_script(selector=selector),
+                _browser_extract_detail_script(selector=selector, match_document_title=match_document_title),
             )
         )
         if not isinstance(result, dict) or result.get("ok") is not True:
@@ -4850,6 +4917,11 @@ class BrowserTools:
         )
         if not any(record.get(key) for key in substantive_keys):
             return None
+        declaration = {"path": ["record"], "identity_fields": ["title", "url"], "cardinality": "one"}
+        if observed_text := result.get("observed_text"):
+            record = {**record, "observed_text": observed_text}
+            declaration.update(context_fields=["price", "availability", "observed_text"],
+                               context_widths={"observed_text": 2000})
         return {
             "schema_version": _BROWSER_DOM_DETAIL_SCHEMA_VERSION,
             "kind": _BROWSER_DOM_DETAIL_KIND,
@@ -4859,7 +4931,7 @@ class BrowserTools:
             "record_scope": record_scope,
             "page": dict(page),
             "record": dict(record),
-            "source_record_collections": [{"path": ["record"], "identity_fields": ["title", "url"], "cardinality": "one"}],
+            "source_record_collections": [declaration],
         }
 
     @staticmethod
@@ -5314,6 +5386,21 @@ class BrowserTools:
                     None, None if selector else value, 5))
 
     @staticmethod
+    def _source_read_failure(invocation, session_id, action, error):
+        failure = _browser_failure_output(error)
+        if failure.get("failure_reason") == "source_timeout" and (
+                invocation.arguments.get("ready_selector") or invocation.arguments.get("ready_text")):
+            return _fail(invocation, "The selected results landmark did not become visible.",
+                {"reason": "source_not_ready", "failure_reason": "source_not_ready", "session_id": session_id,
+                 "page_state_preserved": True,
+                 "recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
+                              "required_tool_names": ["browser_snapshot"],
+                              "argument_constraints": {"inspect_current_results_first": True,
+                                                       "supported_parameters": ["ready_selector", "ready_text"],
+                                                       "wait_seconds": 5}}})
+        return _fail(invocation, f"{action} failed: {error}", failure)
+
+    @staticmethod
     def _source_replay_recipe(invocation, url):
         steps = [{"tool_name": "browser_navigate", "arguments": {"url": url}}]
         for key, argument in (("ready_selector", "selector"), ("ready_text", "text")):
@@ -5372,6 +5459,7 @@ class BrowserTools:
                     "argument_constraints": {"fields": {"type": "array", "minItems": 1,
                         "items": {"type": "string", "enum": list(BROWSER_ITEM_FIELDS)}}}}})
         try:
+            self._wait_for_source_readiness(invocation, session_id)
             result = _run(
                 self._backend.run_js(
                     session_id,
@@ -5395,6 +5483,17 @@ class BrowserTools:
             items = result.get("items")
             if not isinstance(items, list):
                 return _fail(invocation, "Item extraction returned no item list.")
+            # A complete, nonempty collection in an explicitly selected visible
+            # region supplies its own readiness evidence on every repeat. An
+            # empty region may still be loading and needs a separate landmark.
+            has_ready_collection = (
+                bool((selector and selector.strip()) or section_heading)
+                and isinstance(coverage, dict)
+                and coverage.get("scope_found") is True
+                and coverage.get("truncated") is False
+                and coverage.get("candidate_count") == coverage.get("returned_count") == len(items)
+                and bool(items)
+            )
             if fields is not None:
                 selected = {*fields, "source_index", "section_id", "additional_sections"}
                 items = [{key: value for key, value in item.items() if key in selected}
@@ -5413,9 +5512,14 @@ class BrowserTools:
                 # The adapter records the actual rendered URL, never a model
                 # guess. The background runner validates this declared READ
                 # prerequisite and uses its own persistent tab/profile.
-                **({"observation_setup": [{"tool_name": "browser_navigate",
-                    "arguments": {"url": page["url"]}}]}
+                **({"observation_setup": self._source_replay_recipe(invocation, page["url"])}
                    if isinstance(page["url"], str) and page["url"].startswith(("https://", "http://")) else {}),
+                "observation_readiness": {
+                    "verified": has_ready_collection or bool(
+                        invocation.arguments.get("ready_selector") or invocation.arguments.get("ready_text")
+                    ),
+                    "supported_parameters": ["ready_selector", "ready_text"],
+                },
                 "source_record_collections": [{"path": ["items"],
                     "identity_fields": identity_fields,
                     "context_fields": ["title", "price_text", "numeric_snippets", "url"],
@@ -5428,7 +5532,7 @@ class BrowserTools:
                 output["page_state_assertion"] = assertion
             return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"Item extraction failed: {e}", _browser_failure_output(e))
+            return self._source_read_failure(invocation, session_id, "Item extraction", e)
 
     @_serialized_browser_operation
     def browser_extract_detail(self, invocation: ToolInvocation) -> ToolResult:
@@ -5445,6 +5549,7 @@ class BrowserTools:
             extraction = self._runtime_dom_detail_extraction(
                 session_id,
                 selector=normalized_selector,
+                match_document_title=True,
             )
             if extraction is None:
                 return _fail(
@@ -5692,11 +5797,18 @@ class BrowserTools:
         try:
             # An observed, model-selected readiness criterion is replayed by
             # background reads too. No site names, text inference or fixed sleep.
-            if invocation.arguments.get('ready_selector'):
-                _run(self._backend.wait_for(session_id, str(invocation.arguments['ready_selector']), None, None, 5))
-            if invocation.arguments.get('ready_text'):
-                _run(self._backend.wait_for(session_id, None, None, str(invocation.arguments['ready_text']), 5))
-            text = _run(self._backend.extract_text(session_id, selector))
+            self._wait_for_source_readiness(invocation, session_id)
+            capture = None
+            if (invocation.flow_context or {}).get("scheduled_task_run") is True:
+                try:
+                    capture = _run(self._backend.run_js(session_id,
+                        "() => { const el = document.querySelector(" + json.dumps(selector or "body") + "); "
+                        "return el && {text: el.innerText, page_url: el.ownerDocument.URL}; }"), timeout_seconds=2)
+                except Exception:
+                    # Playwright-specific selectors still use the usual reader.
+                    capture = None
+            text = (capture["text"] if isinstance(capture, dict) and isinstance(capture.get("text"), str)
+                    else _run(self._backend.extract_text(session_id, selector)))
             output: dict[str, object] = {
                 "text": text,
                 "length": len(text),
@@ -5706,18 +5818,13 @@ class BrowserTools:
             }
             if assertion := self._current_page_assertion(invocation, session_id):
                 output["page_state_assertion"] = assertion
+            if isinstance(capture, dict) and capture.get("text") == text:
+                observed_url = capture.get("page_url")
+                if text.strip() and isinstance(observed_url, str) and observed_url.startswith(("http://", "https://")):
+                    output.update(result_kind="browser_rendered_text", page_url=observed_url)
             return _ok(invocation, output)
         except Exception as e:
-            failure = _browser_failure_output(e)
-            if failure.get('failure_reason') == 'source_timeout' and (
-                    invocation.arguments.get('ready_selector') or invocation.arguments.get('ready_text')):
-                return _fail(invocation, 'The selected results-readiness landmark was not visible within the bounded wait.',
-                    {'reason': 'source_not_ready', 'failure_reason': 'source_not_ready', 'session_id': session_id,
-                        'recovery': {'kind': 'correct_arguments', 'retry_tool_name': 'browser_extract_text',
-                            'required_tool_names': ['browser_snapshot'],
-                            'argument_constraints': {'inspect_current_results_first': True,
-                                'supported_parameters': ['ready_selector', 'ready_text'], 'wait_seconds': 5}}})
-            return _fail(invocation, f'Extract text failed: {e}', failure)
+            return self._source_read_failure(invocation, session_id, "Text extraction", e)
 
     @_serialized_browser_operation
     def browser_screenshot(self, invocation: ToolInvocation) -> ToolResult:

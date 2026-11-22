@@ -118,7 +118,8 @@ def watch_chat_frames(page, frames, errors, base, *, on_frame=None):
         socket.on('framesent',submitted)
     def requested(request):
         if request.method=='POST' and request.url==base+'/api/chat':submitted(request.post_data)
-    page.on('pageerror',lambda error:errors.append(str(error)))
+    if errors is not None:
+        page.on('pageerror',lambda error:errors.append(str(error)))
     page.on('websocket',socket_opened)
     page.on('request',requested)
     page.on('response',response)
@@ -185,9 +186,31 @@ def live_web(request):
                 browser.close()
 
 
-def _terminal_for_submission(frames,prompt,conversation):
+def approve_owned_cron_delete(page, approval, base, cron_id, *, deadline):
+    approval_id = approval["approval_id"]
+    response = page.request.get(f"{base}/api/status?full=1",
+                                timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+    assert response.ok, response.status
+    record = next(record for record in response.json()["approvals"] if record["approval_id"] == approval_id)
+    assert (record["resource"], record["status"], record["context"]["scheduler_target"]["id"]) == (
+        "delete_cron", "pending", cron_id)
+    card = page.locator("#messages .approval-bubble[data-approval-id=" + json.dumps(approval_id) + "]")
+    action = card.get_by_role("button", name=re.compile(r"^(Delete|Allow once)$"))
+    with page.expect_response(lambda response: response.url == f"{base}/api/approve/{approval_id}"
+                              and response.request.method == "POST",
+                              timeout=max(1, int((deadline - time.monotonic()) * 1000))) as receipt:
+        action.click()
+    assert receipt.value.ok, receipt.value.status
+    body = receipt.value.json()
+    assert body.get("ok") is True and body.get("approval_id") == approval_id, body
+    assert isinstance(body.get("resume"), dict) and body["resume"].get("type") == "message", body
+    return body["resume"]
+
+
+def _terminal_for_submission(frames, prompt, conversation, *, audit_prompt=None):
+    wire_prompts = (prompt,) if audit_prompt is None else (prompt, audit_prompt)
     submitted=[frame for frame in frames if frame.get('type')=='_submitted'
-        and frame.get('text')==prompt and frame.get('conversation_id')==conversation]
+        and frame.get('text') in wire_prompts and frame.get('conversation_id')==conversation]
     if not submitted:return None
     turn_id=submitted[-1]['turn_id']
     terminal=[frame for frame in frames if frame.get('type') in {'done','error','approval_required'}
@@ -217,7 +240,7 @@ def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=
             if blocked:
                 pytest.exit(blocked, returncode=1)
             next_provider_check = time.monotonic() + 15
-        terminal = _terminal_for_submission(frames[before:],prompt,conversation)
+        terminal = _terminal_for_submission(frames[before:], prompt, conversation, audit_prompt=audit_prompt)
         if terminal is not None:
             break
         if poll_full_status and time.monotonic() >= next_status_poll:
@@ -319,7 +342,7 @@ def _submit(live_web, prompt, timeout=240, poll_full_status=False, audit_prompt=
 
 
 @pytest.mark.parametrize("name", CASES)
-def test_live_stage_web_catalogue(name, live_web):
+def test_live_stage_web_catalogue(name, live_web, record_property):
     page, frames, errors, database, conversation, base = live_web
     scenario = catalogue.SCENARIOS[name]
     if ('image_generate' in scenario.required_tool_all or scenario.required_tool_any == ('image_generate',)):
@@ -532,8 +555,21 @@ def test_live_stage_web_catalogue(name, live_web):
                     required_tool_any=tuple(dict.fromkeys((*contract.required_tool_any,"browser_run_task"))))
         assert "could not turn it into a focused answer" not in response["text"], response
         if name == "image":
-            generated = [row.get('output', {}) for turn in turns for row in turn.get('tool_results', [])
-                if row.get('tool_name') == 'image_generate' and row.get('status') == 'completed']
+            attempts = [row for turn in turns for row in turn.get('tool_results', [])
+                if row.get('tool_name') == 'image_generate']
+            generated = [row.get('output', {}) for row in attempts if row.get('status') == 'completed']
+            if not generated and attempts:
+                final_attempt = attempts[-1]
+                failure = final_attempt.get('output') or {}
+                if final_attempt.get('status') == 'failed' and failure.get('http_status_code') == 402:
+                    assert failure.get('retryable') is False and failure.get('terminal_user_action_required') is True
+                    assert sum((row.get('output') or {}).get('http_status_code') == 402 for row in attempts) == 1
+                    assert turns[-1].get('response_fulfilled') is False and not response['artifacts']
+                    guidance = response['text'].casefold()
+                    assert 'credits' in guidance and 'billing' in guidance, response['text']
+                    record_property('provider_blocker', 'image_generate:http_402')
+                    pytest.fail('Image provider returned HTTP 402. A funded provider is required to verify raster generation.',
+                                pytrace=False)
             assert generated and any(not row.get('fallback_used') for row in generated), generated
         if name == "html_research_real_images":
             # The request requires itineraries, not an exact English heading.

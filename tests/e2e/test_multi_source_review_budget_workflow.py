@@ -37,7 +37,8 @@ def test_later_source_reaches_real_report_review_under_budget_pressure(tmp_path,
         source_calls.append(1)
         return ToolResult(inv.invocation_id,inv.tool_name,'completed',copy.deepcopy(report))
     conversation='web:three-subject-report';root=artifact_root_for_principal(conversation);root.mkdir(parents=True,exist_ok=True);path=root/'report.html'
-    expected='<!doctype html><html><body><h1>Comparison</h1>'+''.join('<p>'+fact+'</p>' for fact in facts)+'</body></html>'
+    content='<!doctype html><html><body><h1>Comparison</h1>'+''.join('<p>'+fact+'</p>' for fact in facts)+'</body></html>'
+    expected=content.replace('<html>', '<html><head><meta charset="utf-8"><title>report</title></head>', 1)
     class Provider:
         phase=0;reviews=0;errors=[]
         def create(self,**kw):
@@ -103,7 +104,7 @@ def test_later_source_reaches_real_report_review_under_budget_pressure(tmp_path,
             if self.phase==1:return tool('request_tool_scope',{'capabilities':['web','local_files'],'tool_names':['fixture_public_source','file_write'],
                 'required_tool_names':['fixture_public_source','file_write'],'artifact_extensions':['.html']})
             if self.phase==2:return tool('fixture_public_source',{})
-            if self.phase==3:return tool('file_write',{'path':str(path),'content':expected})
+            if self.phase==3:return tool('file_write',{'path':str(path),'content':content})
             assert self.phase==4,'The reviewer restarted completed research or generation'
             return text('The comparison report is attached.\nMEDIA:'+str(path))
     model=Provider();runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');runtime.model_client=model

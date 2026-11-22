@@ -80,11 +80,15 @@ class Scenario:
     max_artifact_count: int = 0
     require_no_artifacts: bool = False
     min_xlsx_rows: int = 0
+    max_xlsx_rows: int | None = None
+    required_xlsx_record_labels: tuple[str, ...] = ()
     min_html_step_groups: int = 0
     require_no_tools: bool = False
     allow_approval_required: bool = False
     auto_approve: bool = False
     requires_email_send_flag: bool = False
+    api_fixture_env: tuple[str, ...] = ()
+    expected_capture_url: str | None = None
     runner: str = "http"
     max_numbered_blocks_per_response: int | None = None
     forbidden_after_artifact_tool_any: tuple[str, ...] = ()
@@ -226,8 +230,9 @@ SCENARIOS: dict[str, Scenario] = {
     "artifact_preflight_scope_fast_path": Scenario(
         name="artifact_preflight_scope_fast_path",
         prompt=(
-            "Create a tiny test-only artifact pack named stage_latency_probe with a one-page PDF note, "
-            "a CSV containing two rows, and a self-contained HTML page. Use concise synthetic content."
+            "Create three tiny test-only files for stage_latency_probe: a one-page PDF note, "
+            "a CSV containing two rows, and a self-contained HTML page. Use concise synthetic content. "
+            "Attach the three files individually in this reply."
         ),
         max_average_ms=120000,
         max_single_ms=120000,
@@ -235,6 +240,7 @@ SCENARIOS: dict[str, Scenario] = {
         required_text_any=(),
         forbidden_text=("couldn't attach", "task is still open"),
         required_artifact_extensions=(".pdf", ".csv", ".html"),
+        max_artifact_count=3,
     ),
     "stage_runtime_patch_regressions": Scenario(
         name="stage_runtime_patch_regressions",
@@ -364,7 +370,8 @@ SCENARIOS: dict[str, Scenario] = {
         max_average_ms=30000,
         max_single_ms=45000,
         required_text_any=("°", "F", "forecast", "weather", "temperature"),
-        forbidden_text=("could not resolve", "send me a", "ZIP code"),
+        forbidden_text=("could not resolve", "send me a", "provide your zip code", "what is your zip code",
+                        "what's your zip code", "what’s your zip code"),
         required_tool_any=("weather_forecast",),
     ),
     "profile_weather": Scenario(
@@ -673,6 +680,7 @@ SCENARIOS: dict[str, Scenario] = {
         require_nonuniform_image=True,
         min_artifact_count=1,
         runner="browser_screenshot_artifact_delivery",
+        api_fixture_env=("NULLION_LIVE_CAPTURE_SOURCE",),
     ),
     "browser_context_capture_recovery": Scenario(
         name="browser_context_capture_recovery",
@@ -682,6 +690,7 @@ SCENARIOS: dict[str, Scenario] = {
         require_image_artifact=True, require_loaded_browser_capture=True,
         require_nonuniform_image=True, min_artifact_count=1,
         runner="browser_screenshot_artifact_delivery",
+        api_fixture_env=("NULLION_LIVE_CAPTURE_SOURCE",),
     ),
     "browser_context_capture_recovery_variant": Scenario(
         name="browser_context_capture_recovery_variant",
@@ -691,6 +700,7 @@ SCENARIOS: dict[str, Scenario] = {
         require_image_artifact=True, require_loaded_browser_capture=True,
         require_nonuniform_image=True, min_artifact_count=1,
         runner="browser_screenshot_artifact_delivery",
+        api_fixture_env=("NULLION_LIVE_CAPTURE_SOURCE",),
     ),
     "browser_page_screenshot_artifact_delivery": Scenario(
         name="browser_page_screenshot_artifact_delivery",
@@ -702,6 +712,7 @@ SCENARIOS: dict[str, Scenario] = {
         required_artifact_extensions=(".png",),
         require_image_artifact=True,
         require_loaded_browser_capture=True,
+        expected_capture_url="https://example.com/",
         require_nonuniform_image=True,
         min_artifact_count=1,
     ),
@@ -1074,12 +1085,17 @@ SCENARIOS: dict[str, Scenario] = {
         max_single_ms=360000,
         required_text_any=(),
         forbidden_text=("Waiting for user input", "please provide the dataset", "paste", "large_tool_results"),
-        required_tool_all=("browser_run_js", "file_write", "spreadsheet_create"),
+        required_tool_all=("spreadsheet_create",),
+        required_tool_any=("file_download", "file_write"),
         required_artifact_extensions=(".xlsx",),
         required_artifact_names=("stage_planner_large_web_dataset_handoff.xlsx",),
         required_artifact_text_all=("Photo 001", "Photo 100", "Thumbnail URL"),
+        min_xlsx_rows=101,
+        max_xlsx_rows=101,
+        required_xlsx_record_labels=tuple(f"Photo {index:03}" for index in range(1, 101)),
         forbidden_artifact_extensions=(".csv", ".json", ".txt"),
         min_artifact_count=1,
+        max_artifact_count=1,
         runner="planner_large_web_dataset_handoff",
     ),
     "artifact_followup_retry_guard": Scenario(
@@ -2559,9 +2575,16 @@ def _run_browser_screenshot_artifact_delivery(
     )
     if runtime_db_available:
         records = [record for raw in tool_outputs for record in _walk_json_mappings(json.loads(raw))]
-        assert any(record.get("tool_name") == "browser_screenshot" and record.get("status") == "completed"
+        verified_paths = {
+            record["output"]["path"] for record in records
+            if record.get("tool_name") == "browser_screenshot" and record.get("status") == "completed"
             and isinstance(record.get("output"), dict) and record["output"].get("page_url") == cart_url
-            for record in records), f"{scenario.name}: capture did not show the owned fixture URL"
+            and isinstance(record["output"].get("path"), str) and record["output"]["path"]
+        }
+        delivered_images = [artifact for artifact in artifacts if _artifact_is_image(artifact)]
+        assert delivered_images and all(isinstance(artifact, dict)
+            and isinstance(artifact.get("path"), str) and artifact["path"] in verified_paths
+            for artifact in delivered_images), f"{scenario.name}: delivered screenshot did not show the owned fixture URL"
     scenario_download_dir = (
         download_dir / scenario.name / f"run-{index}"
         if download_dir is not None
@@ -4066,6 +4089,7 @@ def _run_planner_large_web_dataset_handoff(
         runtime_db,
         conversation_id,
         required_tool_all=scenario.required_tool_all,
+        required_tool_any=scenario.required_tool_any,
         timeout_seconds=20.0,
     )
     delivered_text = "\n\n".join(
@@ -5399,11 +5423,26 @@ def _download_and_check_artifacts(
                         f"artifact {name!r} is missing required worksheet names "
                         f"{sorted(missing_sheet_names)!r}; got {sorted(sheet_names)!r}"
                     )
-                if scenario.min_xlsx_rows > 0:
+                if scenario.min_xlsx_rows > 0 or scenario.max_xlsx_rows is not None:
                     row_count = _xlsx_row_count(data)
                     assert row_count >= scenario.min_xlsx_rows, (
                         f"artifact {name!r} contained {row_count} worksheet row(s), "
                         f"expected at least {scenario.min_xlsx_rows}"
+                    )
+                    if scenario.max_xlsx_rows is not None:
+                        assert row_count <= scenario.max_xlsx_rows, (
+                            f"artifact {name!r} contained {row_count} worksheet row(s), "
+                            f"expected no more than {scenario.max_xlsx_rows}"
+                        )
+                if scenario.required_xlsx_record_labels:
+                    from openpyxl import load_workbook
+                    workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+                    try:
+                        labels = tuple(row[0] for row in workbook.active.iter_rows(min_row=2, max_col=1, values_only=True))
+                    finally:
+                        workbook.close()
+                    assert labels == scenario.required_xlsx_record_labels, (
+                        f"artifact {name!r} did not contain the expected record labels in order"
                     )
         if suffix in {".html", ".htm"}:
             visible_text, artifact_visual_asset_count = _validate_html_visual_content(name, data)
@@ -5579,17 +5618,35 @@ def _assert_contract(
                 records.extend(_walk_json_mappings(json.loads(raw)))
             except (TypeError, ValueError):
                 continue
-        captures = [r.get("output", {}) for r in records
+        capture_records = [(r.get("invocation_id"), r["output"]) for r in records
                     if r.get("tool_name") == "browser_screenshot" and r.get("status") == "completed"
                     and isinstance(r.get("output"), dict)]
+        # Code Mode can project the same file without its page provenance.
+        native_receipts = {(invocation_id, capture["path"]) for invocation_id, capture in capture_records
+            if isinstance(capture.get("path"), str) and "session_id" in capture and "page_url" in capture}
+        descriptor_fields = {"artifact_descriptors", "artifact_path", "artifact_paths", "path"}
+        captures = [capture for invocation_id, capture in capture_records if not (
+            isinstance(invocation_id, str) and invocation_id and isinstance(capture.get("path"), str)
+            and (invocation_id, capture["path"]) in native_receipts
+            and isinstance(capture.get("artifact_descriptors"), list) and capture.keys() <= descriptor_fields)]
         navigation_sessions = {r["output"].get("session_id") for r in records
             if r.get("tool_name") in {"browser_navigate", "browser_open"}
-            and r.get("status") == "completed" and isinstance(r.get("output"), dict)}
+            and r.get("status") == "completed" and isinstance(r.get("output"), dict)
+            and isinstance(r["output"].get("session_id"), str) and r["output"]["session_id"]}
         assert captures and all(
             capture.get("session_id") in navigation_sessions
             and str(capture.get("page_url") or "").startswith(("http://", "https://"))
             for capture in captures
         ), f"{scenario.name}: missing loaded-page capture from the navigation session: {captures!r}"
+        if scenario.expected_capture_url:
+            assert all(capture["page_url"].rstrip("/") == scenario.expected_capture_url.rstrip("/") for capture in captures), (
+                f"{scenario.name}: capture does not show the requested page")
+        if scenario.require_image_artifact:
+            captured_paths = {capture.get("path") for capture in captures}
+            delivered = [artifact.get("path") for artifact in (response.get("artifacts") or ())
+                         if isinstance(artifact, dict) and _artifact_is_image(artifact)]
+            assert delivered and all(isinstance(path, str) and path and path in captured_paths for path in delivered), (
+                f"{scenario.name}: delivered image must match a loaded-page capture")
     _assert_numbered_response_shape(scenario, response)
     if scenario.forbidden_text:
         hits = [fragment for fragment in scenario.forbidden_text if fragment.lower() in lowered]
@@ -5742,6 +5799,10 @@ def shared_live_baseline(argv: list[str]) -> int:
     return result
 
 
+def missing_api_fixture_env(scenario: Scenario) -> tuple[str, ...]:
+    return tuple(name for name in scenario.api_fixture_env if not os.environ.get(name, "").strip())
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         from scripts.live_stage_provider_guard import process_provider_guard
@@ -5777,20 +5838,38 @@ def main(argv: list[str] | None = None) -> int:
                 "research_artifact_email_followup_pack",
             ])
     selected = list(dict.fromkeys(selected))
+    missing_fixtures = {
+        name: missing for name in selected
+        if (missing := missing_api_fixture_env(SCENARIOS[name]))
+    }
+    if args.scenario and missing_fixtures:
+        print(json.dumps({"ok": False, "missing_api_fixtures": missing_fixtures}))
+        return 2
+    selected = [name for name in selected if name not in missing_fixtures]
     base_url = args.base_url.rstrip("/")
     runtime_db_available = args.runtime_db.exists()
     failures: list[str] = []
-    summary: list[dict[str, Any]] = []
+    summary: list[dict[str, Any]] = [
+        {"scenario": name, "status": "skipped", "missing_api_fixtures": missing}
+        for name, missing in missing_fixtures.items()
+    ]
 
     try:
-        status = _get_json(f"{base_url}/api/status?full=1", args.timeout)
+        status = _get_json(f"{base_url}/api/status", args.timeout)
         summary.append({"scenario": "status", "ok": bool(status.get("ok", True)), "keys": sorted(status)[:20]})
-        config = _get_json(f"{base_url}/api/config", args.timeout)
-        summary.append({"scenario": "config_read", "ok": True})
+        if status.get("ok") is False:
+            raise RuntimeError("Stage is not ready")
+        config = {}
+        if "image" in selected:
+            config = _get_json(f"{base_url}/api/config", args.timeout)
+            summary.append({"scenario": "config_read", "ok": True})
     except Exception as exc:
         config = {}
-        failures.append(f"stage_preflight: {exc}")
-    if args.fail_fast and failures:
+        failure = f"Stage status or configuration could not be read ({type(exc).__name__})"
+        failures.append(f"stage_preflight: {failure}")
+        print(json.dumps({"event": "scenario_failure", "scenario": "stage_preflight",
+                          "failure": failure, "exception_type": type(exc).__name__}), flush=True)
+    if failures:
         print(json.dumps({'ok': False, 'summary': summary, 'failures': failures}))
         return 1
 

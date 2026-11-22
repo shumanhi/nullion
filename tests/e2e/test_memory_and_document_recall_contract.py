@@ -201,8 +201,8 @@ def test_memory_tools_leave_plain_requests_on_one_call_fast_path(tmp_path,monkey
                 if protocol_reply is not None: return protocol_reply
                 self.calls+=1
                 expected={'request_tool_scope','chat_history_search','memory_search'}
-                expected.add('code_mode' if code_mode=='on' else 'terminal_exec')
-                if code_mode=='read_only':expected.add('code_mode')
+                if code_mode != 'on':
+                    expected.add('terminal_exec')
                 assert self.calls==1 and {r['name'] for r in kwargs['tools']}==expected
                 return response('Hello.')
         model=Plain();start=time.perf_counter()

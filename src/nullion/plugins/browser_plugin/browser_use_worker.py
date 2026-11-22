@@ -65,6 +65,13 @@ def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, py
                     from nullion.request_progress import SOURCE_ACTIVITY_PHASES
                     if isinstance(data.get('activity_phase'), str) and data['activity_phase'] in SOURCE_ACTIVITY_PHASES:
                         counts['activity_phase'] = data['activity_phase']
+                    step = data.get('browser_step')
+                    if (counts.get('activity_phase') == 'planning_browser_step'
+                            and type(step) is int and 1 <= step <= 1000):
+                        counts['browser_step'] = step
+                        waiting = data.get('waiting_seconds')
+                        if type(waiting) is int and 12 <= waiting <= 1000:
+                            counts['waiting_seconds'] = waiting
                     if progress_callback is not None:
                         try:
                             progress_callback(counts)

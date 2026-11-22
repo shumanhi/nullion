@@ -8,8 +8,9 @@ from uuid import uuid4
 
 import pytest
 
-from tests.e2e.test_live_stage_web_matrix import catalogue, live_web, _submit
+from tests.e2e.test_live_stage_web_matrix import approve_owned_cron_delete, catalogue, live_web, _submit
 from tests.e2e.live_primary_assertions import record_primary_boundary
+from tests.e2e.live_web_artifact_assertions import raster_web
 
 pytestmark = pytest.mark.skipif(os.environ.get("NULLION_LIVE_STAGE_E2E") != "1",
                                reason="Opt-in real stage Web acceptance")
@@ -84,9 +85,8 @@ def test_live_web_owned_scheduler_rename_and_cancel(live_web):
             approvals = [f for f in frames[before:] if f.get("type") == "approval_required"]
             if approvals and not approved:
                 approval = approvals[-1]
-                assert job["id"] in json.dumps(approval) or marker in json.dumps(approval), approval
                 # Approve only the deletion of the fixture this test owns.
-                page.get_by_role("button", name="Allow once", exact=True).last.click()
+                approve_owned_cron_delete(page, approval, base, job["id"], deadline=deadline)
                 approved = True
             terminals = [f for f in frames[before:] if f.get('type') == 'done']
             if terminals and not chose_deletion and not approved:
@@ -198,7 +198,8 @@ def test_live_web_owned_cron_delivers_report_with_actual_data(live_web):
                f'with North=12 and South=19, total=31, and the marker {token}. '
                'Deliver only the finished HTML. No external lookups are needed.',
         "artifact_delivery_options":{"required_artifact_extensions":[".html"],
-            "requires_attachment_delivery":True,"html_image_delivery_mode":"file",
+            "requires_attachment_delivery":True,
+            "artifact_deliverables":[{"extension":".html","role":"file"}],
             "doctor_monitoring_enabled":False},
     }, timeout=30)
     identifier = created["job"]["id"]
@@ -223,14 +224,16 @@ def test_live_web_owned_cron_delivers_report_with_actual_data(live_web):
         if stored['last_result']=='partial_success':
             # A wrapper error remains diagnostic even when all requested report
             # bytes were produced and delivered. Accept it only with native
-            # complete-report proof and no failed underlying operation.
+            # complete-report proof and a completed write after any retries.
             from tests.e2e.test_live_stage_web_cron_recovery import _diagnostics
             runs=[row for row in _diagnostics(conversation) if row.get('event_type')=='conversation.cron_run'
                   and row.get('cron_id')==identifier]
             assert runs and runs[-1]['response_fulfilled'] is True and not runs[-1]['report_failed'],runs
             assert not runs[-1]['remaining_work'],runs[-1]
-            failures=[row for row in runs[-1]['tool_results'] if row['status']!='completed']
-            assert failures and all(row['tool_name']=='code_mode' for row in failures),failures
+            assert runs[-1]['report_content_status'] == 'complete', runs[-1]
+            assert runs[-1]['report_presentation_status'] == 'complete' and runs[-1]['report_partial'] is False, runs[-1]
+            assert any(row['tool_name']=='file_write' and row['status']=='completed'
+                       for row in runs[-1]['tool_results']), runs[-1]
         assert not errors
     finally:
         catalogue._delete_json(base + "/api/crons/" + identifier, timeout=30)
@@ -406,6 +409,7 @@ def test_live_web_browser_facts_can_become_a_generated_visual(live_web):
 
 
 def test_live_web_browser_facts_do_not_block_raster_image_generation(live_web):
+    """Provider-native proof; a local render cannot satisfy this contract."""
     config=catalogue._get_json(live_web[-1]+'/api/config',timeout=15)
     if not config.get('image_generate_enabled') or not config.get('image_generate_available'):
         pytest.skip('Stage image_generate is disabled or unavailable; preserve its configured media settings')
@@ -435,6 +439,57 @@ def test_live_web_browser_facts_do_not_block_raster_image_generation(live_web):
     (out/'result.json').write_text(json.dumps({'reply':response,'turn':turn},ensure_ascii=False,indent=2))
     assert not any(row['status']=='failed' and (row.get('output') or {}).get('reason')==
         'sourced_image_collection_failed' for row in turn.get('tool_results',[])),turn
+
+
+def test_live_web_browser_facts_can_become_a_local_png(raster_web, record_property):
+    """Source-to-PNG delivery stays testable without an image-provider charge."""
+    import hashlib
+    import io
+    from PIL import Image
+    from playwright.sync_api import expect
+
+    live_web = raster_web.surface
+    filename = 'source-facts-' + uuid4().hex[:12] + '.png'
+    response, turn, elapsed = raster_web.saved or _submit(live_web,
+        'Use browser_run_task to read the displayed price and exact stock count at '
+        'https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html. '
+        'Then use image_render to create one local PNG infographic named ' + filename + '. '
+        'Show the price, stock count and source URL in large readable text. '
+        'Use the local renderer only, without calling image_generate or an image provider. '
+        'Inspect the rendered PNG before delivery and caption it with the same two values. '
+        'Deliver only this final PNG here; do not schedule tasks or send external messages.', timeout=240)
+    rows = turn.get('tool_results', [])
+    assert any(row['tool_name'] == 'browser_run_task' and row['status'] == 'completed' for row in rows), turn
+    assert not any(row['tool_name'] == 'image_generate' for row in rows), turn
+    renders = [row['output'] for row in rows if row['tool_name'] == 'image_render' and row['status'] == 'completed']
+    assert len(renders) == 1 and len(response['artifacts']) == 1, turn
+    assert '51.77' in response['text'] and '22' in response['text'], response
+    artifact = response['artifacts'][0]
+    data, content_type = catalogue._artifact_bytes(live_web[-1], artifact, timeout=30)
+    assert data.startswith(b'\x89PNG\r\n\x1a\n'), content_type
+    assert renders[0]['image_sha256'] == hashlib.sha256(data).hexdigest(), renders
+    with Image.open(io.BytesIO(data)) as image:
+        assert image.width >= 256 and image.height >= 256, image.size
+    page = live_web[0]
+    cards = page.locator('#messages .image-artifact-card')
+    expect(cards).to_have_count(1)
+    preview = cards.locator('img.image-artifact-preview')
+    expect(preview).to_be_visible()
+    expect(preview).to_have_css('object-fit', 'contain')
+    expect(cards.get_by_role('button', name='Download', exact=True)).to_be_visible()
+    page.reload(wait_until='domcontentloaded')
+    expect(page.locator('#messages .image-artifact-card')).to_have_count(1)
+    expect(page.locator('#messages img.image-artifact-preview')).to_have_css('object-fit', 'contain')
+    record_property('raster_delivery_method', 'local_renderer')
+    if elapsed is not None:
+        record_property('source_to_png_seconds', elapsed / 1000)
+    out = Path(os.environ['NULLION_LIVE_EVIDENCE_DIR']) / 'browser-facts-local-png'
+    out.mkdir(parents=True, exist_ok=True)
+    (out / 'infographic.png').write_bytes(data)
+    (out / 'result.json').write_text(json.dumps({'reply': response, 'turn': turn,
+        'delivery_method': 'local_renderer', 'native_image_provider_verified': False,
+        'evidence_kind': 'saved_boundary_reuse' if raster_web.replay else 'fresh_generation'}, ensure_ascii=False, indent=2))
+    page.screenshot(path=str(out / 'web.png'), full_page=False)
 
 
 def test_live_web_local_read_does_not_append_activity_when_verbose_is_off(live_web):

@@ -4724,6 +4724,7 @@ def test_browser_extract_detail_merges_same_role_equivalent_prices(
         '<span class="price">$19<sup>99</sup></span>',
         '<span class="price">$19<span>99</span></span>',
         '<span class="price">19<span>99</span>€</span>',
+        '<span class="price"><span aria-hidden="true">$<span>19</span><sup>99</sup></span></span>',
     ],
 )
 def test_browser_extract_detail_never_concatenates_split_cents_as_whole_price(
@@ -4748,6 +4749,27 @@ def test_browser_extract_detail_never_concatenates_split_cents_as_whole_price(
         ]
         assert all("1999" not in value.replace(",", "") for value in rendered_prices)
         assert "price" not in record
+    finally:
+        _run(backend.close_session(session_id))
+        _run(backend.shutdown())
+
+
+def test_browser_extract_detail_uses_unique_visible_heading_matching_document_title(monkeypatch):
+    backend = _new_playwright_backend_or_skip(monkeypatch)
+    tools = BrowserTools(backend=backend, pool=BrowserSessionPool(), policy=BrowserPolicy())
+    title = "Batería recargable de alta capacidad"
+    html = (f"<title>{title} | Tienda</title><main><h1>Ayuda</h1>"
+            "<article><h1><a href='/other'>Otra oferta</a></h1><p class='price'>$99</p></article>"
+            f"<article><h1>{title}</h1><p itemprop='price'>$17</p><h1>Especificaciones</h1>"
+            "<p>Paquete de 8</p></article></main>")
+    session_id = "visible-heading-detail"
+    try:
+        _run(backend.navigate(session_id, "data:text/html;charset=utf-8," + quote(html)))
+        result = tools.browser_extract_detail(inv("browser_extract_detail", {"session_id": session_id}))
+        assert result.status == "completed"
+        record = result.output["record"]
+        assert record["title"] == title and record["price"] == "$17"
+        assert "Paquete de 8" in record["observed_text"] and "$99" not in record["observed_text"]
     finally:
         _run(backend.close_session(session_id))
         _run(backend.shutdown())
@@ -6877,17 +6899,24 @@ def test_browser_snapshot_includes_named_hidden_editable_controls(monkeypatch) -
     <html>
       <body>
         <input aria-label="Where" style="visibility:hidden; display:block; width:160px; height:20px" />
+        <nav><h2><a href="https://example.com/menu">Menu</a></h2></nav>
+        <main><a href="https://example.com/first"><h2>Primer producto</h2></a>
+        <h2><a href="https://example.com/second">Segundo producto</a></h2></main>
       </body>
     </html>
     """
     try:
         _run(backend.navigate("hidden-editable", "data:text/html," + quote(html)))
-        snapshot = tools.browser_snapshot(inv("browser_snapshot", {"session_id": "hidden-editable"}))
+        snapshot = tools.browser_snapshot(inv("browser_snapshot", {"session_id": "hidden-editable", "max_elements": 1}))
         elements = snapshot.output["snapshot"]["elements"]
 
         where = next(element for element in elements if element.get("label") == "Where")
         assert where["editable"] is True
         assert where["visible"] is False
+        assert snapshot.output["snapshot"]["heading_links"] == [
+            {"title": "Primer producto", "url": "https://example.com/first"},
+            {"title": "Segundo producto", "url": "https://example.com/second"},
+        ]
     finally:
         _run(backend.close_session("hidden-editable"))
         _run(backend.shutdown())

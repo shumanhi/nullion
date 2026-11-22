@@ -681,6 +681,65 @@ def test_web_chat_http_deferred_background_cron_keeps_visible_receipt(monkeypatc
     )
 
 
+@pytest.mark.parametrize("role", ["source", "deliverable", "compacted_internal_capture"])
+def test_web_chat_does_not_replace_reply_for_missing_source_image(monkeypatch, tmp_path, role) -> None:
+    from fastapi.testclient import TestClient
+
+    from nullion import platform_chat
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path / "workspaces"))
+    roots = workspace_storage_roots_for_principal("web:helper")
+    path = str(roots.artifacts / "capture.png")
+    reply = "La tarifa publicada es de 37 dólares."
+
+    def fake_run_platform_chat_request(runtime_arg, request):
+        output = {"artifact_paths": [path]}
+        if role == "compacted_internal_capture":
+            output.update(result_kind="source_observations", execution_audit={
+                "version": 1, "captures_are_internal": True, "deliverable_file_count": 0, "downloaded_file_count": 0,
+            })
+        else:
+            output["artifact_descriptors"] = [{"path": path, "role": role}]
+        return platform_chat.PlatformChatResponse(text=reply, artifact_paths=[path], tool_results=[
+            {"tool_name": "browser_run_task", "status": "completed", "output": output},
+        ])
+
+    monkeypatch.setattr(platform_chat, "run_platform_chat_request", fake_run_platform_chat_request)
+    app = web_app.create_app(bootstrap_persistent_runtime(tmp_path / "runtime.db"),
+        orchestrator=None, registry=ToolRegistry(filesystem_allowed_roots=[tmp_path]))
+    response = TestClient(app).post("/api/chat", json={
+        "text": "Comprueba la tarifa publicada.", "conversation_id": "web:helper"})
+    assert response.status_code == 200
+    assert response.json()["artifacts"] == []
+    if role == "deliverable":
+        assert "could not attach" in response.json()["text"]
+    else:
+        assert response.json()["text"] == reply
+
+
+@pytest.mark.parametrize("promoted", [False, True])
+def test_explicit_image_format_does_not_promote_internal_capture(tmp_path, promoted):
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.tools import ToolResult
+
+    path = str(tmp_path / "capture.png")
+    output = {"result_kind": "source_observations", "artifact_paths": [path], "execution_audit": {
+        "version": 1, "captures_are_internal": True, "downloaded_file_count": 0,
+        "deliverable_file_count": int(promoted),
+    }}
+    if promoted:
+        output["artifact_descriptors"] = [{"path": path, "role": "deliverable"}]
+    results = [ToolResult("capture", "browser_run_task", "completed", output)]
+    paths = web_app._materialize_fetch_artifact_for_web(
+        bootstrap_persistent_runtime(tmp_path / "runtime.db"),
+        prompt="Adjunta el resultado como .png.", tool_results=results,
+        principal_id="web:helper", requested_extension=".png",
+    )
+    assert paths == ([path] if promoted else [])
+
+
 def test_web_chat_platform_artifact_candidates_scrub_suppressed_helper(monkeypatch, tmp_path) -> None:
     from fastapi.testclient import TestClient
 

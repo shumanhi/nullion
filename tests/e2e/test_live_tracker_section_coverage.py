@@ -125,6 +125,7 @@ def test_section_story_appearing_after_start_delivers_exactly_one_real_web_alert
                 expect(page.locator('#live-trackers-dash')).to_contain_text('Match found', timeout=8000)
                 from nullion.chat_store import get_chat_store
                 job=app.state.live_tracker_store.get(jobs[0]['id'])
+                assert job['probe']==probe
                 messages=get_chat_store().load_messages(job['conversation_id'])
                 alerts=[m for m in messages if (m.get('metadata') or {}).get('source') == 'live_tracker']
                 assert len(alerts)==1 and job['notification_status']=='sent' and job['consecutive_errors']==0

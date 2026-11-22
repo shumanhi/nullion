@@ -17,8 +17,10 @@ def test_browser_model_uses_native_schema_without_an_extra_request(monkeypatch, 
         model_config = ConfigDict(extra='forbid')
         value: str
     calls = []
+    steps = []
     class Client:
         def create(self, **kwargs):
+            assert steps == [1], 'Progress must start before the provider call'
             calls.append(kwargs)
             assert kwargs['tools'][0]['name'] == 'browser_decision'
             assert kwargs['tools'][0]['input_schema'] == Decision.model_json_schema()
@@ -26,7 +28,7 @@ def test_browser_model_uses_native_schema_without_an_extra_request(monkeypatch, 
             if response_kind == 'incomplete': return {'completion':{'status':'incomplete','reason':'max_output_tokens'}}
             if response_kind == 'json_text': return {'content':[{'type':'text','text':json.dumps({'value':'確認'})}]}
             return {'completion':{'usage':{'input_tokens':120,'output_tokens':9}},'content':[{'type':'tool_use','name':'browser_decision','input':{'value':'確認', **({'unexpected':1} if response_kind == 'invalid_native' else {})}}]}
-    model = NullionBrowserModel(Client())
+    model = NullionBrowserModel(Client(), before_inference=steps.append)
     if response_kind in {'invalid_native','incomplete'}:
         with pytest.raises(ValueError): asyncio.run(model.ainvoke([], output_format=Decision))
     else:
