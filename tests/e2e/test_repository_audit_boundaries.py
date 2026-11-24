@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import threading
 import time
 from types import SimpleNamespace
 
@@ -93,6 +94,72 @@ def test_real_update_panel_uses_one_post_then_observes(environment,tmp_path,monk
             browser.close();playwright.stop()
     with sqlite3.connect(home/'runtime.db') as conn:
         assert conn.execute('SELECT COUNT(*) FROM update_operations').fetchone()==(1,)
+
+
+def test_telegram_update_shows_progress_until_the_terminal_reply(environment, tmp_path, monkeypatch):
+    from nullion import updater
+    from nullion.config import load_settings
+    from nullion.telegram_app import ChatOperatorService
+
+    _, runtime = environment
+    _local_release(tmp_path, monkeypatch)
+    fetch = updater._fetch_update_refs
+    allow_fetch = threading.Event()
+
+    def wait_for_remote(*args, **kwargs):
+        assert allow_fetch.wait(10), "Telegram did not show progress during the release lookup"
+        return fetch(*args, **kwargs)
+
+    monkeypatch.setattr(updater, "_fetch_update_refs", wait_for_remote)
+    settings = load_settings(env={
+        "NULLION_TELEGRAM_OPERATOR_CHAT_ID": "123",
+        "NULLION_TELEGRAM_BOT_TOKEN": "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
+    })
+    service = ChatOperatorService(runtime=runtime, settings=settings,
+        bot_token=settings.telegram.bot_token, operator_chat_id="123")
+
+    async def scenario():
+        updates = asyncio.Queue()
+        operations = []
+
+        class Sent:
+            message_id = 62
+
+            async def edit_text(self, text, **kwargs):
+                operations.append(("edit", text))
+                updates.put_nowait(text)
+
+            async def delete(self):
+                operations.append(("delete", ""))
+
+        class Message:
+            chat = SimpleNamespace(id=123)
+            message_id = 61
+            text = "/update@nullion_fixture_bot"
+            from_user = SimpleNamespace(id=123, is_bot=False)
+            reply_to_message = None
+
+            async def reply_text(self, text, **kwargs):
+                operations.append(("send", text))
+                updates.put_nowait(text)
+                return Sent()
+
+        task = asyncio.create_task(service.on_message(
+            SimpleNamespace(update_id=60, message=Message()), SimpleNamespace(bot=None)))
+        try:
+            async with asyncio.timeout(6):
+                while "Checking for an update" not in await updates.get():
+                    pass
+            assert not task.done()
+            assert len([operation for operation, _ in operations if operation == "send"]) == 1
+        finally:
+            allow_fetch.set()
+            await asyncio.wait_for(task, timeout=15)
+        assert any(operation == "send" and "Already up to date: v1.0.0" in text
+                   for operation, text in operations)
+        assert operations[-1] == ("delete", "")
+
+    asyncio.run(scenario())
 
 
 def test_profile_browser_saves_only_active_lane(environment,tmp_path,monkeypatch):

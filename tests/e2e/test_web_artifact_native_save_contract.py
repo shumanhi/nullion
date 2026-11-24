@@ -9,9 +9,12 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker Web UI')
 
 
-@pytest.mark.parametrize('extension',['.png','.pdf'])
-def test_restored_artifact_ui_save_receipt_matches_native_file_bytes(tmp_path,monkeypatch,extension):
-    from PIL import Image
+@pytest.mark.parametrize('extension,dimensions,viewport',[
+    ('.pdf',None,1280),
+    *[('.png',dimensions,viewport) for dimensions in ((480,120),(120,480)) for viewport in (390,1280)],
+])
+def test_restored_artifact_ui_save_receipt_matches_native_file_bytes(tmp_path,monkeypatch,extension,dimensions,viewport):
+    from PIL import Image,ImageDraw
     from pypdf import PdfWriter
     from playwright.sync_api import sync_playwright,expect
     from nullion import web_app
@@ -24,7 +27,14 @@ def test_restored_artifact_ui_save_receipt_matches_native_file_bytes(tmp_path,mo
     conversation='web:native-save:'+extension[1:];identity='owned-artifact-turn'
     root=artifact_root_for_principal(conversation);root.mkdir(parents=True,exist_ok=True)
     source=root/('owned-save'+extension)
-    if extension=='.png':Image.new('RGB',(120,80),'blue').save(source)
+    colors=('red','lime','blue','yellow')
+    if extension=='.png':
+        image=Image.new('RGB',dimensions,'white');draw=ImageDraw.Draw(image)
+        width,height=dimensions;dx,dy=width//4,height//4
+        for box,color in zip(((0,0,dx,dy),(width-dx,0,width-1,dy),
+                (0,height-dy,dx,height-1),(width-dx,height-dy,width-1,height-1)),colors):
+            draw.rectangle(box,fill=color)
+        image.save(source)
     else:
         writer=PdfWriter();writer.add_blank_page(width=595.28,height=841.89)
         with source.open('wb') as stream:writer.write(stream)
@@ -42,7 +52,8 @@ def test_restored_artifact_ui_save_receipt_matches_native_file_bytes(tmp_path,mo
     app=web_app.create_app(runtime,orchestrator=None,registry=ToolRegistry())
     with _UvicornThread(app,_free_port()) as server,sync_playwright() as pw:
         browser=pw.chromium.launch(headless=True)
-        context=browser.new_context();context.add_init_script(selected_artifact_conversation_script(conversation))
+        context=browser.new_context(viewport={'width':viewport,'height':900})
+        context.add_init_script(selected_artifact_conversation_script(conversation))
         page=context.new_page();requests=[];page.on('request',lambda request:requests.append(request.url)
             if request.method=='POST' and request.url==server.base_url+'/api/chat' else None)
         try:
@@ -53,6 +64,16 @@ def test_restored_artifact_ui_save_receipt_matches_native_file_bytes(tmp_path,mo
             if extension=='.png':
                 card=page.locator('.image-artifact-card').filter(has_text=source.name)
                 expect(card).to_have_count(1)
+                preview=card.locator('img.image-artifact-preview')
+                expect(preview).to_be_visible()
+                preview.evaluate('(img) => img.decode()')
+                # All four source corners must remain visible in the actual
+                # browser preview, across portrait/landscape and mobile/desktop.
+                # A cover crop loses these markers even though the file is valid.
+                rendered=Image.open(io.BytesIO(preview.screenshot())).convert('RGB')
+                pixels=set(rendered.getdata())
+                from PIL import ImageColor
+                assert all(ImageColor.getrgb(color) in pixels for color in colors), (dimensions,viewport)
                 control=card.locator('button.image-artifact-btn').nth(1)
                 expect(control).to_have_text('Download')
             else:

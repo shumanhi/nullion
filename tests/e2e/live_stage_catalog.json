@@ -457,6 +457,9 @@
     },
     "tests/e2e/test_live_stage_web_pdf_flow.py::test_live_web_code_mode_recalls_original_pdf_with_native_reference_receipt": {
       "category": "context"
+    },
+    "tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_facts_can_become_a_local_png": {
+      "category": "artifacts"
     }
   },
   "scenario_categories": {
@@ -797,6 +800,7 @@
       "test_live_web_email_pagination_follows_exact_continuation_without_query_partitioning",
       "test_live_web_browser_facts_can_become_a_generated_visual",
       "test_live_web_browser_facts_do_not_block_raster_image_generation",
+      "test_live_web_browser_facts_can_become_a_local_png",
       "test_live_web_local_read_does_not_append_activity_when_verbose_is_off",
       "test_live_web_rejected_image_provider_does_not_publish_a_placeholder"
     ],

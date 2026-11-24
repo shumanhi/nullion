@@ -92,15 +92,37 @@ def test_partial_fulfillment_is_distinct_from_failed_delivery():
     assert failed.status.value == 'failed' and not failed.delivery_succeeded
 
 
-@pytest.mark.parametrize('tampered', [False, True])
-def test_css_delivery_transform_renews_only_an_unchanged_owned_report(tmp_path, tampered):
-    from nullion.cron_delivery import _apply_responsive_html_delivery_guard
-    path = tmp_path/'report.html'; path.write_text('<!doctype html><html><body>one</body></html>')
-    result = {'cron_report_request': 'request', 'cron_report_content_receipt': bind_report_outcome(
-        'request', {'status':'partial', 'remaining_work':['Missing current observations']}, [str(path)])}
-    if tampered: path.write_text('<!doctype html><html><body>different facts</body></html>')
-    _apply_responsive_html_delivery_guard([str(path)], result=result)
-    assert partial_report_receipt('request', result['cron_report_content_receipt'], [str(path)]) is not tampered
+@pytest.mark.parametrize('changed_file', [None, 'html', 'companion'])
+def test_css_delivery_transform_renews_only_an_unchanged_owned_report(tmp_path, changed_file):
+    from nullion.cron_delivery import _CRON_RESPONSIVE_HTML_GUARD, _apply_responsive_html_delivery_guard
+
+    path = tmp_path / 'report.html'
+    document = (b'<!doctype html><html><head>\r\n<title>Report </head></title>'
+        b'<script>const closing = "</head>";</script><!-- </head> -->'
+        b'</HEAD ><body>one</body></html>')
+    path.write_bytes(document)
+    companion = tmp_path / 'sources.csv'
+    source = b'id,value\n1,one\n'
+    companion.write_bytes(source)
+    paths = [str(path), str(companion)]
+    receipt = bind_report_outcome('request',
+        {'status': 'partial', 'remaining_work': ['Missing current observations']}, paths)
+    result = {'cron_report_request': 'request', 'cron_report_content_receipt': receipt}
+    if changed_file == 'html':
+        document = document.replace(b'one', b'different facts')
+        path.write_bytes(document)
+    if changed_file == 'companion':
+        source = source.replace(b'one', b'different facts')
+        companion.write_bytes(source)
+
+    _apply_responsive_html_delivery_guard(paths, result=result)
+
+    assert partial_report_receipt('request', result['cron_report_content_receipt'], paths) is (changed_file is None)
+    if changed_file is None:
+        document = document.replace(b'</HEAD >', _CRON_RESPONSIVE_HTML_GUARD.encode() + b'</HEAD >')
+    assert path.read_bytes() == document
+    assert companion.read_bytes() == source
+    assert result['cron_report_content_receipt']['files'][str(companion.resolve())] == receipt['files'][str(companion.resolve())]
 
 
 def test_missing_required_call_cannot_be_satisfied_by_a_generated_document():

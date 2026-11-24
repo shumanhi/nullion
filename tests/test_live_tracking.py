@@ -1212,6 +1212,63 @@ def test_semantic_setup_rejects_unusable_prepared_source(fixture,status,expected
         assert result.output['validation']['problem']['code']=='missing_data'
 
 
+@pytest.mark.parametrize('history_mode,truncated,verdict,expected,model_calls', [
+    ('records', True, 'matched', 'failed', 0),
+    ('snapshot', True, 'no_match', 'failed', 0),
+    ('records', False, 'no_match', 'completed', 1),
+    (None, True, 'no_match', 'completed', 0),
+])
+def test_tracker_admission_checks_collection_coverage_before_semantic_evaluation(
+    fixture, history_mode, truncated, verdict, expected, model_calls,
+):
+    from nullion.live_tracking import observation_preparation
+    from nullion.live_tracking_tools import register_live_tracker_tools
+
+    f = fixture
+    page_url = 'https://example.test/記事/1'
+    step = {'tool_name': 'sensor_read', 'arguments': {}}
+    output = {
+        'result_kind': 'browser_item_collection',
+        'items': [{'url': page_url}],
+        'coverage': {'scope_found': True, 'candidate_count': 204 if truncated else 1,
+                     'returned_count': 1, 'truncated': truncated},
+        'source_record_collections': [{'path': ['items'], 'change_identity_fields': ['url']}],
+        'observation_readiness': {'verified': True},
+    }
+    calls = []
+
+    def evaluator():
+        calls.append(True)
+        answer = json.dumps({'status': verdict, 'summary': '記事',
+            'checked_scopes': [{'step': 0, 'section_id': None}],
+            'evidence': [{'step': 0, 'pointer': '/items/0/url', 'value': page_url}]})
+        return SimpleNamespace(create=lambda **_: {'content': [{'type': 'text', 'text': answer}]})
+
+    register_live_tracker_tools(f.registry, model_client_getter=evaluator)
+    f.registry.live_tracker_store_path = f.store.path
+    condition = ({'kind': 'semantic', 'history_mode': history_mode, 'instruction': '記事の変更を通知'}
+                 if history_mode is not None else {'kind': 'structured', 'summary': '記事',
+                    'conditions': [{'step': 0, 'pointer': '/items/0/url', 'op': 'equals', 'value': page_url}]})
+    signature = json.dumps(step, sort_keys=True)
+    context = {'conversation_id': 'web:coverage', 'prepared_observations': {signature: output},
+               'observation_preparations': {signature: observation_preparation(step, output)}}
+    result = f.registry.invoke(ToolInvocation('coverage', 'create_live_tracker', 'web:coverage', {
+        'name': '記事の観測', 'duration_seconds': 90, 'probe': [step], 'matcher': condition,
+    }, flow_context=context))
+
+    assert result.status == expected and len(calls) == model_calls
+    jobs = f.store.list('workspace_admin')
+    if expected == 'failed':
+        assert jobs == [] and result.output['ready_prepared_probes'] == []
+        assert result.output['validation'] == {'code': 'incomplete_observation', 'coverage_gaps': [
+            {'step': 0, 'truncated': True, 'returned_count': 1, 'candidate_count': 204},
+        ]}
+    else:
+        job, = jobs
+        assert job['probe'] == [step]
+        assert job['observation_baseline_set'] is (history_mode == 'records')
+
+
 def test_restart_saved_setup_is_bounded_scoped_atomic_and_idempotent(fixture):
     f = fixture
     now = utcnow()
@@ -1313,6 +1370,67 @@ def test_preparation_admission_reports_oversized_and_uses_unicode_polling_budget
     assert observation_preparation(step,{'value':float('nan')})['status']=='unsupported_source_output'
 
 
+
+def test_article_probe_fits_without_dropping_any_records():
+    import json
+    from nullion.live_tracking import MAX_PROBE_OUTPUT_CHARS, observation_preparation
+
+    records = [{'title': '記事' + 'a' * 85 + str(index),
+                'canonical_url': 'https://example.test/news/category/long-title-' + str(index) + '-' + 'b' * 68,
+                'section_heading': '観測されたニュース', 'source_index': index}
+               for index in range(63)]
+    payload = {'items': records}
+    assert len(json.dumps(payload, ensure_ascii=False)) > MAX_PROBE_OUTPUT_CHARS
+    receipt = observation_preparation({'tool_name': 'browser_extract_items', 'arguments': {}}, payload)
+    assert receipt['status'] == 'ready'
+    assert len(payload['items']) == 63
+
+
+@pytest.mark.parametrize(
+    'scope, item_count, total_count, explicit_readiness, expected_status',
+    [
+        ({'selector': '#記事 a'}, 1, 1, {}, 'ready'),
+        ({'section_heading': '最新記事'}, 1, 1, {}, 'ready'),
+        ({'selector': '#記事 a'}, 1, 2, {}, 'needs_source_readiness'),
+        ({'section_heading': '最新記事'}, 0, 0, {}, 'needs_source_readiness'),
+        ({}, 1, 1, {}, 'needs_source_readiness'),
+        ({'section_heading': '最新記事'}, 0, 0, {'ready_selector': '#loaded'}, 'ready'),
+    ],
+)
+def test_tracker_item_preparation_uses_verified_scoped_collection_or_landmark(
+    scope, item_count, total_count, explicit_readiness, expected_status,
+):
+    from nullion.live_tracking import observation_preparation
+    from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy
+    from nullion.plugins.browser_plugin.browser_session import BrowserSessionPool
+    from nullion.plugins.browser_plugin.browser_tools import BrowserTools
+
+    calls = []
+    page_url = 'https://example.test/記事'
+
+    async def run_js(_session_id, script):
+        if script == '() => location.href':
+            return page_url
+        return {
+            'url': page_url,
+            'items': [{'title': '最新記事', 'canonical_url': f'{page_url}/{i}'} for i in range(item_count)],
+            'coverage': {'scope_found': True, 'truncated': item_count < total_count,
+                         'candidate_count': total_count, 'returned_count': item_count},
+        }
+
+    async def wait_for(_session_id, selector, _url, _text, _timeout):
+        calls.append(selector)
+
+    tools = BrowserTools(backend=SimpleNamespace(run_js=run_js, wait_for=wait_for),
+                         pool=BrowserSessionPool(), policy=BrowserPolicy())
+    arguments = {**scope, **explicit_readiness, 'fields': ['title', 'canonical_url']}
+    result = tools.browser_extract_items(ToolInvocation('articles', 'browser_extract_items', 'web:articles', arguments))
+    assert result.status == 'completed', result.error
+    receipt = observation_preparation({'tool_name': 'browser_extract_items', 'arguments': arguments}, result.output)
+    assert receipt['status'] == expected_status
+    assert calls == list(explicit_readiness.values())
+
+
 def test_success_resets_only_matching_browser_precondition_failure_streak():
     from nullion.agent_orchestrator import _reset_repaired_precondition_streaks
     def key(tool,session,**other):return json.dumps({'tool_name':tool,'session_id':session,**other})
@@ -1340,6 +1458,48 @@ def test_semantic_history_uses_declared_identity_and_survives_reordering_edits_a
     assert after['records'][0]['status']=='new'
     unavailable,_=observation_identity_history([{'source_record_collections':None}])
     assert not unavailable['available']
+
+
+@pytest.mark.parametrize('truncated,rows,expected', [
+    (False, [{'url': 'https://example.test/記事'}], 1),
+    (False, [], 0),
+    (True, [{'url': 'https://example.test/記事'}], None),
+    (False, [{'title': '識別子がない'}], None),
+])
+def test_only_a_complete_prepared_collection_seeds_the_records_baseline(truncated, rows, expected):
+    from nullion.live_tracking import observation_preparation, prepared_record_identity_keys
+
+    scope = {'selector': '#記事 a', 'visible_link_count': 99, 'sample_text': ['見出し']}
+    output = {
+        'result_kind': 'browser_item_collection',
+        'items': rows,
+        'coverage': {'scope_found': True, 'candidate_count': 99 if truncated else len(rows),
+                     'returned_count': len(rows), 'truncated': truncated, 'available_scopes': [scope]},
+        'source_record_collections': [{'path': ['items'], 'change_identity_fields': ['url']}],
+        'observation_readiness': {'verified': True},
+    }
+    step = {'tool_name': 'browser_extract_items', 'arguments': {'selector': scope['selector']}}
+    receipt = observation_preparation(step, output)
+    if truncated:
+        assert receipt['collection_coverage'] == {
+            'truncated': True, 'candidate_count': 99, 'returned_count': 1, 'available_scopes': [scope],
+        }
+    keys = prepared_record_identity_keys([output])
+    assert (None if keys is None else len(keys)) == expected
+
+
+def test_incomplete_tracker_reply_reports_observed_counts_without_internal_source_details():
+    from nullion.response_fulfillment_contract import operation_failure_reply
+
+    result = ToolResult('tracker', 'create_live_tracker', 'failed', {
+        'validation_kind': 'live_tracker_invalid_plan', 'executed': False,
+        'validation': {'code': 'incomplete_observation', 'coverage_gaps': [
+            {'returned_count': 40, 'candidate_count': 204, 'available_scopes': [{'selector': '#内部'}]},
+        ]},
+    }, error='Private diagnostic')
+    reply = operation_failure_reply([result], required_tool_names=['create_live_tracker'])
+    assert '40 of 204 records' in reply and 'No new alert was created.' in reply
+    assert '#内部' not in reply and 'Private diagnostic' not in reply
 
 
 def test_projected_canonical_url_match_identity_does_not_change_with_record_order():

@@ -95,7 +95,7 @@ def test_native_image_code_mode_delivers_original_png_without_browser_navigation
                     "call_tool('image_render', " + json.dumps({"card_pages": [page], "output_path": str(self.path)}) + ")"})
             assert self.phase == 3 + int(provider_failure), "No repeated screenshot/inspection/authoring rounds"
             assert any(b.get("type") == "image" for m in kw["messages"] for b in m.get("content", []) if isinstance(b, dict))
-            return text("Your image is attached.\n\nMEDIA:" + str(self.path))
+            return text(self.caption + "\n\nMEDIA:" + str(self.path))
     model = Model()
     orchestrator = AgentOrchestrator(model_client=model)
     samples = []
@@ -113,29 +113,42 @@ def test_native_image_code_mode_delivers_original_png_without_browser_navigation
             root.mkdir(parents=True, exist_ok=True)
             model.phase = 0
             model.path = root / ("designed-" + str(index) + ".png")
+            model.caption = [
+                'Schedule 10:53 AM to 12:58 PM; restaurant 37 follows the event.',
+                '予定は10:53 AMから12:58 PMまで。その後の候補はレストラン37です。',
+                'Horario de 10:53 AM a 12:58 PM; restaurante 37 después del evento.',
+            ][index]
             started = time.monotonic()
             if surface == "web":
                 response = client.post("/api/chat", json={"text": prompt, "conversation_id": cid})
                 assert response.status_code == 200, response.text
                 artifacts = response.json()["artifacts"]
                 assert len(artifacts) == 1, (response.json(),model.errors,model.trace[-3:])
+                if not action_pending:
+                    assert model.caption in response.json()['text'], response.json()
                 response = client.get(artifacts[0]["url"])
                 assert response.status_code == 200
                 delivered = response.content
             else:
                 uploads = []
+                visible = []
                 class Message:
                     text = prompt
                     message_id = 8300 + index
                     reply_to_message = None
                     chat = SimpleNamespace(id=77, send_action=lambda **kwargs: asyncio.sleep(0))
                     async def reply_text(self, value, **kwargs):
+                        visible.append(value)
                         return SimpleNamespace(message_id=9300)
                     async def reply_document(self, document, caption=None, **kwargs):
+                        visible.append(caption or '')
                         uploads.append(document.read())
                         return SimpleNamespace(message_id=9400)
                 asyncio.run(service.on_message(SimpleNamespace(update_id=8300+index, message=Message()), SimpleNamespace(bot=None)))
                 assert len(uploads) == 1,(model.errors,model.trace[-3:])
+                from html import unescape
+                if not action_pending:
+                    assert model.caption in unescape('\n'.join(visible)), visible
                 delivered = uploads[0]
             samples.append(time.monotonic() - started)
             assert delivered == model.path.read_bytes()

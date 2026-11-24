@@ -93,22 +93,53 @@ class LiveTrackerPlanError(ValueError):
         self.validation = {"code": code, **details}
 
 
+def _encode_probe_observation(output):
+    return json.dumps(output, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def incomplete_collection_coverage(output):
+    if not isinstance(output, dict) or output.get("result_kind") != "browser_item_collection":
+        return None
+    coverage = output.get("coverage")
+    if not isinstance(coverage, dict) or coverage.get("truncated") is not True:
+        return None
+    facts = {"truncated": True}
+    for key in ("candidate_count", "returned_count"):
+        if type(coverage.get(key)) is int and coverage[key] >= 0:
+            facts[key] = coverage[key]
+    scopes = coverage.get("available_scopes")
+    if isinstance(scopes, list):
+        facts["available_scopes"] = [
+            {"selector": scope["selector"], "visible_link_count": scope["visible_link_count"],
+             "sample_text": [sample[:100] for sample in scope.get("sample_text", [])[:2]
+                             if isinstance(sample, str)] if isinstance(scope.get("sample_text"), list) else []}
+            for scope in scopes[:6]
+            if isinstance(scope, dict) and isinstance(scope.get("selector"), str)
+            and 0 < len(scope["selector"]) <= 500
+            and type(scope.get("visible_link_count")) is int and scope["visible_link_count"] > 0
+        ]
+    return facts
+
+
 def observation_preparation(step, output):
     """Same lossless admission limit at setup and polling, including Unicode."""
     try:
-        size = len(json.dumps(output, ensure_ascii=False, allow_nan=False))
+        size = len(_encode_probe_observation(output))
     except (TypeError, ValueError):
         return {"status": "unsupported_source_output", "probe": step,
                 "next_action": "read_a_json_serializable_observation"}
+    coverage = incomplete_collection_coverage(output)
+    evidence = {"collection_coverage": coverage} if coverage is not None else {}
     readiness = output.get('observation_readiness') if isinstance(output, dict) else None
     if size <= MAX_PROBE_OUTPUT_CHARS and isinstance(readiness, dict) and readiness.get('verified') is False:
         return {'status': 'needs_source_readiness', 'probe': step,
             'observed_chars': size, 'limit_chars': MAX_PROBE_OUTPUT_CHARS,
             'next_action': 'read_again_with_verified_readiness',
-            'supported_parameters': readiness.get('supported_parameters', [])}
+            'supported_parameters': readiness.get('supported_parameters', []), **evidence}
     return {"status": "ready" if size <= MAX_PROBE_OUTPUT_CHARS else "needs_narrower_source",
             "probe": step, "observed_chars": size, "limit_chars": MAX_PROBE_OUTPUT_CHARS,
-            "next_action": "reuse_exact_probe" if size <= MAX_PROBE_OUTPUT_CHARS else "narrow_and_read_source_again"}
+            "next_action": "reuse_exact_probe" if size <= MAX_PROBE_OUTPUT_CHARS else "narrow_and_read_source_again",
+            **evidence}
 
 
 class ContinuationWindowEnded(ValueError):
@@ -267,7 +298,7 @@ def validate_prepared_observations(plan, matcher, observations, preparations=Non
             raise LiveTrackerPlanError('The source needs a verified result-readiness condition before it can be repeated in a fresh worker. Re-read with an observed stable readiness landmark.',
                 code='source_readiness_unverified', step=index,
                 supported_parameters=readiness.get('supported_parameters', []))
-        size = len(json.dumps(output, ensure_ascii=False, allow_nan=False))
+        size = len(_encode_probe_observation(output))
         if size > MAX_PROBE_OUTPUT_CHARS:
             raise LiveTrackerPlanError("The prepared observation is too large for a live check; narrow the read before starting tracking",
                 code="observation_too_large", step=index, observed_chars=size, limit_chars=MAX_PROBE_OUTPUT_CHARS)
@@ -275,8 +306,20 @@ def validate_prepared_observations(plan, matcher, observations, preparations=Non
         if matcher['kind'] == 'semantic' and isinstance(coverage, dict) and coverage.get('complete') is False:
             raise LiveTrackerPlanError('This source returns an incomplete preview. Prepare a complete, scoped content read before tracking.',
                 code='incomplete_observation', step=index, coverage=coverage)
-    if matcher["kind"] == "semantic" and len(_semantic_packet(matcher, outputs)) > MAX_SEMANTIC_PACKET_CHARS:
-        raise ValueError("The prepared evidence exceeds the live evaluation limit; narrow the source before starting tracking")
+    if matcher["kind"] == "semantic":
+        coverage_gaps = [
+            {"step": index, **coverage} for index, output in enumerate(outputs)
+            if (coverage := incomplete_collection_coverage(output)) is not None
+        ]
+        if coverage_gaps:
+            raise LiveTrackerPlanError(
+                "The prepared read returned only a sample. Re-read the full requested collection using a compact "
+                "projection or separately verified complete regions. Test the exact replacement reads. "
+                "Ask before narrowing the requested coverage if a complete read cannot fit.",
+                code="incomplete_observation", coverage_gaps=coverage_gaps,
+            )
+        if len(_semantic_packet(matcher, outputs)) > MAX_SEMANTIC_PACKET_CHARS:
+            raise ValueError("The prepared evidence exceeds the live evaluation limit; narrow the source before starting tracking")
     if matcher["kind"] == "structured":
         for row in matcher["conditions"]:
             if json_pointer(outputs[row["step"]], row["pointer"]) is _MISSING:
@@ -331,6 +374,25 @@ def observation_identity_history(outputs, seen=(), baseline_set=False):
                 records.append({"step": step, "pointer": pointer+"/"+str(index),
                     "status": "baseline" if not baseline_set else "seen_before" if key in seen else "new"})
     return {"available": available, "baseline_established": bool(baseline_set), "records": records}, tuple(dict.fromkeys(keys))
+
+
+def prepared_record_identity_keys(outputs):
+    """Use setup as the baseline only when the source attests every record."""
+    expected_count = 0
+    for output in outputs:
+        if not isinstance(output, dict) or not output.get("source_record_collections"):
+            continue
+        coverage = output.get("coverage")
+        if (output.get("result_kind") != "browser_item_collection" or not isinstance(coverage, dict)
+                or coverage.get("scope_found") is not True or coverage.get("truncated") is not False
+                or type(count := coverage.get("returned_count")) is not int or count < 0
+                or coverage.get("candidate_count") != count):
+            return None
+        expected_count += count
+    history, keys = observation_identity_history(outputs)
+    if history["available"] and len(keys) == expected_count <= MAX_OBSERVATION_IDENTITIES:
+        return keys
+    return None
 
 
 def snapshot_plan_binding(probe, probe_contexts=()):
@@ -877,6 +939,7 @@ class LiveTrackerStore:
         notify_on_expiry=True,
         require_start_receipt=False,
         initial_comparison_snapshot=None,
+        initial_observation_identity_keys=None,
         stop_after_match=True,
         now=None,
     ):
@@ -919,8 +982,8 @@ class LiveTrackerStore:
             baseline=None,
             comparison_snapshot=(json.loads(json.dumps(initial_comparison_snapshot, allow_nan=False))
                 if initial_comparison_snapshot is not None else None),
-            seen_observation_keys=[],
-            observation_baseline_set=False,
+            seen_observation_keys=list(initial_observation_identity_keys or ()),
+            observation_baseline_set=initial_observation_identity_keys is not None,
             notify_on_expiry=notify_on_expiry,
             notification_status=None,
             require_start_receipt=require_start_receipt,
@@ -1938,7 +2001,7 @@ class LiveTrackerEngine:
                                    if isinstance(output.get("observation_recovery"), dict) else {})},
                         )
                     }
-                encoded = json.dumps(result.output, ensure_ascii=False, allow_nan=False)
+                encoded = _encode_probe_observation(result.output)
                 readiness = result.output.get('observation_readiness') if isinstance(result.output, dict) else None
                 if isinstance(readiness, dict) and readiness.get('verified') is False:
                     return {'outcome': Observation('source_error', reason='source_readiness_unverified',

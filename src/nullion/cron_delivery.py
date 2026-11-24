@@ -11,7 +11,7 @@ from nullion.research_budget import research_scope
 
 import base64
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -422,8 +422,16 @@ def record_interrupted_cron_delivery_runs(
 
 
 def _manual_cron_failure_detail(reason: str, error: str) -> str:
+    if reason == "cron_required_artifact_missing":
+        return "  Some required files could not be verified for delivery."
+    if reason == "cron_run_unfulfilled_delivery_contract":
+        return "  The run stopped before its required results could be verified for delivery."
+    if reason == "cron_report_content_receipt_changed":
+        return "  A file changed after verification, so delivery was stopped."
     if reason == "cron_run_model_timeout":
-        return "  Reason: Model/provider response timed out before the scheduled task finished."
+        return "  The model timed out before the scheduled task finished."
+    if reason == "cron_run_exception":
+        return "  The scheduled task stopped before it finished. Try running it again."
     if reason == "cron_run_reached_iteration_limit":
         return "  Reason: Scheduled task stopped before producing a deliverable result."
     if reason == "cron_run_waiting_for_approval" or reason == "approval_required":
@@ -439,11 +447,7 @@ def _manual_cron_failure_detail(reason: str, error: str) -> str:
     if reason == "cron_run_without_completed_tool_evidence":
         return "  Reason: Scheduled task did not complete a data-gathering tool before producing a result."
     if reason == "cron_run_account_connection_unavailable":
-        return f"  Reason: {error or 'Account connection is unavailable. Reconnect or update the connection, then try again.'}."
-    if error and error != reason:
-        return f"  Reason: {error}."
-    if reason:
-        return f"  Reason: {reason}."
+        return f"  {error or 'Account connection is unavailable. Reconnect or update the connection, then try again.'}"
     return "  The run ended before a result could be delivered."
 _CRON_SENSITIVE_ACCOUNT_TOOLS = frozenset(
     {
@@ -625,8 +629,35 @@ def _cron_artifact_delivery_contract(job: object) -> tuple[bool, tuple[str, ...]
             extension = f".{extension}"
         if re.fullmatch(r"\.[a-z0-9]{1,16}", extension) and extension not in extensions:
             extensions.append(extension)
-    required = options.get("requires_attachment_delivery") is True or bool(extensions)
-    return required, tuple(extensions)
+    from nullion.scheduled_artifact_contract import extension_requirements
+    slots = _saved_cron_deliverables(job)
+    required = (options.get("requires_attachment_delivery") is True or bool(extensions)
+                or any(slot["required"] for slot in slots))
+    return required, tuple(dict.fromkeys((*extensions, *extension_requirements(slots))))
+
+
+def _has_saved_cron_attachment_contract(job: object) -> bool:
+    options = getattr(job, "artifact_delivery_options", None)
+    return isinstance(options, dict) and any(
+        key in options for key in ("requires_attachment_delivery", "required_artifact_extensions",
+                                   "required_extensions", "artifact_deliverables")
+    )
+
+
+def _saved_cron_deliverables(job):
+    from nullion.scheduled_artifact_contract import normalize_deliverables
+    options = getattr(job, "artifact_delivery_options", None)
+    return normalize_deliverables(options["artifact_deliverables"]) if (
+        isinstance(options, dict) and "artifact_deliverables" in options) else ()
+
+
+def _cron_completion_attachment_contract(job, state):
+    from nullion.agent_orchestrator import _required_attachment_extensions_from_turn_state
+    required, extensions = _cron_artifact_delivery_contract(job)
+    if _has_saved_cron_attachment_contract(job):
+        return required, extensions
+    extensions = _required_attachment_extensions_from_turn_state(state)
+    return bool(extensions), extensions
 
 
 def _resolve_missing_cron_artifact_contract(
@@ -639,9 +670,7 @@ def _resolve_missing_cron_artifact_contract(
     instructions so an edit cannot reuse an old contract.
     """
     options = getattr(job, "artifact_delivery_options", None)
-    if isinstance(options, dict) and (
-        "requires_attachment_delivery" in options or "required_artifact_extensions" in options
-    ):
+    if _has_saved_cron_attachment_contract(job):
         return job
     from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
     task = str(getattr(job, "task", "") or "")
@@ -1555,7 +1584,7 @@ def _recover_typed_html_artifact_after_terminal_limit(
             ), review_attempts=result.get("cron_artifact_review_attempts", []))
         return False
 
-    from nullion.artifacts import artifact_root_for_principal
+    from nullion.artifacts import artifact_root_for_principal, normalize_html_document
 
     safe_name = re.sub(r"[^a-z0-9]+", "-", str(getattr(job, "name", "") or "scheduled-report").casefold()).strip("-")
     safe_name = (safe_name[:72].rstrip("-") or "scheduled-report")
@@ -1563,7 +1592,8 @@ def _recover_typed_html_artifact_after_terminal_limit(
     artifact_root.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_root / f"{safe_name}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}.html"
     try:
-        artifact_path.write_text(report, encoding="utf-8")
+        artifact_path.write_text(normalize_html_document(report, title=str(getattr(job, "name", "") or "Scheduled report")),
+                                 encoding="utf-8")
     except OSError:
         logger.warning("Could not write structured cron timeout recovery artifact", exc_info=True)
         if record_preflight is not None:
@@ -1703,6 +1733,8 @@ def _cron_review_only_uncertainty(job: object, result: dict[str, object]) -> boo
 
 def _prepared_cron_artifact_delivery_satisfied(job, result, *, content_receipt) -> bool:
     """Reconcile owned partial bytes with delivery, not research completion."""
+    if (result.get("response_presentation") or {}).get("missing_html_variants"):
+        return False
     from nullion.report_completion import partial_report_receipt
     from nullion.artifact_validation import validate_artifact_paths
     from nullion.artifacts import artifact_format_extension, normalize_artifact_extensions
@@ -1721,38 +1753,55 @@ def _partial_cron_report_available(job: object, result: dict[str, object], *, se
         return result.get('response_fulfilled') is not True
     if ((_cron_alert_delivery_mode(job) or result.get("cron_alert_delivery_mode")) == CRON_ALERT_DELIVERY_MODE_VERIFIED_MATCHES_ONLY
             or any(result.get(key) for key in ("suspended_for_approval", "cron_run_cancelled",
-                "raw_tool_payload_blocked", "cron_delivery_failed", "cron_verification_failed"))
-            or result.get("artifact_delivery_satisfied") is not True):
+                "raw_tool_payload_blocked", "cron_delivery_failed", "cron_verification_failed"))):
         return False
     from nullion.source_selection import pending_source_selection
     if pending_source_selection(result.get("tool_results") or ()):
         return False
-    from nullion.report_completion import partial_report_receipt
+    from nullion.artifact_lifecycle import artifact_candidate_versions, identity, manifest_delivery_paths
+    from nullion.report_completion import partial_report_receipt, report_receipt_matches
     from nullion.artifact_validation import validate_artifact_paths
     paths = (result.get("artifacts") or []) if selected_paths is None else selected_paths
     request = str(getattr(job, "task", "") or "") if job is not None else str(result.get("cron_report_request") or "")
-    return (partial_report_receipt(request,
-        result.get("cron_report_content_receipt"), paths) and validate_artifact_paths(paths).ok)
+    receipt = result.get("cron_report_content_receipt")
+    if result.get("artifact_delivery_satisfied") is True:
+        return partial_report_receipt(request, receipt, paths) and validate_artifact_paths(paths).ok
+    if result.get("artifact_delivery_required") is not True or result.get("response_fulfilled") is not False:
+        return False
+    tool_results = result.get("tool_results")
+    selected = manifest_delivery_paths(paths, tool_results)
+    producers = artifact_candidate_versions(tool_results)
+    return bool(selected and all(identity(path) in producers for path in selected)
+                and len(selected) == len(paths) and report_receipt_matches(request, receipt, selected)
+                and validate_artifact_paths(selected).ok)
 
 
-def _filter_cron_delivery_media_to_required_extensions(job: object, text: str) -> str:
+def _filter_cron_delivery_media_to_required_extensions(job: object, text: str, result=None) -> str:
     options = getattr(job, "artifact_delivery_options", None)
     if not isinstance(options, dict) or options.get("deliver_required_extensions_only") is not True:
         return str(text or "")
     required, extensions = _cron_artifact_delivery_contract(job)
-    if not required or not extensions:
+    slots = (result or {}).get("cron_artifact_deliverables") or _saved_cron_deliverables(job)
+    if not required and not slots:
         return str(text or "")
 
-    from nullion.artifacts import parse_media_directive_line
+    from nullion.artifacts import artifact_format_extension, normalize_artifact_extensions, parse_media_directive_line
+    from nullion.artifact_lifecycle import identity
+    from nullion.scheduled_artifact_contract import match_deliverables
 
-    allowed = set(extensions)
+    selected = (result or {}).get("artifacts") or ()
+    tool_results = (result or {}).get("tool_results") or ()
+    _, role_paths = match_deliverables(
+        [{**slot, "required": True} for slot in slots], selected, tool_results, registry=None)
+    allowed = set(normalize_artifact_extensions(extensions))
     kept: list[str] = []
     for line in str(text or "").splitlines():
         directive = parse_media_directive_line(line)
         if directive is None:
             kept.append(line)
             continue
-        if Path(str(directive.path or "")).suffix.lower() in allowed:
+        if (artifact_format_extension(directive.path or "") in allowed
+                or directive.path and identity(directive.path) in role_paths):
             kept.append(line)
         elif directive.prefix:
             kept.append(directive.prefix)
@@ -1801,9 +1850,12 @@ def cron_agent_prompt(job: object, *, label: str, run_context: dict[str, str] | 
     window = execution_window_context(getattr(job, "execution_window", None),
         datetime.fromisoformat(run_context["current_datetime"]) if run_context else None)
     typed_contract = ""
+    slots = _saved_cron_deliverables(job)
+    if slots:
+        typed_contract += "- Saved final deliverables: " + json.dumps(slots, ensure_ascii=False) + ".\n"
     if requires_attachment:
         formats = ", ".join(required_extensions) if required_extensions else "the configured artifact format"
-        typed_contract = (
+        typed_contract += (
             "- Typed runtime contract: this run is incomplete until it creates and delivers a current-run "
             f"artifact in: {formats}. A text summary cannot replace that artifact.\n"
         )
@@ -1832,7 +1884,13 @@ def cron_agent_prompt(job: object, *, label: str, run_context: dict[str, str] | 
         f"report_delivery_context: {json.dumps(report_delivery_context(artifact_delivery_required=requires_attachment))}\n"
         f"{typed_contract}"
         "- Cron may deliver text, file attachments, both, or no message, depending on the task.\n"
-        "- If a file/report/export is expected, create it and attach it with a MEDIA line.\n"
+        "- When planning required files, declare them in the typed artifact_extensions and artifact_deliverables "
+        "fields of request_tool_scope before research. Give source images and derived images separate roles. "
+        "Use image_render for a derived visual that can be authored from captured findings. "
+        "Once a requested image role is satisfied by a verified artifact, reuse that file. "
+        "If the image provider is unavailable and the task permits a derived visual, use the local card renderer through image_render. "
+        "Use inspect_retained_evidence directly when offered, using owned receipt IDs. "
+        "Create each file and attach it with a MEDIA line. Bundle linked HTML and its local assets in a portable ZIP.\n"
         "- For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, use "
         "structured title/sections/slides/text pages so the artifact tool can produce a readable report-quality "
         "layout; do not deliver raw browser screenshots, loose image attachments, or unformatted text dumps as "
@@ -2092,11 +2150,16 @@ class _ScheduledCompletionPreparer:
         if key in self._attempted:
             return None
         self._attempted.add(key)
-        required, extensions = _cron_artifact_delivery_contract(self.job)
+        required, extensions = _cron_completion_attachment_contract(self.job, state)
+        from nullion.scheduled_artifact_contract import extension_requirements, scoped_deliverables, missing_deliverables
+        slots = scoped_deliverables(state)
+        missing_slots = missing_deliverables(slots, paths, previous, state["tool_registry"])
+        required = required or any(slot["required"] for slot in slots)
+        from nullion.artifacts import artifact_format_extension
         from nullion.artifact_validation import validate_artifact_paths
         valid_paths = bool(paths) and validate_artifact_paths(paths).ok
-        valid_files = valid_paths and all(any(Path(path).suffix.lower() == extension for path in paths)
-                                        for extension in extensions)
+        standalone_extensions = set(extensions) - set(extension_requirements(slots))
+        valid_files = valid_paths and not missing_slots and standalone_extensions <= {artifact_format_extension(path) for path in paths}
         flow = state.get('tool_flow_context') or {}
         execution = flow.get('scheduled_execution_context') or {}
         from nullion.agent_orchestrator import _completion_review_scope_contract
@@ -2110,6 +2173,7 @@ class _ScheduledCompletionPreparer:
                 'missing_callable_required_tool_names', 'unavailable_required_tool_names',
                 'required_tool_attempt_statuses')},
             artifact_delivery_required=required, artifact_delivery_satisfied=not required or valid_files,
+            cron_artifact_deliverables=list(slots), cron_missing_artifact_deliverables=list(missing_slots),
             required_artifact_extensions=list(extensions), response_fulfilled=None,
             cron_recovery_tool_names=[spec.name for spec in state['tool_registry'].list_specs()],
             **dict(state.get('completion_interruption') or {}))
@@ -2123,8 +2187,9 @@ class _ScheduledCompletionPreparer:
                 cron_material_outcome_contract=[asdict(row) for row in review.material_requirements],
                 cron_presentation_assistance_pending=True)
         before = outcome_binding(request, {}, text, previous, paths)
-        _recover_typed_html_artifact_after_terminal_limit(self.job, self.conversation_id, self.payload,
-            model_client=self.model_client, record_preflight=self.record_preflight)
+        if not slots:
+            _recover_typed_html_artifact_after_terminal_limit(self.job, self.conversation_id, self.payload,
+                model_client=self.model_client, record_preflight=self.record_preflight)
         interrupted = any((state.get('completion_interruption') or {}).get(key) for key in
             ('model_timed_out', 'model_response_failed', 'raw_tool_payload_blocked', 'reached_iteration_limit'))
         incomplete_presentation = (state.get('response_presentation') or {}).get('fulfillment_satisfied') is False
@@ -2136,8 +2201,9 @@ class _ScheduledCompletionPreparer:
             invalid_retained = not _retained_cron_text_available(self.job, prior)
         leaked_evidence = _cron_result_leaked_internal_tool_output(self.payload, text)
         empty_with_evidence = not str(text or '').strip() and _cron_result_has_completed_tool_evidence(self.payload)
-        compose_text = review is not None or (not required and (
-            interrupted or incomplete_presentation or invalid_retained or leaked_evidence or empty_with_evidence))
+        missing_files = required and not self.payload.get('artifact_delivery_satisfied')
+        compose_text = not missing_files and (review is not None or (not required and (
+            interrupted or incomplete_presentation or invalid_retained or leaked_evidence or empty_with_evidence)))
         if compose_text:
             self.payload['cron_presentation_assistance_pending'] = True
         if compose_text and not self.payload.get('cron_report_delivery_gate'):
@@ -2568,6 +2634,7 @@ def _run_single_agent_cron_turn(
         "cron_id": str(getattr(job, "id", "") or ""),
         "cron_name": str(getattr(job, "name", "") or ""),
         "planned_action_tool_names": list(getattr(connector_scope, "write_tool_names", ())),
+        "scheduled_chat_delivery_mode": getattr(connector_scope, "chat_delivery_mode", ""),
         "scheduled_source_scope": source_scope_contract,
         "scheduled_execution_context": {
             **run_context,
@@ -2581,6 +2648,8 @@ def _run_single_agent_cron_turn(
             **({'prior_delivery_history':prior_delivery_context} if prior_delivery_context is not None else {}),
         },
         "requires_artifact_delivery": requires_artifact_delivery,
+        **({"scheduled_artifact_deliverables": list(_saved_cron_deliverables(job))}
+           if "artifact_deliverables" in (getattr(job, "artifact_delivery_options", None) or {}) else {}),
         # The common agent owner reviews the saved request and prepared
         # document bytes before the scheduler performs transport delivery.
         "producer_iteration_budget_fixed": True,
@@ -2665,23 +2734,32 @@ def _run_single_agent_cron_turn(
     def prepare_result(result):
         from nullion.producer_completion import clear_review_result
         clear_review_result(result)
+        from nullion.artifacts import artifact_format_extension
+        from nullion.artifact_validation import validate_artifact_paths
+        retained_results = list(getattr(result, 'tool_results', ()) or ())
+        required_formats = tuple(dict.fromkeys(
+            (*required_artifact_extensions, *(getattr(result, "required_artifact_extensions", ()) or ()))))
         requires_files = requires_artifact_delivery or bool(getattr(result, 'artifact_delivery_required', False))
         selected_files = list(getattr(result, 'artifacts', ()) or ())
-        from nullion.artifact_validation import validate_artifact_paths
-        available_files = bool(selected_files) and validate_artifact_paths(selected_files).ok if requires_files else True
+        from nullion.scheduled_artifact_contract import extension_requirements, scoped_deliverables
+        slots = scoped_deliverables({"tool_flow_context": flow_context, "tool_results": retained_results})
+        standalone_extensions = set(required_formats) - set(extension_requirements(slots))
+        available_files = not requires_files or (bool(selected_files) and validate_artifact_paths(selected_files).ok
+            and standalone_extensions <= {artifact_format_extension(path) for path in selected_files})
         result_payload = {
             "text": getattr(result, "final_text", "") or "",
-            "tool_results": list(getattr(result, "tool_results", ()) or ()),
-            "artifacts": list(getattr(result, "artifacts", ()) or ()),
+            "tool_results": retained_results,
+            "artifacts": selected_files,
             "suspended_for_approval": bool(getattr(result, "suspended_for_approval", False)),
             "approval_id": getattr(result, "approval_id", None),
             "reached_iteration_limit": bool(getattr(result, "reached_iteration_limit", False)),
             "raw_tool_payload_blocked": bool(getattr(result, "raw_tool_payload_blocked", False)),
             "response_fulfilled": getattr(result, "response_fulfilled", None),
             "model_timed_out": bool(getattr(result, "model_timed_out", False)),
-            "artifact_delivery_required": requires_artifact_delivery or bool(getattr(result, "artifact_delivery_required", False)),
+            "model_response_failed": bool(getattr(result, "model_response_failed", False)),
+            "artifact_delivery_required": requires_files,
             "artifact_delivery_satisfied": available_files and bool(getattr(result, "artifact_delivery_satisfied", True)),
-            "required_artifact_extensions": list(required_artifact_extensions or getattr(result, "required_artifact_extensions", ()) or ()),
+            "required_artifact_extensions": list(required_formats),
             "response_presentation": dict(getattr(result, "response_presentation", {}) or {}),
             'prepared_answer': getattr(result, 'prepared_answer', None),
             'completion_checkpoint': getattr(result, 'completion_checkpoint', None),
@@ -2728,12 +2806,23 @@ def _run_single_agent_cron_turn(
         for key, value in producer_metadata.items():
             if key.startswith('cron_') or key == '_cron_text_report_candidate':
                 result_payload[key] = value
+        from nullion.scheduled_artifact_contract import missing_deliverables, scoped_deliverables
+        resolved_slots = scoped_deliverables({"tool_flow_context": flow_context,
+            "tool_results": result_payload.get("tool_results") or ()})
+        if resolved_slots:
+            result_payload['cron_artifact_deliverables'] = list(resolved_slots)
+            result_payload['cron_missing_artifact_deliverables'] = list(missing_deliverables(resolved_slots,
+                result_payload.get("artifacts") or (), result_payload.get("tool_results") or (), execution_registry))
+        if producer_metadata.get('model_response_failed') is True:
+            result_payload['model_response_failed'] = True
         # Completion can remain false after an unfinished source step or an
         # unavailable review. Delivery still owns the unchanged prepared files:
         # an overall fulfillment flag is not a missing-file receipt. Reconcile
         # only the content owner's byte-bound report with the saved delivery
         # contract, retaining all ordinary cancellation/approval/delivery gates.
-        if _prepared_cron_artifact_delivery_satisfied(job, result_payload,
+        if result_payload.get('cron_missing_artifact_deliverables'):
+            result_payload.update(artifact_delivery_required=True, artifact_delivery_satisfied=False)
+        elif _prepared_cron_artifact_delivery_satisfied(job, result_payload,
                 content_receipt=producer_metadata.get('cron_report_content_receipt')):
             result_payload['artifact_delivery_satisfied'] = True
         from nullion.agent_orchestrator import _CompletionReviewHandoff
@@ -2850,6 +2939,8 @@ def _run_single_agent_cron_turn(
                 result_payload.pop('cron_report_failed', None)
                 _record_preflight('scheduled_budget_approval_created', approval_id=approval_id,
                     used_model_rounds=used_rounds, execution_budget=execution_budget)
+        if (result_payload.get("artifact_delivery_required") and not result_payload.get("artifact_delivery_satisfied")):
+            result_payload["response_fulfilled"] = False
         if (not result_payload.get("suspended_for_approval")
                 and not _partial_cron_report_available(job, result_payload)) and (
             (result_payload.get("artifact_delivery_required") and not result_payload.get("artifact_delivery_satisfied"))
@@ -2936,6 +3027,8 @@ def _cron_report_failure_notice(result: dict[str, object]) -> str:
     from nullion.response_fulfillment_contract import operation_failure_reply
     from nullion.browser_capture_contract import repaired_browser_results
     retry_notice = _cron_retry_notice(result)
+    if result.get("reason") == "cron_required_artifact_missing":
+        return "The scheduled task could not verify all required files for delivery. " + retry_notice
     if result.get("cron_outcome_review_disposition") in {"retry", "needs_user_input", "needs_approval", "blocked"}:
         notice = result.get("cron_outcome_review_notice")
         if isinstance(notice, str) and notice.strip():
@@ -3382,8 +3475,8 @@ def _repair_cron_agent_final_text_if_needed(
             record_preflight("completion_required", finding_chars=len(findings),
                 remaining_work=_cron_safe_remaining_work(result.get("cron_remaining_work")))
 
-    # Inspections, protocol correction and transport retries share the writer's
-    # existing allowance. A timed-out call cannot restart another full window.
+    # Final composition has one deadline for retained-evidence inspection and
+    # retries. The earlier research writer may already have spent its allowance.
     repair_deadline = time.monotonic() + 60
     from nullion.research_budget import current_budget
     if (budget := current_budget()) is not None and budget.active:
@@ -3428,8 +3521,9 @@ def _repair_cron_agent_final_text_if_needed(
                     system=_cron_final_repair_system_prompt(),
                 )
                 from nullion.research_budget import prepare_model_request, call_model
-                prepare_model_request(options)
-                response = call_model(model_client.create, options, cancellation_checker=cancellation_checker)
+                prepare_model_request(options, production=True)
+                response = call_model(model_client.create, options, cancellation_checker=cancellation_checker,
+                    production=True)
                 failure_phase = 'response_processing'
                 if cancellation_checker is not None and cancellation_checker():
                     return
@@ -4201,7 +4295,7 @@ def manual_cron_silent_delivery_text(
             return "This task's tracking window has not started. Checks begin " + format_user_datetime(start) + "."
         return "This task's tracking window has not started yet."
     if isinstance(result, dict) and result.get('cron_report_delivery_gate'):
-        return "The saved delivery condition was not met, so no report was generated. The schedule remains enabled."
+        return "The saved delivery condition was not met, so no report was generated."
     return "There was nothing new to report."
 
 
@@ -4297,6 +4391,10 @@ def manual_cron_terminal_status_text(
     elif status in {'unknown', 'partial'}:
         row = f"! Delivery unconfirmed: {label} finished processing."
         detail = "  Check this chat before requesting a resend; automatic upload replay has stopped."
+    elif (status in {"sent", "saved"} and (result_payload.get("execution_outcome") or {}).get("status")
+            == "partially_succeeded"):
+        row = f"! Partial result: {label} finished with some work unverified."
+        detail = "  The verified result is available in this chat."
     elif failed:
         detail = _manual_cron_failure_detail(reason, str(result_payload.get("error") or ""))
         row = f"! Failed: {label} could not complete."
@@ -4364,11 +4462,11 @@ def start_manual_cron_background_delivery(
             logger.debug("Could not deliver manual cron status update", exc_info=True)
             return False
 
-    def _emit_terminal_status(status_text: str) -> None:
+    def _emit_terminal_status(status_text: str) -> bool:
         if terminal_status_delivered.is_set():
-            return
+            return True
         terminal_status_delivered.set()
-        _emit_status_update(status_text, terminal=True)
+        return _emit_status_update(status_text, terminal=True)
 
     def _cancel_background_run() -> bool:
         if completed_event.is_set() or cancel_event.is_set():
@@ -4436,7 +4534,10 @@ def start_manual_cron_background_delivery(
             if before_run is not None:
                 cleanup = before_run()
             runner = workflow_runner or run_cron_delivery_workflow
-            runner_kwargs: dict[str, object] = {"label": label, "callbacks": callbacks}
+            runner_callbacks = (
+                replace(callbacks, notify_terminal_failure=False) if status_update_callback else callbacks
+            )
+            runner_kwargs: dict[str, object] = {"label": label, "callbacks": runner_callbacks}
             try:
                 runner_signature = inspect.signature(runner)
             except (TypeError, ValueError):
@@ -4479,9 +4580,17 @@ def start_manual_cron_background_delivery(
             completed_event.set()
             status_terminal.set()
             status_stop.set()
-            _emit_terminal_status(
+            status_confirmed = _emit_terminal_status(
                 manual_cron_terminal_status_text(job, label=label, result=result, error=error),
             )
+            if status_update_callback and not status_confirmed and not cancel_event.is_set():
+                failure_result = result or (_cron_agent_exception_result(error) if error else {})
+                reason = str(failure_result.get("reason") or "")
+                if reason in _CRON_TERMINAL_NOTICE_REASONS and "cron_failure_notice_sent" not in failure_result:
+                    channel = callbacks.effective_channel(job)
+                    target = callbacks.delivery_target(job, channel)
+                    _notify_cron_terminal_failure(job, channel, target, cron_conversation_id(job, channel, target),
+                                                  label, failure_result, callbacks)
             if cleanup is not None:
                 try:
                     cleanup()
@@ -4594,15 +4703,15 @@ def scheduled_task_delivery_text(job: object, text: str, *, run_label: str | Non
     """Format a user-visible scheduled task delivery header."""
     name = str(getattr(job, "name", "") or "Scheduled task").strip() or "Scheduled task"
     label = str(run_label or "Scheduled task").strip() or "Scheduled task"
-    body = str(text or "").strip()
-    from nullion.chat_text import UserMessage, render_user_message
+    from nullion.chat_text import UserMessage, render_report_reply, render_user_message
+
+    body = (render_report_reply(text) or "").strip()
     current_header = render_user_message(UserMessage(title=f'{label.upper()}: {name}', kind='scheduled'))
     if body == current_header or body.startswith(current_header + '\n'):
         return body
     timestamp_suffix, normalized_body = _strip_leading_cron_report_heading(body, name)
     if timestamp_suffix or normalized_body != body:
         body = normalized_body
-    from nullion.chat_text import UserMessage, render_user_message
     title=f'{label.upper()}: {name}'
     if timestamp_suffix:
         title += ' — ' + timestamp_suffix
@@ -4923,7 +5032,9 @@ def _cron_result_account_connection_failure(result: dict[str, object]) -> str | 
                 provider = provider_id.strip()
             else:
                 provider = error.split(" requires ", 1)[0].strip() or provider
-            return f"{provider} is missing required connection configuration: {error}"
+            if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", provider):
+                provider = tool_name
+            return f"{provider} is missing required connection configuration. Reconnect or update the connection, then try again."
     return None
 
 
@@ -5169,9 +5280,11 @@ def _inline_html_local_image_assets(
     html_path = Path(str(html_path_text or "")).expanduser()
     if html_path.suffix.lower() not in {".html", ".htm"}:
         return set()
+    from nullion.artifacts import decode_html_document, normalize_html_document
+
     try:
-        original = html_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        original = decode_html_document(html_path.read_bytes())
+    except (OSError, LookupError, UnicodeError):
         return set()
     support_assets: set[str] = set()
     remote_image_cache: dict[str, str | None] = {}
@@ -5239,7 +5352,7 @@ def _inline_html_local_image_assets(
     updated = _HTML_LOCAL_IMAGE_SRC_RE.sub(replace, original)
     if changed and updated != original:
         try:
-            html_path.write_text(updated, encoding="utf-8")
+            html_path.write_text(normalize_html_document(updated, title=html_path.stem), encoding="utf-8")
         except OSError:
             return set()
     return support_assets
@@ -5271,8 +5384,10 @@ def _prepare_cron_deliverable_paths_for_delivery(
     principal_id: str | None = None,
     collected_assets: dict[str, str] | None = None,
 ) -> tuple[tuple[str, ...], set[str]]:
-    """Make HTML artifacts self-contained and suppress their local support files."""
+    """Apply legacy HTML presentation when there is no reviewed file selection."""
     unique_paths = tuple(dict.fromkeys(path for path in paths if str(path or "").strip()))
+    if html_image_delivery_mode == HTML_IMAGE_DELIVERY_MODE_LINKED:
+        return unique_paths, set()
     support_assets: set[str] = set()
     for path in unique_paths:
         support_assets.update(
@@ -5539,6 +5654,32 @@ def _cron_delivery_candidate_paths(
     if text_paths_are_structured_outputs:
         return tuple(dict.fromkeys([*text_referenced_paths, *structured_paths]))
     return tuple(dict.fromkeys(text_referenced_paths))
+
+
+def _cron_manifest_paths(result: dict[str, object], candidates: Sequence[str], state_filenames: set[str]):
+    from nullion.artifact_lifecycle import identity, manifest_delivery_paths
+    from nullion.artifacts import artifact_format_extension
+    from nullion.scheduled_artifact_contract import match_deliverables
+
+    declared = [_artifact_path_from_value(value) for value in _artifact_values(result.get("artifacts"))]
+    eligible = tuple(path for path in (*candidates, *declared)
+        if path and not _is_state_artifact_media(path, state_filenames)
+        and artifact_format_extension(path) not in _INTERNAL_STATE_ARTIFACT_EXTENSIONS)
+    receipts = result.get("tool_results") or ()
+    selected = manifest_delivery_paths(_exclude_source_evidence_paths(eligible, result), receipts)
+    if selected is None:
+        return None
+    from nullion.response_fulfillment_contract import IMAGE_ATTACHMENT_EXTENSIONS
+    # Native producer and image validation supersede a filename hint for
+    # an explicitly selected image. State formats and mirrored files stay excluded.
+    flagged_images = {identity(path) for path in selected if _cron_internal_state_path(path)
+                      and artifact_format_extension(path) in IMAGE_ATTACHMENT_EXTENSIONS}
+    role_paths = ()
+    if flagged_images:
+        slots = [{**slot, "required": True} for slot in result.get("cron_artifact_deliverables") or ()
+                 if slot["role"] in {"source_image", "derived_image"}]
+        _, role_paths = match_deliverables(slots, selected, receipts, registry=None)
+    return tuple(path for path in selected if not _cron_internal_state_path(path) or identity(path) in role_paths)
 
 
 def _path_resolved_or_expanded(path_text: str) -> Path:
@@ -6545,9 +6686,10 @@ def cron_delivery_text_from_result(
     report/export attachments and completed tool artifact fields while
     preventing tracker/checkpoint files from becoming user-facing attachments.
     """
+    from nullion.chat_text import render_report_reply
     from nullion.response_fulfillment_contract import user_visible_text_from_output
 
-    text = cron_delivery_text(user_visible_text_from_output(result), result.get("artifacts"))
+    text = cron_delivery_text(render_report_reply(user_visible_text_from_output(result)) or "", result.get("artifacts"))
     text = _replace_internal_reference_output_leak(result, text)
     text = _replace_sensitive_account_leak(result, text)
     text = _replace_file_inventory_leak(result, text)
@@ -6566,6 +6708,12 @@ def cron_delivery_text_from_result(
         state_filenames=state_filenames,
     )
     text_referenced_paths = _exclude_source_evidence_paths(text_referenced_paths, result)
+    selected = _cron_manifest_paths(result, structured_paths, state_filenames)
+    if selected is not None:
+        text = _cron_delivery_text_without_media_directives(text)
+        text = _filter_internal_state_paths_from_text(text, selected)
+        text = _strip_deliverable_artifact_paths_from_text(text, selected)
+        return _append_media_directives(text, selected)
     deliverable_paths = _cron_delivery_candidate_paths(
         text_referenced_paths=text_referenced_paths,
         structured_paths=structured_paths,
@@ -6589,6 +6737,127 @@ def cron_delivery_text_from_result(
     )
 
 
+def _cron_without_bundled_html(paths: tuple[str, ...], result: dict[str, object]) -> tuple[str, ...]:
+    """Omit loose HTML only when a selected, portable ZIP contains that report."""
+    from posixpath import dirname, join, normpath
+    from stat import S_IFMT, S_IFREG
+    from zipfile import BadZipFile, ZipFile
+
+    from nullion.artifact_evidence import artifact_structure_evidence
+    from nullion.artifacts import artifact_format_extension, normalize_artifact_extensions
+    from nullion.messaging_adapters import _LinkedHtmlAssetParser, _expand_linked_html_assets
+    from nullion.scheduled_artifact_contract import extension_requirements, missing_deliverables
+
+    html_files = [Path(path) for path in paths if artifact_format_extension(path) == ".html"]
+    bundles = [path for path in paths if artifact_format_extension(path) == ".zip"]
+    if not html_files or not bundles:
+        return paths
+
+    def regular_member(info):
+        name = info.filename
+        return (not name.startswith(("/", "../")) and normpath(name) == name
+                and S_IFMT(info.external_attr >> 16) in {0, S_IFREG} and not info.is_dir())
+
+    css_dependency = re.compile(r"(?:url\s*\(|@import\b)", re.IGNORECASE)
+
+    def dependencies_match(archive, member, path, content):
+        # Direct HTML references can be verified here. CSS imports and URLs
+        # are indirect dependencies, so keep the loose copy when present.
+        if css_dependency.search(content):
+            return False
+        parser = _LinkedHtmlAssetParser()
+        parser.feed(content)
+        remaining = 5 * 1024 * 1024
+        root = path.resolve().parent
+        for reference in dict.fromkeys(parser.references):
+            address = urlsplit(reference)
+            if address.scheme in {"http", "https", "data"} or reference.startswith("#"):
+                continue
+            local = Path(unquote(address.path))
+            target = (root / local).resolve()
+            if address.scheme or address.netloc or not address.path or local.is_absolute() or not target.is_relative_to(root):
+                return False
+            member_path = normpath(join(dirname(member), local.as_posix()))
+            try:
+                asset = archive.getinfo(member_path)
+            except KeyError:
+                return False
+            if (not regular_member(asset) or asset.file_size > remaining
+                    or asset.file_size != target.stat().st_size):
+                return False
+            payload = archive.read(asset)
+            if payload != target.read_bytes():
+                return False
+            if local.suffix.lower() == ".css":
+                stylesheet = payload.decode("utf-8")
+                if "\\" in stylesheet or css_dependency.search(stylesheet):
+                    return False
+            remaining -= asset.file_size
+        return True
+
+    redundant = set()
+    for bundle in bundles:
+        facts = artifact_structure_evidence(Path(bundle))
+        if facts.get("inspection_complete") is not True:
+            continue
+        try:
+            with ZipFile(bundle) as archive:
+                for document in facts.get("portable_html_documents") or ():
+                    if document.get("portable") is not True or not document.get("linked_asset_members"):
+                        continue
+                    member = document["entry_member"]
+                    archive_member = archive.getinfo(member)
+                    if not regular_member(archive_member) or archive_member.file_size > 1024 * 1024:
+                        continue
+                    archived = archive.read(archive_member)
+                    content = archived.decode("utf-8")
+                    guarded = _responsive_html_with_delivery_guard(content).encode("utf-8")
+                    for path in html_files:
+                        if path.name != Path(member).name or path.stat().st_size > 1024 * 1024 + len(_CRON_RESPONSIVE_HTML_GUARD):
+                            continue
+                        standalone = path.read_bytes()
+                        if standalone not in (archived, guarded):
+                            continue
+                        if dependencies_match(archive, member, path, content):
+                            redundant.add(str(path))
+        except (OSError, ValueError, LookupError, RuntimeError, BadZipFile):
+            continue
+
+    if not redundant:
+        return paths
+    selected = tuple(path for path in paths if path not in redundant)
+    expanded = tuple(Path(path).resolve() for path in selected)
+    if set(_expand_linked_html_assets(expanded)) != set(expanded):
+        # Exact upload must preserve assets still needed by another loose
+        # HTML document in the same delivery.
+        return paths
+    slots = tuple(slot for slot in result.get("cron_artifact_deliverables") or ()
+                  if slot["extension"] == ".html" or slot["role"] == "file" and slot["extension"] == ".zip")
+    required_formats = set(normalize_artifact_extensions(result.get("required_artifact_extensions")))
+    required_formats.difference_update(extension_requirements(slots))
+    if ".html" in required_formats and not any(artifact_format_extension(path) == ".html" for path in selected):
+        return paths
+    receipts = result.get("tool_results") or ()
+    if slots:
+        requested_slots = [{**slot, "required": True} for slot in slots]
+        previously_missing = missing_deliverables(requested_slots, paths, receipts, registry=None)
+        if missing_deliverables(requested_slots, selected, receipts, registry=None) != previously_missing:
+            return paths
+    return selected
+
+
+def _cron_caption_attachment_order(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Give the report caption to a document when a delivery also includes images."""
+    from nullion.artifacts import artifact_format_extension
+    from nullion.response_fulfillment_contract import IMAGE_ATTACHMENT_EXTENSIONS
+
+    if paths and artifact_format_extension(paths[0]) in IMAGE_ATTACHMENT_EXTENSIONS:
+        for index, path in enumerate(paths[1:], 1):
+            if artifact_format_extension(path) not in IMAGE_ATTACHMENT_EXTENSIONS:
+                return (path, *paths[:index], *paths[index + 1:])
+    return paths
+
+
 def cron_delivery_artifact_paths_from_result(
     result: dict[str, object],
     text: str | None = None,
@@ -6597,7 +6866,11 @@ def cron_delivery_artifact_paths_from_result(
     html_image_delivery_mode: str = HTML_IMAGE_DELIVERY_MODE_AUTO,
 ) -> tuple[str, ...]:
     """Return concrete artifact paths that this cron delivery is about to expose."""
+    from nullion.artifact_lifecycle import filter_delivery_paths
     from nullion.artifacts import parse_media_directive_line
+
+    if result.get("cron_finalized_attachment_paths") is not None:
+        return tuple(result["cron_finalized_attachment_paths"])
 
     state_filenames = _workspace_state_filenames(result)
     structured_paths = list(_structured_tool_artifact_paths(result, state_filenames))
@@ -6609,6 +6882,9 @@ def cron_delivery_artifact_paths_from_result(
         )
     )
     text_referenced_paths = list(_exclude_source_evidence_paths(text_referenced_paths, result))
+    selected = _cron_manifest_paths(result, structured_paths, state_filenames)
+    if selected is not None:
+        return selected
     paths = list(
         _cron_delivery_candidate_paths(
             text_referenced_paths=text_referenced_paths,
@@ -6636,7 +6912,6 @@ def cron_delivery_artifact_paths_from_result(
         principal_id=principal_id,
         collected_assets=_collected_report_assets(result),
     )
-    from nullion.artifact_lifecycle import filter_delivery_paths
     return tuple(filter_delivery_paths(deliverable_paths, result.get("tool_results", ())))
 
 
@@ -6705,8 +6980,12 @@ def cron_artifact_validation_block_reason(
     html_image_delivery_mode: str = HTML_IMAGE_DELIVERY_MODE_AUTO,
 ) -> str | None:
     """Validate deliverable cron artifacts before marking a run delivered."""
+    from nullion.artifact_lifecycle import delivery_manifest
     from nullion.artifact_validation import validate_artifact_paths
+    from nullion.artifacts import artifact_format_extension, normalize_artifact_extensions
+    from nullion.report_completion import report_receipt_matches
 
+    manifest = delivery_manifest(result.get("tool_results"))
     normalized_mode = _normalize_html_image_delivery_mode(html_image_delivery_mode)
     paths = cron_delivery_artifact_paths_from_result(
         result,
@@ -6714,22 +6993,35 @@ def cron_artifact_validation_block_reason(
         principal_id=principal_id,
         html_image_delivery_mode=normalized_mode,
     )
-    if result.get("deliver_required_extensions_only"):
-        allowed_extensions = {
-            extension if extension.startswith(".") else f".{extension}"
-            for raw_extension in result.get("required_artifact_extensions") or ()
-            if (extension := str(raw_extension or "").strip().lower())
-        }
-        if allowed_extensions:
-            paths = tuple(path for path in paths if Path(path).suffix.lower() in allowed_extensions)
+    required_extensions = set(normalize_artifact_extensions(result.get("required_artifact_extensions")))
+    slots = result.get("cron_artifact_deliverables") or ()
+    if slots and text is not None:
+        from nullion.artifact_lifecycle import identity
+        from nullion.artifacts import media_candidate_paths_from_text
+        selected_for_upload = {identity(path) for path in media_candidate_paths_from_text(text)}
+        paths = tuple(path for path in paths if identity(path) in selected_for_upload)
+    from nullion.scheduled_artifact_contract import extension_requirements, missing_deliverables
+    missing_roles = missing_deliverables(slots, paths, result.get("tool_results") or (), registry=None)
+    required_extensions.difference_update(extension_requirements(slots))
+    if result.get("deliver_required_extensions_only") and required_extensions and not slots:
+        paths = tuple(path for path in paths if artifact_format_extension(path) in required_extensions)
+    selected_extensions = {artifact_format_extension(path) for path in paths if Path(path).is_file()}
+    if (result.get("artifact_delivery_required") and not result.get("cron_report_partial")
+            and (missing_roles or required_extensions - selected_extensions)):
+        return "cron_required_artifact_missing"
     if not paths:
         result.pop("cron_artifact_validation_errors", None)
+        if result.get("artifact_delivery_required") and manifest is not None:
+            return "cron_required_artifact_missing"
         return None
-    _apply_responsive_html_delivery_guard(paths, result=result)
-    if result.get("cron_report_content_receipt"):
-        from nullion.report_completion import report_receipt_matches
-        if not report_receipt_matches(str(result.get("cron_report_request") or ""),
-                result["cron_report_content_receipt"], list(paths)):
+    receipt = result.get("cron_report_content_receipt")
+    request = str(result.get("cron_report_request") or "")
+    if receipt and not report_receipt_matches(request, receipt, list(paths)):
+        return "cron_report_content_receipt_changed"
+    if manifest is None or receipt:
+        updated = _apply_responsive_html_delivery_guard(paths, result=result)
+        if receipt and updated and not report_receipt_matches(
+                request, result["cron_report_content_receipt"], list(paths)):
             return "cron_report_content_receipt_changed"
     validation = validate_artifact_paths(paths)
     if validation.ok:
@@ -6776,6 +7068,57 @@ def cron_artifact_validation_block_reason(
     return "cron_artifact_validation_failed"
 
 
+def _responsive_html_with_delivery_guard(text: str) -> str:
+    from html.parser import HTMLParser
+
+    class HeadBoundary(HTMLParser):
+        html_open = None
+        head_open = None
+        head_close = None
+        in_title = False
+        in_body = False
+
+        def handle_starttag(self, tag, attrs):
+            if self.in_body or self.head_close or self.in_title:
+                return
+            if tag == "html" and self.html_open is None:
+                self.html_open = self.getpos(), len(self.get_starttag_text())
+            elif tag == "head" and self.head_open is None:
+                self.head_open = self.getpos(), len(self.get_starttag_text())
+            elif tag == "title" and self.head_open:
+                self.in_title = True
+            elif tag == "body":
+                self.in_body = True
+
+        def handle_endtag(self, tag):
+            if tag == "title":
+                self.in_title = False
+            elif tag == "head" and self.head_open and not (self.in_title or self.in_body or self.head_close):
+                self.head_close = self.getpos()
+
+    def offset(position):
+        line, column = position
+        return sum(len(part) + 1 for part in text.split("\n", line - 1)[:-1]) + column
+
+    parser = HeadBoundary(convert_charrefs=False)
+    for start in range(0, len(text), 8192):
+        parser.feed(text[start:start + 8192])
+        if parser.head_close or parser.in_body:
+            break
+    if parser.head_close:
+        index = offset(parser.head_close)
+        return text[:index] + _CRON_RESPONSIVE_HTML_GUARD + text[index:]
+    if parser.head_open:
+        position, length = parser.head_open
+        index = offset(position) + length
+        return text[:index] + _CRON_RESPONSIVE_HTML_GUARD + text[index:]
+    if parser.html_open:
+        position, length = parser.html_open
+        index = offset(position) + length
+        return text[:index] + "<head>" + _CRON_RESPONSIVE_HTML_GUARD + "</head>" + text[index:]
+    return _CRON_RESPONSIVE_HTML_GUARD + text
+
+
 def _apply_responsive_html_delivery_guard(
     paths: Sequence[str],
     *,
@@ -6783,50 +7126,40 @@ def _apply_responsive_html_delivery_guard(
 ) -> tuple[str, ...]:
     """Add a small mobile overflow guard to deliverable HTML reports."""
 
-    from nullion.report_completion import report_receipt_matches, bind_report_outcome
+    from nullion.report_completion import report_receipt_matches
+
+    html_paths = [Path(path).expanduser() for path in paths if Path(path).suffix.lower() in {".html", ".htm"}]
+    if not html_paths:
+        return ()
     receipt = (result or {}).get("cron_report_content_receipt")
-    receipt_paths = list((receipt or {}).get("files", {}))
+    file_hashes = dict((receipt or {}).get("files", {}))
     request = str((result or {}).get("cron_report_request") or "")
-    owned_before = report_receipt_matches(request, receipt, receipt_paths)
+    if receipt and not report_receipt_matches(request, receipt, list(file_hashes)):
+        return ()
     updated: list[str] = []
-    for raw_path in paths:
-        path = Path(str(raw_path)).expanduser()
-        if path.suffix.lower() not in {".html", ".htm"}:
-            continue
+    for path in html_paths:
         try:
-            text = path.read_text(encoding="utf-8")
+            before = path.read_bytes()
+            text = before.decode("utf-8")
+            key = str(path.resolve())
         except (OSError, UnicodeDecodeError):
+            continue
+        if receipt and file_hashes.get(key) != hashlib.sha256(before).hexdigest():
             continue
         if _CRON_RESPONSIVE_HTML_GUARD_ID in text:
             continue
-        if re.search(r"</head\s*>", text, flags=re.IGNORECASE):
-            guarded = re.sub(
-                r"</head\s*>",
-                _CRON_RESPONSIVE_HTML_GUARD + "</head>",
-                text,
-                count=1,
-                flags=re.IGNORECASE,
-            )
-        elif re.search(r"<html\b[^>]*>", text, flags=re.IGNORECASE):
-            guarded = re.sub(
-                r"(<html\b[^>]*>)",
-                r"\1<head>" + _CRON_RESPONSIVE_HTML_GUARD + "</head>",
-                text,
-                count=1,
-                flags=re.IGNORECASE,
-            )
-        else:
-            guarded = _CRON_RESPONSIVE_HTML_GUARD + text
+        after = _responsive_html_with_delivery_guard(text).encode("utf-8")
         try:
-            path.write_text(guarded, encoding="utf-8")
+            path.write_bytes(after)
         except OSError:
             continue
+        if receipt:
+            file_hashes[key] = hashlib.sha256(after).hexdigest()
         updated.append(str(path))
     if result is not None:
-        if owned_before and updated:
-            # Only this exact CSS-only runtime transform may renew a receipt.
-            # A file changed before the transform never inherits completion.
-            result["cron_report_content_receipt"] = bind_report_outcome(request, receipt, receipt_paths)
+        if receipt and updated:
+            # Update only the bytes written by this stylesheet transform.
+            result["cron_report_content_receipt"] = {**receipt, "files": file_hashes}
         if updated:
             result["cron_responsive_html_guard_applied"] = list(updated)
         else:
@@ -6931,6 +7264,7 @@ class CronRunDeliveryCallbacks:
     notify_approval_required: Callable[[object, str, str, dict[str, object]], None] | None = None
     record_chat_turn: Callable[..., None] | None = None
     health_store_path: Path | None = None
+    notify_terminal_failure: bool = True
 
 
 def _record_cron_chat_context(state, delivered_text):
@@ -7094,6 +7428,17 @@ def _cron_run_cancelled_node(state: _CronRunDeliveryState) -> dict[str, object]:
 def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     result = dict(state.get("result") or {})
     result.setdefault('cron_schedule_enabled', getattr(state['job'], 'enabled', None))
+    required, extensions = _cron_artifact_delivery_contract(state["job"])
+    # The verified condition can make the saved file requirement inapplicable to this run.
+    if required and not result.get("cron_report_delivery_gate"):
+        from nullion.artifacts import normalize_artifact_extensions
+
+        result["artifact_delivery_required"] = True
+        result["required_artifact_extensions"] = normalize_artifact_extensions(
+            [*extensions, *(result.get("required_artifact_extensions") or ())]
+        )
+    if slots := _saved_cron_deliverables(state["job"]):
+        result["cron_artifact_deliverables"] = list(slots)
     safe_failure_notice = bool(result.get("cron_failure_notice")) and not result.get("cron_report_partial")
     from nullion.execution_outcome import owned_prepared_answer
     owned_answer = owned_prepared_answer(result, str(getattr(state['job'], 'task', '') or ''))
@@ -7117,13 +7462,17 @@ def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, o
                  or (result.get("cron_source_verification_required") is True
                      and result.get("cron_source_verification_satisfied") is not True))):
         _suppress_unverified_cron_alert(result)
+        result["cron_delivery_message_only"] = True
         if state["callbacks"].silent_delivery_text is None:
             return {"result": result, "text": "", "artifacts": [], "block_reason": None}
         text = (str(result.get("text") or "").strip() if safe_failure_notice else "") or _cron_report_failure_notice(result)
-        return {"result": result, "text": text,
+        return {"result": result, "text": _cron_delivery_text_without_media_directives(text),
                 "artifacts": [], "block_reason": None}
     if result.get("cron_failure_notice"):
-        return {"result": result, "text": str(result.get("text") or "Scheduled task could not complete."),
+        result["cron_delivery_message_only"] = True
+        text = (_cron_report_failure_notice(result) if result.get("reason") == "cron_required_artifact_missing"
+                else _cron_delivery_text_without_media_directives(str(result.get("text") or "")))
+        return {"result": result, "text": text or _cron_report_failure_notice(result),
                 "artifacts": [], "block_reason": None}
     if result.get("cron_alert_delivery_decision") == "silent" and result.get("response_fulfilled") is True:
         replacement = ""
@@ -7131,16 +7480,63 @@ def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, o
             replacement = state["callbacks"].silent_delivery_text(state["job"], state.get("label", ""), result) or ""
             if str(replacement).strip():
                 result["cron_silent_result_replaced"] = True
+                result["cron_delivery_message_only"] = True
+                replacement = _cron_delivery_text_without_media_directives(replacement)
         return {"result": result, "text": str(replacement), "artifacts": [],
                 "block_reason": state["callbacks"].block_reason(result, "", [])}
-    artifacts = result.get("artifacts")
+    if (result.get("model_response_failed") is True and result.get("artifacts")
+            and result.get("artifact_delivery_satisfied") is True):
+        report_caption = ("Partial report attached. See the report for which checks could be verified."
+            if result.get("cron_report_partial") else "Report attached. See the report for its data and limitations.")
+        result["text"] = result["final_text"] = report_caption
     html_image_delivery_mode = _cron_html_image_delivery_mode(state.get("job"), result)
     text = cron_delivery_text_from_result(
         result,
         principal_id=state.get("conversation_id"),
         html_image_delivery_mode=html_image_delivery_mode,
     )
-    text = _filter_cron_delivery_media_to_required_extensions(state.get("job"), str(text))
+    text = _filter_cron_delivery_media_to_required_extensions(state.get("job"), str(text), result)
+    artifacts = result.get("artifacts")
+    from nullion.artifact_lifecycle import delivery_manifest
+    from nullion.artifacts import media_candidate_paths_from_text
+    paths = tuple(str(path) for path in media_candidate_paths_from_text(text))
+    manifest = delivery_manifest(result.get("tool_results"))
+    pruned_paths = _cron_without_bundled_html(paths, result)
+    if pruned_paths != paths and manifest is None:
+        # Legacy delivery already filters working images and text sidecars.
+        # Preserve that selection before switching this package to exact upload.
+        from nullion.messaging_adapters import prepare_reply_for_platform_delivery
+
+        legacy = prepare_reply_for_platform_delivery(text, principal_id=state.get("conversation_id"))
+        allowed = {_cron_artifact_path_key(path) for path in legacy.attachments}
+        path_keys = {_cron_artifact_path_key(path) for path in paths}
+        if allowed <= path_keys:
+            admitted = tuple(path for path in paths if _cron_artifact_path_key(path) in allowed)
+            projected = _cron_without_bundled_html(admitted, result)
+            pruned_paths = projected if projected != admitted else paths
+        else:
+            # Keep legacy delivery when it discovered additional files.
+            pruned_paths = paths
+    ordered_paths = _cron_caption_attachment_order(pruned_paths)
+    if ordered_paths != paths:
+        caption = _cron_delivery_text_without_media_directives(text)
+        caption = _strip_deliverable_artifact_paths_from_text(caption, paths)
+        text = _append_media_directives(caption, ordered_paths)
+    if pruned_paths != paths:
+        result["cron_finalized_attachment_paths"] = ordered_paths
+    if result.get("cron_finalized_attachment_paths") is not None or manifest is not None:
+        artifacts = list(ordered_paths)
+        from nullion.report_completion import project_report_receipt
+        receipt = result.get("cron_report_content_receipt")
+        request = str(result.get("cron_report_request") or "")
+        if receipt and artifacts and (projected := project_report_receipt(request, receipt, artifacts)):
+            result["cron_report_content_receipt"] = projected
+            # All downstream consumers use the same exact attachment set.
+            result["artifacts"] = artifacts
+    if artifacts and _partial_cron_report_available(state["job"], result, selected_paths=artifacts):
+        result["cron_report_partial"] = True
+        if result.get("artifact_delivery_satisfied") is not True:
+            text = "Partial delivery. I could verify the attached files, but some required files are still missing.\n\n" + text
     block_reason = state["callbacks"].block_reason(result, str(text), artifacts)
     if block_reason is None:
         block_reason = cron_artifact_validation_block_reason(
@@ -7186,10 +7582,12 @@ def _send_platform_delivery(
     channel: str,
     target: str,
     text: str,
+    *,
+    exact_artifact_paths: tuple[str, ...] | None = None,
 ) -> bool:
     from nullion.delivery_acknowledgement import UnconfirmedDelivery
     try:
-        return _call_platform_delivery(callback, job, channel, target, text)
+        return _call_platform_delivery(callback, job, channel, target, text, exact_artifact_paths=exact_artifact_paths)
     except UnconfirmedDelivery:
         raise
     except Exception:
@@ -7203,6 +7601,8 @@ def _call_platform_delivery(
     channel: str,
     target: str,
     text: str,
+    *,
+    exact_artifact_paths: tuple[str, ...] | None = None,
 ) -> bool:
     """Call platform delivery callbacks across the old and current contracts."""
     try:
@@ -7222,9 +7622,12 @@ def _call_platform_delivery(
         parameter.kind is inspect.Parameter.VAR_POSITIONAL
         for parameter in signature.parameters.values()
     )
+    supports_exact = "exact_artifact_paths" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    kwargs = {"exact_artifact_paths": exact_artifact_paths} if supports_exact and exact_artifact_paths is not None else {}
     if has_varargs or positional_count >= 4:
-        return bool(callback(job, channel, target, text))
-    return bool(callback(job, channel, text))
+        return bool(callback(job, channel, target, text, **kwargs))
+    return bool(callback(job, channel, text, **kwargs))
 
 
 def _cron_requested_outcome(job: object) -> str:
@@ -7309,6 +7712,26 @@ def _attach_cron_execution_outcome(
     return result
 
 
+_CRON_TERMINAL_NOTICE_REASONS = frozenset({"cron_run_exception", "cron_run_model_timeout"})
+
+
+def _notify_cron_terminal_failure(job, channel, target, conversation_id, label, result, callbacks) -> None:
+    reason = str(result["reason"])
+    notice = scheduled_task_delivery_text(job, _manual_cron_failure_detail(reason, "").strip(), run_label=label)
+    try:
+        if channel == "web":
+            notified = callbacks.save_web_delivery(
+                job, conversation_id, notice, [], {**result, "cron_delivery_message_only": True},
+            )
+        else:
+            notified = _send_platform_delivery(callbacks.send_platform_delivery, job, channel,
+                                               target, notice, exact_artifact_paths=())
+        result["cron_failure_notice_sent"] = bool(notified)
+    except Exception:
+        logger.warning("Cron failure notice could not be confirmed [reason=%s]", reason, exc_info=True)
+        result["cron_failure_notice_sent"] = False
+
+
 def _cron_run_blocked_node(state: _CronRunDeliveryState) -> dict[str, object]:
     callbacks = state["callbacks"]
     if callbacks.clear_background_delivery is not None:
@@ -7318,6 +7741,9 @@ def _cron_run_blocked_node(state: _CronRunDeliveryState) -> dict[str, object]:
     result["cron_delivery_status"] = "failed"
     result["cron_delivery_failed"] = True
     result["cron_run_failed"] = True
+    result["response_fulfilled"] = False
+    if reason == "cron_required_artifact_missing":
+        result["artifact_delivery_satisfied"] = False
     result["reason"] = reason
     callbacks.record_event(
         "cron.delivery.failed",
@@ -7327,6 +7753,9 @@ def _cron_run_blocked_node(state: _CronRunDeliveryState) -> dict[str, object]:
         state["conversation_id"],
         reason=reason,
     )
+    if callbacks.notify_terminal_failure and reason in _CRON_TERMINAL_NOTICE_REASONS:
+        _notify_cron_terminal_failure(state["job"], state["delivery_channel"], state["delivery_target"],
+                                      state["conversation_id"], state.get("label"), result, callbacks)
     _attach_cron_execution_outcome(state, result, text=str(state.get("text") or ""))
     return {"result": result}
 
@@ -7351,6 +7780,8 @@ def _cron_run_silent_node(state: _CronRunDeliveryState) -> dict[str, object]:
 
 
 def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
+    from nullion.artifacts import media_candidate_paths_from_text
+
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
     delivered_text = scheduled_task_delivery_text(
@@ -7391,12 +7822,8 @@ def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, objec
         state,
         result,
         text=str(state.get("text") or ""),
-        delivered_artifacts=cron_delivery_artifact_paths_from_result(
-            result,
-            str(state.get("text") or ""),
-            principal_id=state.get("conversation_id"),
-            html_image_delivery_mode=_cron_html_image_delivery_mode(state.get("job"), result),
-        ),
+        delivered_artifacts=() if result.get("cron_delivery_message_only") is True
+        else media_candidate_paths_from_text(delivered_text),
     )
     return {"result": result}
 
@@ -7413,7 +7840,7 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
             try:
                 exc.notice_attempted = True
                 exc.notice_sent = _send_platform_delivery(callbacks.send_platform_delivery,
-                    state['job'], state['delivery_channel'], state['delivery_target'], notice)
+                    state['job'], state['delivery_channel'], state['delivery_target'], notice, exact_artifact_paths=())
             except UnconfirmedDelivery:
                 pass
         result.update(cron_delivery_status=exc.status, cron_delivery_unconfirmed=True,
@@ -7433,6 +7860,7 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
 
 def _cron_run_confirmed_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     from nullion.artifacts import media_candidate_paths_from_text
+    from nullion.artifact_lifecycle import delivery_manifest
 
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
@@ -7442,12 +7870,21 @@ def _cron_run_confirmed_messaging_delivery_node(state: _CronRunDeliveryState) ->
         cron_delivery_text(str(state.get("text") or ""), state.get("artifacts")),
         run_label=state.get("label"),
     )
+    exact = None
+    if result.get("cron_delivery_message_only") is True:
+        exact = ()
+    elif result.get("cron_finalized_attachment_paths") is not None:
+        exact = tuple(result["cron_finalized_attachment_paths"])
+    elif delivery_manifest(result.get("tool_results")) is not None:
+        exact = tuple(str(path) for path in state.get("artifacts") or ())
+    requested_paths = exact if exact is not None else tuple(str(path) for path in media_candidate_paths_from_text(text))
     if _send_platform_delivery(
         callbacks.send_platform_delivery,
         state["job"],
         state["delivery_channel"],
         state["delivery_target"],
         text,
+        exact_artifact_paths=exact,
     ):
         if callbacks.clear_background_delivery is not None:
             callbacks.clear_background_delivery(state["conversation_id"])
@@ -7470,15 +7907,10 @@ def _cron_run_confirmed_messaging_delivery_node(state: _CronRunDeliveryState) ->
             state,
             result,
             text=str(state.get("text") or ""),
-            delivered_artifacts=cron_delivery_artifact_paths_from_result(
-                result,
-                str(state.get("text") or ""),
-                principal_id=state.get("conversation_id"),
-                html_image_delivery_mode=_cron_html_image_delivery_mode(state.get("job"), result),
-            ),
+            delivered_artifacts=requested_paths,
         )
         return {"result": result, "send_attempts": attempts}
-    if media_candidate_paths_from_text(text):
+    if requested_paths:
         required_report = bool(result.get("artifact_delivery_required"))
         fallback_text = (
             "I could not deliver the required report file. The report has not been delivered; please retry this run."
@@ -7490,6 +7922,7 @@ def _cron_run_confirmed_messaging_delivery_node(state: _CronRunDeliveryState) ->
             state["delivery_channel"],
             state["delivery_target"],
             fallback_text,
+            exact_artifact_paths=(),
         ):
             if callbacks.clear_background_delivery is not None:
                 callbacks.clear_background_delivery(state["conversation_id"])

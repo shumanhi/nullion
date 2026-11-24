@@ -181,6 +181,17 @@ def filter_delivery_paths(paths, results):
     return [p for p in paths if identity(p) not in superseded or identity(p) in explicitly_selected]
 
 
+def manifest_delivery_paths(paths, results):
+    """Return the authorized current selection, or None for legacy results."""
+    results = tuple(results or ())
+    selected = delivery_manifest(results)
+    if selected is None:
+        return None
+    eligible = {identity(path) for path in filter_delivery_paths(paths, results)}
+    current = _current_manifest_decisions(results)
+    return tuple(path for path in selected if identity(path) in eligible and current.get(identity(path)) is True)
+
+
 def select_delivery_paths(paths, results, reply, *, required_extensions=()):
     """Return (selected, ambiguous). Preserve explicit multi-file deliveries."""
     from nullion.artifacts import parse_media_directive_line, artifact_format_extension

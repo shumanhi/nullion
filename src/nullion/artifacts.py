@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass
+from email.message import Message
 import hashlib
 import html
 from html.parser import HTMLParser
@@ -399,6 +401,24 @@ def is_unrequested_internal_sidecar_artifact(
     return False
 
 
+def _deliverable_html_document(path: Path, size: int) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as stream:
+            sample = stream.read(512).lower()
+        if "<html" not in sample:
+            return False
+        if size >= _MIN_HTML_ARTIFACT_BYTES:
+            return True
+        # Admit compact documents without exposing short renderer fragments.
+        if re.match(r"(?:\s|<!--.*?-->)*<!doctype[ \t\n\f\r]+html[ \t\n\f\r]*>",
+                    sample.lstrip("\ufeff"), flags=re.DOTALL) is None:
+            return False
+        from nullion.artifact_validation import validate_artifact_paths
+        return validate_artifact_paths([str(path)]).ok
+    except OSError:
+        return False
+
+
 def artifact_descriptor_for_path(path: Path, *, artifact_root: Path) -> ArtifactDescriptor | None:
     resolved_path = path.expanduser().resolve()
     if not path_is_within(resolved_path, artifact_root) or not resolved_path.is_file():
@@ -408,10 +428,8 @@ def artifact_descriptor_for_path(path: Path, *, artifact_root: Path) -> Artifact
         return None
     if resolved_path.suffix.lower() in _BLOCKED_DOWNLOAD_SUFFIXES:
         return None
-    if resolved_path.suffix.lower() in _HTML_ARTIFACT_SUFFIXES:
-        sample = resolved_path.read_text(encoding="utf-8", errors="ignore")[:512].strip().lower()
-        if stat.st_size < _MIN_HTML_ARTIFACT_BYTES or "<html" not in sample:
-            return None
+    if resolved_path.suffix.lower() in _HTML_ARTIFACT_SUFFIXES and not _deliverable_html_document(resolved_path, stat.st_size):
+        return None
     artifact_id = hashlib.sha256(
         f"{resolved_path}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")
     ).hexdigest()[:24]
@@ -444,12 +462,7 @@ def is_deliverable_explicit_media_path(path: Path) -> bool:
     if resolved_path.suffix.lower() in _BLOCKED_DOWNLOAD_SUFFIXES:
         return False
     if resolved_path.suffix.lower() in _HTML_ARTIFACT_SUFFIXES:
-        try:
-            sample = resolved_path.read_text(encoding="utf-8", errors="ignore")[:512].strip().lower()
-        except OSError:
-            return False
-        if stat.st_size < _MIN_HTML_ARTIFACT_BYTES or "<html" not in sample:
-            return False
+        return _deliverable_html_document(resolved_path, stat.st_size)
     return True
 
 
@@ -526,6 +539,46 @@ def output_has_artifact_descriptors(output: object) -> bool:
 
 
 
+UNVERIFIED_ARTIFACT_PUBLICATION_REPLY = "I can’t verify that this request was completed."
+
+
+def scope_declares_message_only(tool_results: Iterable[object] | None) -> bool:
+    """A validated message scope cannot be expanded by authored file paths."""
+    from nullion.tools import normalize_tool_status
+
+    for result in reversed(tuple(tool_results or ())):
+        name = result.get("tool_name") if isinstance(result, dict) else getattr(result, "tool_name", None)
+        status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
+        if name != "request_tool_scope" or normalize_tool_status(status) != "completed":
+            continue
+        output = result.get("output") if isinstance(result, dict) else getattr(result, "output", None)
+        if isinstance(output, dict) and isinstance(output.get("artifact_extensions"), list):
+            return (not output["artifact_extensions"]
+                    and not output.get("embedded_media_artifact_extensions")
+                    and output.get("source_artifact_delivery_requested") is False)
+    return False
+
+
+def filter_message_scope_media_reply(reply: str, *, tool_results, approved_paths: Iterable[str]) -> str:
+    """Retain only authored media selected from the turn's artifact receipts."""
+    if not scope_declares_message_only(tool_results) or not media_candidate_paths_from_text(reply):
+        return reply
+    approved = {Path(path).expanduser().resolve() for path in filter_source_artifact_paths(approved_paths, tool_results)}
+    kept, matched, rejected = [], False, False
+    for line in reply.splitlines():
+        directive = parse_media_directive_line(line)
+        if directive is None:
+            kept.append(line)
+        elif directive.path.expanduser().resolve() in approved:
+            matched = True
+            kept.append(line)
+        else:
+            rejected = True
+    if rejected:
+        return "\n".join(kept).strip() if matched else UNVERIFIED_ARTIFACT_PUBLICATION_REPLY
+    return reply
+
+
 def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[object]) -> list[str]:
     """Explicit source/intermediate roles survive prose and raw path forwarding."""
     tool_results = tuple(tool_results or ())
@@ -540,6 +593,15 @@ def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[ob
         status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
         if name == "request_tool_scope" and status == "completed" and isinstance(output, dict):
             excluded_extensions.update(normalize_artifact_extensions(output.get("excluded_artifact_extensions") or ()))
+        if name == "browser_run_task" and isinstance(output, dict) and output.get("result_kind") == "source_observations":
+            audit = output.get("execution_audit")
+            observed_paths = output.get("artifact_paths")
+            # Older compact receipts can retain these paths without descriptors.
+            if (isinstance(audit, dict) and audit.get("version") == 1
+                    and audit.get("captures_are_internal") is True
+                    and audit.get("deliverable_file_count") == 0 and audit.get("downloaded_file_count") == 0
+                    and isinstance(observed_paths, (list, tuple))):
+                blocked.update(identity(path) for path in observed_paths if isinstance(path, str) and path.strip())
         if not output_has_artifact_descriptors(output):
             continue
         for descriptor in output["artifact_descriptors"]:
@@ -718,6 +780,10 @@ def artifact_path_for_generated_workspace_file(
 
 class _HTMLDocumentEncoding(HTMLParser):
     """Locate real encoding tags without rewriting body, script or style text."""
+
+    # Older supported Python versions only treat script and style as raw text.
+    CDATA_CONTENT_ELEMENTS = ("script", "style", "iframe", "noembed", "noframes", "xmp")
+
     def __init__(self, text: str):
         super().__init__(convert_charrefs=False)
         self.offsets = [0]
@@ -725,6 +791,8 @@ class _HTMLDocumentEncoding(HTMLParser):
             self.offsets.append(self.offsets[-1] + len(line) + 1)
         self.head_end = self.html_end = self.doctype_end = None
         self.encoding_tags = []
+        self.declared_encodings = []
+        self.literal_element = None
         self.feed(text)
 
     def _offset(self):
@@ -732,6 +800,10 @@ class _HTMLDocumentEncoding(HTMLParser):
         return self.offsets[line - 1] + column
 
     def handle_starttag(self, tag, attrs):
+        if self.literal_element:
+            return
+        if tag in {"title", "textarea"}:
+            self.literal_element = tag
         start = self._offset()
         end = start + len(self.get_starttag_text())
         if tag == 'head' and self.head_end is None:
@@ -740,12 +812,70 @@ class _HTMLDocumentEncoding(HTMLParser):
             self.html_end = end
         if tag == 'meta':
             attributes = dict(attrs)
-            if 'charset' in attributes or str(attributes.get('http-equiv') or '').lower() == 'content-type':
+            if "charset" in attributes:
                 self.encoding_tags.append((start, end))
+                self.declared_encodings.append(attributes["charset"])
+            elif str(attributes.get("http-equiv") or "").lower() == "content-type":
+                self.encoding_tags.append((start, end))
+                self.declared_encodings.append(_mime_charset(attributes.get("content")))
+
+    def handle_endtag(self, tag):
+        if tag == self.literal_element:
+            self.literal_element = None
 
     def handle_decl(self, decl):
         if decl.lower().startswith('doctype html') and self.doctype_end is None:
             self.doctype_end = self._offset() + len(decl) + 3
+
+
+def _mime_charset(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    message = Message()
+    message["Content-Type"] = content_type
+    return message.get_content_charset()
+
+
+def _bom_encoding(data: bytes) -> str | None:
+    if data.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return "utf-16"
+    return None
+
+
+def declared_html_encoding(prefix: bytes) -> str | None:
+    """Return a BOM or the first recognized HTML charset in the prescan window."""
+    if bom := _bom_encoding(prefix):
+        return bom
+    if b"charset" not in prefix[:1024].lower():
+        return None
+    from webencodings import lookup
+
+    # Scan ASCII markup without interpreting the non-ASCII content bytes.
+    parser = _HTMLDocumentEncoding(prefix[:1024].decode("latin-1"))
+    for label in parser.declared_encodings:
+        encoding = lookup(label) if label else None
+        if encoding is None:
+            continue
+        if encoding.name in {"utf-16le", "utf-16be"}:
+            return "utf-8"
+        if encoding.name == "x-user-defined":
+            return "cp1252"
+        return encoding.codec_info.name
+    return None
+
+
+def decode_html_document(data: bytes, *, content_type: str | None = None, errors: str = "strict") -> str:
+    """Decode before normalizing or modifying HTML, without losing source bytes."""
+    if bom := _bom_encoding(data):
+        return data.decode(bom, errors)
+    if label := _mime_charset(content_type):
+        from webencodings import lookup
+
+        if encoding := lookup(label):
+            return encoding.codec_info.decode(data, errors)[0]
+    return data.decode(declared_html_encoding(data) or "utf-8", errors)
 
 
 def _normalize_document_encoding(text: str, title: str) -> str:
@@ -768,11 +898,19 @@ def _normalize_document_encoding(text: str, title: str) -> str:
     return result
 
 
+def ensure_utf8_html_encoding(text: str, *, title: str) -> str:
+    """Keep HTML bytes stable when a UTF-8 write already decodes correctly."""
+    encoding = declared_html_encoding(text[:1024].encode("utf-8"))
+    if encoding in {"utf-8", "utf-8-sig"} or (encoding is None and text.isascii()):
+        return text
+    return _normalize_document_encoding(text, title)
+
+
 def normalize_html_document(html_text: str, *, title: str = "Nullion HTML Preview") -> str:
-    text = str(html_text or "").strip()
+    text = str(html_text or "").removeprefix("\ufeff").strip()
     if not text:
         return ""
-    if _HTML_DOCUMENT_RE.search(text[:1024]):
+    if _HTML_DOCUMENT_RE.search(text):
         return _normalize_document_encoding(text, title)
     escaped_title = html.escape(title, quote=True)
     document = (

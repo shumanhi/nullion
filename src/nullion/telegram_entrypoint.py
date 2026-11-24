@@ -476,6 +476,7 @@ def _build_runtime_service_from_settings(
     checkpoint_path: str | Path,
     env_path: str | Path | None = None,
     service_factory=build_telegram_operator_service,
+    probe_checkpoint: Path | None = None,
 ):
     checkpoint = Path(checkpoint_path)
     os.environ["NULLION_CHECKPOINT_PATH"] = str(checkpoint.expanduser())
@@ -484,10 +485,14 @@ def _build_runtime_service_from_settings(
         os.environ["NULLION_ENV_FILE"] = str(Path(env_path).expanduser())
         load_env_file_into_environ(env_path, override=True)
     settings = load_settings(env_path=env_path)
-    try:
+    if probe_checkpoint is not None:
+        checkpoint = probe_checkpoint
         runtime = bootstrap_persistent_runtime(checkpoint)
-    except (ValueError, sqlite3.Error) as exc:
-        runtime = _recover_runtime_from_corrupt_checkpoint(checkpoint, exc)
+    else:
+        try:
+            runtime = bootstrap_persistent_runtime(checkpoint)
+        except (ValueError, sqlite3.Error) as exc:
+            runtime = _recover_runtime_from_corrupt_checkpoint(checkpoint, exc)
     try:
         from nullion.cron_delivery import record_interrupted_cron_delivery_runs
 
@@ -710,6 +715,7 @@ def _build_runtime_service_from_settings(
         text: str,
         *,
         run_label: str = "Scheduled task",
+        exact_artifact_paths: tuple[str, ...] | None = None,
     ) -> bool:
         from nullion.cron_delivery import scheduled_task_delivery_text
 
@@ -718,6 +724,7 @@ def _build_runtime_service_from_settings(
         if not target:
             return False
         message = scheduled_task_delivery_text(job, text, run_label=run_label)
+        delivery_options = {"exact_artifact_paths": exact_artifact_paths} if exact_artifact_paths is not None else {}
         if channel == "telegram":
             if not current_settings.telegram.bot_token:
                 return False
@@ -727,6 +734,7 @@ def _build_runtime_service_from_settings(
                 message,
                 principal_id=f"telegram:{target}",
                 suppress_link_preview=True,
+                **delivery_options,
             ))
         if channel == "slack":
             if not current_settings.slack.bot_token:
@@ -738,6 +746,7 @@ def _build_runtime_service_from_settings(
                 channel=target,
                 text=message,
                 principal_id=f"slack:{target}",
+                **delivery_options,
             ))
         if channel == "discord":
             if not current_settings.discord.bot_token:
@@ -749,6 +758,7 @@ def _build_runtime_service_from_settings(
                 channel_id=target,
                 text=message,
                 principal_id=f"discord:{target}",
+                **delivery_options,
             ))
         return False
 
@@ -877,12 +887,13 @@ def _build_runtime_service_from_settings(
                 record_event=_record_cron_delivery_event,
                 block_reason=cron_delivery_block_reason,
                 save_web_delivery=_save_cron_web_delivery,
-                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
+                send_platform_delivery=lambda cron_job, channel, target, text, **delivery_options: _send_cron_platform_delivery(
                     cron_job,
                     channel,
                     target,
                     text,
                     run_label=label,
+                    **delivery_options,
                 ),
                 start_background_delivery=None,
                 clear_background_delivery=None,
@@ -1005,6 +1016,8 @@ def _build_runtime_service_from_settings(
         default_delivery_channel="telegram" if _operator_chat_id else "",
         default_delivery_target=_operator_chat_id or "",
     )
+    if probe_checkpoint is not None:
+        return service
     try:
         from nullion.startup_warmup import schedule_chat_startup_warmup
 
@@ -1031,11 +1044,13 @@ def build_runtime_service_from_settings(
     *,
     checkpoint_path: str | Path,
     env_path: str | Path | None = None,
+    probe_checkpoint: Path | None = None,
 ):
     return _build_runtime_service_from_settings(
         checkpoint_path=checkpoint_path,
         env_path=env_path,
         service_factory=build_telegram_operator_service,
+        probe_checkpoint=probe_checkpoint,
     )
 
 
@@ -1043,11 +1058,13 @@ def build_messaging_runtime_service_from_settings(
     *,
     checkpoint_path: str | Path,
     env_path: str | Path | None = None,
+    probe_checkpoint: Path | None = None,
 ):
     return _build_runtime_service_from_settings(
         checkpoint_path=checkpoint_path,
         env_path=env_path,
         service_factory=build_messaging_operator_service,
+        probe_checkpoint=probe_checkpoint,
     )
 
 
@@ -1081,6 +1098,7 @@ async def _send_operator_telegram_delivery(
     parse_mode: str | None = None,
     request_id: str | None = None,
     message_only: bool = False,
+    exact_artifact_paths: tuple[str, ...] | None = None,
 ) -> bool:
     """Send a Telegram delivery, uploading any MEDIA artifact directives."""
     from nullion.delivery_acknowledgement import UnconfirmedDelivery, deliver_attachment_batch
@@ -1106,7 +1124,10 @@ async def _send_operator_telegram_delivery(
             principal_id=principal_id,
             max_attachment_bytes=telegram_attachment_upload_limit_bytes(),
             allow_attachments=False if message_only else None,
+            exact_artifact_paths=exact_artifact_paths,
         )
+        if exact_artifact_paths and not delivery.attachments:
+            return False
         async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:
                 from nullion.telegram_app import _telegram_attachment_caption_kwargs

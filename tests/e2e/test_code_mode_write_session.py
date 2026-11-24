@@ -77,6 +77,15 @@ def test_write_approval_resume_preserves_program_and_does_not_repeat_writes(tmp_
     assert first.read_text()=='verified-37' and not last.exists() and not calls
     suspended=runtime.store.get_suspended_turn(result.approval_id)
     assert suspended and suspended.pending_tool_calls[0]['_code_mode_session_id']==result.code_mode_session_id
+    # A recovery wrapper may finish without carrying the orchestrator's
+    # suspended result. Cleanup still has the original durable approval.
+    from nullion.code_mode_sessions import SessionJournal
+    cleanup_state = {'runtime_store': runtime.store, 'principal_id': 'telegram_chat',
+        'conversation_id': 'telegram:77', 'user_message': prompt,
+        'code_mode_session_id': result.code_mode_session_id}
+    code_mode.finish_request(cleanup_state)
+    checkpoint = SessionJournal(cleanup_state).read(result.code_mode_session_id)
+    assert checkpoint['phase'] == 'approval' and checkpoint['approval_id'] == result.approval_id
     runtime.checkpoint(force=True)
     # Restore both native approvals and the VM from durable state, not the old
     # Python objects. This also exercises process-independent session claims.
@@ -103,6 +112,8 @@ def test_write_approval_resume_preserves_program_and_does_not_repeat_writes(tmp_
     assert summary.output['session_id']==result.code_mode_session_id
     assert summary.output['host_calls']=={'urllib.parse.quote':2}
     assert 'published' in resumed.final_text
+    closed = SessionJournal({**cleanup_state, 'runtime_store': restarted.store}).read(result.code_mode_session_id)
+    assert closed['phase'] == 'closed' and closed['snapshot'] is None and closed['selected'] is None
     # Even a duplicate caller bypassing the transport's resume claim cannot
     # restart an already consumed program or repeat the protected effect.
     runner.resume_turn(conversation_id='telegram:77',principal_id='telegram_chat',user_message=prompt,
@@ -112,7 +123,8 @@ def test_write_approval_resume_preserves_program_and_does_not_repeat_writes(tmp_
 
 
 @pytest.mark.asyncio
-async def test_async_harness_resumes_same_write_program_after_restart(tmp_path,monkeypatch):
+@pytest.mark.parametrize('exact_approval', [False, True])
+async def test_async_harness_resumes_same_write_program_after_restart(tmp_path,monkeypatch,exact_approval):
     from nullion import code_mode
     from nullion.langchain_adapters import nullion_tools_as_langchain_tools
     from nullion.runtime import bootstrap_persistent_runtime
@@ -122,11 +134,13 @@ async def test_async_harness_resumes_same_write_program_after_restart(tmp_path,m
     monkeypatch.setenv('NULLION_CODE_MODE','on')
     reg=ToolRegistry();calls=[]
     def save(invocation):
-        calls.append(invocation.tool_name)
+        calls.append((invocation.tool_name, invocation.invocation_id))
         with (tmp_path/(invocation.tool_name+'.txt')).open('a') as stream:stream.write(str(invocation.arguments['value']))
         return ToolResult(invocation.invocation_id,invocation.tool_name,'completed',{'value':invocation.arguments['value']})
     for name,risk,approval in [('prepare_record',ToolRiskLevel.LOW,False),('publish_record',ToolRiskLevel.HIGH,True)]:
-        reg.register(ToolSpec(name,name,risk,ToolSideEffectClass.WRITE,approval,5,input_schema={'type':'object',
+        reg.register(ToolSpec(name,name,risk,ToolSideEffectClass.WRITE,approval,5,
+            **({'permission_scope': 'exact_invocation'} if approval and exact_approval else {}),
+            input_schema={'type':'object',
             'properties':{'value':{'type':'integer'}},'required':['value']}),save)
     flow={'conversation_id':'telegram:77','original_user_message':'確認して保存'}
     observed=[]
@@ -135,7 +149,7 @@ async def test_async_harness_resumes_same_write_program_after_restart(tmp_path,m
     response=json.loads(await tool.ainvoke({'tool_names':['prepare_record','publish_record'],
         'code':"remembered = 37\ncall_tool('prepare_record', {'value':remembered})\ncall_tool('publish_record', {'value':remembered})['output']"}))
     assert response['output']['reason']=='code_mode_awaiting_approval',response
-    assert calls==['prepare_record']
+    assert [name for name, _ in calls] == ['prepare_record']
     identity=response['output']['session_id']
     approval=runtime.store.list_approval_requests()[-1]
     runtime.checkpoint(force=True)
@@ -146,7 +160,13 @@ async def test_async_harness_resumes_same_write_program_after_restart(tmp_path,m
         cleanup_scope='task-37',policy_store=restarted.store,tool_flow_context={**flow,'code_mode_session_id':identity},
         tool_result_callback=resumed.append)[0]
     await tool.coroutine._nullion_code_mode_resume()
-    assert calls==['prepare_record','publish_record']
+    assert [name for name, _ in calls] == ['prepare_record', 'publish_record']
+    if exact_approval:
+        assert calls[-1][1] == approval.context['approval_invocation_id']
+        assert len(restarted.store.list_approval_requests()) == 1
+    with pytest.raises(RuntimeError, match='not resumable'):
+        await tool.coroutine._nullion_code_mode_resume()
+    assert len(calls) == 2
     assert (tmp_path/'prepare_record.txt').read_text()=='37'
     assert (tmp_path/'publish_record.txt').read_text()=='37'
     assert resumed[-1].tool_name==code_mode.TOOL_NAME and resumed[-1].status=='completed',resumed[-1]

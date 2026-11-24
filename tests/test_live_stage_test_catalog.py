@@ -20,9 +20,9 @@ def policy():
 def test_complete_inventory_preserves_parameterized_cases_and_execution_types():
     result=catalog.build_catalog()
     summary=result['summary']
-    assert summary['expanded_cases']==303
-    assert sum(summary['categories'].values())==sum(summary['kinds'].values())==303
-    assert summary['kinds']==dict(live_workflow=280,saved_replay=14,
+    assert summary['expanded_cases']==304
+    assert sum(summary['categories'].values())==sum(summary['kinds'].values())==304
+    assert summary['kinds']==dict(live_workflow=281,saved_replay=14,
                                  local_harness=9,aggregate_entry_point=0)
     assert len({row['selector'] for row in result['tests']})==len(result['tests'])
     assert summary['api_scenarios']==75 and summary['web_catalogue_scenarios']==48
@@ -74,6 +74,8 @@ def test_overlap_audit_retains_distinct_boundaries_and_language_variants():
     variants={'browser_screenshot_artifact_delivery','browser_context_capture_recovery',
               'browser_context_capture_recovery_variant'}
     assert variants <= {row.get('scenario') for row in result['tests']}
+    assert all(('NULLION_LIVE_CAPTURE_SOURCE' in row['gates']) == ('test_live_stage_api_scenarios.py' in row['selector'])
+               for row in result['tests'] if row.get('scenario') in variants)
     recall_review=next(row for row in result['overlap_reviews']
         if row['id']=='explicit-and-implicit-independent-recall')
     assert set(recall_review['selectors'])=={

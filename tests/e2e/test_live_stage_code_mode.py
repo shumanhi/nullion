@@ -176,12 +176,11 @@ def test_live_stage_email_uses_code_session(live_web):
         'What is latest in my email? Give me a brief summary of the newest messages. '
         'Only read my mailbox; do not send, delete or mark anything.', timeout=180)
     results = turn.get('tool_results') or []
-    composed = [r for r in results if r.get('tool_name') == 'code_mode']
-    assert composed and all(r['status'] == 'completed' for r in composed), results
-    reads = [read for r in composed for read in r['output']['reads']]
-    assert any(r['tool_name'] == 'email_search' for r in reads), reads
-    native = {r['invocation_id']:r for r in results}
-    assert all(r['invocation_id'] in native for r in reads)
+    assert any(row.get('tool_name') == 'email_search' and row.get('status') == 'completed'
+               for row in results), results
+    assert not any(row.get('tool_name') in {'email_send', 'email_delete', 'email_update'}
+                   for row in results), results
+    assert turn.get('response_fulfilled') is True
     assert response['text'] and not response['artifacts']
 
 
@@ -735,7 +734,8 @@ def test_live_stage_multi_source_facts_survive_compaction(live_web,record_proper
 
 
 def test_live_stage_delegation_runs_native_preflight_without_repair_program(live_web, record_property):
-    import json
+    _, frames, _, _, _, _ = live_web
+    before = len(frames)
     args = {'url': 'https://example.com/', 'task':
         'Read the heading and the More information link. Record those observations with source URLs, then report. Do not follow links or change the page.',
         'execution_kind': 'adaptive_interaction', 'interaction_reason':
@@ -757,6 +757,9 @@ def test_live_stage_delegation_runs_native_preflight_without_repair_program(live
     assert cleanup and cleanup.get('verified') is True and cleanup.get('remaining_target_count',
         len(cleanup.get('remaining_target_ids') or ())) == 0, cleanup
     assert 'Example Domain' in response['text'] and 'https://' in response['text'], response
+    updates = [frame.get('text', '') for frame in frames[before:] if frame.get('type') == 'progress']
+    assert any('Planning browser step' in update and 'page' in update for update in updates), updates
+    record_property('browser_progress', updates)
     record_property('first_delegation_seconds', elapsed / 1000)
 
 

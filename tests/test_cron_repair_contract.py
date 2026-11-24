@@ -93,7 +93,9 @@ def test_saved_report_instructions_reach_recovery_and_written_bytes(monkeypatch,
     assert payload["instructions"] == job_with_report().task
     assert len(payload["verified_source_records"]) == 2
     from pathlib import Path
-    assert Path(result["artifacts"][0]).read_text() == report
+    assert Path(result["artifacts"][0]).read_text(encoding="utf-8") == report.replace(
+        "<html>", '<html><head><meta charset="utf-8"><title>株価</title></head>', 1,
+    )
     assert result["artifact_delivery_satisfied"] is True
 
 

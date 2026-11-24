@@ -112,3 +112,57 @@ def test_large_captured_document_index_cannot_displace_accepted_source_findings(
     assert view['report_status']=='partial' and [r['value'] for r in view['observations']]==['$80','$88']
     assert view['unknowns']==['After-hours return'] and view['captured_document_inspection']['tool_name']=='inspect_retained_evidence'
     assert len(json.dumps(view))<14000
+def test_mail_projection_preserves_exact_body_evidence_and_retained_identity():
+    from nullion.source_context_projection import compact_email_message
+
+    body = 'Póliza: 2027-02-07, 73 USD. ' + '追加項目 ' * 2500
+    output = {'id': 'mail-73', 'evidence_scope': {'kind': 'email_message'}, 'message': {
+        'id': 'mail-73', 'date': '2026-11-23T08:00:00Z', 'subject': 'Renewal',
+        'body': 'Short provider preview', 'body_payload': body, 'body_is_preview': True,
+        'links': [{'href': 'https://example.test/' + 'c' * 2000}],
+    }}
+    view, omitted = compact_email_message(output, max_chars=1500)
+    message = view['message']
+    assert view['id'] == message['id'] == 'mail-73'
+    assert message['date'] == output['message']['date']
+    assert message['body_is_preview'] and message['body_truncated']
+    assert message['body_payload'].startswith('Póliza: 2027-02-07, 73 USD.')
+    assert body.startswith(message['body_payload']) and message['original_body_chars'] == len(body)
+    assert ['message', 'body_payload'] in omitted and ['message', 'links'] in omitted
+    assert len(json.dumps(view, ensure_ascii=False)) <= 1500
+    assert output['message']['body_payload'] == body
+
+
+@pytest.mark.parametrize('original_chars', [None, 4000])
+def test_mail_projection_keeps_prior_incompleteness_when_a_retained_prefix_fits(original_chars):
+    from nullion.source_context_projection import compact_email_message
+
+    output = {'id': 'mail-73', 'evidence_scope': {'kind': 'email_message'}, 'message': {
+        'id': 'mail-73', 'body': 'Only this prefix is available.', 'body_truncated': True,
+        'body_payload': {'not': 'a text body'}, 'links': ['https://example.test/' + 'c' * 2000],
+        **({'original_body_chars': original_chars} if original_chars is not None else {}),
+    }}
+    view, omitted = compact_email_message(output, max_chars=1500)
+    assert view['message']['body'] == output['message']['body']
+    assert view['message']['body_truncated'] is True
+    assert view['message'].get('original_body_chars') == original_chars
+    assert ['message', 'body'] in omitted and ['message', 'body_payload'] in omitted
+
+
+def test_small_mail_views_exclude_unsanitized_provider_metadata_and_keep_exact_payload_pointer():
+    from nullion.code_mode import _default_observations
+    from nullion.tools import ToolResult
+
+    source = ToolResult('owned-mail', 'email_read', 'completed', {
+        'id': 'mail-73', 'evidence_scope': {'kind': 'email_message'}, 'message': {
+            'id': 'mail-73', 'body': 'Secondary preview', 'body_payload': '', 'body_truncated': True,
+            'original_body_chars': 4000, 'attachments': [{'blob': b'fixture payload'}],
+            'headers': {'internal': 'optional header'},
+        },
+    })
+    observation = _default_observations([source], max_chars=16000)['observations'][0]
+    assert observation['output']['message'] == {'id': 'mail-73', 'body_payload': '',
+        'body_truncated': True, 'original_body_chars': 4000}
+    assert ['message', 'headers'] in observation['omitted_paths']
+    assert ['message', 'attachments'] in observation['omitted_paths']
+    assert observation['inspection_request']['json_pointer'] == '/message/body_payload'

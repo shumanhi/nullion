@@ -6156,6 +6156,9 @@ def test_web_budget_approval_preserves_turn_and_keeps_server_responsive(tmp_path
                 approval_id = page.locator('#messages .approval-bubble').get_attribute('data-approval-id')
                 saved = runtime.store.get_suspended_turn(approval_id)
                 assert saved.resume_token['conversation_turn_id'] == turn_id
+                terminal = page.request.get(server.base_url + '/api/chat/history/' + conv,
+                                            params={'turn_ids': json.dumps([turn_id])})
+                assert terminal.ok and terminal.json()['terminal_replies'] == [], terminal.json()
                 assert 'Observation: 18' in json.dumps(saved.messages_snapshot), json.dumps(saved.messages_snapshot[-2:])
                 runtime.store.add_conversation_event({'conversation_id':conv,'event_type':'conversation.chat_turn',
                     'created_at':datetime.now(timezone.utc).isoformat(),'turn_id':'old-weather-turn',
@@ -6174,6 +6177,14 @@ def test_web_budget_approval_preserves_turn_and_keeps_server_responsive(tmp_path
                 release.set()
                 expect(page.locator('#messages')).to_contain_text(answer, timeout=10000)
                 expect(page.locator('#messages .bubble').filter(has_text=answer)).to_have_count(1)
+                # A late resume receipt can replay activity after history has rendered the reply.
+                page.evaluate('([approvalId, turnId, text]) => handleApprovalResume({resume: {turn_id: turnId, text}}, approvalId)',
+                              [approval_id, turn_id, answer])
+                terminal_bubble = page.locator('#messages .msg.bot .bubble[data-turn-id=' + json.dumps(turn_id) + ']')
+                expect(terminal_bubble).to_have_count(1)
+                page.evaluate("turnId => setBotStatus('Late approval status', turnId)", turn_id)
+                page.evaluate("turnId => updateTaskStatusCard({turn_id: turnId, group_id: 'late-group', text: 'Late planner status'})", turn_id)
+                expect(terminal_bubble).to_contain_text(answer)
                 turns = runtime.store.list_recent_conversation_events(conv, event_type='conversation.chat_turn')
                 assert any(r['turn_id'] == turn_id and r['assistant_reply'] == answer for r in turns)
                 assert runtime.store.get_suspended_turn(approval_id) is None

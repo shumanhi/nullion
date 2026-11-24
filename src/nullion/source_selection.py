@@ -143,6 +143,15 @@ def compact_source_identity_evidence(output, *, encoded: str, max_chars: int):
     """Retain declared identity anchors, never claim truncated rows as source facts."""
     import json
     from urllib.parse import urlsplit, urlunsplit
+    if (isinstance(output, Mapping) and output.get('result_kind') == 'email_message_batch'
+            and isinstance(output.get('messages'), list)):
+        audit = {key: output[key] for key in ('result_kind', 'requested_messages', 'completed_messages',
+            'complete', 'parallel_limit', 'reason') if key in output}
+        audit['messages'] = [{key: row[key] for key in ('id', 'invocation_id', 'status') if key in row}
+                             for row in output.get('messages', ()) if isinstance(row, Mapping)]
+        audit.update(truncated=True, original_chars=len(encoded))
+        if len(json.dumps(audit, ensure_ascii=False)) <= max_chars:
+            return audit
     declarations = output.get('source_record_collections') if isinstance(output, Mapping) else None
     if not isinstance(declarations, list):
         return None

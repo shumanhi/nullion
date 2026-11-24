@@ -6,13 +6,13 @@ This is a coverage catalogue, not an execution-status record. Redundant entry po
 
 ## Counts
 
-The complete source inventory contains **303 potential parameterized entries** across 51 files and 156 test functions, with all 75 API scenarios explicitly selected.
+The complete source inventory contains **304 potential parameterized entries** across 51 files and 157 test functions, with all 75 API scenarios explicitly selected.
 
 The earlier 276-case combined selection was a particular run selection, not the whole repository inventory. An empty API scenario selection is a skipped placeholder, not a real workflow. A pytest case can contain several requests or scenarios; counts are not model-call counts.
 
 | Execution type | Entries | Meaning |
 | --- | ---: | --- |
-| `live_workflow` | 280 | A running stage workflow that can consume model or tool quota. One case may send multiple chat requests. |
+| `live_workflow` | 281 | A running stage workflow that can consume model or tool quota. One case may send multiple chat requests. |
 | `saved_replay` | 14 | Stage UI/history/byte checks of saved evidence; no new test-initiated model or source work. |
 | `local_harness` | 9 | Deterministic local fixture/control checks; no real stage/provider workflow. |
 | `aggregate_entry_point` | 0 | An alternative multi-scenario entry point; do not combine it with individual scenario cases. |
@@ -25,7 +25,7 @@ The earlier 276-case combined selection was a particular run selection, not the 
 | `context` — Context, memory and retained evidence | 35 | Follow-ups, profile facts, history, numbered choices, compaction and exact retained references. |
 | `research` — Research and source accuracy | 47 | Search coverage, bounded research, recommendations, prices, source links and missing facts. |
 | `browser` — Browser lifecycle and recovery | 25 | Desktop attachment, navigation, screenshots, native delegation, owned tabs and recovery. |
-| `artifacts` — Files and generated deliverables | 60 | Document creation, format fidelity, selected versions, downloadable bytes and artifact reuse. |
+| `artifacts` — Files and generated deliverables | 61 | Document creation, format fidelity, selected versions, downloadable bytes and artifact reuse. |
 | `execution` — Code Mode and terminal execution | 17 | Programs, host modules, projections, reusable tools, unsupported imports and terminal outcomes. |
 | `scheduler` — Scheduled jobs and live trackers | 43 | Owned job changes, cancellation, finite lifetimes, conditions, alert delivery and saved-run recovery. |
 | `consent` — Account access and approvals | 32 | Source consent, read-only account boundaries, explicit choices and action approvals. |
@@ -75,6 +75,10 @@ Historical timing records retain their original test IDs. These migrations do no
 - **State and consent:** shared desktop/browser profiles, preferences, memories and named jobs prevent blanket parallelism. Do not infer concurrency safety from a category. Isolate resources before parallel runs. Cases requiring real sends or existing-job execution still require their explicit authorization and prerequisites.
 
 The consolidation changes collected test entry points, not runtime routing, stage configuration or production state.
+
+### Image-provider verification
+
+Native image generation and local PNG rendering have separate live contracts. A successful local render does not verify provider-native generation. Keep quota/auth rejection receipts visible as external blockers; do not change media settings, replenish credits, substitute a fallback, or count a native-provider failure as a native-generation pass. The local source-to-PNG contract verifies rendered file hashes, visible delivery and reload persistence without calling the image provider. `NULLION_LIVE_RASTER_REPLAY` selects an owned completed conversation and turn for read-only UI/history/byte reuse; its evidence is labeled `saved_boundary_reuse` and does not claim fresh generation.
 
 ## Read-only commands
 
@@ -216,9 +220,9 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | Selector | Variants | Execution type | Declared skip flags |
 | --- | ---: | --- | --- |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_continuation_registry_guard]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
-| `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_screenshot_artifact_delivery]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
-| `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_context_capture_recovery]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
-| `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_context_capture_recovery_variant]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_screenshot_artifact_delivery]` | 1 | `live_workflow` | NULLION_LIVE_CAPTURE_SOURCE, NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_context_capture_recovery]` | 1 | `live_workflow` | NULLION_LIVE_CAPTURE_SOURCE, NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_context_capture_recovery_variant]` | 1 | `live_workflow` | NULLION_LIVE_CAPTURE_SOURCE, NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_api_scenarios.py::test_live_stage_api_scenario[browser_page_screenshot_artifact_delivery]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_browser_capture_reuse.py::test_recent_train_results_do_not_reopen_browser` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_browser_capture_reuse.py::test_native_sequence_on_stage` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
@@ -284,6 +288,7 @@ Skip flags below come from declared test decorators. They are not a complete dep
 | `tests/e2e/test_live_stage_web_followups.py::test_live_web_archive_extract_transformation_returns_only_final_file` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_facts_can_become_a_generated_visual` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_facts_do_not_block_raster_image_generation` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
+| `tests/e2e/test_live_stage_web_followups.py::test_live_web_browser_facts_can_become_a_local_png` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_followups.py::test_live_web_rejected_image_provider_does_not_publish_a_placeholder` | 1 | `live_workflow` | NULLION_LIVE_IMAGE_REJECTION_STATUS, NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[svg_artifact_file_write]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |
 | `tests/e2e/test_live_stage_web_matrix.py::test_live_stage_web_catalogue[artifact_preflight_scope_fast_path]` | 1 | `live_workflow` | NULLION_LIVE_STAGE_E2E |

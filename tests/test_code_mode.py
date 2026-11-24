@@ -71,6 +71,29 @@ def test_scope_uses_adapter_opt_in_and_read_metadata(monkeypatch):
     assert run('1', monkeypatch, ['write'])['tool_results'][-1].output['executed_calls'] == 0
 
 
+@pytest.mark.parametrize(
+    'requested, required, valid, direct',
+    [
+        (('read',), (), True, True),
+        (('read',), ('read',), True, True),
+        (('read',), ('write',), True, False),
+        (('read', 'write'), ('read',), True, False),
+        (('read',), (), False, False),
+    ],
+)
+def test_typed_single_tool_scope_keeps_a_direct_path(monkeypatch, requested, required, valid, direct):
+    from nullion.turn_context_policy import TurnToolScopeDecision
+
+    monkeypatch.setenv('NULLION_CODE_MODE', 'on')
+    reg = registry()
+    reg.turn_tool_scope_decision = TurnToolScopeDecision(
+        requested_tool_names=requested, required_tool_names=required, valid=valid,
+    )
+    offered = code_mode.offer_code_mode(reg.list_tool_definitions(), reg)
+    assert ('read' in {tool['name'] for tool in offered}) is direct
+    assert set(offered[-1]['input_schema']['properties']['tool_names']['items']['enum']) == {'read', 'write'}
+
+
 def test_code_mode_and_scope_share_artifact_producer_precedence(monkeypatch):
     from nullion.reasoning_guidance import ARTIFACT_PRODUCTION_GUIDANCE, ARTIFACT_PRODUCER_SELECTION_GUIDANCE
     monkeypatch.setenv('NULLION_CODE_MODE', 'on')
@@ -79,6 +102,21 @@ def test_code_mode_and_scope_share_artifact_producer_precedence(monkeypatch):
     assert ARTIFACT_PRODUCER_SELECTION_GUIDANCE in description
     assert ARTIFACT_PRODUCER_SELECTION_GUIDANCE in ARTIFACT_PRODUCTION_GUIDANCE
     assert 'terminal_exec for rendering with installed Python libraries' not in description
+
+
+def test_compact_browser_batch_signature_keeps_argument_constraints(monkeypatch):
+    import json
+
+    from nullion.plugins.browser_plugin import register_browser_tools
+
+    monkeypatch.setenv('NULLION_CODE_MODE', 'on')
+    reg = ToolRegistry()
+    register_browser_tools(reg)
+    program = code_mode.offer_code_mode(reg.list_tool_definitions(), reg)[-1]
+    signatures = json.loads(program['description'].split('Compact scoped signatures: ', 1)[1])
+    description = signatures['browser_read_pages']['description']
+    assert 'Set expected_heading only for read_kind=detail.' in description
+    assert 'Batch independent URLs with independent_pages=true.' in description
 
 
 def test_real_monty_composes_and_retains_receipts(monkeypatch):
@@ -542,6 +580,42 @@ def test_session_journal_claims_and_owner_are_durable(tmp_path):
     restarted=SessionJournal({**state,'runtime_store':SimpleNamespace(_memory_checkpoint_path=path)})
     assert restarted.read(record['id'])['phase']=='running'
     with pytest.raises(ValueError):SessionJournal({**state,'principal_id':'another'}).read(record['id'])
+
+
+@pytest.mark.parametrize("status, principal, context, kept", [
+    ("pending", "owner", {"conversation_id": "web:owned"}, True),
+    ("approved", "owner", {"trigger_flow": {"conversation_id": "web:owned"}}, True),
+    ("approved", "owner", None, True),
+    ("denied", "owner", {"conversation_id": "web:owned"}, False),
+    ("pending", "foreign", {"conversation_id": "web:owned"}, False),
+    ("pending", "owner", {"conversation_id": "web:foreign"}, False),
+    ("pending", "owner", {"trigger_flow": {"conversation_id": "web:foreign"}}, False),
+    (None, "owner", None, False),
+])
+def test_session_cleanup_preserves_only_actionable_owned_approval(status, principal, context, kept):
+    from datetime import datetime, timezone
+
+    from nullion.approvals import ApprovalRequest, ApprovalStatus
+    from nullion.code_mode_sessions import SessionJournal
+    from nullion.runtime_store import RuntimeStore
+
+    store = RuntimeStore()
+    journal = SessionJournal({"principal_id": "owner", "conversation_id": "web:owned",
+                              "user_message": "確認", "runtime_store": store})
+    record = journal.create()
+    journal.save(record, phase="approval", approval_id="receipt", snapshot="owned-bytes",
+                 pending={"id": "tool-call"}, selected={"id": "program"})
+    if status is not None:
+        store.add_approval_request(ApprovalRequest("receipt", principal, "use_tool", "delete_cron",
+            ApprovalStatus(status), datetime.now(timezone.utc), context=context))
+
+    journal.close(record["id"])
+    final = journal.read(record["id"])
+    if kept:
+        assert final == record
+    else:
+        assert final["phase"] == "closed"
+        assert all(final[key] is None for key in ("snapshot", "pending", "selected"))
 
 
 @pytest.mark.asyncio
@@ -1046,3 +1120,13 @@ def test_native_snapshot_observation_paths_resolve_against_original_receipt():
         'json_pointer': '/snapshot/elements/0/href', 'offset': 0, 'length': 2000}]}
     assert not inspection_failure_output(request, [native])['request_errors']
     assert 'https://example.test/form' in str(inspect_retained(request, [native]))
+
+
+def test_pre_execution_policy_denial_does_not_mark_a_write_uncertain():
+    from nullion.tools import ToolInvocation
+
+    spec = registry().get_spec('write')
+    invocation = ToolInvocation('try-again', 'write', 'fixture', {'value': 37})
+    denied = ToolResult('first-attempt', 'write', 'denied', {'reason': 'boundary_denied'})
+    assert not code_mode.remember_unconfirmed_write(denied, spec, invocation.arguments)
+    assert code_mode.unconfirmed_write_retry(invocation, invocation.arguments, [denied]) is None

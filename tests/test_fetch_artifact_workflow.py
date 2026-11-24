@@ -73,3 +73,17 @@ def test_missing_scoped_artifact_writer_returns_failure_without_throwing(tmp_pat
     assert not result.completed and not result.artifact_paths
     assert 'unavailable' in result.error
     assert not list((tmp_path/'workspaces').rglob('*'+extension))
+
+
+def test_fetched_html_fallback_publishes_utf8_declaration(tmp_path, monkeypatch):
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path / "workspaces"))
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    html = '<html><head><meta charset="windows-1252"></head><body><h1>Asunción · €</h1></body></html>'
+    result = run_fetch_artifact_workflow(
+        runtime, prompt="資料を添付して。", requested_extension=".html", principal_id="web:fetch-report",
+        tool_results=[ToolResult("fetch", "web_fetch", "completed", {"body": html})],
+    )
+    assert result.completed
+    published = Path(result.artifact_paths[0]).read_bytes()
+    assert b'<meta charset="utf-8">' in published[:1024]
+    assert "Asunción · €".encode() in published and b"windows-1252" not in published

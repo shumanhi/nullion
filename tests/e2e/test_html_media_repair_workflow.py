@@ -28,7 +28,7 @@ def test_html_media_repair_reuses_current_image_and_preserves_linked_sibling(tmp
     image = root/'visual.png'; linked = root/'linked.html'; embedded = root/'embedded.html'
     stream = io.BytesIO(); Image.effect_noise((160, 100), 30).convert('RGB').save(stream, format='PNG')
     encoded = base64.b64encode(stream.getvalue()).decode()
-    linked_html = '<!doctype html><html><body><h1>Linked report</h1><a href="embedded.html">Embedded report</a></body></html>'
+    linked_html = '<!doctype html><html><head><meta charset="utf-8"></head><body><h1>Linked report</h1><a href="embedded.html">Embedded report</a></body></html>'
     repaired_html = f'<!doctype html><html><body><h1>Embedded report</h1><img src="{image}"></body></html>'
     class Provider:
         phase = 0; selections = 0; repairs = 0

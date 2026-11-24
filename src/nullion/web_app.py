@@ -2950,7 +2950,7 @@ _HTML = r"""<!DOCTYPE html>
     background: rgba(24,24,32,0.72);
   }
   .image-artifact-preview {
-    display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover;
+    display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: contain;
     background: var(--surface); cursor: zoom-in; border: 0;
   }
   .image-artifact-missing-preview {
@@ -6872,8 +6872,12 @@ function createBotBubble(trackCurrent = true) {
 
 function ensureBotBubble(turnId = null) {
   if (turnId) {
-    const existing = _botTurnBubbles.get(turnId);
-    if (existing) return existing;
+    const tracked = _botTurnBubbles.get(turnId);
+    const existing = tracked && tracked.isConnected ? tracked : findBotBubbleByTurnId(turnId);
+    if (existing) {
+      _botTurnBubbles.set(turnId, existing);
+      return existing;
+    }
     const bubble = createBotBubble(false);
     bubble.dataset.turnId = turnId;
     _botTurnBubbles.set(turnId, bubble);
@@ -7282,6 +7286,8 @@ function updateTaskStatusCard(data) {
   const statusKind = String(data.status_kind || 'task_summary');
   if (statusKind !== 'task_summary') return;
   if (!groupId || !text) return;
+  const finished = turnId && _finishedTurnIds.has(turnId) ? findBotBubbleByTurnId(turnId) : null;
+  if (isVisibleAnswerBubble(finished) && !finished.classList.contains('task-status-bubble')) return;
   if (turnId) _turnIdByTaskGroup.set(groupId, turnId);
   let bubble = _taskStatusBubbles.get(groupId) || null;
   if (!bubble && turnId) bubble = _botTurnBubbles.get(turnId) || null;
@@ -7924,6 +7930,7 @@ function showBotTyping(label = 'Thinking', turnId = null) {
 
 function setBotStatus(text, turnId = null) {
   const bubble = ensureBotBubble(turnId);
+  if (turnId && _finishedTurnIds.has(turnId) && isVisibleAnswerBubble(bubble)) return bubble;
   const activity = detachRunActivity(bubble);
   bubble.classList.add('thinking', 'status-bubble');
   bubble.classList.remove('typing-bubble');
@@ -8742,7 +8749,9 @@ function appendBotChunk(chunk, turnId = null) {
 }
 
 function finalizeBotMsg(fallback = null, isError = false, turnId = null) {
-  let bubble = turnId ? (_botTurnBubbles.get(turnId) || findBotBubbleByTurnId(turnId)) : botMsgEl;
+  let bubble = turnId
+    ? (fallback ? ensureBotBubble(turnId) : findBotBubbleByTurnId(turnId))
+    : botMsgEl;
   if (bubble && fallback) {
     const activity = detachRunActivity(bubble);
     bubble.classList.remove('typing-bubble', 'status-bubble', 'has-run-activity');
@@ -17929,7 +17938,9 @@ def _web_sanitize_delivery_reply(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     source: str = "agent",
 ) -> str:
-    original = str(reply or "")
+    from nullion.chat_text import render_report_reply
+
+    original = render_report_reply(str(reply or "")) or ""
     sanitized = sanitize_user_visible_reply(
         user_message=user_message,
         reply=original,
@@ -19841,7 +19852,7 @@ def _hydrate_chat_history_media(
         if str(item.get("role") or "").lower() == "bot":
             from nullion.chat_text import render_user_message, render_report_reply
             raw_text = str(item.get("text") or "")
-            item["text"] = render_user_message(render_report_reply(raw_text) or raw_text)
+            item["text"] = render_user_message(render_report_reply(raw_text) or "")
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         artifacts = _chat_media_payloads_from_metadata(runtime, metadata, "artifacts", principal_id=principal_id)
         attachments = _chat_media_payloads_from_metadata(runtime, metadata, "attachments", principal_id=principal_id)
@@ -19960,19 +19971,9 @@ def _web_completed_email_attachment_notice(
 
 
 def _web_completed_email_send_summary(result: ToolResult) -> str:
-    output = result.output if isinstance(result.output, dict) else {}
-    recipients = output.get("to")
-    if isinstance(recipients, str):
-        recipient_text = recipients.strip()
-    elif isinstance(recipients, (list, tuple)):
-        recipient_text = ", ".join(str(value).strip() for value in recipients if str(value).strip())
-    else:
-        recipient_text = ""
-    subject = str(output.get("subject") or "").strip()
-    summary = f"✉️ Email sent to {recipient_text or 'the requested recipient'}"
-    if subject:
-        summary += f' with subject "{subject}"'
-    return summary + "."
+    from nullion.chat_operator import _completed_email_send_summaries
+
+    return _completed_email_send_summaries([result])[0]
 
 
 def _web_normalize_completed_email_send_reply(
@@ -19990,6 +19991,12 @@ def _web_normalize_completed_email_send_reply(
         return text
     summary = _web_completed_email_send_summary(email_results[-1])
     reply_text = str(text or "")
+    from nullion.chat_text import render_report_reply
+
+    # Render structured findings before checking legacy plain-text confirmations.
+    report_text = render_report_reply(reply_text)
+    if report_text != reply_text:
+        return report_text or summary
     if summary in reply_text:
         return reply_text
     lowered = reply_text.lower()
@@ -20875,7 +20882,7 @@ def _materialize_fetch_artifact_for_web(
             return []
         existing_matching_artifacts = [
             path
-            for path in artifact_paths_from_tool_results(tool_results)
+            for path in filter_source_artifact_paths(artifact_paths_from_tool_results(tool_results), tool_results)
             if Path(path).suffix.lower() == planned_extension
         ]
         if existing_matching_artifacts:
@@ -21690,15 +21697,17 @@ def create_app(runtime, orchestrator, registry):
             return _web_artifact_descriptors(
                 runtime, list(terminal_manifest), principal_id=conversation_id,
             )
+        if artifact_paths:
+            artifact_paths = filter_source_artifact_paths(artifact_paths, tool_results)
+        if reply_artifact_paths:
+            reply_artifact_paths = filter_source_artifact_paths(reply_artifact_paths, tool_results)
         # The shared turn has already selected its output. Only ask a model
         # to disambiguate format when that output contains artifact evidence.
         # Plain replies must not pay for another provider call during delivery.
-        has_artifact_evidence = bool(
-            artifact_paths
-            or reply_artifact_paths
-            or getattr(result, "artifacts", None)
-            or artifact_paths_from_tool_results(tool_results)
-        )
+        has_artifact_evidence = bool(artifact_paths or reply_artifact_paths or getattr(result, "artifacts", None))
+        if not has_artifact_evidence:
+            tool_paths = artifact_paths_from_tool_results(tool_results)
+            has_artifact_evidence = bool(tool_paths and filter_source_artifact_paths(tool_paths, tool_results))
         requested_attachment_extension = plan_attachment_format(
             user_text,
             model_client=(
@@ -21799,7 +21808,8 @@ def create_app(runtime, orchestrator, registry):
             user_text=user_text,
         )
         from nullion.artifact_lifecycle import delivery_manifest
-        terminal_manifest = delivery_manifest(getattr(result, "tool_results", ()) or ())
+        tool_results = list(getattr(result, "tool_results", ()) or ())
+        terminal_manifest = delivery_manifest(tool_results)
         # Selection already owns this package. Re-inferring a format from the
         # request here can discard independently requested siblings after a
         # linked member was packaged. The descriptor boundary still validates
@@ -21844,8 +21854,9 @@ def create_app(runtime, orchestrator, registry):
             if isinstance(artifact, dict) and str(artifact.get("path") or "").strip()
         ]
         reply_text = str(getattr(result, "text", "") or "")
-        expected_paths = (tuple(terminal_manifest) if terminal_manifest is not None
-                          else tuple(getattr(result, "artifact_paths", None) or ()))
+        expected_paths = terminal_manifest
+        if expected_paths is None and (candidate_paths := getattr(result, "artifact_paths", None)):
+            expected_paths = filter_source_artifact_paths(candidate_paths, tool_results)
         if expected_paths and not artifacts:
             reply_text = (
                 "The file was created, but I could not attach it to this chat. "
@@ -22320,6 +22331,7 @@ def create_app(runtime, orchestrator, registry):
         target: str = "",
         run_label: str = "Scheduled task",
         message_only: bool = False,
+        exact_artifact_paths: tuple[str, ...] | None = None,
     ) -> bool:
         target = str(target or "").strip() or _cron_delivery_target(job, "telegram")
         if not target:
@@ -22341,6 +22353,7 @@ def create_app(runtime, orchestrator, registry):
                     principal_id=f"telegram:{target}",
                     suppress_link_preview=True,
                     **({"message_only": True} if message_only else {}),
+                    **({"exact_artifact_paths": exact_artifact_paths} if exact_artifact_paths is not None else {}),
                 )
             )
         except UnconfirmedDelivery:
@@ -22382,9 +22395,11 @@ def create_app(runtime, orchestrator, registry):
         *,
         run_label: str = "Scheduled task",
         message_only: bool = False,
+        exact_artifact_paths: tuple[str, ...] | None = None,
     ) -> bool:
         if channel == "telegram":
-            sent = _send_cron_telegram_delivery(job, text, target=target, run_label=run_label, message_only=message_only)
+            sent = _send_cron_telegram_delivery(job, text, target=target, run_label=run_label, message_only=message_only,
+                                               exact_artifact_paths=exact_artifact_paths)
             return sent
         target = str(target or "").strip() or _cron_delivery_target(job, channel)
         if not target:
@@ -22394,6 +22409,7 @@ def create_app(runtime, orchestrator, registry):
 
             settings = load_settings()
             message = scheduled_task_delivery_text(job, text, run_label=run_label)
+            delivery_options = {"exact_artifact_paths": exact_artifact_paths} if exact_artifact_paths is not None else {}
             if channel == "slack":
                 from nullion.slack_app import send_slack_platform_delivery
 
@@ -22406,6 +22422,7 @@ def create_app(runtime, orchestrator, registry):
                     text=message,
                     principal_id=f"slack:{target}",
                     **({"message_only": True} if message_only else {}),
+                    **delivery_options,
                 ))
             if channel == "discord":
                 from nullion.discord_app import send_discord_platform_delivery
@@ -22419,6 +22436,7 @@ def create_app(runtime, orchestrator, registry):
                     text=message,
                     principal_id=f"discord:{target}",
                     **({"message_only": True} if message_only else {}),
+                    **delivery_options,
                 ))
         except UnconfirmedDelivery:
             raise
@@ -22436,30 +22454,40 @@ def create_app(runtime, orchestrator, registry):
         run_label: str = "Scheduled task",
         message_only: bool = False,
     ) -> bool:
-        delivery_body = cron_delivery_text(text, artifacts)
+        allow_attachments = not (message_only or result.get("cron_delivery_message_only") is True)
+        delivery_body = cron_delivery_text(text, artifacts if allow_attachments else ())
         fallback = scheduled_task_delivery_text(job, delivery_body, run_label=run_label)
         visible_text = fallback
         artifact_payloads: list[dict[str, object]] = []
+        from nullion.artifact_lifecycle import delivery_manifest
+        exact_artifact_paths = None
+        if allow_attachments:
+            if finalized := result.get("cron_finalized_attachment_paths"):
+                exact_artifact_paths = tuple(finalized)
+            elif delivery_manifest(result.get("tool_results")) is not None:
+                exact_artifact_paths = tuple(map(str, artifacts or ()))
         try:
             platform_delivery = prepare_reply_for_platform_delivery(
                 fallback,
                 principal_id=conv_id,
-                allow_attachments=False if message_only else None,
+                allow_attachments=None if allow_attachments else False,
+                exact_artifact_paths=exact_artifact_paths,
             )
             if platform_delivery.text:
                 visible_text = platform_delivery.text
             elif platform_delivery.attachments:
                 visible_text = "Attached the requested file."
             artifact_paths = [str(path) for path in platform_delivery.attachments]
-            if not artifact_paths and not message_only:
+            if not artifact_paths and allow_attachments and exact_artifact_paths is None:
                 artifact_paths = list(cron_delivery_artifact_paths_from_result(result, delivery_body))
-            artifact_payloads = _web_artifact_descriptors(
-                runtime,
-                artifact_paths,
-                principal_id=conv_id,
-            )
+            if allow_attachments:
+                artifact_payloads = _web_artifact_descriptors(
+                    runtime, artifact_paths, principal_id=conv_id,
+                )
         except Exception:
             logger.debug("Could not prepare web cron delivery artifacts", exc_info=True)
+        if exact_artifact_paths is not None and len(artifact_payloads) != len(exact_artifact_paths):
+            return False
         try:
             from nullion.chat_store import get_chat_store
             get_chat_store().save_message(
@@ -22577,12 +22605,13 @@ def create_app(runtime, orchestrator, registry):
                     result,
                     run_label=label,
                 ),
-                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
+                send_platform_delivery=lambda cron_job, channel, target, text, **delivery_options: _send_cron_platform_delivery(
                     cron_job,
                     channel,
                     target,
                     text,
                     run_label=label,
+                    **delivery_options,
                 ),
                 start_background_delivery=None,
                 clear_background_delivery=None,
@@ -22799,12 +22828,13 @@ def create_app(runtime, orchestrator, registry):
                             result,
                             run_label="Manual scheduled task run",
                         ),
-                        send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
+                        send_platform_delivery=lambda cron_job, channel, target, text, **delivery_options: _send_cron_platform_delivery(
                             cron_job,
                             channel,
                             target,
                             text,
                             run_label="Manual scheduled task run",
+                            **delivery_options,
                         ),
                         start_background_delivery=None,
                         clear_background_delivery=None,
@@ -23172,7 +23202,8 @@ def create_app(runtime, orchestrator, registry):
                 replies = []
                 for event in reversed(events):
                     if (event.get("turn_id") in revoked_replies or event.get("turn_id") not in wanted
-                            or not str(event.get("assistant_reply") or "").strip()):
+                            or not str(event.get("assistant_reply") or "").strip()
+                            or _web_history_turn_awaiting_approval(event)):
                         continue
                     wanted.discard(event["turn_id"])
                     from nullion.chat_store import _artifact_metadata_from_runtime_turn
@@ -23499,11 +23530,19 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": "artifact not found"}, status_code=404)
         if not _is_previewable_web_artifact(descriptor):
             return JSONResponse({"ok": False, "error": "artifact is not previewable"}, status_code=415)
-        return FileResponse(
-            path,
-            media_type=descriptor.media_type,
-            headers=_inline_artifact_headers(descriptor),
-        )
+        headers = _inline_artifact_headers(descriptor)
+        if descriptor.media_type == "text/html":
+            from nullion.artifacts import declared_html_encoding
+
+            try:
+                with path.open("rb") as source:
+                    encoding = declared_html_encoding(source.read(1024))
+            except OSError:
+                return JSONResponse({"ok": False, "error": "artifact not found"}, status_code=404)
+            if encoding:
+                # Leave the byte stream's own declaration authoritative.
+                headers["Content-Type"] = "text/html"
+        return FileResponse(path, media_type=descriptor.media_type, headers=headers)
 
     @app.post("/api/artifacts/{artifact_id}/save")
     async def save_artifact(artifact_id: str):
@@ -31522,6 +31561,18 @@ def _approval_reply_is_new_approval(reply: str | None) -> str | None:
     return approval_id or None
 
 
+def _web_history_turn_awaiting_approval(event: Mapping[str, Any]) -> bool:
+    state = event.get("history_state")
+    if state in {"suspended", "terminal"}:
+        return state == "suspended"
+    approval_id = _approval_reply_is_new_approval(event.get("assistant_reply"))
+    return bool(approval_id) and any(
+        isinstance(row, Mapping) and isinstance(output := row.get("output"), Mapping)
+        and output.get("requires_approval") is True and output.get("approval_id") == approval_id
+        for row in event.get("tool_results") or ()
+    )
+
+
 async def _resume_telegram_turn_from_web_approval(
     runtime,
     *,
@@ -31577,7 +31628,7 @@ async def _resume_telegram_turn_from_web_approval(
         )
     return {
         "type": "message",
-        "text": resumed_text,
+        "text": _web_sanitize_delivery_reply(user_message=None, reply=resumed_text, source="platform_delivery"),
         "channel": "telegram",
         "chat_id": chat_id,
     }
@@ -31753,9 +31804,10 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
 
     approval = store.get_approval_request(approval_id)
     context = (approval.context or {}) if approval is not None else {}
-    needs_saved_workflow = checkpoint_reference(suspended_turn.pending_tool_calls) or context.get("delegated_resume")
-    if needs_saved_workflow and (
-        not suspended_turn.messages_snapshot or not callable(getattr(orchestrator, "resume_turn", None))
+    saved_program = checkpoint_reference(suspended_turn.pending_tool_calls)
+    if (saved_program or context.get("delegated_resume")) and (
+        (not suspended_turn.messages_snapshot and not saved_program)
+        or not callable(getattr(orchestrator, "resume_turn", None))
     ):
         return {"type": "message", "text": "The saved program could not be resumed. The approved action was not run."}
 
@@ -31868,6 +31920,10 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 max_iterations=resume_max_iterations,
                 **callbacks,
             )
+    from nullion.chat_operator import recover_approved_scheduled_email
+    recovered_send = recover_approved_scheduled_email(runtime, suspended_turn, result, tool_registry=registry)
+    if recovered_send is not None and callbacks:
+        callbacks["tool_result_callback"](recovered_send)
     report_saving()
     store.remove_suspended_turn(approval_id)
     try:
@@ -31875,6 +31931,9 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     except Exception:
         logger.debug("Unable to checkpoint after resuming web approval", exc_info=True)
 
+    if recovered_send is not None:
+        return _web_direct_tool_result_resume_payload(runtime, conversation_id=conversation_id,
+            user_text=user_text, tool_result=recovered_send, prior_tool_results=prior_tool_results)
     if getattr(result, "suspended_for_approval", False):
         label, detail, trigger_flow_label, is_web_request = _approval_display_from_turn_result(runtime, result)
         return _web_approval_required_payload({
@@ -31996,6 +32055,17 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         )
         if local_discovery_reply:
             final_text = local_discovery_reply
+    if (
+        _fulfilled
+        and not artifact_paths
+        and getattr(result, "response_fulfilled", None) is not False
+        and not getattr(result, "reached_iteration_limit", False)
+    ):
+        from nullion.chat_operator import completed_scheduled_email_approval_reply
+
+        email_receipt = completed_scheduled_email_approval_reply(approval, suspended_turn, tool_results)
+        if email_receipt is not None:
+            final_text = email_receipt
     resume_token = getattr(suspended_turn, "resume_token", None) or {}
     conversation_turn_id = resume_token.get("conversation_turn_id") or getattr(result, "turn_id", None)
     if not isinstance(conversation_turn_id, str) or not conversation_turn_id.strip():
@@ -32496,7 +32566,7 @@ def _resolve_browser_backend() -> str | None:
     return None
 
 
-def _build_runtime():
+def _build_runtime(*, probe_checkpoint: Path | None = None):
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.config import load_settings as load_app_settings
     from nullion.providers import resolve_plugin_provider_kwargs
@@ -32520,6 +32590,8 @@ def _build_runtime():
 
     app_settings = load_app_settings()
     settings = Settings()
+    if probe_checkpoint is not None:
+        settings.checkpoint_path = probe_checkpoint
     runtime = build_runtime_from_settings(settings)
     artifact_root = ensure_artifact_root(runtime)
     allowed_roots = messaging_file_allowed_roots(

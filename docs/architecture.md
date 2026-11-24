@@ -2009,6 +2009,14 @@ the shared outcome layer binds that success receipt to the optional failed
 method. A stale provider billing warning then cannot contradict a completed
 delivery. Required methods, account effects, approvals, absent files and
 unrelated successful tools remain unresolved until their own contracts pass.
+Native failure accounting preserves the composer's caption, findings and source
+references bound to current selected paths or explicit media references. Earlier failed attempts may remain
+in a partial execution outcome; that state must not replace the authored reply
+with a generic attachment receipt or conceal a pending action.
+Legacy results with files inferred only from tool history retain their native
+receipt fallback. Reply wording never decides which ownership path applies.
+Web image cards fit the entire delivered image inside their preview frame;
+portrait and landscape artifacts must retain their edges on mobile and desktop.
 
 Execution time, memory, source size, native call count and transferred data are
 bounded. Programs use native APIs for file generation, account changes and other

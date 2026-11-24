@@ -68,6 +68,37 @@ def test_typed_alternative_source_continuation_survives_compaction():
     assert pending_source_continuation([first,other]) is None
 
 
+def test_scheduled_controller_handoff_requires_current_source_evidence():
+    from nullion.source_observation_contract import source_continuation_state
+
+    continuation = {'kind': 'alternate_tool', 'source_url': 'https://search.example.test/form',
+        'tool_names': ['browser_navigate', 'browser_extract_text', 'browser_extract_items']}
+    first = ToolResult('handoff', 'browser_run_task', 'completed', {
+        'result_kind': 'source_observations', 'continuation': continuation})
+    nav = ToolResult('navigation', 'browser_navigate', 'completed', {
+        'url': 'https://search.example.test/form', 'session_id': 'cron-current'})
+    read = {'result_kind': 'browser_rendered_text', 'page_url': 'https://search.example.test/results',
+        'text': '現在の料金 37', 'session_id': 'cron-current'}
+    for fields, clears in [({}, True), ({'session_id': 'cron-earlier'}, False),
+                           ({'page_url': 'https://unrelated.example.test/form'}, False),
+                           ({'text': ''}, False)]:
+        capture = ToolResult('capture', 'browser_extract_text', 'completed', {**read, **fields})
+        pending = source_continuation_state([first, nav, capture], require_source_read=True,
+                                            session_id='cron-current')
+        assert pending == ((None, None) if clears else (continuation, 0))
+
+    items = ToolResult('items', 'browser_extract_items', 'completed', {
+        'result_kind': 'browser_item_collection', 'session_id': 'cron-current',
+        'items': [{'price_text': '37 USD'}], 'coverage': {'scope_found': True},
+        'page': {'url': 'https://search.example.test/results'},
+    })
+    assert source_continuation_state([first, nav, items], require_source_read=True,
+                                     session_id='cron-current') == (None, None)
+    items.output['coverage']['scope_found'] = False
+    assert source_continuation_state([first, nav, items], require_source_read=True,
+                                     session_id='cron-current') == (continuation, 0)
+
+
 @pytest.mark.parametrize('status', ['partial', 'completed'])
 def test_completed_source_report_is_not_retried_as_missing_history(status):
     from nullion.agent_orchestrator import TurnResult

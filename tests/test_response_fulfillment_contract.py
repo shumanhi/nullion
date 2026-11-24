@@ -3,6 +3,43 @@ from nullion.runtime_store import RuntimeStore
 from nullion.tools import ToolResult
 
 
+def test_multi_file_media_receipt_does_not_credit_plain_or_linked_siblings(tmp_path):
+    from zipfile import ZipFile
+    from nullion.response_fulfillment_contract import artifact_completed_embedded_media_paths
+
+    workbook = tmp_path / 'charts.xlsx'
+    plain = tmp_path / 'plain.xlsx'
+    for path in (workbook, plain):
+        with ZipFile(path, 'w') as archive:
+            archive.writestr('xl/workbook.xml', '<workbook/>')
+            if path == workbook:
+                archive.writestr('xl/media/figure.png', b'fixture')
+    html = tmp_path / 'linked.html'
+    html.write_text('<html><img src="figure.png"></html>')
+    result = ToolResult('batch', 'terminal_exec', 'completed',
+        {'artifact_paths': [str(workbook), str(plain), str(html)], 'embedded_images': ['figure.png']})
+
+    assert artifact_completed_embedded_media_paths([result]) == (str(workbook),)
+
+
+def test_missing_html_variant_cannot_publish_a_complete_turn(tmp_path):
+    from nullion.agent_orchestrator import _complete_agent_turn
+    from nullion.artifact_evidence import verified_html_delivery_variant
+
+    plain = tmp_path / 'report.html'
+    plain.write_text('<html><body>Plain report</body></html>')
+    assert verified_html_delivery_variant(plain) == 'self_contained'
+    result = _complete_agent_turn({
+        'tool_results': [ToolResult('report', 'file_write', 'completed', {'artifact_path': str(plain)})],
+        'artifacts': [str(plain)], 'artifact_missing_html_variants': ['embedded'],
+        'user_message': '画像を埋め込んだHTML版も添付。',
+        'principal_id': 'web:fixture', 'conversation_id': 'web:fixture',
+    }, final_text='Only the plain report is ready.', response_fulfilled=True)['result']
+    assert result.response_fulfilled is False
+    assert result.artifact_delivery_required is True
+    assert result.artifact_delivery_satisfied is False
+
+
 def test_completed_web_search_preserves_model_prose():
     reply = (
         "I fetched the page. If you want, I can pull a concise top headlines "

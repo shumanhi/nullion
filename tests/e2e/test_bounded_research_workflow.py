@@ -160,6 +160,7 @@ def test_observed_page_reference_writes_artifact_without_source_guard_retry(tmp_
         False, 5), _build_file_write_handler(tmp_path, allowed_roots=(tmp_path,)))
     path = tmp_path/'観測.html'
     content = '<html><body><h1>Example Domain</h1><a href="https://example.com/">出典</a></body></html>'
+    expected = content.replace("<body>", '<head><meta charset="utf-8"><title>観測</title></head><body>', 1)
     class Model:
         phase = 0
         def create(self, **kwargs):
@@ -177,14 +178,14 @@ def test_observed_page_reference_writes_artifact_without_source_guard_retry(tmp_
             if mode == 'off':
                 if self.phase == 2:return call('browser_navigate', {'url':'https://example.com'})
                 if self.phase == 3:return call('file_write', {'path':str(path), 'content':content})
-            assert path.read_text() == content
+            assert path.read_text() == expected
             return text('保存しました。 '+str(path))
     result = AgentOrchestrator(model_client=Model()).run_turn(conversation_id='web:verified-reference',
         principal_id='workspace_admin', user_message=prompt, conversation_history=[], tool_registry=registry,
         policy_store=runtime.store, approval_store=runtime.store)
     writes = [row for row in result.tool_results if row.tool_name == 'file_write']
     assert len(writes) == 1 and writes[0].status == 'completed', writes
-    assert path.read_bytes() == content.encode('utf-8')
+    assert path.read_bytes() == expected.encode('utf-8')
     assert str(path) in result.artifacts
 
 
@@ -243,3 +244,61 @@ def test_explicit_refresh_invalidates_both_execution_and_request_snapshots(tmp_p
         events = runtime.store.list_recent_conversation_events('web:refresh')
         budget = next(e for e in reversed(events) if e['event_type']=='conversation.research_budget')
         assert budget['usage']['research_native_calls'] == 2
+
+
+@pytest.mark.parametrize('prompt', ['照合して結果を教えてください。', 'Contrasta ambas fuentes.'])
+def test_required_source_keeps_a_native_attempt_after_a_slow_read(tmp_path, monkeypatch, prompt):
+    from fastapi.testclient import TestClient
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.tools import ToolRegistry, ToolSpec, ToolResult, ToolRiskLevel, ToolSideEffectClass
+    from nullion.web_app import create_app
+    from tests.e2e.test_quoted_reply_review_and_cleanup import isolate, text
+    from tests.workflow_provider_protocol import workflow_provider_reply
+
+    runtime = isolate(tmp_path, monkeypatch)
+    monkeypatch.setenv('NULLION_CODE_MODE', 'off')
+    monkeypatch.setenv('NULLION_RESEARCH_SECONDS', '2')
+    first, second = 'fixture_primary_read', 'fixture_comparison_read'
+    names = [first, second]
+    registry = ToolRegistry()
+
+    def read(invocation):
+        if invocation.arguments.get('attempt') == 2:
+            time.sleep(2.1)
+        return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
+                          {'value': 37 if invocation.tool_name == first else 42})
+
+    for name in names:
+        registry.register(ToolSpec(name, 'Read a required observation', ToolRiskLevel.LOW,
+                                   ToolSideEffectClass.READ, False, 3,
+                                   capability_tags=('web', 'explicit_scope_only', 'required_scope_only')), read)
+
+    class Provider:
+        phase = 0
+        def create(self, **kwargs):
+            protocol = workflow_provider_reply(kwargs, completion=True)
+            if protocol is not None:
+                return protocol
+            self.phase += 1
+            if self.phase == 1:
+                return call('request_tool_scope', {'capabilities': ['web'], 'tool_names': names,
+                                               'required_tool_names': names})
+            if self.phase in (2, 3):
+                return call(first, {'attempt': self.phase - 1})
+            if self.phase == 4:
+                time.sleep(.25)
+                return call(second, {})
+            return text('37 / 42')
+
+    model = Provider()
+    with TestClient(create_app(runtime, AgentOrchestrator(model_client=model), registry)) as client:
+        conversation = 'web:required-source-reservation'
+        started = time.monotonic()
+        response = client.post('/api/chat', json={'text': prompt, 'conversation_id': conversation})
+        assert time.monotonic() - started < 3
+        assert response.status_code == 200 and '37 / 42' in response.json()['text'], response.json()
+        turn = runtime.store.list_recent_conversation_events(conversation, event_type='conversation.chat_turn')[-1]
+        assert turn['response_fulfilled'] is True
+        assert {row['tool_name'] for row in turn['tool_results'] if row['status'] == 'completed'} >= set(names), [
+            (row['tool_name'], row['status'], row.get('output', {}).get('reason'), row.get('output', {}).get('required_tool_names'))
+            for row in turn['tool_results']]

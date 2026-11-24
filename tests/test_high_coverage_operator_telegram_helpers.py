@@ -19145,8 +19145,31 @@ def test_telegram_registered_run_cron_returns_deferred_receipt_with_running_stat
     registry = ToolRegistry()
     completed = threading.Event()
     delivered = threading.Event()
+    terminal_status_delivered = threading.Event()
     captured: dict[str, object] = {}
     deliveries: list[dict[str, object]] = []
+    status_deliveries: list[dict[str, object]] = []
+
+    class StatusBot:
+        """Keep the real status renderer, isolating only the external SDK."""
+
+        def __init__(self, token, **kwargs):
+            self.token = token
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def send_message(self, chat_id, text, **kwargs):
+            status_deliveries.append({"chat_id": chat_id, "text": text, **kwargs})
+            if "✓ Completed" in text:
+                terminal_status_delivered.set()
+            return SimpleNamespace(message_id=17)
+
+        async def edit_message_text(self, **kwargs):
+            return await self.send_message(**kwargs)
 
     class FakeOrchestrator:
         model_client = object()
@@ -19186,6 +19209,10 @@ def test_telegram_registered_run_cron_returns_deferred_receipt_with_running_stat
     monkeypatch.setattr(telegram_entrypoint, "_resolve_browser_backend", lambda: None)
     monkeypatch.setattr(telegram_entrypoint, "default_browser_backend_for_web_research", lambda settings: None)
     monkeypatch.setattr(telegram_entrypoint, "_send_operator_telegram_delivery", fake_send_operator_telegram_delivery)
+    # Terminal status delivery is a separate SDK operation from the result.
+    # An invalid token must never let this fixture contact the real Bot API.
+    import telegram
+    monkeypatch.setattr(telegram, "Bot", StatusBot)
 
     telegram_entrypoint._build_runtime_service_from_settings(
         checkpoint_path=tmp_path / "runtime.db",
@@ -19213,6 +19240,8 @@ def test_telegram_registered_run_cron_returns_deferred_receipt_with_running_stat
     assert captured["run_turn"]["conversation_id"] == "telegram:100001"
     assert delivered.wait(2)
     assert deliveries
+    assert terminal_status_delivered.wait(2)
+    assert status_deliveries and all(row["chat_id"] == "100001" for row in status_deliveries)
 
 
 def test_telegram_registered_run_cron_registers_cancellable_conversation_id(

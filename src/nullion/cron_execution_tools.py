@@ -46,6 +46,7 @@ class CronConnectorScopeDecision:
     delivery_mode: str = ""
     failure_reason: str = ""
     error_type: str = ""
+    chat_delivery_mode: str = ""
 
 
 class CronExecutionToolRegistry:
@@ -649,11 +650,14 @@ def build_cron_connector_scope_decision(
                     and (not value["write_tool_names"] or (value["allow_connector_tools"] and any(
                         provider.get("provider_id") in value["provider_ids"] and provider.get("permission_mode") == "write"
                         for provider in provider_summaries)))
-                    and value.get("delivery_mode") in {"report_each_run", "verified_matches_only"}):
+                    and value.get("delivery_mode") in {"report_each_run", "verified_matches_only"}
+                    and ("email_send" not in value["write_tool_names"]
+                         or value.get("chat_delivery_mode") in ("", "confirmation_only", "report"))):
                 return CronConnectorScopeDecision(
                     allow_connector_tools=value["allow_connector_tools"],
                     provider_ids=tuple(value["provider_ids"]), confidence=value["confidence"], valid=True,
-                    write_tool_names=tuple(value["write_tool_names"]), delivery_mode=value["delivery_mode"])
+                    write_tool_names=tuple(value["write_tool_names"]), delivery_mode=value["delivery_mode"],
+                    chat_delivery_mode=value.get("chat_delivery_mode", ""))
     prompt = {
         "surface": "scheduled_task_execution",
         "available_connector_providers": list(provider_summaries),
@@ -671,6 +675,8 @@ def build_cron_connector_scope_decision(
             "write_tool_names": {"type": "array", "items": {"enum": write_names} if write_names else False, "uniqueItems": True},
             "delivery_mode": {"enum": ["report_each_run", "verified_matches_only"]},
         })
+        if "email_send" in write_names:
+            properties["chat_delivery_mode"] = {"enum": ["confirmation_only", "report"]}
     prompt["response_schema"] = {"type": "object", "additionalProperties": False,
         "required": list(properties), "properties": properties}
     system = (
@@ -699,6 +705,12 @@ def build_cron_connector_scope_decision(
             'report_each_run for reports requested on every run. Determine these from the full saved task '
             'in any language, never from its title alone. Never invent tool names or provider ids.'
         )
+        if "chat_delivery_mode" in properties:
+            system += (
+                ' Set chat_delivery_mode to confirmation_only only when email_send is the sole requested '
+                'delivery action and the saved task asks for all report content to be delivered by email. '
+                'Choose report when it requests any findings, summary, or file in chat, or when uncertain.'
+            )
     try:
         response = model_client.create(
             messages=[
@@ -744,6 +756,9 @@ def build_cron_connector_scope_decision(
             payload = json.loads(_extract_response_text(response))
             selected = payload.get("write_tool_names", [])
             mode = payload.get("delivery_mode", "")
+            chat_mode = payload.get("chat_delivery_mode")
+            if chat_mode not in ("confirmation_only", "report"):
+                chat_mode = ""
             if (not isinstance(selected, list) or any(not isinstance(name, str) for name in selected)
                     or mode not in {"", "report_each_run", "verified_matches_only"}):
                 return CronConnectorScopeDecision(failure_reason="invalid_execution_contract")
@@ -756,7 +771,8 @@ def build_cron_connector_scope_decision(
             if selected and (not writable or not decision.allow_connector_tools
                              or len(writes) != len(set(selected))):
                 return CronConnectorScopeDecision(failure_reason="invalid_execution_contract")
-            decision = replace(decision, write_tool_names=writes, delivery_mode=mode)
+            decision = replace(decision, write_tool_names=writes, delivery_mode=mode,
+                               chat_delivery_mode=chat_mode if writes == ("email_send",) else "")
             if mode:  # Do not cache incomplete legacy responses or transient failures.
                 from dataclasses import asdict
                 set_json("cron.execution_contract", cache_key, asdict(decision), version="v2",

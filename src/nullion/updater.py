@@ -4,7 +4,7 @@ Flow:
   1. fetch()     — git fetch, compare HEAD vs the selected update target
   2. snapshot()  — save pip freeze + current git commit when an update exists
   3. apply()     — reset source to the target commit + pip install -e .
-  4. health()    — import check + /api/status + messaging bootstrap probes
+  4. health()    — database readiness, application bootstraps, and /api/health
   5. rollback()  — restore pip state + git reset if health fails
 
 Entry points:
@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import sysconfig
@@ -571,12 +572,12 @@ def rollback(snap: Path) -> bool:
 def _probe_web_status(port: int = 8742, timeout: float = 10.0) -> bool:
     try:
         import urllib.request
-        url = f"http://localhost:{port}/api/status"
+        url = f"http://localhost:{port}/api/health"
         with urllib.request.urlopen(url, timeout=timeout) as r:
             if getattr(r, "status", 200) >= 400:
                 return False
             data = json.loads(r.read())
-            return data.get("status") != "error"
+            return data.get("status") == "ok"
     except Exception as exc:
         log.warning("Web health probe failed on port %s: %s", port, exc)
         return False
@@ -596,9 +597,12 @@ def _default_env_path() -> Path | None:
 
 
 def _default_checkpoint_path() -> Path:
-    explicit = os.environ.get("NULLION_CHECKPOINT")
+    explicit = os.environ.get("NULLION_CHECKPOINT_PATH") or os.environ.get("NULLION_CHECKPOINT")
     if explicit:
         return Path(explicit)
+    data_dir = os.environ.get("NULLION_DATA_DIR")
+    if data_dir:
+        return Path(data_dir).expanduser() / "runtime.db"
     installed = _install_dir() / "runtime.db"
     if installed.exists():
         return installed
@@ -695,12 +699,15 @@ def run_post_update_migrations(
         log.debug("Startup maintenance skipped: %s", exc, exc_info=True)
 
     try:
-        from nullion.runtime import bootstrap_persistent_runtime
+        from nullion.runtime_persistence import _is_sqlite_runtime_path
 
         runtime_json = checkpoint.with_name("runtime-store.json")
         had_runtime_json = runtime_json.exists()
-        runtime = bootstrap_persistent_runtime(checkpoint)
-        runtime.checkpoint()
+        if had_runtime_json or not checkpoint.exists() or not _is_sqlite_runtime_path(checkpoint):
+            from nullion.runtime import bootstrap_persistent_runtime
+
+            runtime = bootstrap_persistent_runtime(checkpoint)
+            runtime.checkpoint()
         details["runtime_imported"] = bool(had_runtime_json and checkpoint.exists())
     except Exception as exc:
         details["warnings"].append("runtime migration skipped; existing runtime data was left unchanged")
@@ -756,9 +763,15 @@ def fresh_post_update_migrations(
     return payload if isinstance(payload, dict) else {"warnings": ["migration returned non-object payload"]}
 
 
+# Both constructors use disposable runtime state. The installed checkpoint is
+# verified separately so history size cannot determine the startup deadline.
+_STARTUP_PROBE_TIMEOUT = 30.0
+_FRESH_INTERPRETER_ALLOWANCE = 10.0
+
+
 def _probe_messaging_platform_bootstrap(
     *,
-    timeout: float = 30.0,
+    timeout: float = _STARTUP_PROBE_TIMEOUT,
     env_path: str | Path | None = None,
     checkpoint_path: str | Path | None = None,
 ) -> bool:
@@ -771,8 +784,11 @@ def _probe_messaging_platform_bootstrap(
             (
                 "import sys\n"
                 "from pathlib import Path\n"
+                "from tempfile import TemporaryDirectory\n"
                 "from nullion.config import load_settings\n"
                 "from nullion.messaging_runtime import build_messaging_runtime_service_from_settings\n"
+                "from nullion.runtime_persistence import save_runtime_store\n"
+                "from nullion.runtime_store import RuntimeStore\n"
                 "from nullion.telegram_entrypoint import (\n"
                 "    build_runtime_service_from_settings,\n"
                 ")\n"
@@ -780,19 +796,23 @@ def _probe_messaging_platform_bootstrap(
                 "checkpoint_path = Path(sys.argv[2])\n"
                 "settings = load_settings(env_path=env_path)\n"
                 "checked = []\n"
-                "if settings.telegram.bot_token:\n"
-                "    build_runtime_service_from_settings(checkpoint_path=checkpoint_path, env_path=env_path)\n"
-                "    checked.append('telegram')\n"
-                "if settings.slack.enabled:\n"
-                "    from nullion.slack_app import _require_slack_settings\n"
-                "    _require_slack_settings(settings)\n"
-                "    build_messaging_runtime_service_from_settings(checkpoint_path=checkpoint_path, env_path=env_path)\n"
-                "    checked.append('slack')\n"
-                "if settings.discord.enabled:\n"
-                "    from nullion.discord_app import _require_discord_settings\n"
-                "    _require_discord_settings(settings)\n"
-                "    build_messaging_runtime_service_from_settings(checkpoint_path=checkpoint_path, env_path=env_path)\n"
-                "    checked.append('discord')\n"
+                "with TemporaryDirectory(prefix='nullion-health-messaging-') as directory:\n"
+                "    probe = Path(directory) / 'runtime.db'\n"
+                "    save_runtime_store(RuntimeStore(), probe)\n"
+                "    kwargs = dict(checkpoint_path=checkpoint_path, env_path=env_path, probe_checkpoint=probe)\n"
+                "    if settings.telegram.bot_token:\n"
+                "        build_runtime_service_from_settings(**kwargs)\n"
+                "        checked.append('telegram')\n"
+                "    if settings.slack.enabled:\n"
+                "        from nullion.slack_app import _require_slack_settings\n"
+                "        _require_slack_settings(settings)\n"
+                "        checked.append('slack')\n"
+                "    if settings.discord.enabled:\n"
+                "        from nullion.discord_app import _require_discord_settings\n"
+                "        _require_discord_settings(settings)\n"
+                "        checked.append('discord')\n"
+                "    if settings.slack.enabled or settings.discord.enabled:\n"
+                "        build_messaging_runtime_service_from_settings(**kwargs)\n"
                 "print('ok:' + (','.join(checked) if checked else 'none'))\n"
             ),
             env_arg,
@@ -820,9 +840,15 @@ def _probe_web_bootstrap(*, _warnings_out: list[str] | None = None) -> bool:
             sys.executable,
             "-c",
             (
-                "import nullion\n"
+                "from pathlib import Path\n"
+                "from tempfile import TemporaryDirectory\n"
                 "from nullion.web_app import _build_runtime, _STARTUP_WARNINGS\n"
-                "runtime, orchestrator, registry = _build_runtime()\n"
+                "from nullion.runtime_persistence import save_runtime_store\n"
+                "from nullion.runtime_store import RuntimeStore\n"
+                "with TemporaryDirectory(prefix='nullion-health-web-') as directory:\n"
+                "    probe = Path(directory) / 'runtime.db'\n"
+                "    save_runtime_store(RuntimeStore(), probe)\n"
+                "    runtime, orchestrator, registry = _build_runtime(probe_checkpoint=probe)\n"
                 "# A missing model client is a warning, not a fatal error —\n"
                 "# the runtime can still start; the user will see an error when they chat.\n"
                 "if getattr(runtime, 'model_client', None) is None and not _STARTUP_WARNINGS:\n"
@@ -832,7 +858,7 @@ def _probe_web_bootstrap(*, _warnings_out: list[str] | None = None) -> bool:
         ],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=_STARTUP_PROBE_TIMEOUT,
         cwd=_subprocess_cwd(),
     )
     # Collect any provider warnings emitted by _build_runtime.
@@ -859,29 +885,42 @@ def health_check(
 ) -> bool:
     """Check independent bootstraps concurrently, including for older updaters.
 
-    An already-running old release keeps its 45-second outer probe deadline.
-    The new package must finish these bounded, independent probes within that
-    envelope too, rather than relying solely on a new parent updater deadline.
-    All checks remain required; bootstrap exceptions propagate as failures.
+    Run startup checks in parallel so an older updater's outer deadline still
+    covers two independent constructors. Each check must succeed.
     """
     from concurrent.futures import ThreadPoolExecutor
+    from nullion.runtime_persistence import check_runtime_checkpoint_readiness
 
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="update-health") as pool:
+    checkpoint = checkpoint_path or _default_checkpoint_path()
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="update-health") as pool:
+        database_ready = pool.submit(check_runtime_checkpoint_readiness, checkpoint)
         web_bootstrap = pool.submit(_probe_web_bootstrap, _warnings_out=_warnings_out)
         messaging_bootstrap = (
             pool.submit(
                 _probe_messaging_platform_bootstrap,
-                timeout=30.0,
+                timeout=_STARTUP_PROBE_TIMEOUT,
                 env_path=env_path if env_path is not None else _default_env_path(),
-                checkpoint_path=checkpoint_path or _default_checkpoint_path(),
+                checkpoint_path=checkpoint,
             )
             if require_messaging
             else None
         )
         web_reachable = not require_web or _probe_web_status(port=port, timeout=timeout)
-        web_ready = web_bootstrap.result()
-        messaging_ready = messaging_bootstrap.result() if messaging_bootstrap is not None else True
-    return web_reachable and web_ready and messaging_ready
+        try:
+            database_ready.result()
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            log.warning("Runtime database readiness check failed: %s", exc)
+            return False
+        readiness = []
+        for surface, probe in (("Web", web_bootstrap), ("Messaging", messaging_bootstrap)):
+            if probe is None:
+                continue
+            try:
+                readiness.append(probe.result())
+            except subprocess.TimeoutExpired as exc:
+                log.warning("%s startup health check timed out after %.0f seconds", surface, exc.timeout)
+                readiness.append(False)
+    return web_reachable and all(readiness)
 
 
 def fresh_health_check(
@@ -936,9 +975,9 @@ def fresh_health_check(
         ],
         capture_output=True,
         text=True,
-        # Import/bootstrap (30s), optional HTTP, messaging bootstrap (30s),
-        # plus fresh interpreter startup. The envelope must cover all stages.
-        timeout=40 + (max(0, timeout) if require_web else 0) + (30 if require_messaging else 0),
+        # The startup processes and optional HTTP probe overlap. Allow
+        # interpreter startup even when a child uses its full budget.
+        timeout=max(_STARTUP_PROBE_TIMEOUT, timeout if require_web else 0) + _FRESH_INTERPRETER_ALLOWANCE,
         cwd=_src_dir(),
     )
     if _warnings_out is not None:
@@ -1275,6 +1314,8 @@ async def _update_health_node(state: _UpdateWorkflowState) -> dict[str, object]:
                 ),
             }
         steps = _update_emit(state, "health", "Health check failed — rolling back.", ok=False)
+        state = {**state, "steps": steps}
+        steps = _update_emit(state, "rollback", "Rolling back to previous version...")
         ok = await _update_run_blocking(lambda: rollback(snap))
         msg = "Rollback successful. Previous version restored." if ok else "Rollback also failed — check logs."
         state = {**state, "steps": steps}

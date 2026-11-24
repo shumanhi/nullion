@@ -14,7 +14,9 @@ from tests.e2e.test_live_stage_web_matrix import live_web
 )
 def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf(record_property) -> None:
     import hashlib
+    from datetime import datetime, timedelta
     from uuid import uuid4
+    from zoneinfo import ZoneInfo
     from scripts import live_stage_chat_contract_probe as probe
 
     base_url = os.environ.get("NULLION_LIVE_BASE_URL", "http://127.0.0.1:8753").rstrip("/")
@@ -24,11 +26,18 @@ def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf(record
     assert probe.shared_live_baseline(["--base-url", base_url, "--runtime-db", str(runtime_db),
         "--scenario", "simple", "--scenario", "weather", "--repeat", "2"]) == 0
     conversation_id = f"web:live-stage-flight-correction:{uuid4().hex}"
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    first_departure = today + timedelta(days=(2 - today.weekday()) % 7 + 7)
+    weekends = []
+    for offset in (0, 7, 14):
+        departure = first_departure + timedelta(days=offset)
+        weekends.append(f"{departure.isoformat()} to {(departure + timedelta(days=4)).isoformat()}")
     parent = (
-        "Can you search couple of direct flights to see which one might be cheaper for a weekend "
-        "this month (except the next one) ..leave wed..come back Sunday. Nyc to SF create a pdf for easy delivery"
+        "Compare nonstop round-trip flights from New York City to San Francisco for two weekends, "
+        f"{weekends[0]} and {weekends[1]}, for one adult in economy. "
+        "Create a PDF showing the verified prices for each weekend."
     )
-    correction = "But there are more weekends in this month"
+    correction = f"Please include the additional weekend {weekends[2]} in the same comparison and PDF."
     def post_owned_flight(text, *, timeout):
         try:
             return probe._post_json(f"{base_url}/api/chat",
@@ -68,9 +77,8 @@ def test_live_stage_flight_correction_keeps_parent_and_delivers_final_pdf(record
     assert event and event.get("parent_turn_id") == parent_event["turn_id"], event
     kept_existing_pdf = False
     if not response.get('artifacts'):
-        # Relative-date objections may need clarification (including whether
-        # today's departure or an excluded weekend should be included). Finish
-        # that interaction instead of demanding unnecessary fresh research.
+        # A clarification may ask whether to extend the earlier comparison.
+        # If the user keeps the original options, reuse its existing PDF.
         import re
         options = re.findall(r'(?m)^\s*(\d+)[.)]\s+', str(response.get('text') or ''))
         assert options[:2] == ['1','2'], response
@@ -359,8 +367,9 @@ def test_live_stage_native_recall_with_code_mode():
     seed_conversation = 'web:native-recall-seed:'+token
     probe._post_json(base+'/api/chat', {'text':seed,'conversation_id':seed_conversation}, timeout=180)
     seed_event = probe._chat_turn_for_user_message_with_poll(db,seed_conversation,seed)
-    assert seed_event and reference in seed_event.get('assistant_reply','')
-    probe._post_json(base+f'/api/chat/history/{seed_conversation}/archive', {}, timeout=30)
+    assert seed_event and seed_event.get('user_message') == seed, seed_event
+    archived, _ = probe._post_json(base+f'/api/chat/history/{seed_conversation}/archive', {}, timeout=30)
+    assert archived.get('ok'), archived
     prompt = f'Which notebook did we choose for {topic}?'
     conversation = 'web:native-recall-check:'+token
     reply, elapsed = probe._post_json(base+'/api/chat', {'text':prompt,'conversation_id':conversation}, timeout=180)

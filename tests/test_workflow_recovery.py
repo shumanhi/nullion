@@ -271,3 +271,24 @@ def test_normalization_preserves_runtime_recovery_receipts():
     normalized = normalize_tool_result(failed)
     assert normalized.recovered_by == ('s',)
     assert recovered_failure_ids([normalized, ToolResult('s', 'read', 'completed', {})]) == {'f'}
+
+
+def test_browser_handoff_keeps_completed_native_read_from_this_request():
+    from nullion.source_observation_contract import retained_browser_handoff_documents
+
+    def read(identity, tool, url, text):
+        return ToolResult(identity, tool, "completed", {
+            "result_kind": "browser_page_collection",
+            "pages": [{"page_url": url, "status": "completed"}],
+            "documents": [{"url": url, "text": text}],
+        })
+
+    url = "https://fixture.example/overview"
+    results = [
+        read("old-turn", "browser_read_pages", url, "An old cart subtotal."),
+        read("preflight", "browser_run_task", url, "Yesterday's order section and this cart subtotal."),
+        ToolResult("handoff", "browser_run_task", "completed", {"report_status": "blocked"}),
+    ]
+    documents = retained_browser_handoff_documents(results, 2, request_invocation_ids={"preflight", "handoff"})
+    assert documents == {"1.0": {"url": url, "host": "fixture.example",
+        "text": "Yesterday's order section and this cart subtotal."}}

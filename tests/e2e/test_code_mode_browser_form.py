@@ -32,7 +32,16 @@ def test_native_form_interactions_compose_without_booking_or_extra_model_turns(t
         def do_GET(self):
             self.send_response(200);self.send_header('Content-Type','text/html');self.end_headers()
             if landing and self.path == '/':
-                self.wfile.write(b'<html><body><a href="/form">Formulario</a></body></html>');return
+                self.wfile.write(
+                    b'<html><body><a href="/form">Formulario</a>'
+                    b'<input name="account" type="password" value="FixturePassword482">'
+                    b'<input name="background" style="visibility:hidden" value="FixtureHidden093">'
+                    b'<input name="transparent" style="opacity:0" value="FixtureTransparent145">'
+                    b'<input name="code" autocomplete="one-time-code" value="908754">'
+                    b'<input name="public" value="Visible route">'
+                    b'</body></html>'
+                )
+                return
             self.wfile.write(b'''<html><body><form onsubmit="event.preventDefault(); document.querySelector('#results').textContent='Available for '+document.querySelector('#party').value+' on '+document.querySelector('#date').value+' at 6:00 PM';">
             <label>Party<input id="party" name="party"></label><label>Date<input id="date" name="date"></label>
             <button id="search">Find availability</button></form><main id="results"></main></body></html>''')
@@ -78,6 +87,15 @@ def test_native_form_interactions_compose_without_booking_or_extra_model_turns(t
             navigation=[r for r in results if r['tool_name']=='browser_navigate']
             assert navigation and all(r['output']['state_verification'] == {
                 'navigation_completed': True, 'controls_verified': False} for r in navigation)
+            if landing:
+                snapshot = next(r["output"]["snapshot"] for r in results if r["tool_name"] == "browser_snapshot")
+                controls = {row["name"]: row for row in snapshot["elements"] if row.get("name")}
+                assert controls["public"]["value"] == "Visible route"
+                assert controls["background"]["visible"] is False
+                for name in ("account", "background", "transparent", "code"):
+                    assert controls[name]["element_id"] and controls[name]["value"] == ""
+                for private_value in ("FixturePassword482", "FixtureHidden093", "FixtureTransparent145", "908754"):
+                    assert private_value not in str(results)
             program=next(r for r in results if r['tool_name']=='code_mode')
             assert program['status']=='completed',program
             assert '2026-11-15' in str(program['output']['value']) and '6:00 PM' in str(program['output']['value'])

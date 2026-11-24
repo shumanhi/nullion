@@ -152,3 +152,38 @@ def test_model_snapshot_index_does_not_fall_back_to_cut_json():
     assert snapshots[0]['captured_element_count']==180
     assert 'preview' not in str(view.keys())
     assert len(json.dumps(view,ensure_ascii=False))<48_000
+
+
+def test_snapshot_link_budget_keeps_complete_destinations_with_other_observations():
+    links = [{"title":f"商品 {index}", "url":f"https://store.test/item/{index}?reference=" + "x" * 810}
+             for index in range(6)]
+    result = ToolResult('snapshot', 'browser_snapshot', 'completed', {'snapshot':{'heading_links':links,
+        'elements':[{'tag':'input', 'editable':True, 'element_id':'n-1'}]}})
+    operations = [ToolResult('open', 'browser_open', 'completed', {}),
+                  ToolResult('navigate', 'browser_navigate', 'completed', {}), result]
+    observations = code_mode._default_observations(operations, max_chars=16_000)['observations']
+    snapshot = observations[-1]['output']['snapshot']
+    assert snapshot['heading_links'][:2] == links[:2]
+    assert snapshot['heading_links_truncated']['shown'] == len(snapshot['heading_links'])
+    assert snapshot['heading_links_truncated']['total'] == 6
+    assert snapshot['elements'][0]['element_id'] == 'n-1'
+    assert len(result.output['snapshot']['heading_links']) == 6
+
+
+def test_large_detail_batch_keeps_visible_prices_and_variants_in_model_view():
+    details = []
+    for index, fact in enumerate(('Paquete de 8, $17', '8 個入り、$21')):
+        details.append({'source_page_url':f'https://store.test/item/{index}?id=' + 'x' * 780,
+            'title':f'商品 {index}', 'observed_text':('x' * 600) + fact + ('z' * 800),
+            'record':{'long_audit':'a' * 16000}})
+    output = {'result_kind':'browser_page_collection', 'details':details,
+              'pages':[{'status':'completed'}, {'status':'completed'}], 'completed_pages':2}
+    native = ToolResult('details', 'browser_read_pages', 'completed', output)
+    result = {'value':output, 'operations':[{'tool_name':native.tool_name, 'invocation_id':native.invocation_id}],
+        'native_observations':code_mode._default_observations([native])['observations']}
+    wire = code_mode.compact_output(result, max_chars=8_000)
+    evidence = wire['native_observations'][0]['output']['detail_evidence']
+    for source, row in zip(evidence, details, strict=True):
+        assert source['source_url'] == row['source_page_url']
+        assert ''.join(source['visible_text_segments']) == row['observed_text']
+    assert len(json.dumps(wire, ensure_ascii=False)) < 8_000

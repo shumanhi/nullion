@@ -4007,7 +4007,14 @@ def _message_role(message: Any) -> str | None:
 
 
 def _pending_approval_from_tool_results(tool_results: list[Any]) -> dict[str, str | None] | None:
+    # An exact-invocation approval keeps its identity when it executes.
+    # Use its newest receipt while preserving the order of distinct approvals.
+    latest = {(result.tool_name, result.invocation_id): result for result in tool_results
+              if getattr(result, 'invocation_id', None)}
     for result in tool_results:
+        identity = getattr(result, 'invocation_id', None)
+        if identity and latest.get((result.tool_name, identity)) is not result:
+            continue
         if getattr(result, "recovered_by", ()):
             continue
         output = getattr(result, "output", None)

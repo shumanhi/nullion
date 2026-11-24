@@ -1083,6 +1083,84 @@ def test_live_stage_capture_ignores_timing_event_without_receipt():
         tool_names={"browser_navigate", "browser_screenshot"}, runtime_db_available=True, tool_output_texts=outputs)
 
 
+def test_weather_accepts_answer_that_repeats_the_provided_zip_code():
+    probe = live_stage_chat_contract_probe
+    probe._assert_contract(probe.SCENARIOS["weather"],
+        response={"text": "It is 65°F in ZIP code 10024."}, elapsed_ms=100,
+        tool_names={"weather_forecast"}, runtime_db_available=True)
+    with pytest.raises(AssertionError, match="forbidden response text"):
+        probe._assert_contract(probe.SCENARIOS["weather"],
+            response={"text": "What's your ZIP code for the forecast?"}, elapsed_ms=100,
+            tool_names={"weather_forecast"}, runtime_db_available=True)
+
+
+@pytest.mark.parametrize("data_rows, duplicate, problem", [
+    (99, False, "worksheet row"),
+    (100, False, None),
+    (101, False, "worksheet row"),
+    (100, True, "record labels in order"),
+])
+def test_planner_dataset_attachment_checks_exact_row_count(tmp_path, data_rows, duplicate, problem):
+    from contextlib import nullcontext
+    from openpyxl import Workbook
+
+    probe = live_stage_chat_contract_probe
+    scenario = probe.SCENARIOS["planner_large_web_dataset_handoff"]
+    name = scenario.required_artifact_names[0]
+    path = tmp_path / name
+    workbook = Workbook()
+    workbook.active.append(["Record", "Category", "Detail URL", "Image URL", "Thumbnail URL", "Summary"])
+    for index in range(1, data_rows + 1):
+        label_index = 49 if duplicate and index == 50 else index
+        workbook.active.append([f"Photo {label_index:03}", "Scene", "https://example.com/detail",
+                                "https://example.com/photo", "https://example.com/thumb", "Description"])
+    workbook.save(path)
+    expected = pytest.raises(AssertionError, match=problem) if problem else nullcontext()
+    with expected:
+        probe._download_and_check_artifacts("http://localhost", [{"path": str(path), "name": name}],
+                                            scenario=scenario, timeout=1)
+
+
+@pytest.mark.parametrize("descriptor_path", ["/report.png", "/unverified.png"])
+def test_live_stage_capture_accepts_only_an_echo_of_verified_file(descriptor_path):
+    scenario = Scenario("capture", "", None, None, require_loaded_browser_capture=True)
+    records = [
+        {"tool_name": "browser_navigate", "status": "completed", "output": {"session_id": "one"}},
+        {"invocation_id": "capture", "tool_name": "browser_screenshot", "status": "completed", "output": {
+            "session_id": "one", "page_url": "https://example.com/", "path": "/report.png"}},
+        {"invocation_id": "capture", "tool_name": "browser_screenshot", "status": "completed", "output": {
+            "path": descriptor_path, "artifact_descriptors": [{"path": descriptor_path}]}},
+    ]
+    from contextlib import nullcontext
+    expected = nullcontext() if descriptor_path == "/report.png" else pytest.raises(AssertionError, match="loaded-page capture")
+    with expected:
+        live_stage_chat_contract_probe._assert_contract(scenario, response={}, elapsed_ms=1,
+            tool_names={"browser_navigate", "browser_screenshot"}, runtime_db_available=True,
+            tool_output_texts=[json.dumps(row) for row in records])
+
+
+@pytest.mark.parametrize("page_url, delivered_path, problem", [
+    ("https://example.com/", "/report.png", None),
+    ("https://elsewhere.example/", "/report.png", "requested page"),
+    ("https://example.com/", "/replacement.png", "match a loaded-page capture"),
+])
+def test_live_stage_capture_binds_delivered_image_to_requested_page(page_url, delivered_path, problem):
+    from contextlib import nullcontext
+
+    scenario = Scenario("capture", "", None, None, require_loaded_browser_capture=True,
+                        require_image_artifact=True, expected_capture_url="https://example.com/")
+    records = [
+        {"tool_name": "browser_navigate", "status": "completed", "output": {"session_id": "one"}},
+        {"tool_name": "browser_screenshot", "status": "completed", "output": {
+            "session_id": "one", "page_url": page_url, "path": "/report.png"}},
+    ]
+    response = {"artifacts": [{"path": delivered_path, "name": delivered_path.rsplit("/", 1)[-1]}]}
+    with pytest.raises(AssertionError, match=problem) if problem else nullcontext():
+        live_stage_chat_contract_probe._assert_contract(scenario, response=response, elapsed_ms=1,
+            tool_names={"browser_navigate", "browser_screenshot"}, runtime_db_available=True,
+            tool_output_texts=[json.dumps(row) for row in records])
+
+
 def test_shared_baseline_reuses_only_success_in_same_process(monkeypatch):
     probe = live_stage_chat_contract_probe
     probe._successful_live_baselines.clear()
@@ -1188,4 +1266,47 @@ def test_live_probe_correlates_terminal_to_exact_outgoing_submission(prompt):
     result={'type':'done','turn_id':'new','text':'Requested reply','conversation_id':'c'}
     frames.append(result)
     assert _terminal_for_submission(frames,prompt,'c')==result
+    assert _terminal_for_submission(frames, '/chat ' + prompt, 'c', audit_prompt=prompt) == result
     assert _terminal_for_submission(frames,prompt,'other') is None
+
+
+def test_exact_cron_approval_uses_workflow_deadline(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tests.e2e import test_live_stage_web_matrix as matrix
+
+    base = "http://127.0.0.1:8753"
+    approval_id = "owned"
+    response_body = {"ok": True, "approval_id": approval_id, "resume": {"type": "message"}}
+    pending = {"approval_id": approval_id, "resource": "delete_cron", "status": "pending",
+               "context": {"scheduler_target": {"id": "cron-fixture"}}}
+
+    class Page:
+        clicked = False
+
+        def locator(self, selector):
+            assert selector == '#messages .approval-bubble[data-approval-id="owned"]'
+            return self
+
+        def get_by_role(self, role, name):
+            assert role == "button" and name.fullmatch("Delete")
+            return self
+
+        def click(self):
+            self.clicked = True
+
+        @contextmanager
+        def expect_response(self, predicate, *, timeout):
+            assert timeout == 75_000
+            response = SimpleNamespace(url=f"{base}/api/approve/{approval_id}",
+                request=SimpleNamespace(method="POST"), ok=True, json=lambda: response_body)
+            assert predicate(response)
+            yield SimpleNamespace(value=response)
+
+    page = Page()
+    page.request = SimpleNamespace(get=lambda url, **kwargs: SimpleNamespace(
+        ok=True, json=lambda: {"approvals": [pending]}))
+    monkeypatch.setattr(matrix, "time", SimpleNamespace(monotonic=lambda: 25))
+    assert matrix.approve_owned_cron_delete(page, pending, base, "cron-fixture", deadline=100) == response_body["resume"]
+    assert page.clicked

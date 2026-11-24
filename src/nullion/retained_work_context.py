@@ -201,7 +201,13 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
         projected_sources = any(isinstance(r.output, dict)
             and isinstance(r.output.get('source_record_collections'), list)
             and len(json.dumps(r.output, ensure_ascii=False)) > 14000 for r in owned.values())
-        return _shared_security_view(messages, by_use), projected_sources
+        projected_mail = any(r.tool_name == 'email_read' and isinstance(r.output, dict)
+            and r.output.get('result_kind') == 'email_message_batch'
+            and any(isinstance(row.get('inspection_request'), dict)
+                and row['inspection_request'].get('invocation_id') == r.invocation_id
+                for row in r.output.get('messages') or () if isinstance(row, dict))
+            for r in owned.values())
+        return _shared_security_view(messages, by_use), projected_sources or projected_mail
     fresh_chars = sum(len(json.dumps(b.get('content', []), ensure_ascii=False))
         for _, b in blocks if str(b.get('tool_use_id')) in fresh_uses)
     # Exact fresh windows stay intact. Replaying the same windows again in the
@@ -234,8 +240,8 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
         max_chars=max(0, HISTORY_CHARS // 2 - fresh_chars))
     retained_chars = len(json.dumps(inspected, ensure_ascii=False))
     archived_count = sum(str(b.get("tool_use_id")) not in fresh_uses for _, b in blocks)
-    budget = min(ARCHIVED_RESULT_CHARS, max(64,
-        (HISTORY_CHARS - fresh_chars - retained_chars) // max(1, archived_count) - 400))
+    archived_share = max(64, (HISTORY_CHARS - fresh_chars - retained_chars) // max(1, archived_count) - 400)
+    budget = min(ARCHIVED_RESULT_CHARS, archived_share)
     view = []
     security_policies = []
     for message in messages:
@@ -284,8 +290,32 @@ def producer_context(messages, results, invocation_metadata, *, include_unmapped
                     # Archive the same typed view the producer already saw.
                     # Raw Code Mode values duplicate entire native collections
                     # and can obscure the exact pointers needed to reuse them.
-                    projected = _compact_tool_output_for_model_context(result.tool_name, result.output)
-                    output, omitted = compact_evidence_value(redact_value(projected), max_chars=budget)
+                    projected = redact_value(_compact_tool_output_for_model_context(result.tool_name, result.output))
+                    result_budget = budget
+                    mail_projector = None
+                    if result.tool_name == 'code_mode' and isinstance(projected, dict):
+                        from nullion.code_mode import compact_output, email_observation_count
+
+                        if email_observation_count(projected):
+                            mail_projector = compact_output
+                    elif (result.tool_name == 'email_read' and isinstance(projected, dict)
+                            and projected.get('result_kind') == 'email_message_batch'):
+                        from nullion.source_context_projection import compact_email_batch
+
+                        mail_projector = compact_email_batch
+                    if mail_projector is not None:
+                        # An exact inspection adds one window to the comparison.
+                        # The view is encoded again inside protocol text.
+                        mail_budget = archived_share
+                        for _ in range(3):
+                            candidate = mail_projector(projected, max_chars=mail_budget)
+                            wire_chars = len(json.dumps(json.dumps(candidate, ensure_ascii=False), ensure_ascii=False)) - 2
+                            if wire_chars <= archived_share:
+                                projected = candidate
+                                result_budget = archived_share
+                                break
+                            mail_budget = max(64, mail_budget - (wire_chars - archived_share) - 128)
+                    output, omitted = compact_evidence_value(projected, max_chars=result_budget)
                     if projected != result.output:
                         omitted = [[], *omitted]
                 payload = {"invocation_id": result.invocation_id, "status": result.status,

@@ -40,7 +40,7 @@ def scenario_definitions(root):
             if not isinstance(call, ast.Call):
                 raise ValueError('Review nonliteral scenario definition')
             fields = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords
-                      if kw.arg in ('runner', 'requires_email_send_flag')}
+                      if kw.arg in ('runner', 'requires_email_send_flag', 'api_fixture_env')}
             definitions[ast.literal_eval(key)] = fields
     return definitions, constants(tree)
 
@@ -125,8 +125,10 @@ def build_catalog(root=ROOT, policy=None):
                 rows.extend({**base,'selector':selector+'['+v+']'} for v in variants)
             elif selected is not None:
                 for name in selected:
+                    api_gates = scenarios[name].get('api_fixture_env', ()) if path.name == 'test_live_stage_api_scenarios.py' else ()
                     rows.append({**base, 'selector':selector+'['+name+']', 'scenario':name,
                                  'category':scenario_categories[name],
+                                 'gates': sorted(set(base['gates']).union(api_gates)),
                                  'requires_email_send_authorization':bool(
                                      scenarios[name].get('requires_email_send_flag', False))})
             else:
@@ -218,6 +220,14 @@ def markdown(catalog, policy):
               '- **Local harness:** run in Docker with deterministic local checks, separately from paid acceptance.',
               '- **State and consent:** shared desktop/browser profiles, preferences, memories and named jobs prevent blanket parallelism. Do not infer concurrency safety from a category. Isolate resources before parallel runs. Cases requiring real sends or existing-job execution still require their explicit authorization and prerequisites.', '',
               'The consolidation changes collected test entry points, not runtime routing, stage configuration or production state.', '',
+              '### Image-provider verification', '',
+              'Native image generation and local PNG rendering have separate live contracts. A successful local render '
+              'does not verify provider-native generation. Keep quota/auth rejection receipts visible as external blockers; '
+              'do not change media settings, replenish credits, substitute a fallback, or count a native-provider failure as '
+              'a native-generation pass. The local source-to-PNG contract verifies rendered file hashes, visible delivery '
+              'and reload persistence without calling the image provider. `NULLION_LIVE_RASTER_REPLAY` selects an '
+              'owned completed conversation and turn for read-only UI/history/byte reuse; its evidence is labeled '
+              '`saved_boundary_reuse` and does not claim fresh generation.', '',
               '## Read-only commands', '', '```sh',
               'python3 scripts/live_stage_test_catalog.py',
               'python3 scripts/live_stage_test_catalog.py --category browser --selectors',

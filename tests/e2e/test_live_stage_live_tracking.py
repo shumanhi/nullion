@@ -84,17 +84,11 @@ def test_live_stage_web_any_finite_window_and_same_tracker_amendments(live_web):
 
 def _open_tracking_page(base):
     from tests.e2e.test_web_surface_contracts import _open_page
+    from tests.e2e.test_live_stage_web_matrix import watch_chat_frames
     frames=[]
     def configure(page):
-        def received(raw):
-            try:frames.append(json.loads(raw))
-            except (ValueError,TypeError):pass
-        page.on('websocket',lambda socket:socket.on('framereceived',received))
-        def response(item):
-            if item.request.method=='POST' and item.url==base+'/api/chat':
-                value=item.json();frames.append({**value,'type':'done' if value.get('type')=='message' else value.get('type')})
-        page.on('response',response)
-    return (*_open_page(base,configure_page=configure),frames)
+        watch_chat_frames(page, frames, None, base)
+    return (*_open_page(base, configure_page=configure), frames)
 
 
 def _submit_tracker_creation(page,frames,errors,database,base,prompt,jobs,*,timeout=120):
@@ -402,7 +396,7 @@ def test_live_stage_web_cadence_clarification_uses_actual_tracker_contract(live_
     from tests.e2e.test_live_stage_web_matrix import _submit,catalogue,_turns
     page,frames,errors,database,conversation,base=live_web
     name='Cadence '+uuid4().hex[:8]
-    source=os.environ.get('NULLION_LIVE_NEWS_SOURCE','https://www.cnn.com').rstrip('/')
+    source=(os.environ.get('NULLION_LIVE_NEWS_SOURCE') or 'https://www.cnn.com').rstrip('/')
     section='News' if os.environ.get('NULLION_LIVE_NEWS_SOURCE') else 'Developing'
     marker='CANARY_'+uuid4().hex
     def owned():
@@ -436,7 +430,7 @@ def test_live_stage_web_numeric_lifetime_and_cadence_creates_article_tracker(liv
     from tests.e2e.test_live_stage_web_matrix import _submit,catalogue,_turns
     page,frames,errors,database,conversation,base=live_web
     name='Article continuation '+uuid4().hex[:8]
-    source=os.environ.get('NULLION_LIVE_NEWS_SOURCE','https://www.cnn.com').rstrip('/')
+    source=(os.environ.get('NULLION_LIVE_NEWS_SOURCE') or 'https://www.cnn.com').rstrip('/')
     def owned():
         return [row for row in catalogue._get_json(base+'/api/live-trackers',timeout=15)['trackers'] if row['name']==name]
     try:

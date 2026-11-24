@@ -4,7 +4,9 @@ from html import unescape
 import asyncio
 import json
 import os
+import shlex
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +48,7 @@ def setup(tmp_path, monkeypatch, probe):
         scope_context = []
         chat_calls = 0
         answer = ''
-        pending_probe = False
+        pending_commands = ()
         def create(self, **kw):
             from tests.workflow_provider_protocol import workflow_provider_reply
             reply = workflow_provider_reply(kw, reasoned=True)
@@ -60,16 +62,18 @@ def setup(tmp_path, monkeypatch, probe):
             if aux is not None:
                 return aux
             self.chat_calls += 1
-            if self.pending_probe:
-                self.pending_probe = False
-                return tool('terminal_exec', {'command':"printf 'Local terminal capability verified.'", 'network_mode':'none'})
+            if self.pending_commands:
+                command, *self.pending_commands = self.pending_commands
+                return tool('terminal_exec', {'command':command, 'network_mode':'none'})
             return response(self.answer)
     model = Model()
     runtime.model_client = model
     orchestrator = AgentOrchestrator(model_client=model)
-    def prepare(answer):
+    def prepare(answer, commands=None):
         model.answer = answer
-        model.pending_probe = probe
+        if commands is None:
+            commands = ["printf 'Local terminal capability verified.'"] if probe else []
+        model.pending_commands = commands
     return runtime, registry, orchestrator, model, prepare
 
 
@@ -156,3 +160,58 @@ def test_full_answer_survives_shell_and_plain_turns_stay_fast(tmp_path, monkeypa
     from nullion.runtime_persistence import load_runtime_store
     stored = load_runtime_store(runtime.checkpoint_path)
     assert any(row.get('assistant_reply') == CASES[-1][1] for row in stored.list_conversation_events())
+
+
+@pytest.mark.parametrize("surface", ["api", "telegram"])
+def test_shell_discovery_and_diagnostics_preserve_answer(tmp_path, monkeypatch, surface):
+    from fastapi.testclient import TestClient
+    from nullion.config import NullionSettings, TelegramSettings
+    from nullion.telegram_app import ChatOperatorService
+    from nullion.web_app import create_app
+
+    prompt = "登録済みのユーザーは何人ですか？"
+    answer = "Nullionには4人のユーザーが登録されています。"
+    runtime, registry, orchestrator, model, prepare = setup(tmp_path, monkeypatch, probe=False)
+    sources = [str(tmp_path / "home" / name) for name in ("fixture-config.json", "fixture-settings.json")]
+    (tmp_path / "home").mkdir(exist_ok=True)
+    for path in sources:
+        Path(path).write_text("{}", encoding="utf-8")
+    diagnostics = ["dict;", "TOP_KEYS ['multi_user_enabled', 'users'];", "LIST users 4;"]
+    prepare(answer, [shlex.join(["printf", "%s\n", *lines]) for lines in (sources, diagnostics)])
+    wire = []
+
+    class Message:
+        chat = SimpleNamespace(id=90200, send_action=lambda **kwargs: asyncio.sleep(0))
+        message_id = 51003
+        reply_to_message = None
+        text = prompt
+
+        async def reply_text(self, value, **kwargs):
+            wire.append(unescape(value))
+            return SimpleNamespace(message_id=51004)
+
+    app = create_app(runtime, orchestrator=orchestrator, registry=registry)
+    with TestClient(app) as client:
+        if surface == "api":
+            conversation = "web:shell-diagnostics"
+            response = client.post("/api/chat", json={"text": prompt, "conversation_id": conversation})
+            assert response.status_code == 200, response.text
+            assert response.json()["text"] == answer
+        else:
+            conversation = "telegram:90200"
+            settings = NullionSettings(telegram=TelegramSettings(bot_token="123456:abcdefghijklmnopqrstuvwxyz",
+                operator_chat_id="90200", chat_enabled=True))
+            service = ChatOperatorService(runtime=runtime, settings=settings, bot_token=settings.telegram.bot_token,
+                operator_chat_id="90200", model_client=model, agent_orchestrator=orchestrator)
+            asyncio.run(service.on_message(SimpleNamespace(update_id=51003, message=Message()),
+                SimpleNamespace(bot=None)))
+            assert wire == [answer]
+
+    turns = runtime.store.list_conversation_events(conversation)
+    turn = next(row for row in reversed(turns) if row.get("event_type") == "conversation.chat_turn")
+    assert turn["assistant_reply"] == answer
+    native = [row for row in turn["tool_results"] if row["tool_name"] == "terminal_exec"]
+    assert [row["status"] for row in native] == ["completed", "completed"]
+    assert [row["output"]["stdout"].splitlines() for row in native] == [sources, diagnostics]
+    assert not turn.get("artifact_paths")
+    assert model.chat_calls == 3

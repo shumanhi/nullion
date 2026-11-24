@@ -55,3 +55,37 @@ def test_unresolved_pattern_is_not_reported_as_already_absent(tmp_path):
     receipt = _terminal_delete_receipt(observations)
     assert receipt['changes'][0]['status']=='unconfirmed'
     assert receipt['summary']=='Deletion was not confirmed.'
+
+
+def test_shell_discovery_preserves_verified_partial_deletion_receipt(tmp_path):
+    from nullion.chat_operator import _append_chat_artifacts_to_reply, _sanitize_chat_reply
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.tools import ToolInvocation, ToolResult, _build_terminal_exec_handler
+
+    deleted = tmp_path / "delete.txt"
+    retained = tmp_path / "retain.txt"
+    for path in (deleted, retained):
+        path.write_text("fixture", encoding="utf-8")
+    command = shlex.join(["rm", "-f", "--", str(deleted), str(retained)])
+
+    class Backend:
+        def run(self, *args, **kwargs):
+            deleted.unlink()
+            return SimpleNamespace(stdout="Both deleted", stderr="", exit_code=0, shell="sh")
+
+    handler = _build_terminal_exec_handler(tmp_path, allowed_roots=[tmp_path], terminal_executor_backend=Backend())
+    result = handler(ToolInvocation("delete", "terminal_exec", "workspace_admin", {"command": command}))
+    results = [
+        ToolResult("discover", "file_search", "completed", {"matches": [str(deleted), str(retained)]}),
+        result,
+    ]
+    prompt = "Elimina los dos archivos seleccionados."
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    reply = _append_chat_artifacts_to_reply(
+        runtime, reply="Ya eliminé los dos archivos.", artifact_paths=(), prompt=prompt,
+        tool_results=results, required_attachment_extensions=(),
+    )
+    assert _sanitize_chat_reply(prompt=prompt, reply=reply, tool_results=results) == reply
+    assert "Deleted 1 path." in reply and "was not confirmed" in reply
+    assert "Both deleted" not in reply
+    assert retained.is_file()

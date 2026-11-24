@@ -4291,7 +4291,9 @@ def _structured_tool_evidence_sections(
                 continue
             summary = _file_search_payload_summary([result])
             items = _structured_evidence_items_from_mapping(result.output)
-            lines = _summary_to_bullet_lines(summary)
+            no_matches = isinstance(result.output, dict) and result.output.get("matches") == []
+            lines = ([f"- {summary}"] if summary and no_matches and not _file_search_match_paths_from_output(result.output)
+                     else _summary_to_bullet_lines(summary))
             if lines:
                 sections.append(("File search", lines, items or [result.output]))
             continue
@@ -9606,8 +9608,8 @@ def _file_search_payload_summary(results: list[ToolResult]) -> str | None:
         if not safe_names:
             pattern = output.get("pattern")
             if isinstance(pattern, str) and pattern.strip():
-                label = json.dumps(pattern.strip()[:300], ensure_ascii=False)
-                return f"No matching files found for {label} in the searched locations."
+                label = json.dumps(pattern.strip()[:300], ensure_ascii=False).replace("`", r"\u0060")
+                return f"No matching files found for `{label}` in the searched locations."
             return "I searched the available files but did not find a matching file, so I could not prove the answer from files."
         shown = ", ".join(f"`{name}`" for name in safe_names[:5])
         extra = len(safe_names) - 5

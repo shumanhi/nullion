@@ -33,6 +33,9 @@ def test_explicit_interaction_submits_form_after_preflight_in_one_program(tmp_pa
             'NULLION_BROWSER_HEADLESS':'true','NULLION_BROWSER_BLOCK_PRIVATE':'false'}.items():
         monkeypatch.setenv(k,v)
     submitted=[];workers=[]
+    observe_status = surface == 'telegram' and not initial_open
+    step_one_visible = threading.Event()
+    step_two_visible = threading.Event()
     class Source(BaseHTTPRequestHandler):
         def do_GET(self):
             query=parse_qs(urlsplit(self.path).query)
@@ -55,6 +58,12 @@ def test_explicit_interaction_submits_form_after_preflight_in_one_program(tmp_pa
         assert task.prior_source_steps[-1]['status']=='completed'
         assert task.prior_source_steps[-1]['output']['completed_pages']==1
         assert task.request_time_context['accepted_local_date']
+        if observe_status and len(workers) == 1:
+            progress = kwargs['progress_callback']
+            for step, published in ((1, step_one_visible), (2, step_two_visible)):
+                progress({'pages_checked': 1, 'findings_found': 0,
+                    'activity_phase': 'planning_browser_step', 'browser_step': step})
+                assert published.wait(6), f'Browser step {step} never reached Telegram'
         with sync_playwright() as p:
             browser=p.chromium.launch(headless=True,args=['--no-sandbox'])
             try:
@@ -112,7 +121,17 @@ def test_explicit_interaction_submits_form_after_preflight_in_one_program(tmp_pa
                         text=prompt+' '+url;message_id=message_number[0];reply_to_message=None
                         chat=SimpleNamespace(id=123,send_action=lambda **kw:asyncio.sleep(0))
                         async def reply_text(self,value,**kw):
-                            sent.append(value);return SimpleNamespace(message_id=message_number[0]+100)
+                            def record(value):
+                                sent.append(value)
+                                if 'Planning browser step 1' in value and '1 page checked' in value:
+                                    step_one_visible.set()
+                                if 'Planning browser step 2' in value and '1 page checked' in value:
+                                    step_two_visible.set()
+                            async def edit_text(value, **kwargs):
+                                record(value)
+                            record(value)
+                            return SimpleNamespace(message_id=message_number[0]+100, edit_text=edit_text,
+                                delete=lambda: asyncio.sleep(0))
                     asyncio.run(service.on_message(SimpleNamespace(update_id=message_number[0],message=Message()),SimpleNamespace(bot=None)))
                     assert sent
                     visible=sent[-1]

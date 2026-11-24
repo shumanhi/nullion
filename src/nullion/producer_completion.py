@@ -223,6 +223,27 @@ def source_delivery_contract(state, results):
     from nullion.browser_capture_contract import capture_only_scope
     from pathlib import Path
     from nullion.artifacts import ARTIFACT_ROLE_SOURCE, ARTIFACT_ROLE_DELIVERABLE, artifact_paths_from_output_descriptors, normalize_artifact_extensions
+    from nullion.scheduled_artifact_contract import scoped_deliverables, source_image_paths
+    registry = state.get('tool_registry')
+    source_slots = [row for row in scoped_deliverables(state) if row['role'] == 'source_image']
+    if source_slots:
+        matching = []
+        receipts = []
+        for row in results:
+            paths = source_image_paths((), (row,), registry)
+            formats = {Path(path).suffix.lower() for path in paths}
+            if not formats:
+                continue
+            owned = {ext for ext in formats if any(not slot['extension'] or slot['extension'] == ext
+                                                   for slot in source_slots)}
+            if owned:
+                matching.extend(sorted(owned))
+                receipts.append(row.invocation_id)
+        if receipts:
+            return ({'requirement_kind': 'deliverable', 'delivery_required': True,
+                     'eligible_evidence_invocation_ids': list(dict.fromkeys(receipts)),
+                     'eligible_evidence_tool_names': sorted({row.tool_name for row in results
+                         if row.invocation_id in receipts})},), normalize_artifact_extensions(matching)
     decision = getattr(state.get('tool_registry'), 'turn_tool_scope_decision', None)
     capture = (capture_only_scope(decision, results)
         and '.png' in (getattr(decision, 'requested_artifact_extensions', ()) or ()))

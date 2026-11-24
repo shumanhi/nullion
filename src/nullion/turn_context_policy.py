@@ -3096,6 +3096,7 @@ class ScopedTurnToolRegistry:
                     "scheduler_selection_policy": widened.turn_tool_scope_decision.scheduler_selection_policy,
                     "scheduler_target_scope": widened.turn_tool_scope_decision.scheduler_target_scope,
                     "available_tools": list(callable_tool_names),
+                    "selected_tool_names": sorted(explicitly_requested_tools.intersection(callable_tool_names)),
                     "required_tool_names": list(callable_required_tool_names),
                     "requested_required_tool_names": list(merged_required_tool_names),
                     "superseded_unselected_required_tool_names": list(superseded_unselected_required),

@@ -89,7 +89,18 @@ def test_control_handoff_keeps_session_and_resolves_after_real_alternative_tool(
     failed = ToolResult('open','browser_open','failed',{})
     assert pending_source_continuation([result,failed])
     good = ToolResult('open','browser_open','completed',{'session_id':'agent-browser-default'})
-    assert pending_source_continuation([result,good]) is None
+    assert pending_source_continuation([result,good])
+    navigation = ToolResult('nav', 'browser_navigate', 'completed', {'page_url':'https://example.test'})
+    shell = ToolResult('read', 'browser_extract_text', 'completed', {
+        'result_kind':'browser_rendered_text', 'page_url':'https://example.test', 'text':'結果',
+        'observation_readiness':{'verified':False},
+    })
+    assert pending_source_continuation([result, good, navigation, shell])
+    shell.output['observation_readiness'] = {'verified':True}
+    shell.output['page_url'] = 'https://different.example.test'
+    assert pending_source_continuation([result, shell])
+    shell.output['page_url'] = 'https://example.test/results'
+    assert pending_source_continuation([result, good, navigation, shell]) is None
 
 
 @pytest.mark.asyncio

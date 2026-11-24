@@ -6500,21 +6500,27 @@ def test_websocket_chat_streams_tool_activity_before_final_reply(tmp_path, monke
             })
 
             saw_live_tool_activity = False
+            reply = []
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 event = websocket.receive_json()
-                assert event["type"] != "chunk"
                 if (
                     event["type"] == "activity"
                     and event.get("id") == "orchestrate"
                     and "web_fetch" in event.get("detail", "")
                 ):
                     saw_live_tool_activity = True
+                if event["type"] == "chunk":
+                    assert saw_live_tool_activity
+                    reply.append(event["text"])
+                if event["type"] == "done":
                     break
-                if event["type"] in {"response", "error"}:
-                    break
+                assert event["type"] != "error", event
+            else:
+                pytest.fail("WebSocket did not finish the reply")
 
             assert saw_live_tool_activity
+            assert "".join(reply) == "Fetched."
 
 
 def test_websocket_tool_use_decision_does_not_send_working_notice_before_final_reply(tmp_path, monkeypatch) -> None:

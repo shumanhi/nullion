@@ -1389,28 +1389,181 @@ def partial_source_report_reply(tool_results, *, draft=None) -> str:
 
 
 def pending_source_continuation(tool_results):
-    """Return a producer's typed continuation until another source is observed."""
+    """Return the unresolved handoff or source continuation."""
+    continuation, _ = source_continuation_state(tool_results)
+    return continuation
+
+
+def source_continuation_state(tool_results, *, require_source_read=False, session_id=None):
+    """Return the pending continuation and the position of its producer receipt."""
     from nullion.tools import normalize_tool_status
+
     pending = None
-    for result in tool_results or ():
+    producer_index = None
+    for index, result in enumerate(tool_results or ()):
         if normalize_tool_status(getattr(result, 'status', None)) != 'completed':
             continue
         output = getattr(result, 'output', None)
-        if pending and pending.get('kind') == 'alternate_tool' and isinstance(output, Mapping) and getattr(result, 'tool_name', None) in (pending.get('tool_names') or ()):
-            # A successful controller handoff resolves this continuation, not
-            # the user's request. Normal producer/tool contracts still apply.
-            pending = None
-        if not isinstance(output, Mapping) or output.get('result_kind') != 'source_observations':
+        if not isinstance(output, Mapping):
+            continue
+        if pending and result.tool_name in (pending.get('tool_names') or ()):
+            needs_ready_read = pending.get('source_readiness_required') is True
+            if needs_ready_read or require_source_read:
+                if _continuation_has_source_read(output, session_id, pending):
+                    pending = None
+            elif pending.get('kind') == 'alternate_tool':
+                pending = None
+        if output.get('result_kind') != 'source_observations':
             continue
         continuation = output.get('continuation')
         if isinstance(continuation, Mapping) and continuation.get('kind') in {'alternative_source', 'alternate_tool'}:
             pending = dict(continuation)
+            producer_index = index
         elif (pending and output.get('report_status') == 'completed' and not output.get('blocker')
+              and (not require_source_read or result.tool_name in (pending.get('tool_names') or ()))
               and _source_observation_identities(output)):
-            # Search forms can show different verified results at the same
-            # canonical URL. A completed observed lookup resolves continuation;
-            # navigation or an unchanged partial page alone still cannot.
             pending = None
-        elif pending and output.get('page_url') and output.get('page_url') != pending.get('source_url'):
+        elif (pending and not require_source_read and pending.get('source_readiness_required') is not True
+              and output.get('page_url') and output.get('page_url') != pending.get('source_url')):
             pending = None
-    return pending
+    return (pending, producer_index) if pending else (None, None)
+
+
+def retained_browser_handoff_documents(tool_results, producer_index, *, request_invocation_ids=()):
+    """Keep actual native text captures available when a source remains unresolved."""
+    from urllib.parse import urlsplit
+    from nullion.tools import normalize_tool_status
+
+    documents = {}
+    for index, result in enumerate(tool_results or ()):
+        if index == producer_index or result.tool_name not in {"browser_read_pages", "browser_run_task"}:
+            continue
+        if index < producer_index and result.invocation_id not in request_invocation_ids:
+            continue
+        output = result.output
+        if (normalize_tool_status(result.status) != "completed" or not isinstance(output, Mapping)
+                or output.get("result_kind") != "browser_page_collection"):
+            continue
+        completed = {page.get("page_url") for page in output.get("pages") or ()
+                     if isinstance(page, Mapping) and page.get("status") == "completed"
+                     and isinstance(page.get("page_url"), str)}
+        for doc_index, doc in enumerate(output.get("documents") or ()):
+            if not isinstance(doc, Mapping):
+                continue
+            url, body = doc.get("url"), doc.get("text")
+            if not isinstance(url, str) or url not in completed or not isinstance(body, str) or not body.strip():
+                continue
+            try:
+                parsed = urlsplit(url)
+            except ValueError:
+                continue
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None:
+                continue
+            documents[f"{index}.{doc_index}"] = {"url": url, "host": parsed.hostname, "text": body[:8000]}
+    return dict(list(documents.items())[-3:])
+
+
+def browser_handoff_partial_reply(text, documents, continuation):
+    """Publish only exact excerpts from the captured documents, with provenance."""
+    from urllib.parse import quote, urlsplit
+    from nullion.redaction import redact_text
+
+    try:
+        payload = json.loads(text or "")
+    except (TypeError, ValueError):
+        return None
+    selections = payload.get("findings") if isinstance(payload, Mapping) else None
+    if not isinstance(selections, list):
+        return None
+    findings = []
+    for row in selections[:3]:
+        if not isinstance(row, Mapping):
+            continue
+        record_id, excerpt = row.get("source_id"), row.get("excerpt")
+        if not isinstance(record_id, str) or not isinstance(excerpt, str):
+            continue
+        record = documents.get(record_id)
+        excerpt = " ".join(excerpt.split())
+        if (not record or not 12 <= len(excerpt) <= 420
+                or excerpt not in " ".join(record["text"].split())):
+            continue
+        link = quote(record["url"], safe=":/?&=%#@!$+,;~[]")
+        line = f'- [{record["host"]}](<{link}>) — {redact_text(excerpt)}'
+        if line not in findings:
+            findings.append(line)
+    if not findings:
+        return None
+    try:
+        host = urlsplit(str(continuation.get("source_url") or "")).hostname
+    except ValueError:
+        host = None
+    source = host or "the original source"
+    return "\n\n".join([f"I couldn’t finish verifying {source}. I did capture these results:", "\n".join(findings)])
+
+
+def _continuation_has_source_read(output, session_id, continuation):
+    if session_id and output.get('session_id') != session_id:
+        return False
+    kind = output.get('result_kind')
+    if kind == 'browser_page_collection':
+        for capture in output.get("verified_pages") or ():
+            if (isinstance(capture, Mapping) and capture.get("format") == "verified_browser_page.v1"
+                    and _continuation_has_source_read({"result_kind": "browser_item_collection",
+                        "page": {"url": capture.get("page_url")}, "items": capture.get("records"),
+                        "coverage": {"scope_found": True}, "observation_readiness": {"verified": True},
+                        "session_id": output.get("session_id")}, session_id, continuation)):
+                return True
+        for page in output.get("pages") or ():
+            if not isinstance(page, Mapping) or page.get("status") != "completed":
+                continue
+            readiness = page.get("readiness")
+            if not isinstance(readiness, Mapping) or readiness.get("condition_verified") is not True:
+                continue
+            url = page.get("page_url")
+            for doc in output.get("documents") or ():
+                if not isinstance(doc, Mapping) or doc.get("url") != url:
+                    continue
+                if _continuation_has_source_read({"result_kind": "browser_rendered_text", "page_url": url,
+                        "text": doc.get("text"), "observation_readiness": {"verified": True},
+                        "session_id": output.get("session_id")}, session_id, continuation):
+                    return True
+            items = [item for item in output.get("items") or ()
+                     if isinstance(item, Mapping) and item.get("source_page_url") == url]
+            if _continuation_has_source_read({"result_kind": "browser_item_collection", "page": {"url": url},
+                    "items": items, "coverage": page.get("coverage"), "observation_readiness": {"verified": True},
+                    "session_id": output.get("session_id")}, session_id, continuation):
+                return True
+        return False
+    if continuation.get('source_readiness_required') is True:
+        readiness = output.get('observation_readiness')
+        if (kind not in {'browser_rendered_text', 'browser_item_collection'}
+                or not isinstance(readiness, Mapping) or readiness.get('verified') is not True):
+            return False
+    if kind == 'browser_rendered_text':
+        url, text = output.get('page_url'), output.get('text')
+        if not isinstance(text, str) or not text.strip():
+            return False
+    elif kind == 'browser_item_collection':
+        items, coverage, page = output.get('items'), output.get('coverage'), output.get('page')
+        if not isinstance(items, list) or not items or not isinstance(coverage, Mapping) or coverage.get('scope_found') is not True:
+            return False
+        url = page.get('url') if isinstance(page, Mapping) else None
+    else:
+        assertion = output.get('page_state_assertion')
+        if not isinstance(assertion, Mapping) or assertion.get('verified') is not True:
+            return False
+        result = assertion.get('result')
+        url = result.get('url') if isinstance(result, Mapping) else None
+    if not isinstance(url, str):
+        return False
+
+    from urllib.parse import urlsplit
+    try:
+        observed = urlsplit(url)
+        source = urlsplit(str(continuation.get('source_url') or ''))
+    except ValueError:
+        return False
+    if observed.scheme not in {'http', 'https'} or not observed.hostname:
+        return False
+    return (continuation.get('kind') != 'alternate_tool' or not source.hostname
+        or (observed.scheme, observed.netloc) == (source.scheme, source.netloc))

@@ -1,7 +1,7 @@
 """Exact newly requested evidence must reach the consumer before archiving."""
 import json
 
-from nullion.retained_work_context import INSPECT_TOOL, inspect_retained, producer_context
+from nullion.retained_work_context import ARCHIVED_RESULT_CHARS, HISTORY_CHARS, INSPECT_TOOL, inspect_retained, producer_context
 from nullion.tools import ToolResult
 from nullion.workflow_reasoning import remember_review_inspections
 from tests.test_retained_work_context import history
@@ -31,6 +31,36 @@ def test_every_new_source_result_is_readable_before_it_is_archived():
     assert all(f'NEW_FACT_{i}' in visible for i in range(8))
     assert 'EXACT=0' not in visible, 'Old history should still be compacted'
     assert json.dumps(messages) == before
+
+
+def test_ordinary_archived_result_keeps_its_per_result_cap_even_when_history_has_room():
+    messages, results, metadata = history(1)
+    add_batch(messages, results, metadata, [ToolResult('fresh', 'opaque_check', 'completed', {'checked': True})])
+    view, _ = producer_context(messages, results, metadata)
+    archived = json.loads(view[1]['content'][0]['content'][0]['text'])
+    assert len(json.dumps(archived['output'], ensure_ascii=False)) <= ARCHIVED_RESULT_CHARS
+    assert archived['retained_evidence']['preview_only'] is True
+
+
+def test_archived_mail_projection_charges_escaping_against_live_inspection_budget():
+    messages, results, metadata = [], [], {}
+    operations = [{'tool_name': 'email_read', 'invocation_id': f'owned-mail-{i}', 'status': 'completed'}
+                  for i in range(10)]
+    observations = [{**operation, 'output': {'id': f'mail-{i}', 'message': {
+        'id': f'mail-{i}', 'body': f'Dated obligation {i}. ' + '"a' * 800},
+        'evidence_scope': {'kind': 'email_message'}}, 'omitted_paths': []}
+        for i, operation in enumerate(operations)]
+    add_batch(messages, results, metadata, [ToolResult('mail-program', 'code_mode', 'completed', {
+        'value': None, 'operations': operations, 'native_observations': observations,
+    })])
+    add_batch(messages, results, metadata, [ToolResult(f'window-{i}', INSPECT_TOOL, 'completed', {
+        'windows': [{'content': 'z\n'*5500, 'offset': 1500, 'shown_chars': 11000}]
+    }) for i in range(2)])
+
+    view, _ = producer_context(messages, results, metadata)
+    wire = json.dumps(view, ensure_ascii=False)
+    assert 'Dated obligation 9.' in wire
+    assert len(wire) <= HISTORY_CHARS
 
 
 def test_every_inspection_in_one_batch_keeps_its_exact_window():

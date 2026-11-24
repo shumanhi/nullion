@@ -67,11 +67,91 @@ def telegram_boundary(monkeypatch):
             return SimpleNamespace(message_id=len(deliveries))
     import telegram as telegram_sdk
     monkeypatch.setattr(telegram_sdk, 'Bot', Bot)
-    def send(job, channel, target, text):
+    def send(job, channel, target, text, *, exact_artifact_paths=None):
         assert channel == 'telegram'
+        if exact_artifact_paths is not None:
+            from nullion.telegram_entrypoint import _send_operator_telegram_delivery
+            return asyncio.run(_send_operator_telegram_delivery('synthetic-token', target, text,
+                principal_id='telegram:'+target, exact_artifact_paths=exact_artifact_paths))
         return asyncio.run(telegram_app._send_operator_telegram_message('synthetic-token', target, text,
                            principal_id='telegram:'+target))
     return deliveries, send
+
+
+@pytest.mark.parametrize('mode', ['complete', 'partial', 'unverified', 'over_batch_limit', 'withheld', 'empty_manifest'])
+def test_scheduled_manifest_owns_the_exact_telegram_uploads(tmp_path, monkeypatch, mode):
+    from base64 import b64encode
+    from PIL import Image
+    from nullion.artifact_evidence import verified_html_delivery_variant
+    from nullion.artifact_lifecycle import record_delivery_manifest
+    from nullion.cron_delivery import (_CRON_RESPONSIVE_HTML_GUARD, CronRunDeliveryCallbacks,
+        cron_delivery_block_reason, manual_cron_terminal_status_text, run_cron_delivery_workflow)
+    from nullion.crons import CronJob
+    from nullion.report_completion import bind_report_outcome, report_receipt_matches
+    from nullion.tools import ToolResult
+
+    setup_runtime(tmp_path, monkeypatch)
+    if mode == 'over_batch_limit':
+        monkeypatch.setenv('NULLION_MAX_AUTOMATIC_ATTACHMENT_BATCH', '2')
+    root = tmp_path / 'workspaces' / 'workspace_admin' / 'artifacts'
+    root.mkdir(parents=True)
+    monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT', str(root.parent.parent))
+    asset = root / 'figure.png'
+    Image.new('RGB', (2, 2), 'blue').save(asset)
+    embedded, linked, data, draft = (root / name for name in
+        ('preview.html', 'portable.html', 'data.csv', 'draft.csv'))
+    embedded.write_text('<!doctype html><html><head></head><body><img src="data:image/png;base64,' +
+        b64encode(asset.read_bytes()).decode() + '"></body></html>')
+    linked.write_text('<!doctype html><html><head></head><img src="figure.png"></html>')
+    assert linked.stat().st_size < 64
+    assert verified_html_delivery_variant(linked) == 'linked'
+    assert verified_html_delivery_variant(embedded) == 'embedded'
+    data.write_text('value\n42\n')
+    draft.write_text('value\nstale\n')
+    selected = [str(p) for p in (embedded, linked, data, asset)]
+    outputs = [ToolResult('produce', 'terminal_exec', 'completed', {
+        'artifact_descriptors': [{'path': p, 'role': 'deliverable'} for p in [*selected, str(draft)]],
+    })]
+    record_delivery_manifest(outputs, [] if mode == 'empty_manifest' else selected, review_status='completed')
+    expected = {p.name: p.read_bytes() for p in (embedded, linked, data, asset)}
+    job = CronJob('artifact-fixture', '成果物', '* * * * *', '二種類のHTMLと表と画像を送信。',
+        delivery_channel='telegram', delivery_target='123', html_image_delivery_mode='auto')
+    complete = mode in {'complete', 'over_batch_limit', 'empty_manifest'}
+    producer = {'text': f'生成済み。\nMEDIA:{draft}', 'artifacts': selected, 'tool_results': outputs,
+        'artifact_delivery_required': True, 'artifact_delivery_satisfied': complete,
+        'response_fulfilled': complete, 'cron_report_request': job.task}
+    if mode != 'unverified':
+        producer['cron_report_content_receipt'] = bind_report_outcome(job.task,
+            {'status': 'complete', 'content_status': 'complete'}, selected)
+    if mode == 'withheld':
+        producer['cron_failure_notice'] = True
+        job.artifact_delivery_options['alert_delivery_mode'] = 'verified_matches_only'
+    deliveries, send = telegram_boundary(monkeypatch)
+    result = run_cron_delivery_workflow(job, label='Manual scheduled task run', callbacks=CronRunDeliveryCallbacks(
+        effective_channel=lambda job: job.delivery_channel, delivery_target=lambda job, channel: job.delivery_target,
+        run_agent_turn=lambda *args, **kwargs: producer, record_event=lambda *args, **kwargs: None,
+        block_reason=cron_delivery_block_reason, save_web_delivery=lambda *args: None, send_platform_delivery=send,
+        silent_delivery_text=(lambda *args: 'No verified results.') if mode == 'withheld' else None))
+    actual = {Path(entry['path']).name: entry['bytes'] for entry in deliveries if 'bytes' in entry}
+    guard = _CRON_RESPONSIVE_HTML_GUARD.encode()
+    guarded = mode in {'complete', 'partial', 'over_batch_limit'}
+    current = {p.name: p.read_bytes() for p in (embedded, linked, data, asset)}
+    if guarded:
+        for path in (embedded, linked):
+            expected[path.name] = expected[path.name].replace(b'</head>', guard + b'</head>')
+    assert current == expected
+    if guarded:
+        assert report_receipt_matches(job.task, result['cron_report_content_receipt'], selected)
+        assert verified_html_delivery_variant(linked) == 'linked'
+        assert verified_html_delivery_variant(embedded) == 'embedded'
+    assert result['cron_delivery_status'] == ('failed' if mode in {'over_batch_limit', 'empty_manifest'} else 'sent'), result.get('reason')
+    no_files = mode in {'unverified', 'over_batch_limit', 'withheld', 'empty_manifest'}
+    assert actual == ({} if no_files else current), (result.get('execution_outcome'), deliveries)
+    assert set(map(Path, result['execution_outcome']['artifacts_delivered'])) == (
+        set() if no_files else set(map(Path, selected)))
+    if mode == 'partial':
+        assert result['execution_outcome']['status'] == 'partially_succeeded'
+        assert 'Partial result' in manual_cron_terminal_status_text(job, result=result)
 
 
 def run_scheduled(job, client, runtime, registry, send, *, agent_conversation_id=None, record_chat_turn=None):
@@ -138,6 +218,64 @@ def test_web_scheduler_records_delivery_only_after_actual_chat_storage(tmp_path,
             assert '20 USD' in receipts[-1]['assistant_reply']
         else:
             assert str(crons.get_cron(ident).last_result).startswith('error:')
+
+
+@pytest.mark.parametrize("terminal_timeout", [False, True])
+def test_failed_web_cron_notice_withholds_completed_artifact(tmp_path, monkeypatch, terminal_timeout):
+    from fastapi.testclient import TestClient
+    from cron_scheduler_helpers import finish_scheduler
+    from nullion import config, cron_delivery, crons, web_app
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.artifacts import artifact_root_for_principal
+    from nullion.config import NullionSettings
+    from nullion.tools import ToolRegistry, ToolResult
+
+    runtime = setup_runtime(tmp_path, monkeypatch)
+    conversation_id = "web:operator"
+    root = artifact_root_for_principal(conversation_id)
+    root.mkdir(parents=True, exist_ok=True)
+    artifact = root / "withheld-report.html"
+    artifact.write_text("<!doctype html><html><body>Unreviewed draft data</body></html>", encoding="utf-8")
+
+    def incomplete_producer(*args, **kwargs):
+        return {
+            "text": "生成中のレポート",
+            "response_fulfilled": False,
+            "artifacts": [str(artifact)],
+            "tool_results": [ToolResult("draft-write", "file_write", "completed",
+                                        {"artifact_path": str(artifact)})],
+            **({"cron_run_failed": True, "reason": "cron_run_model_timeout"} if terminal_timeout else {}),
+        }
+
+    settings = NullionSettings(doctor_enabled=False)
+    monkeypatch.setattr(cron_delivery, "run_single_agent_cron_turn", incomplete_producer)
+    monkeypatch.setattr(config, "load_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(web_app, "load_settings", lambda *args, **kwargs: settings)
+    schedulers = []
+    monkeypatch.setattr(crons.CronScheduler, "start", lambda self: schedulers.append(self))
+    app = web_app.create_app(runtime, orchestrator=AgentOrchestrator(model_client=object()),
+                             registry=ToolRegistry(filesystem_allowed_roots=(tmp_path,)))
+    with TestClient(app) as client:
+        created = client.post("/api/crons", json={"name": "確認", "schedule": "* * * * *",
+            "task": "確認済みのレポートを表示してください。", "enabled": True,
+            "delivery_channel": "web", "delivery_target": conversation_id})
+        assert created.status_code == 200, created.text
+        job_id = created.json()["job"]["id"]
+        job = crons.get_cron(job_id)
+        job.next_run = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        crons.save_crons([job])
+        schedulers[-1]._tick()
+        finish_scheduler(schedulers[-1])
+
+        history = client.get(f"/api/chat/history/{conversation_id}").json()
+        notices = [row for row in history["messages"] if row["role"] == "bot"]
+        assert len(notices) == 1, history
+        assert ("timed out" if terminal_timeout else "report") in notices[0]["text"].lower(), notices
+        assert not notices[0].get("artifacts")
+        assert str(artifact) not in json.dumps(notices[0])
+        assert "Unreviewed draft data" not in notices[0]["text"]
+        assert artifact.is_file()
+        assert str(crons.get_cron(job_id).last_result).startswith("error:")
 
 
 def test_web_scheduler_telegram_delivery_is_saved_in_actual_chat_history(tmp_path, monkeypatch):
@@ -311,23 +449,35 @@ def test_completed_report_delivers_without_extra_model_review(tmp_path, monkeypa
             self.calls += 1
             if self.calls == 1: return tool_response('market_quote', {'symbols':['AAA']})
             if self.calls == 2: return tool_response('file_write', {'path':str(path), 'content':document})
+            if review_failure == 'model-response':
+                from nullion.model_clients import ModelClientResponseError
+                raise ModelClientResponseError('fixture_failure_after_report')
             return text_response('Report attached.\nMEDIA:'+str(path))
     client = Client()
     elapsed = []
-    for _ in range(3):
+    repeats = 1 if review_failure == 'model-response' else 3
+    for _ in range(repeats):
         client.calls = 0
         started = time.monotonic()
         result = run_scheduled(job, client, runtime, registry, send)
         elapsed.append(time.monotonic()-started)
-        assert result['execution_outcome']['execution_succeeded'] is True, result
+        if review_failure != 'model-response':
+            assert result['execution_outcome']['execution_succeeded'] is True, result
         assert result['artifact_delivery_satisfied'] is True
     assert client.reviews == 0
-    assert len(deliveries) == 3
+    assert len(deliveries) == repeats
     assert all(item['bytes'] == Path(item['path']).read_bytes() for item in deliveries)
     assert all(b'<body>AAA 20</body>' in item['bytes'] for item in deliveries)
+    if review_failure == 'model-response':
+        assert 'report attached' in deliveries[0]['caption'].lower()
+        assert 'model request failed' not in deliveries[0]['caption']
     assert sum(elapsed)/len(elapsed) < 2.5 and max(elapsed) < 3.5, elapsed
     assert any(event.event_type == 'tool.invocation.completed' and event.payload.get('tool_name') == 'file_write'
                for event in runtime.store.list_events())
+
+
+def test_written_cron_report_survives_a_failed_model_response(tmp_path, monkeypatch):
+    test_completed_report_delivers_without_extra_model_review(tmp_path, monkeypatch, '価格と時刻を表示', 'model-response')
 
 
 @pytest.mark.parametrize('recover', [True, False, None])
@@ -572,7 +722,7 @@ def test_legacy_html_job_recovers_after_source_success_or_reports_failure_withou
     else:
         assert stored.last_result == 'error: cron_required_artifact_missing'
         assert 'bytes' not in deliveries[0]
-        assert 'could not create the required report file' in deliveries[0]['text']
+        assert 'could not verify all required files for delivery' in deliveries[0]['text']
         assert result['execution_outcome']['execution_succeeded'] is False
     assert result['cron_delivery_status'] == 'sent'
 
@@ -929,7 +1079,9 @@ def test_model_timeout_report_retains_all_completed_quote_rows(tmp_path, monkeyp
     from nullion import crons
     from nullion.model_clients import ModelClientTimeoutError
     from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
+    from nullion.research_budget import current_budget
     from nullion.tools import ToolRegistry, register_market_quote_tool
+    monkeypatch.setenv("NULLION_RESEARCH_WRITING_SECONDS", "60")
     runtime = setup_runtime(tmp_path, monkeypatch)
     runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(
         rule_id='complete-quotes-network', principal_id=GLOBAL_PERMISSION_PRINCIPAL,
@@ -954,6 +1106,8 @@ def test_model_timeout_report_retains_all_completed_quote_rows(tmp_path, monkeyp
             protocol_reply = workflow_provider_reply(kwargs, completion=True)
             if protocol_reply is not None: return protocol_reply
             if not kwargs.get('tools'):
+                assert current_budget().writing_remaining() == 0
+                assert 1 < kwargs['timeout'] <= 60
                 evidence = kwargs['messages'][0]['content'][0]['text'].split('Verified compact tool evidence from this run:\n',1)[1].split('\n\n',1)[0]
                 rows = json.loads(evidence)
                 quotes = rows[0]['source_records']
@@ -965,6 +1119,9 @@ def test_model_timeout_report_retains_all_completed_quote_rows(tmp_path, monkeyp
             self.calls += 1
             if self.calls == 1:
                 return tool_response('market_quote', {'symbols': symbols})
+            budget = current_budget()
+            budget.finish_research('simulated_prior_writer')
+            budget.writing_started -= 120
             raise ModelClientTimeoutError('Simulated provider timeout after all quote reads completed')
     elapsed = []
     for _ in range(3):
@@ -1487,3 +1644,288 @@ def test_web_saved_alert_persists_only_the_bound_public_delivery(tmp_path, monke
         assert '_verified_cron_alert_decision' not in json.dumps(history)
         assert crons.get_cron(ident).last_result == 'ok'
         assert len(reads) == 1
+
+
+@pytest.mark.parametrize('recovery_succeeds', [True, False])
+def test_legacy_multi_file_scope_survives_writer_timeout_without_text_repair(tmp_path, monkeypatch, recovery_succeeds):
+    from nullion import crons
+    from nullion.artifacts import artifact_root_for_principal
+    from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
+    from nullion.tools import (ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass,
+                               register_market_quote_tool, _build_file_write_handler)
+
+    runtime = setup_runtime(tmp_path, monkeypatch)
+    calls = []
+    for kind in (BoundaryKind.OUTBOUND_NETWORK, BoundaryKind.FILESYSTEM_ACCESS):
+        runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(
+            rule_id=kind.value, principal_id=GLOBAL_PERMISSION_PRINCIPAL, kind=kind,
+            mode=PolicyMode.ALLOW, selector='*', created_by='fixture', created_at=datetime.now(UTC)))
+    deliveries, send = telegram_boundary(monkeypatch)
+    registry = ToolRegistry(filesystem_allowed_roots=(tmp_path,))
+    def fetch_quote(symbol, timeout):
+        calls.append('source_read')
+        return {'symbol': symbol, 'price': 20}
+    register_market_quote_tool(registry, quote_fetcher=fetch_quote)
+    registry.register(ToolSpec('file_write', 'Write a requested report', ToolRiskLevel.LOW,
+        ToolSideEffectClass.WRITE, False, 20, capability_tags=('local_files',), produced_artifact_extensions=('.html', '.csv')),
+        _build_file_write_handler(allowed_roots=(tmp_path,)))
+    job = crons.add_cron('多形式レポート', '* * * * *', '価格を確認し、HTML と CSV の両方を添付してください。',
+                        delivery_channel='telegram', delivery_target='2222')
+    assert not job.artifact_delivery_options
+    path = artifact_root_for_principal('telegram:2222') / 'report.html'
+    table = path.with_suffix('.csv')
+
+    class Client:
+        rounds = 0
+        def create(self, **kwargs):
+            if 'rejected draft final response' in str(kwargs.get('messages')).lower():
+                calls.append('text_composer')
+                raise TimeoutError('Unexpected text-only recovery for missing files')
+            protocol = workflow_provider_reply(kwargs, completion=True)
+            if protocol is not None:
+                return protocol
+            if any(tool['name'] == 'select_artifact_delivery' for tool in kwargs.get('tools') or []):
+                selected = ['a0', 'a1'] if table.is_file() else ['a0']
+                return tool_response('select_artifact_delivery', {
+                    'status': 'selected', 'selected_ids': selected, 'required_html_variants': [],
+                    'reason': 'Select the completed formats.'})
+            if not kwargs.get('tools'):
+                return text_response('{}')
+            self.rounds += 1
+            if 'Finish only the missing scheduled files' in str(kwargs.get('messages')):
+                offered = {tool['name'] for tool in kwargs['tools']}
+                calls.append('recovery')
+                assert 'file_write' in offered
+                assert 'market_quote' not in offered
+                assert 'request_tool_scope' not in offered
+                if not recovery_succeeds:
+                    raise TimeoutError('Writer could not recover the CSV')
+                self.recovery_rounds = getattr(self, 'recovery_rounds', 0) + 1
+                if self.recovery_rounds == 1:
+                    return tool_response('request_tool_scope', {
+                        'capabilities': ['market_data'], 'tool_names': ['market_quote'],
+                        'required_tool_names': [], 'research_effort': 'standard'})
+                if self.recovery_rounds > 2:
+                    return text_response(f'検証済みの価格レポートです。\nMEDIA:{path}\nMEDIA:{table}')
+                reply = tool_response('file_write', {'path': str(table), 'content': 'symbol,price\nAAA,20\n'})
+                reply['content'][0]['id'] = 'file-write-csv'
+                return reply
+            if self.rounds == 1:
+                return tool_response('request_tool_scope', {
+                    'capabilities': ['market_data', 'local_files'], 'tool_names': ['market_quote', 'file_write'],
+                    'required_tool_names': ['market_quote', 'file_write'], 'artifact_extensions': ['.html', '.csv'],
+                    'artifact_deliverables': [{'role': 'file', 'extension': ext} for ext in ('.html', '.csv')],
+                    'research_effort': 'standard', 'research_questions': ['確認済みの価格']})
+            if self.rounds == 2:
+                return tool_response('market_quote', {'symbols': ['AAA']})
+            if self.rounds == 3:
+                return tool_response('file_write', {'path': str(path), 'content': '<html><body>AAA: 20</body></html>'})
+            raise TimeoutError('Writer could not finish the CSV')
+
+    result = run_scheduled(job, Client(), runtime, registry, send)
+    receipts = [(r.tool_name, r.status, r.output.get('artifact_extensions'), r.output.get('reason'), r.error)
+                for r in result.get('tool_results', [])]
+    assert 'text_composer' not in calls, (receipts, result.get('reason'))
+    assert result['artifact_delivery_required'] is True
+    assert set(result['required_artifact_extensions']) == {'.html', '.csv'}
+    assert calls.count('source_read') == 1, (calls, receipts)
+    assert 'recovery' in calls, (calls, receipts, result.get('response_presentation'))
+    attachments = {Path(delivery['path']).name: delivery['bytes'] for delivery in deliveries if 'path' in delivery}
+    if recovery_succeeds:
+        assert result['artifact_delivery_satisfied'] is True, (receipts, result.get('execution_outcome'), deliveries)
+        assert result['execution_outcome']['status'] == 'succeeded', result['execution_outcome']
+        assert attachments == {path.name: path.read_bytes(), table.name: b'symbol,price\nAAA,20\n'}
+        assert any(row[3] == 'scheduled_recovery_scope_fixed' for row in receipts)
+    else:
+        assert result['artifact_delivery_satisfied'] is False
+        assert result['execution_outcome']['status'] == 'partially_succeeded'
+        assert attachments == {path.name: path.read_bytes()}
+        assert any('some required files are still missing' in str(delivery) for delivery in deliveries)
+
+
+@pytest.mark.parametrize("receipt_mode", ["complete", "narrowed", "changed"])
+def test_scheduled_typed_roles_validate_actual_uploads(tmp_path, monkeypatch, receipt_mode):
+    from base64 import b64encode
+    from zipfile import ZipFile
+
+    from PIL import Image
+    from nullion.artifact_lifecycle import record_delivery_manifest
+    from nullion.cron_delivery import (
+        CronRunDeliveryCallbacks, cron_artifact_validation_block_reason,
+        cron_delivery_block_reason, run_cron_delivery_workflow,
+    )
+    from nullion.crons import CronJob
+    from nullion.report_completion import bind_report_outcome, report_receipt_matches
+    from nullion.scheduled_artifact_contract import missing_deliverables, normalize_deliverables
+    from nullion.tools import ToolResult
+
+    setup_runtime(tmp_path, monkeypatch)
+    root = tmp_path / 'workspaces' / 'workspace_admin' / 'artifacts'
+    root.mkdir(parents=True)
+    monkeypatch.setenv('NULLION_WORKSPACE_STORAGE_ROOT', str(root.parent.parent))
+    source, derived, embedded, bundle = map(root.joinpath,
+        ('page.png', 'derived_web_snapshot.png', 'embedded.html', 'linked.zip'))
+    Image.new('RGB', (3, 4), 'blue').save(source)
+    Image.new('RGB', (4, 3), 'red').save(derived)
+    embedded.write_text('<!doctype html><html><head></head><body><img src="data:image/png;base64,'
+        + b64encode(source.read_bytes()).decode() + '"></body></html>', encoding='utf-8')
+    with ZipFile(bundle, 'w') as output:
+        output.writestr('report.html', '<!doctype html><html><head></head><body><img src="assets/page.png"></body></html>')
+        output.write(source, 'assets/page.png')
+
+    selected = [str(path) for path in (embedded, bundle, source, derived)]
+    def receipt(name, paths, *, source=False):
+        return ToolResult(name, name, 'completed', {
+            'artifact_descriptors': [{'path': str(path), 'role': 'deliverable'} for path in paths]},
+            response_requirements={'_native_scheduled_source_artifact': True} if source else None)
+
+    results = [receipt('file_write', [embedded]), receipt('archive_create', [bundle]),
+        receipt('browser_screenshot', [source], source=True), receipt('image_render', [derived])]
+    slots = normalize_deliverables([
+        {'role': 'embedded_html', 'extension': '.html'},
+        {'role': 'linked_html', 'extension': '.html'},
+        {'role': 'source_image', 'extension': ''},
+        {'role': 'derived_image', 'extension': ''},
+    ])
+    assert not missing_deliverables(slots, selected, results, registry=None)
+    assert missing_deliverables(slots, [path for path in selected if path != str(source)], results,
+                                registry=None) == (slots[2],)
+    assert not missing_deliverables([{**slots[2], 'required': False}, slots[3]],
+                                    [str(derived)], results, registry=None)
+    assert missing_deliverables(slots, selected, [*results, receipt('image_generate', [source])],
+                                registry=None) == (slots[2],)
+    record_delivery_manifest(results, selected, review_status='completed')
+    job = CronJob('typed-pack', '成果物', '* * * * *', '写真と図と二種類のウェブ資料を作成。',
+        delivery_channel='telegram', delivery_target='123', artifact_delivery_options={
+            'artifact_deliverables': list(slots), 'deliver_required_extensions_only': True})
+    producer = {'text': '作成しました。', 'artifacts': selected, 'tool_results': results,
+        'response_fulfilled': True, 'artifact_delivery_required': True, 'artifact_delivery_satisfied': True,
+        'cron_artifact_deliverables': list(slots), 'required_artifact_extensions': ['.html'],
+        'deliver_required_extensions_only': True}
+    stripped = '\n'.join('MEDIA:' + path for path in selected if path != str(source))
+    assert cron_artifact_validation_block_reason(producer.copy(), stripped) == 'cron_required_artifact_missing'
+
+    bare = root / 'bare.html'
+    bare.write_text('<!doctype html><html><head></head><body><img src="page.png"></body></html>')
+    bare_selection = [str(bare) if path == str(bundle) else path for path in selected]
+    bare_receipts = [receipt('file_write', [bare]), *results]
+    record_delivery_manifest(bare_receipts, bare_selection, review_status='completed')
+    bare_producer = {**producer, 'artifacts': bare_selection, 'tool_results': bare_receipts}
+    assert cron_artifact_validation_block_reason(bare_producer,
+        '\n'.join('MEDIA:' + path for path in bare_selection)) == 'cron_required_artifact_missing'
+    if receipt_mode != "complete":
+        state_file = root / "checkpoint.json"
+        state_file.write_text('{"fixture": true}')
+        results.append(receipt('file_write', [state_file]))
+        candidates = [*selected, str(state_file)]
+        producer.update(artifacts=candidates, response_fulfilled=False, artifact_delivery_satisfied=False,
+            cron_report_partial=True, cron_report_request=job.task,
+            cron_report_content_receipt=bind_report_outcome(job.task, {'status': 'unknown'}, candidates))
+        record_delivery_manifest(results, candidates, review_status='completed')
+        if receipt_mode == "changed":
+            Image.new('RGB', (4, 3), 'green').save(derived)
+    else:
+        record_delivery_manifest(results, selected, review_status='completed')
+
+    deliveries, send = telegram_boundary(monkeypatch)
+    outcome = run_cron_delivery_workflow(job, label='Manual scheduled task run', callbacks=CronRunDeliveryCallbacks(
+        effective_channel=lambda job: job.delivery_channel, delivery_target=lambda job, channel: job.delivery_target,
+        run_agent_turn=lambda *args, **kwargs: producer, record_event=lambda *args, **kwargs: None,
+        block_reason=cron_delivery_block_reason, save_web_delivery=lambda *args: None, send_platform_delivery=send))
+    uploads = {Path(row['path']).name: row['bytes'] for row in deliveries if 'path' in row}
+    if receipt_mode == "changed":
+        assert not uploads
+        assert outcome['response_fulfilled'] is False
+        return
+    assert outcome['cron_delivery_status'] == 'sent', (outcome.get('reason'), deliveries)
+    assert uploads == {path.name: path.read_bytes() for path in (embedded, bundle, source, derived)}
+    if receipt_mode == "narrowed":
+        assert outcome['execution_outcome']['status'] == 'partially_succeeded'
+        assert report_receipt_matches(job.task, outcome['cron_report_content_receipt'], selected)
+        assert set(outcome['execution_outcome']['artifacts_delivered']) == set(selected)
+
+
+@pytest.mark.parametrize("selection", [
+    "legacy", "manifest", "different_asset", "standalone_required", "stylesheet_dependency",
+])
+def test_scheduled_html_bundle_does_not_send_working_copy_or_caption_image(tmp_path, monkeypatch, selection):
+    from base64 import b64encode
+    from zipfile import ZipFile
+
+    from PIL import Image
+    from nullion.artifact_lifecycle import record_delivery_manifest
+    from nullion.cron_delivery import (
+        CronRunDeliveryCallbacks, _responsive_html_with_delivery_guard, cron_delivery_block_reason,
+        run_cron_delivery_workflow,
+    )
+    from nullion.crons import CronJob
+    from nullion.tools import ToolResult
+
+    setup_runtime(tmp_path, monkeypatch)
+    root = tmp_path / "workspaces" / "workspace_admin" / "artifacts"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(root.parent.parent))
+    illustration, embedded, linked, bundle, css = (
+        root / name for name in ("illustration.png", "embedded.html", "linked.html", "bundle.zip", "report.css")
+    )
+    Image.new("RGB", (3, 4), "blue").save(illustration)
+    content = ('<!doctype html><html><head><meta charset="utf-8">'
+               '<link rel="stylesheet" href="report.css"></head>'
+               '<body><h1>確認済み</h1><img src="illustration.png"></body></html>')
+    linked.write_text(_responsive_html_with_delivery_guard(content), encoding="utf-8")
+    stylesheet = ('body { background: url("background.png") }'
+                  if selection == "stylesheet_dependency" else "body { color: navy }")
+    css.write_text(stylesheet, encoding="utf-8")
+    embedded.write_text('<!doctype html><html><head></head><body><img src="data:image/png;base64,'
+                        + b64encode(illustration.read_bytes()).decode() + '"></body></html>', encoding="utf-8")
+    with ZipFile(bundle, "w") as package:
+        package.writestr(linked.name, content)
+        package.write(illustration, illustration.name)
+        package.writestr(css.name, "body { color: gray }" if selection == "different_asset" else css.read_bytes())
+
+    paths = [str(path) for path in (illustration, embedded, linked, bundle)]
+    receipts = [ToolResult(path.name, name, "completed", {
+        "artifact_path": str(path), "artifact_descriptors": [{"path": str(path), "role": "deliverable"}],
+    }) for path, name in ((illustration, "image_render"), (embedded, "file_write"),
+                         (linked, "file_write"), (bundle, "archive_create"))]
+    slots = []
+    if selection == "legacy":
+        thumbnail = root / "working_thumbnail.png"
+        Image.new("RGB", (2, 2), "red").save(thumbnail)
+        paths.append(str(thumbnail))
+        receipts.append(ToolResult("working-thumbnail", "image_render", "completed", {
+            "artifact_path": str(thumbnail),
+            "artifact_descriptors": [{"path": str(thumbnail), "role": "deliverable"}],
+        }))
+    else:
+        slots = [{"role": role, "extension": extension, "required": True}
+                 for role, extension in (("embedded_html", ".html"), ("linked_html", ".html"),
+                                         ("derived_image", ".png"))]
+        if selection == "standalone_required":
+            slots.append({"role": "file", "extension": ".html", "required": True})
+        record_delivery_manifest(receipts, paths, review_status="completed")
+    job = CronJob("portable-report", "二種類のウェブ資料", "* * * * *", "資料を作成してください。",
+                  delivery_channel="telegram", delivery_target="123", html_image_delivery_mode="linked")
+    producer = {"text": "資料を作成しました。\n" + "\n".join("MEDIA:" + path for path in paths),
+                "tool_results": receipts, "artifacts": paths, "artifact_delivery_required": True,
+                "response_fulfilled": True, "artifact_delivery_satisfied": True,
+                "required_artifact_extensions": [".html"], "cron_artifact_deliverables": slots}
+    deliveries, send = telegram_boundary(monkeypatch)
+    outcome = run_cron_delivery_workflow(job, label="Manual scheduled task run", callbacks=CronRunDeliveryCallbacks(
+        effective_channel=lambda job: job.delivery_channel, delivery_target=lambda job, channel: job.delivery_target,
+        run_agent_turn=lambda *args, **kwargs: producer, record_event=lambda *args, **kwargs: None,
+        block_reason=cron_delivery_block_reason, save_web_delivery=lambda *args: None, send_platform_delivery=send))
+    assert outcome["cron_delivery_status"] == "sent", outcome.get("reason")
+    uploads = [row for row in deliveries if "path" in row]
+    assert Path(uploads[0]["path"]).name == embedded.name
+    assert "資料を作成しました" in uploads[0]["caption"]
+    expected = [embedded, bundle]
+    if selection != "legacy":
+        expected.insert(1, illustration)
+    if selection in {"different_asset", "standalone_required", "stylesheet_dependency"}:
+        expected.insert(2, linked)
+    assert {Path(row["path"]).name: row["bytes"] for row in uploads} == {
+        path.name: path.read_bytes() for path in expected
+    }
+    if selection != "legacy":
+        assert not next(row for row in uploads if Path(row["path"]).name == illustration.name)["caption"]

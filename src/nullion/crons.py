@@ -865,6 +865,9 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
 
 def _validate_tracker_options(options: object) -> None:
     if isinstance(options, dict):
+        if "artifact_deliverables" in options:
+            from nullion.scheduled_artifact_contract import normalize_deliverables
+            normalize_deliverables(options["artifact_deliverables"])
         for key in ("tracker_status_notifications", "tracker_health_notifications", "doctor_monitoring_enabled"):
             if key in options and type(options[key]) is not bool:
                 raise ValueError(f"{key} must be a boolean")

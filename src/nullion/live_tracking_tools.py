@@ -23,6 +23,7 @@ from nullion.live_tracking import (
     validate_plan,
     validate_prepared_observations,
     evaluate_semantic,
+    prepared_record_identity_keys,
     observation_problem,
     EVALUATION_TIMEOUT_SECONDS,
 )
@@ -336,6 +337,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                 prepared = (invocation.flow_context or {}).get("prepared_observations")
                 evaluator = getattr(registry, "live_tracker_model_client_getter", None)
                 initial_snapshot = None
+                initial_record_keys = None
                 if matcher["kind"] == "semantic" and prepared is not None and callable(evaluator):
                     outputs = [prepared[json.dumps(step, ensure_ascii=False, sort_keys=True, default=str)] for step in probe]
                     check = evaluate_semantic(matcher, outputs, evaluator())
@@ -358,6 +360,8 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                             raise LiveTrackerPlanError('Narrow the source so both current and previous observations fit losslessly.',
                                 code='comparison_history_too_large')
                         initial_snapshot = dict(check.comparison_snapshot)
+                    elif matcher.get('history_mode', 'records') == 'records':
+                        initial_record_keys = prepared_record_identity_keys(outputs)
                 # Carry only trusted runtime session state. Tool arguments and
                 # user text cannot choose another conversation's browser handle.
                 source_refresh = args.get("source_refresh", DEFAULT_SOURCE_REFRESH)
@@ -412,6 +416,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                     require_start_receipt="prepared_observations"
                     in (invocation.flow_context or {}),
                     initial_comparison_snapshot=initial_snapshot,
+                    initial_observation_identity_keys=initial_record_keys,
                     stop_after_match=args.get('stop_after_match', False),
                     now=now,
                 )
@@ -455,9 +460,11 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                 return ToolResult(invocation.invocation_id, invocation.tool_name, 'failed',
                     {'reason': 'live_tracking_needs_details', 'clarification': str(exc)+'\n\n'+DURATION_CHOICE}, str(exc))
             context = invocation.flow_context or {}
+            coverage_gaps = exc.validation.get("coverage_gaps", ()) if isinstance(exc, LiveTrackerPlanError) else ()
+            failed_probes = [args["probe"][gap["step"]] for gap in coverage_gaps]
             ready = [receipt["probe"] for receipt in (context.get("observation_preparations") or {}).values()
-                     if receipt.get("status") == "ready"]
-            repairable = [{key: receipt[key] for key in ('status','probe','supported_parameters','next_action','observed_chars','limit_chars') if key in receipt}
+                     if receipt.get("status") == "ready" and receipt["probe"] not in failed_probes]
+            repairable = [{key: receipt[key] for key in ('status','probe','supported_parameters','next_action','observed_chars','limit_chars','collection_coverage') if key in receipt}
                 for receipt in (context.get('observation_preparations') or {}).values()
                 if receipt.get('status') in {'needs_source_readiness','needs_narrower_source','unsupported_source_output'}]
             repeatable = [spec.name for spec in registry.list_specs()
@@ -517,7 +524,7 @@ def register_live_tracker_tools(registry, *, model_client_getter=None):
                         },
                         "required": ["tool_name", "arguments"],
                     },
-                    "description": "Exact tested native READ tools and arguments, not code_mode or batch/delegated executors. For browser text verify an observed results landmark through ready_selector or ready_text. Keep the complete relevant observation within its stated size limit. Use ready_prepared_probes or repairable_preparations from a failed admission; do not replace a native read with an orchestrator wrapper. No shell, writes, screenshots or generic gateways.",
+                    "description": "Exact tested native READ tools and arguments, not code_mode or batch/delegated executors. For browser text verify a stable observed results landmark through ready_selector or ready_text. A results selector must remain valid as records change. For collections, compare returned_count and candidate_count before starting. A truncated sample cannot establish the baseline for the whole collection. Re-read the full requested coverage using a compact projection or verified complete regions, and ask before narrowing the requested coverage. Use ready_prepared_probes or repairable_preparations from a failed admission. No shell, writes, screenshots or generic gateways.",
                 },
                 "matcher": {
                     "type": "object",

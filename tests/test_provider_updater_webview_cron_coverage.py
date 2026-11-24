@@ -1548,7 +1548,14 @@ def test_run_update_workflow_handles_no_update_success_and_rollback(tmp_path, mo
     emitted.clear()
     rolled_back: list[Path | None] = []
     monkeypatch.setattr(updater, "fresh_health_check", lambda **kwargs: False)
-    monkeypatch.setattr(updater, "rollback", lambda snap: rolled_back.append(snap) or True)
+
+    def restore_previous_release(snap):
+        assert emitted[-1].step == "rollback"
+        assert emitted[-1].message == "Rolling back to previous version..."
+        rolled_back.append(snap)
+        return True
+
+    monkeypatch.setattr(updater, "rollback", restore_previous_release)
 
     failed = asyncio.run(updater.run_update(emit=emitted.append))
 
@@ -1556,7 +1563,7 @@ def test_run_update_workflow_handles_no_update_success_and_rollback(tmp_path, mo
     assert failed.rolled_back is True
     assert failed.error == "Health check failed after update."
     assert rolled_back == [snapshot_path]
-    assert [step.step for step in emitted][-2:] == ["health", "rollback"]
+    assert [step.step for step in emitted][-3:] == ["health", "rollback", "rollback"]
 
 
 def test_webview_helpers_single_instance_sizing_and_cli(tmp_path, monkeypatch) -> None:
@@ -1671,14 +1678,15 @@ def test_webview_loading_health_api_reports_failure(monkeypatch) -> None:
     assert "Cannot reach the local app" in payload["message"]
 
 
-def test_fresh_health_envelope_covers_sequential_child_checks(monkeypatch):
+@pytest.mark.parametrize("timeout,require_web,expected", [(10, True, 40), (45, True, 55), (45, False, 40)])
+def test_fresh_health_envelope_covers_parallel_checks(monkeypatch, timeout, require_web, expected):
     calls = []
     def run(*args, **kwargs):
         calls.append(kwargs)
         return SimpleNamespace(returncode=0, stdout='ok', stderr='')
     monkeypatch.setattr(updater.subprocess, 'run', run)
-    assert updater.fresh_health_check(timeout=10, require_web=True, require_messaging=True)
-    assert calls[-1]['timeout'] >= 30 + 10 + 30 + 5
+    assert updater.fresh_health_check(timeout=timeout, require_web=require_web, require_messaging=True)
+    assert calls[-1]['timeout'] == expected
 
 
 @pytest.mark.parametrize('error', [subprocess.TimeoutExpired('health', 45), OSError('cannot start probe')])

@@ -397,6 +397,7 @@ async def send_discord_platform_delivery(
     text: str,
     principal_id: str | None = None,
     message_only: bool = False,
+    exact_artifact_paths: tuple[str, ...] | None = None,
 ) -> bool:
     """Send a platform delivery to Discord over REST, uploading MEDIA artifacts."""
     if not bot_token or not channel_id:
@@ -457,6 +458,7 @@ async def send_discord_platform_delivery(
                 target_id=channel_id,
                 principal_id=principal_id,
                 delivery_contract=DeliveryContract.message_only() if message_only else None,
+                exact_artifact_paths=exact_artifact_paths,
                 send_text=_send_text,
                 send_attachments=_send_attachments,
             )

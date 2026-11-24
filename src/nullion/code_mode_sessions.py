@@ -16,6 +16,10 @@ from uuid import uuid4
 _LOCK = threading.RLock()
 
 
+class CodeModeSessionMissing(ValueError):
+    """The journal has no record for a saved session reference."""
+
+
 class SessionJournal:
     def __init__(self, state):
         self.owner = [state.get('principal_id', ''), state.get('conversation_id', ''), hashlib.sha256(state.get('user_message', '').encode()).hexdigest()]
@@ -66,7 +70,9 @@ class SessionJournal:
             else:
                 record = self.memory.get(identity)
                 record = json.loads(json.dumps(record)) if record else None
-            if record is None or record['owner'] != self.owner:
+            if record is None:
+                raise CodeModeSessionMissing('code_mode_session_missing')
+            if record['owner'] != self.owner:
                 raise ValueError('code_mode_session_owner_mismatch')
             return record
 
@@ -105,6 +111,26 @@ class SessionJournal:
 
     def close(self, identity):
         record = self.read(identity)
+        # A wrapper can lose its suspended result while the durable owner is
+        # still waiting on an exact approval. Terminal cleanup must leave that
+        # program available for the existing approval resume and claim checks.
+        if record['phase'] == 'closed':
+            return
+        if record['phase'] == 'approval':
+            from nullion.approval_context import FLOW_TRIGGER_CONTEXT_KEY
+            from nullion.approvals import ApprovalStatus
+
+            approval_id = record.get('approval_id')
+            read_approval = getattr(self.store, 'get_approval_request', None)
+            approval = read_approval(approval_id) if callable(read_approval) and approval_id else None
+            if (approval is not None and approval.requested_by == self.owner[0]
+                    and approval.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}):
+                context = approval.context or {}
+                trigger = context.get(FLOW_TRIGGER_CONTEXT_KEY)
+                conversations = (context.get('conversation_id'),
+                    trigger.get('conversation_id') if isinstance(trigger, dict) else None)
+                if all(conversation in (None, '', self.owner[1]) for conversation in conversations):
+                    return
         # Keep the claim/tombstone, not source data or executable bytes.
         self.save(record, phase='closed', snapshot=None, pending=None, selected=None, owner=self.owner)
 

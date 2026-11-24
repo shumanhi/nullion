@@ -231,6 +231,144 @@ def test_control_quotes_cannot_move_to_another_page_or_invalid_source_id():
         assert evidence.retain(report) == 0
 
 
+def test_batched_literal_search_preserves_exact_lines_and_control_indexes():
+    from nullion.plugins.browser_plugin.browser_use_adapter import BrowserPageRead
+
+    url = "https://example.com/results"
+    lines = ["最初の値 19:30", *(f"説明 {index}" for index in range(130)), "最後の値 20:30"]
+    controls = [
+        {"label": "Nombre", "text": "Nombre", "visible": True},
+        {"label": "Personas", "value": "2", "visible": True},
+        {"label": "20:30 para 2 personas", "text": "20:30", "visible": True},
+        {"tag": "SELECT", "visible": True, "text": "ausente reservado", "value": "2",
+         "options": [{"text": "ausente", "value": "3", "selected": False},
+                     {"text": "reservado", "value": "2", "selected": True}]},
+        {"label": "ausente", "visible": False},
+    ]
+
+    async def captured():
+        return {"url": url, "text": "\n".join(lines), "controls": controls}
+
+    evidence = PageEvidence("operator", BrowserPolicy(), text_capture=captured)
+    asyncio.run(evidence.capture(SimpleNamespace(url=url, title="Resultados", dom_state=None, screenshot=None)))
+    params = BrowserPageRead(source_id=0, queries=["19:30", "20:30", "Personas", "ausente", "reservado"])
+    result = evidence.page_state(**params.model_dump())
+    matches = {row["query"]: row for row in result["query_matches"]}
+    assert result["source_id"] == 0 and result["source_url"] == url
+    assert matches["19:30"]["matched_line_indices"] == [0]
+    assert matches["20:30"]["matched_line_indices"] == [131]
+    assert matches["Personas"]["matched_control_indices"] == [1, 2]
+    assert matches["ausente"]["matched_line_indices"] == matches["ausente"]["matched_control_indices"] == []
+    assert matches["reservado"]["matched_control_indices"] == [3]
+    assert [row["control_index"] for row in result["controls"]] == [2, 1, 3]
+    assert result["controls"][-1]["selected_options"] == [{"text": "reservado", "value": "2", "selected": True}]
+    assert "options" not in result["controls"][-1]
+    assert result["text_lines"][-1] == {"index": 131, "text": "最後の値 20:30"}
+    assert len(evidence.pages) == 1
+
+    with pytest.raises(ValidationError):
+        BrowserPageRead(query="20:30", queries=["19:30", "20:30"])
+
+
+@pytest.mark.parametrize("property_name", ["label", "text"])
+def test_control_display_evidence_uses_exact_visible_text(property_name):
+    url = "https://example.com/results"
+    display = "20:30 para 2 personas"
+
+    async def captured():
+        return {"url": url, "text": "Resultados",
+                "controls": [{property_name: display, "visible": visible, "disabled": disabled}
+                             for visible, disabled in ((True, False), (False, False), (True, True))]}
+
+    evidence = PageEvidence("operator", BrowserPolicy(), text_capture=captured)
+    asyncio.run(evidence.capture(SimpleNamespace(url=url, title="Resultados", dom_state=None, screenshot=None)))
+    observation = {"label": "Hora", "semantic_role": "attribute", "source_id": 0,
+                   "control_index": 0, "control_property": property_name}
+    assert evidence.retain(BrowserReport(goal_status="answered", next_action="report",
+                                         observations=[observation])) == 1
+    retained, = evidence.observations
+    assert retained["value"] == retained["quote"] == display
+    assert retained["control_state"]["observed_property"] == property_name
+    assert retained["source_url"] == url
+
+    hidden = {**observation, "control_index": 1}
+    disabled = {**observation, "control_index": 2}
+    conflicting = {**observation, "value": "21:30"}
+    manually_indexed = {k: v for k, v in disabled.items() if k != "control_property"}
+    manually_indexed.update(value=display, quote=display)
+    assert evidence.retain(BrowserReport(goal_status="answered", next_action="report",
+                                         observations=[hidden, disabled, conflicting, manually_indexed])) == 0
+    assert [x["reason"] for x in evidence.last_rejections] == [
+        "control_property_not_captured", "control_property_not_captured",
+        "control_property_value_mismatch", "quote_not_captured"]
+
+    blocker = BrowserReport(goal_status="blocked", next_action="report", blocker="Control unavailable",
+                            observations=[{**disabled, "control_property": "disabled"}])
+    assert evidence.retain(blocker) == 1
+    assert evidence.observations[-1]["evidence_kind"] == "source_blocker"
+
+
+def test_terminal_report_can_restore_redundant_fields_from_an_exact_capture():
+    from nullion.plugins.browser_plugin.browser_use_adapter import _record_observations_result
+
+    url = "https://example.com/results"
+    text = "選択肢 19:30\n第二候補  20:30\n重複\n重複"
+    control = {"label": "Personas", "value": "2", "visible": True, "disabled": False}
+
+    async def captured():
+        return {"url": url, "text": text, "controls": [control]}
+
+    evidence = PageEvidence("operator", BrowserPolicy(), text_capture=captured)
+    asyncio.run(evidence.capture(SimpleNamespace(url=url, title="Resultados", dom_state=None, screenshot=None)))
+    observations = [
+        {"label": "一番目", "source_id": 0, "quote": "選択肢 19:30"},
+        {"label": "二番目", "source_id": 0, "value": "第二候補 20:30"},
+        {"label": "Personas", "source_id": 0, "control_index": 0, "control_property": "value",
+         "value": "2", "quote": "Personas\nvalue: 2"},
+    ]
+    report = BrowserReport(goal_status="answered", next_action="report", observations=observations)
+    result = _record_observations_result(evidence, report, SimpleNamespace)
+    assert result.is_done and result.success and evidence.finished_report
+    assert [row["value"] for row in evidence.observations] == ["選択肢 19:30", "第二候補  20:30", "2"]
+    assert [row["quote"] for row in evidence.observations] == [
+        "選択肢 19:30", "第二候補  20:30", "Personas\nvalue: 2"]
+    assert evidence.evidence_value_repairs == 2 and not evidence.rejected
+
+    for unsupported in (
+        {"label": "partial", "source_id": 0, "value": "19:30"},
+        {"label": "duplicated", "source_id": 0, "value": "重複"},
+        {"label": "unbound", "value": "第二候補 20:30"},
+        {"label": "invented", "source_id": 0, "quote": "第三候補 21:30"},
+        {"label": "partial quote", "source_id": 0, "quote": "9:30"},
+        {**observations[2], "quote": "Personas\nvalue: 3"},
+    ):
+        invalid = BrowserReport(goal_status="answered", next_action="report", observations=[unsupported])
+        assert evidence.retain(invalid) == 0 and evidence.last_rejections
+
+
+@pytest.mark.parametrize("view", ["disabled", "hidden", "sdk_only"])
+def test_quote_only_report_does_not_repair_from_unavailable_controls_or_sdk_text(view):
+    from nullion.plugins.browser_plugin.browser_use_adapter import _record_observations_result
+
+    url = "https://example.com/results"
+    display = "時間 19:30"
+
+    async def captured():
+        return {"url": url, "text": display, "controls": [
+            {"text": display, "visible": view != "hidden", "disabled": view == "disabled"}]}
+
+    state = SimpleNamespace(url=url, title="候補", screenshot=None,
+                            dom_state=SimpleNamespace(llm_representation=lambda: display))
+    evidence = PageEvidence("operator", BrowserPolicy(), text_capture=None if view == "sdk_only" else captured)
+    asyncio.run(evidence.capture(state))
+    report = BrowserReport(goal_status="answered", next_action="report",
+                           observations=[{"label": "時間", "source_id": 0, "quote": display}])
+    result = _record_observations_result(evidence, report, SimpleNamespace)
+    assert not getattr(result, "is_done", False)
+    assert not evidence.observations and not evidence.evidence_value_repairs
+    assert evidence.last_rejections[0]["reason"] == "missing_value_or_quote"
+
+
 def test_isolated_worker_cleanup_does_not_wait_for_abandoned_model_request(tmp_path, monkeypatch):
     import json
     import subprocess
@@ -562,3 +700,31 @@ def test_native_property_evidence_rejects_mismatches_and_keeps_text_claims_stric
             'source_id':0, 'value':url + ('?invented=1' if mutation == 'wrong_url' else '')}
     assert evidence.retain(BrowserReport(goal_status='answered', next_action='report', observations=[observation])) == 0
     assert evidence.last_rejections and not evidence.observations
+
+
+def test_page_read_keeps_exact_data_for_one_step_and_only_capture_id_in_history():
+    from nullion.plugins.browser_plugin.browser_use_adapter import _page_state_action_result
+
+    state = {'source_id': 0, 'text_lines': [{'index': 10, 'text': 'Verified 37'}]}
+    result = _page_state_action_result(state, lambda **fields: SimpleNamespace(**fields))
+    import json
+    assert json.loads(result.extracted_content) == state
+    assert result.include_extracted_content_only_once is True
+    assert 'source_id=0' in result.long_term_memory
+    assert 'Verified 37' not in result.long_term_memory
+
+
+def test_implicit_repair_feedback_does_not_repeat_a_select_catalog():
+    from nullion.plugins.browser_plugin.browser_use_adapter import _page_state_action_result
+    import json
+
+    control = {"control_index": 0, "tag": "SELECT", "text": "A B C",
+               "options": [{"text": label, "selected": label == "B"} for label in "ABC"]}
+    state = {"source_id": 1, "controls": [control]}
+    result = _page_state_action_result({"current_page": state, "rejected": ["example"]},
+                                       lambda **fields: SimpleNamespace(**fields))
+    content = json.loads(result.extracted_content)
+    assert content["rejected"] == ["example"]
+    preview, = content["current_page"]["controls"]
+    assert preview["selected_options"] == [{"text": "B", "selected": True}] and "options" not in preview
+    assert result.include_extracted_content_only_once is True and "source_id=1" in result.long_term_memory

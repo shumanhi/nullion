@@ -17,6 +17,10 @@ def test_packaged_member_exclusion_does_not_hide_revised_standalone_sibling(tmp_
     monkeypatch.setenv('HOME',str(tmp_path));monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'));monkeypatch.setenv('NULLION_ENV_FILE',str(tmp_path/'none.env'));monkeypatch.setenv('NULLION_MEMORY_ENABLED','0');monkeypatch.setenv('NULLION_TASK_PLANNER_FEED_MODE','off');chat_store._store=None
     runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');cid='web:packaged-revision';root=artifact_root_for_principal(cid);package=root/'linked';package.mkdir(parents=True,exist_ok=True)
     image=package/'image.png';Image.new('RGB',(32,32),'green').save(image);linked=package/'linked.html';standalone=root/'standalone.html';bundle=root/'page.zip'
+    def standalone_html(value):
+        return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Independent report</title></head>'
+                f'<body><h1>Separate value {value}</h1><p>This self-contained edition is a distinct requested '
+                'deliverable. Its current value is recorded in the heading above.</p></body></html>')
     registry=tools.ToolRegistry(filesystem_allowed_roots=[tmp_path]);writes=[];archives=[]
     writer=tools._build_file_write_handler(tmp_path,allowed_roots=[tmp_path]);archiver=tools._build_archive_create_handler(tmp_path,allowed_roots=[tmp_path])
     def write(inv):r=writer(inv);writes.append(r);return r
@@ -50,20 +54,22 @@ def test_packaged_member_exclusion_does_not_hide_revised_standalone_sibling(tmp_
                 self.selections+=1;packet=kw['messages'][0]['content'][0]['text'].split('Prepared file candidates: ',1)[1].split('\n',1)[1].split('\n')[0];rows=json.loads(packet)
                 expected={'linked.html','standalone.html'} if self.selections==1 else {'page.zip','standalone.html'}
                 ids=[r['candidate_id'] for r in rows if r['filename'] in expected];assert len(ids)==2,rows
-                return call('select_artifact_delivery',{'status':'needs_packaging' if self.selections==1 else 'selected','selected_ids':ids,'reason':'Retain the separate requested self-contained edition with the portable linked bundle.'})
+                return call('select_artifact_delivery',{'status':'needs_packaging' if self.selections==1 else 'selected',
+                    'selected_ids':ids,'required_html_variants':['linked','self_contained'],
+                    'reason':'Retain the separate requested self-contained edition with the portable linked bundle.'})
             if 'select_attachment_format' in names:return call('select_attachment_format',{'extension':'.html','confidence':1})
             if not names:return text('{}')
             self.phase+=1
             if self.phase==1:return call('request_tool_scope',{'capabilities':['local_files'],'tool_names':['file_write'],'required_tool_names':['file_write'],'artifact_extensions':['.html']})
             if self.phase==2:return call('file_write',{'path':str(linked),'content':'<html><body><h1>Linked</h1><img src="image.png"></body></html>','inline_local_html_images':False})
-            if self.phase==3:return call('file_write',{'path':str(standalone),'content':'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Independent report</title></head><body><h1>Separate value '+('37' if revision else '38')+'</h1><p>This self-contained edition is a distinct requested deliverable. Its current value is recorded in the heading above.</p></body></html>'})
+            if self.phase==3:return call('file_write',{'path':str(standalone),'content':standalone_html(37 if revision else 38)})
             if self.phase==4:return text('The two reports are prepared.')
             if self.phase==5:return call('request_tool_scope',{'capabilities':['local_files'],'tool_names':['archive_create'],'required_tool_names':['archive_create'],'artifact_extensions':['.zip'],'excluded_artifact_extensions':['.html']})
             if self.phase==6:return call('archive_create',{'output_path':str(bundle),'source_paths':[str(package)]})
             if self.phase==7:return text('The two reports are prepared.')
             if self.phase==8:
                 if not revision:return call('file_read',{'path':str(standalone)})
-                return call('file_write',{'path':str(standalone),'content':'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Independent report</title></head><body><h1>Separate value 38</h1><p>This self-contained edition is a distinct requested deliverable. Its current value is recorded in the heading above.</p></body></html>'})
+                return call('file_write',{'path':str(standalone),'content':standalone_html(38)})
             assert self.phase==9,'The sibling repair restarted unrelated generation'
             return text('The final reports are ready.'+('' if revision else '\nMEDIA:'+str(bundle)))
     model=Provider();runtime.model_client=model
@@ -73,7 +79,9 @@ def test_packaged_member_exclusion_does_not_hide_revised_standalone_sibling(tmp_
         assert response.status_code==200 and {a['name'] for a in data['artifacts']}=={'page.zip','standalone.html'},data
         for artifact in data['artifacts']:
             downloaded=client.get(artifact['url']);assert downloaded.status_code==200
-            if artifact['name']=='standalone.html':assert b'38' in downloaded.content and b'37' not in downloaded.content
+            if artifact['name']=='standalone.html':
+                assert b'Separate value 38' in downloaded.content
+                assert b'Separate value 37' not in downloaded.content
             else:
                 import io
                 with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:assert archive.read('image.png')==image.read_bytes()

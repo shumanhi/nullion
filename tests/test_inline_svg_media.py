@@ -69,7 +69,7 @@ def test_valid_svg_data_image_is_native_html_media(tmp_path,form):
     result=_build_file_write_handler(tmp_path)(ToolInvocation('svg-data','file_write','web:svg-data',
         {'path':str(path),'content':body},flow_context={'required_embedded_media_extensions':['.html']}))
     assert result.status=='completed',result
-    assert path.read_text()==body
+    assert path.read_bytes() == body.encode("utf-8")
     assert artifact_file_embedded_media_count(path)==1
 
 

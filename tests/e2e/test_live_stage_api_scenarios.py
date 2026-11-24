@@ -11,6 +11,9 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_LIVE_STAGE_E2E')!='1',reas
 def test_live_stage_api_scenario(scenario_name):
     assert scenario_name in probe.SCENARIOS
     assert os.environ.get('NULLION_E2E_CONTAINER')=='1'
+    missing = probe.missing_api_fixture_env(probe.SCENARIOS[scenario_name])
+    if missing:
+        pytest.skip("Missing stage fixture: " + ", ".join(missing))
     assert probe.main(['--base-url',os.environ.get('NULLION_LIVE_BASE_URL','http://127.0.0.1:8753'),
         '--runtime-db',os.environ.get('NULLION_LIVE_RUNTIME_DB','/stage/runtime.db'),
         '--repeat',os.environ.get('NULLION_LIVE_REPEAT','1'),'--fail-fast','--scenario',scenario_name])==0

@@ -19,6 +19,9 @@ def pytest_runtest_logreport(report):
     row={'nodeid':report.nodeid,'phase':report.when,'outcome':report.outcome,
         'duration_seconds':report.duration,'recorded_at':time.time()}
     if report.failed:
+        provider_blocker = dict(report.user_properties).get('provider_blocker')
+        if provider_blocker is not None:
+            row['provider_blocker'] = provider_blocker
         row['failure']=str(report.longrepr)[:3500]
         row['scenario_failures']=[]
         for line in report.capstdout.splitlines():
@@ -65,13 +68,18 @@ def stop_paid_live_tests_after_terminal_provider_failure(request, live_stage_pro
     if os.environ.get('NULLION_LIVE_STAGE_E2E') != '1' or not request.node.path.name.startswith('test_live_stage'):
         yield
         return
-    blocked = live_stage_provider_guard.check_boundary()
-    if blocked:
-        pytest.exit(blocked, returncode=1)
+    def check():
+        try:
+            blocked = live_stage_provider_guard.check_boundary()
+        except OSError:
+            pytest.exit("Live stage evidence bridge unavailable. Remaining cases were not attempted.",
+                        returncode=pytest.ExitCode.INTERNAL_ERROR)
+        if blocked:
+            pytest.exit(blocked, returncode=pytest.ExitCode.TESTS_FAILED)
+
+    check()
     yield
-    blocked = live_stage_provider_guard.check_boundary()
-    if blocked:
-        pytest.exit(blocked, returncode=1)
+    check()
 
 
 @pytest.fixture(autouse=True)

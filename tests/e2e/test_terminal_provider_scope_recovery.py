@@ -14,7 +14,8 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Doc
 
 @pytest.mark.parametrize('mode',['off','on'])
 @pytest.mark.parametrize('fallback',[False,True])
-def test_terminal_generation_failure_stays_unavailable_without_recovery_loop(tmp_path,monkeypatch,mode,fallback,record_property,rediscover=False):
+@pytest.mark.parametrize('transport',['urllib','sdk'])
+def test_terminal_generation_failure_stays_unavailable_without_recovery_loop(tmp_path,monkeypatch,mode,fallback,record_property,transport,rediscover=False):
     from datetime import UTC,datetime
     from fastapi.testclient import TestClient
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -32,6 +33,11 @@ def test_terminal_generation_failure_stays_unavailable_without_recovery_loop(tmp
     native_calls=[]
     def generate(prompt,*args,**kwargs):
         native_calls.append(prompt)
+        if transport == 'sdk':
+            import httpx
+            from openai import APIStatusError
+            response = httpx.Response(402, request=httpx.Request('POST', 'https://provider.invalid/generate'))
+            raise APIStatusError('Provider requires payment', response=response, body=None)
         cause=urllib.error.HTTPError('https://provider.invalid/generate',402,'Payment required',{},io.BytesIO(b''))
         raise RuntimeError('Provider requires payment') from cause
     registry=ToolRegistry(filesystem_allowed_roots=[tmp_path])
@@ -116,4 +122,4 @@ def test_terminal_generation_failure_stays_unavailable_without_recovery_loop(tmp
 @pytest.mark.parametrize('mode',['off','on'])
 def test_repeated_terminal_provider_scope_stops_before_budget_prompt(tmp_path,monkeypatch,mode,record_property):
     test_terminal_generation_failure_stays_unavailable_without_recovery_loop(
-        tmp_path,monkeypatch,mode,False,record_property,rediscover=True)
+        tmp_path,monkeypatch,mode,False,record_property,'urllib',rediscover=True)

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from dataclasses import replace
+from string import Template
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
@@ -21,7 +23,13 @@ def text_links_script(selector=None):
                 && ['http:', 'https:'].includes(node.protocol));
         const headings = [...(root.matches('h1,h2,h3') ? [root] : []), ...root.querySelectorAll('h1,h2,h3')]
             .filter(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
+        const normalize = value => ' ' + value.normalize('NFKC').toLowerCase()
+            .replace(/[^\\p{L}\\p{M}\\p{N}]+/gu, ' ').trim() + ' ';
+        const title = normalize(document.title);
+        const matchingHeadings = headings.filter(node => node.matches('h1')).map(node => node.innerText.trim())
+            .filter(label => label.length <= 500 && normalize(label).trim().length >= 24 && title.includes(normalize(label)));
         return {url:location.href, document_title:document.title,
+            primary_heading:matchingHeadings.length === 1 ? matchingHeadings[0] : null,
             headings:headings.slice(0,24).map(node => ({level:Number(node.tagName.slice(1)),text:(node.innerText || '').trim().slice(0,1000)})),
             heading_coverage:{scope_found:true,observed_count:headings.length,returned_count:Math.min(24,headings.length),truncated:headings.length>24},
             links:anchors.slice(0,200).map(node => ({text:(node.innerText || node.getAttribute('aria-label') || '').trim().slice(0,500), url:node.href})),
@@ -29,16 +37,133 @@ def text_links_script(selector=None):
     }""".replace('SELECTOR', json.dumps(selector))
 
 
+def observed_link_script(text: str) -> str:
+    return Template(r"""() => {
+        const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const expected = normalize($label);
+        const rendered = node => {
+            if (node.checkVisibility) {
+                return node.checkVisibility({opacityProperty: true, visibilityProperty: true});
+            }
+            if (!node.getClientRects().length || getComputedStyle(node).visibility !== 'visible') return false;
+            for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+                const style = getComputedStyle(ancestor);
+                if (Number(style.opacity) === 0 || style.contentVisibility === 'hidden') return false;
+            }
+            return true;
+        };
+        const links = [...new Set([...document.querySelectorAll('a[href]')]
+            .filter(node => ['http:', 'https:'].includes(node.protocol)
+                && !node.hasAttribute('download')
+                && !node.closest('[inert], [aria-disabled="true" i]')
+                && rendered(node)
+                && normalize(node.innerText || node.getAttribute('aria-label')) === expected)
+            .map(node => node.href))].slice(0, 2);
+        return {url: location.href, links};
+    }""").substitute(label=json.dumps(text))
+
+
+class PageContextMatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selector: str = Field(min_length=1, max_length=500,
+        description="Observed unique selector for rendered context text, a selected option label, or a date/time control.")
+    text: str = Field(min_length=1, max_length=140,
+        description="Exact visible value expected for this request, such as its date, origin, or destination.")
+
+
+class VerifyPageRecords(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    context: list[PageContextMatch] = Field(min_length=1, max_length=6,
+        description="The visible values that together verify the requested context on this page.")
+    row_selector: str = Field(min_length=1, max_length=500,
+        description="Observed selector for the visible result rows, relative to the selected results region.")
+    fields: dict[Literal["title", "price_text", "compact_text"], str] = Field(min_length=1, max_length=3,
+        description="Required native fields and their observed selectors, relative to each result row. "
+                    "Include title and price_text for priced options.")
+
+
+class LinkSourceRecords(VerifyPageRecords):
+    selector: str = Field(min_length=1, max_length=1000,
+        description="Observed region on the source page containing the useful overview rows.")
+
+
+def verified_items_script(extraction, *, selector, verification):
+    """Read request context and its records in the same DOM evaluation."""
+    from nullion.plugins.browser_plugin.browser_tools import _PRIVATE_CONTROL_SELECTOR
+
+    plan = json.dumps({**verification.model_dump(), "scope_selector": selector})
+    return Template(r"""() => {
+        const plan = $plan;
+        const visible = node => node.checkVisibility
+            ? node.checkVisibility({opacityProperty: true, visibilityProperty: true})
+            : node.getClientRects().length && getComputedStyle(node).visibility === 'visible';
+        const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const dateTypes = new Set(['date', 'datetime-local', 'month', 'time', 'week']);
+        const valueAt = (root, selector, limit, context = false) => {
+            const matches = [...root.querySelectorAll(selector)].filter(visible);
+            if (matches.length !== 1) return '';
+            const element = matches[0];
+            let displayed = '';
+            if (element.matches($private_controls) || element.isContentEditable
+                    || element.tagName === 'TEXTAREA') return '';
+            if (element.tagName === 'INPUT') {
+                if (!context || !dateTypes.has(element.type)) return '';
+                displayed = element.value;
+            } else if (element.tagName === 'SELECT') {
+                if (!context || element.multiple || element.size > 1) return '';
+                displayed = element.selectedOptions[0]?.label;
+            } else {
+                displayed = element.innerText;
+            }
+            const value = normalize(displayed);
+            return value.length <= limit ? value : '';
+        };
+        const context = [];
+        for (const check of plan.context) {
+            const value = valueAt(document, check.selector, 140, true);
+            if (!value || value !== normalize(check.text)) return {verified_context: null};
+            context.push(value);
+        }
+        const rows = new Set();
+        for (const scope of document.querySelectorAll(plan.scope_selector)) {
+            if (!visible(scope)) continue;
+            for (const row of scope.querySelectorAll(plan.row_selector)) {
+                if (visible(row)) rows.add(row);
+                if (rows.size >= 30) break;
+            }
+            if (rows.size >= 30) break;
+        }
+        const limits = {title: 180, price_text: 48, compact_text: 250};
+        const records = [...rows].map(row => Object.fromEntries(
+            Object.entries(plan.fields).map(([name, selector]) => [name, valueAt(row, selector, limits[name])])
+        ));
+        return {...$extraction, url:location.href, verified_context: context, verified_records: records};
+    }""").substitute(plan=plan, extraction="(" + extraction + ")",
+        private_controls=json.dumps(_PRIVATE_CONTROL_SELECTOR))
+
+
+
 class PageRead(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str | None = Field(default=None, min_length=1)
+    follow_link_text: str | None = Field(default=None, min_length=1, max_length=500,
+        description="For read-only navigation from url, follow the unique visible HTTP link with this exact label. "
+                    "Use only a link observed on the source page. Readiness and extraction apply to its destination.")
+    retain_link_source: LinkSourceRecords | None = Field(default=None,
+        description="Verify useful overview facts on the source page before following the link. "
+                    "They remain available even if the destination cannot be read.")
     read_kind: Literal["items", "detail", "text"] = "items"
     selector: str | None = Field(default=None, min_length=1, max_length=1000)
     section_heading: str | None = Field(default=None, min_length=1, max_length=500)
     ready_selector: str | None = Field(default=None, min_length=1, max_length=500)
     ready_text: str | None = Field(default=None, min_length=1, max_length=200)
+    expected_heading: str | None = Field(default=None, min_length=1, max_length=500,
+        description="For detail reads, the visible product or record heading, or a distinctive phrase from it, observed "
+                    "on the source page. Wait for one matching heading and scope the detail read to its record.")
     max_items: int = Field(default=30, ge=1, le=100)
     max_text_chars: int = Field(default=16000, ge=1000, le=50000)
+    verify_records: VerifyPageRecords | None = Field(default=None,
+        description="Verify context and retain structured results for delivery if another source or the model times out.")
 
 
 class PageReadBatch(BaseModel):
@@ -54,7 +179,7 @@ def can_batch_read_plan(owner, arguments, principal_id):
     try:
         batch = PageReadBatch.model_validate(arguments)
         for page in batch.pages:
-            if not page.url:
+            if not page.url or page.follow_link_text:
                 return False
             owner._policy.check_url(page.url,
                 allow_private_host=_principal_allows_private_host_navigation(principal_id))
@@ -229,6 +354,8 @@ def browser_task_read_preflight(owner, invocation):
             "execution_kind": "adaptive_interaction",
             "condition": "requested_evidence_requires_interaction",
             "guidance": "Only a native page read ran. Use these findings or lightweight readers for research. "
+                "For a visible link to the requested results, use browser_read_pages with the captured URL, "
+                "or follow_link_text when only its label was retained. "
                 "If required evidence needs interactive controls or a visual state, call this tool with "
                 "execution_kind=adaptive_interaction and an interaction_reason grounded in this observation, "
                 "or use native controls. Changing the controller is distinct from repeating an empty read. "
@@ -245,11 +372,24 @@ def read_pages(owner, invocation):
     from nullion.tools import tool_execution_remaining_seconds, tool_execution_cancelled
     try:
         batch = PageReadBatch.model_validate(invocation.arguments)
-        if len(batch.pages) > 1 and (not batch.independent_pages or any(page.url is None for page in batch.pages)):
-            raise ValueError("Multiple reads require explicit independent_pages=true and a URL for every page")
+        if len(batch.pages) > 1 and any(page.url is None for page in batch.pages):
+            raise ValueError("Multiple reads require an explicit URL for every page")
         # Validate the entire batch before opening any tab. URLs and source text
         # are opaque references; no website or natural-language intent routing.
         for page in batch.pages:
+            if page.expected_heading is not None and (page.read_kind != "detail" or not page.expected_heading.strip()):
+                raise ValueError("Expected heading requires a detail read and a visible heading label.")
+            if page.follow_link_text and (not page.url or len(batch.pages) != 1):
+                raise ValueError("Following an observed link requires one source URL in a single-page read.")
+            if page.retain_link_source and not page.follow_link_text:
+                raise ValueError("Retaining a link source requires follow_link_text.")
+            if page.verify_records and (page.read_kind != "items" or not page.selector
+                    or not (page.ready_selector or page.ready_text)):
+                raise ValueError("Record verification requires an item read, results selector and readiness condition.")
+            for verification in (page.verify_records, page.retain_link_source):
+                if verification is not None and ("title" not in verification.fields
+                        or any(not 0 < len(value.strip()) <= 500 for value in verification.fields.values())):
+                    raise ValueError("Record verification requires valid visible field selectors including title.")
             if page.url:
                 owner._policy.check_url(page.url,
                     allow_private_host=_principal_allows_private_host_navigation(invocation.principal_id))
@@ -259,9 +399,12 @@ def read_pages(owner, invocation):
     owner._remember_session(invocation, parent_session)
     started = time.monotonic()
     completed_reads = set()
+    verified_link_sources = []
+    parallel_limit = 2 if batch.independent_pages else 1
 
     async def execute():
-        semaphore = asyncio.Semaphore(2)
+        semaphore = asyncio.Semaphore(parallel_limit)
+        verified_reads = {}
 
         async def read(index, request):
             # The current tab is retained when no URL is supplied. Explicit
@@ -270,6 +413,7 @@ def read_pages(owner, invocation):
                 f"{invocation.invocation_id}:{index}".encode()).hexdigest()[:12]
             owns_tab = session != parent_session
             async with semaphore:
+                followed_link = None
                 try:
                     if owns_tab:
                         # Register the exact owned tab before creation. A
@@ -285,6 +429,40 @@ def read_pages(owner, invocation):
                                 await pending_context
                         await owner._backend.navigate(session, request.url)
                         completed_reads.add("browser_navigate")
+                    if request.follow_link_text:
+                        allow_private = _principal_allows_private_host_navigation(invocation.principal_id)
+                        source_url = await owner._backend.run_js(session, "() => location.href")
+                        owner._policy.check_url(source_url, allow_private_host=allow_private)
+                        link_script = observed_link_script(request.follow_link_text)
+                        link_deadline = time.monotonic() + 5
+                        observation = await owner._backend.run_js(session, link_script)
+                        while (isinstance(observation, dict) and observation.get("url") == source_url
+                               and observation.get("links") == [] and time.monotonic() < link_deadline):
+                            await asyncio.sleep(0.25)
+                            observation = await owner._backend.run_js(session, link_script)
+                        if not isinstance(observation, dict) or observation.get("url") != source_url:
+                            return {"status": "failed", "requested_url": request.url, "page_url": source_url,
+                                "read_kind": request.read_kind, "failure_reason": "source_context_unverified"}
+                        links = observation.get("links")
+                        if verification := request.retain_link_source:
+                            from nullion.browser_verified_records import verified_page_capture
+
+                            script = verified_items_script("{}", selector=verification.selector, verification=verification)
+                            source = await owner._backend.run_js(session, script)
+                            if isinstance(source, dict) and source.get("url") == source_url:
+                                captured = verified_page_capture(page_url=source_url, capture_time=time.time(),
+                                    context=source.get("verified_context"), rows=source.get("verified_records") or (),
+                                    fields=verification.fields)
+                                if captured:
+                                    verified_link_sources.append(captured)
+                        if not isinstance(links, list) or len(links) != 1:
+                            return {"status": "failed", "requested_url": request.url, "page_url": source_url,
+                                "read_kind": request.read_kind,
+                                "failure_reason": "source_link_ambiguous" if links else "source_link_unavailable"}
+                        destination = links[0]
+                        owner._policy.check_url(destination, allow_private_host=allow_private)
+                        followed_link = {"source_url": source_url, "destination_url": destination}
+                        await owner._backend.navigate(session, destination)
                     if request.ready_selector:
                         await owner._backend.wait_for(session, request.ready_selector, None, None, 5)
                         completed_reads.add("browser_wait_for")
@@ -295,8 +473,14 @@ def read_pages(owner, invocation):
                     owner._policy.check_url(current_url,
                         allow_private_host=_principal_allows_private_host_navigation(invocation.principal_id))
                     if request.read_kind == "items":
-                        data = await owner._backend.run_js(session, _browser_extract_items_script(
-                            max_items=request.max_items, selector=request.selector, section_heading=request.section_heading))
+                        script = _browser_extract_items_script(max_items=request.max_items,
+                            selector=request.selector, section_heading=request.section_heading)
+                        if request.verify_records:
+                            script = verified_items_script(script, selector=request.selector, verification=request.verify_records)
+                        data = await owner._backend.run_js(session, script)
+                        if request.verify_records and isinstance(data, dict) and data.get("verified_context") is None:
+                            return {"status": "failed", "requested_url": request.url, "page_url": current_url,
+                                    "read_kind": "items", "failure_reason": "source_context_unverified"}
                         if not isinstance(data, dict) or not isinstance(data.get("items"), list):
                             raise ValueError("Page item extraction returned an invalid result")
                         if (data.get("coverage") or {}).get("scope_found") is False:
@@ -304,10 +488,21 @@ def read_pages(owner, invocation):
                                 "failure_reason": "source_scope_missing", "coverage": data.get("coverage"),
                                 "read_kind": request.read_kind}
                     elif request.read_kind == "detail":
-                        data = await owner._backend.run_js(session, _browser_extract_detail_script(selector=request.selector))
+                        script = _browser_extract_detail_script(selector=request.selector,
+                            expected_heading=request.expected_heading, match_document_title=True)
+                        heading_deadline = time.monotonic() + 5
+                        data = await owner._backend.run_js(session, script)
+                        while (request.expected_heading and isinstance(data, dict)
+                               and data.get("reason") in {"expected_detail_heading_missing", "scope_not_found"}
+                               and time.monotonic() < heading_deadline):
+                            await asyncio.sleep(0.25)
+                            data = await owner._backend.run_js(session, script)
                         if not isinstance(data, dict):
                             raise ValueError("Page detail extraction returned an invalid result")
                         if data.get("ok") is False:
+                            if request.expected_heading:
+                                return {"status": "failed", "requested_url": request.url, "page_url": current_url,
+                                    "read_kind": "detail", "failure_reason": data.get("reason")}
                             # The same authorized DOM can still expose text. Keep
                             # this failure as provenance, not a completed detail.
                             detail_failure = {"ok": False, "reason": data.get("reason")}
@@ -328,6 +523,19 @@ def read_pages(owner, invocation):
                             "truncated": len(text) > request.max_text_chars}
                         if isinstance(links, dict):
                             data.update(links)
+                            if heading := links.get("primary_heading"):
+                                detail = None
+                                try:
+                                    detail = await owner._backend.run_js(session, _browser_extract_detail_script(
+                                        selector=request.selector, expected_heading=heading))
+                                except Exception:
+                                    pass  # The original text read is already captured.
+                                if isinstance(detail, dict) and detail.get("ok") and detail.get("page", {}).get("url") == links.get("url"):
+                                    record = detail.get("record", {})
+                                    data["observed_title"] = record.get("title")
+                                    data["observed_text"] = detail.get("observed_text")
+                                    if record.get("price"):
+                                        data["observed_price"] = record["price"]
                     if request.read_kind == "text" and (
                             (data.get("detail_extraction") and not str(data.get("text") or "").strip())
                             or (data.get("link_coverage") or {}).get("scope_found") is False):
@@ -339,13 +547,30 @@ def read_pages(owner, invocation):
                         allow_private_host=_principal_allows_private_host_navigation(invocation.principal_id))
                     completed_reads.add({"items": "browser_extract_items", "detail": "browser_extract_detail",
                                          "text": "browser_extract_text"}[request.read_kind])
-                    return {"status": "completed", "requested_url": request.url, "page_url": observed_url,
+                    result = {"status": "completed", "requested_url": request.url, "page_url": observed_url,
                         "read_kind": request.read_kind, "readiness": {"selector": request.ready_selector,
-                            "text": request.ready_text, "condition_verified": bool(request.ready_selector or request.ready_text)},
+                            "text": request.ready_text,
+                            "condition_verified": bool(request.ready_selector or request.ready_text
+                                                       or (request.read_kind == "detail" and request.expected_heading)),
+                            **({"heading": request.expected_heading} if request.read_kind == "detail"
+                               and request.expected_heading else {})},
                         "data": data}
+                    if followed_link:
+                        result["followed_link"] = followed_link
+                    if request.verify_records:
+                        from nullion.browser_verified_records import verified_page_capture
+                        result["verified_page"] = verified_page_capture(page_url=observed_url, capture_time=time.time(),
+                            context=data.pop("verified_context"), rows=data.pop("verified_records"),
+                            fields=request.verify_records.fields)
+                        if result["verified_page"]:
+                            # Closing a task-owned tab must not revoke a page
+                            # result already captured before the batch deadline.
+                            verified_reads[index] = result
+                    return result
                 except Exception as error:
                     return {"status": "failed", "requested_url": request.url, "read_kind": request.read_kind,
-                        "error": str(error)[:500], **_browser_failure_output(error)}
+                        "error": str(error)[:500], **_browser_failure_output(error),
+                        **({"followed_link": followed_link} if followed_link else {})}
                 finally:
                     if owns_tab:
                         try:
@@ -381,10 +606,10 @@ def read_pages(owner, invocation):
                 task.cancel()
             if pending:
                 await asyncio.wait(pending, timeout=3)
-            return [task.result() if task in completed and not task.cancelled() else {
+            return [task.result() if task in completed and not task.cancelled() else verified_reads.get(index, {
                 "status": "failed", "requested_url": request.url, "read_kind": request.read_kind,
-                "failure_reason": "request_cancelled" if cancelled else "source_timeout", "failure_scope": "invocation"}
-                for task, request in zip(tasks, batch.pages)]
+                "failure_reason": "request_cancelled" if cancelled else "source_timeout", "failure_scope": "invocation"})
+                for index, (task, request) in enumerate(zip(tasks, batch.pages))]
         finally:
             for task in tasks:
                 if not task.done():
@@ -392,7 +617,10 @@ def read_pages(owner, invocation):
 
     results = _run(execute(), timeout_seconds=45)
     items, details, documents, pages = [], [], [], []
+    verified_pages = list(verified_link_sources)
     for result in results:
+        if verified := result.pop("verified_page", None):
+            verified_pages.append(verified)
         data = result.pop("data", {})
         pages.append(result)
         if result["status"] != "completed":
@@ -404,7 +632,10 @@ def read_pages(owner, invocation):
             result["item_count"] = len(data["items"])
             items.extend({**row, "source_page_url": page_url} for row in data["items"] if isinstance(row, dict))
         elif result["read_kind"] == "detail":
-            details.append({**data, "source_page_url": page_url})
+            record = data.get("record") or {}
+            details.append({**data, "source_page_url": page_url, **{
+                key: record[key] for key in ("title", "price", "availability", "description", "details") if key in record
+            }})
         else:
             documents.append({**data, "url": page_url})
     declarations = []
@@ -412,9 +643,11 @@ def read_pages(owner, invocation):
                                      ("details", details, ["source_page_url"]), ("documents", documents, ["url"])):
         if records:
             context_fields = ({'items':['title','price_text','numeric_snippets','url'],
-                'details':['record','source_page_url'], 'documents':['text','links','url']})[key]
+                'details':['title','price','availability','observed_text','description','details'],
+                'documents':['observed_title','observed_price','observed_text','text','links','url']})[key]
             declarations.append({"path": [key], "identity_fields": identities, "cardinality": "many",
-                'context_fields':context_fields})
+                'context_fields':context_fields,
+                **({'context_widths':{'observed_text':2000}} if key in {'details', 'documents'} else {})})
     completed = sum(page["status"] == "completed" for page in pages)
     from nullion.request_progress import publish_source_progress
     publish_source_progress(invocation, unit='pages', completed=completed,
@@ -422,7 +655,8 @@ def read_pages(owner, invocation):
     output = {"result_kind": "browser_page_collection", "pages": pages, "items": items,
         "details": details, "documents": documents, "source_record_collections": declarations,
         "completed_pages": completed, "requested_pages": len(pages), "session_id": parent_session,
-        "parallel_limit": 2, "elapsed_seconds": round(time.monotonic()-started, 3)}
+        "parallel_limit": parallel_limit, "elapsed_seconds": round(time.monotonic()-started, 3),
+        **({"verified_pages": verified_pages} if verified_pages else {})}
     # A wholly failed reconnect offers the existing numbered recovery choices.
     # Partial batches keep their observed findings and per-page failures.
     if not completed:

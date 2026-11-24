@@ -52,9 +52,12 @@ def test_missing_independent_contract_never_retires_required_tools():
     assert _completion_review_scope_contract(registry,[result])['missing_callable_required_tool_names']==['pdf_create']
 
 
-@pytest.mark.parametrize('pattern',['不存在.pdf','inexistente.pdf','missing.pdf'])
+@pytest.mark.parametrize('pattern',['不存在_資料.pdf','inexistente_37.pdf','missing.pdf'])
 def test_negative_filename_presentation_keeps_native_search_subject(tmp_path,pattern):
-    from nullion.response_sanitizer import _file_search_payload_summary
+    from nullion.chat_text import render_user_message
+    from nullion.response_sanitizer import _structured_tool_evidence_sections
     result=search(tmp_path,pattern=pattern)
     assert result.output['pattern']==pattern
-    assert pattern in _file_search_payload_summary([result])
+    [(heading, [summary], _)] = _structured_tool_evidence_sections([result], user_message=None)
+    assert heading == 'File search'
+    assert pattern in render_user_message(summary)

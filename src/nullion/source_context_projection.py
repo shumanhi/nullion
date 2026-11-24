@@ -3,6 +3,93 @@ from copy import deepcopy
 import json
 
 
+def email_body_field(message):
+    if not isinstance(message, dict):
+        return None
+    payload = message.get('body_payload')
+    if isinstance(payload, str) and (payload or message.get('body_truncated') is True):
+        return 'body_payload'
+    return 'body' if isinstance(message.get('body'), str) else None
+
+
+def is_email_message_evidence(output):
+    scope = output.get('evidence_scope') if isinstance(output, dict) else None
+    return isinstance(scope, dict) and scope.get('kind') == 'email_message' and email_body_field(output.get('message')) is not None
+
+
+def email_evidence_count(output):
+    if isinstance(output, dict) and output.get('result_kind') == 'email_message_batch':
+        messages = output.get('messages')
+        return sum(isinstance(row, dict) and is_email_message_evidence(row.get('output'))
+                   for row in messages) if isinstance(messages, list) else 0
+    return int(is_email_message_evidence(output))
+
+
+def compact_email_message(output, *, max_chars):
+    """Keep the identity and message text ahead of optional mail metadata."""
+    message = output['message']
+    body_field = email_body_field(message)
+    body = message.get(body_field)
+    scope = output['evidence_scope']
+    view = {'id': output.get('id'), 'evidence_scope': {key: scope[key] for key in (
+        'kind', 'retrieved_at', 'message_sent_at', 'current_account_state_verified') if key in scope}, 'message': {
+        key: message[key] for key in ('id', 'subject', 'date', 'from') if isinstance(message.get(key), str)}}
+    projected = view['message']
+    if message.get('body_is_preview') is True:
+        projected['body_is_preview'] = True
+    if isinstance(body, str):
+        original_chars = message.get('original_body_chars')
+        was_truncated = message.get('body_truncated') is True
+        if type(original_chars) is not int or original_chars < len(body):
+            original_chars = None if was_truncated else len(body)
+        # Leave room for escaping and the projection metadata. Reduce only
+        # when the actual serialized size exceeds the caller's share.
+        length = min(len(body), max(0, max_chars - len(json.dumps(view, ensure_ascii=False)) - 100))
+        while True:
+            projected[body_field] = body[:length]
+            if was_truncated or length < len(body) or (original_chars is not None and length < original_chars):
+                if original_chars is not None:
+                    projected['original_body_chars'] = original_chars
+                projected['body_truncated'] = True
+            if len(json.dumps(view, ensure_ascii=False)) <= max_chars:
+                break
+            if not length:
+                return None, [[]]
+            length //= 2
+    elif len(json.dumps(view, ensure_ascii=False)) > max_chars:
+        return None, [[]]
+    omitted = [[key] for key in output if key not in view]
+    omitted.extend(['evidence_scope', key] for key in scope if key not in view['evidence_scope'])
+    omitted.extend(['message', key] for key in message if key not in projected)
+    if projected.get('body_truncated'):
+        omitted.append(['message', body_field])
+    return view, omitted
+
+
+def compact_email_batch(output, *, max_chars):
+    """Keep ordered per-message outcomes and bounded, inspectable body text."""
+    view = {key: output[key] for key in ('result_kind', 'provider_id', 'requested_messages',
+        'completed_messages', 'complete', 'parallel_limit', 'reason') if key in output}
+    messages = output.get('messages')
+    sources = [row for row in messages if isinstance(row, dict)] if isinstance(messages, list) else []
+    rows = [{key: row[key] for key in ('id', 'invocation_id', 'status', 'inspection_request') if key in row}
+            for row in sources]
+    view['messages'] = rows
+    budget = max(0, max_chars - len(json.dumps(view, ensure_ascii=False)))
+    share = max(0, budget // max(1, len(rows)) - 220)
+    for original, row in zip(sources, rows):
+        native = original.get('output')
+        if is_email_message_evidence(native):
+            projected, omitted = compact_email_message(native, max_chars=share)
+            if projected is not None:
+                row['output'] = projected
+            if omitted:
+                row['output_partial'] = True
+        elif isinstance(native, dict):
+            row['output'] = {key: native[key] for key in ('reason', 'executed') if key in native}
+    return view
+
+
 def compact_native_page_history(output, *, max_chars):
     """Keep native page text and its exact observed links together in history."""
     if (not isinstance(output,dict) or output.get('result_kind')!='browser_page_collection'
@@ -21,6 +108,9 @@ def compact_native_page_history(output, *, max_chars):
         return None
     result={key:deepcopy(output[key]) for key in ('result_kind','session_id','completed_pages',
         'requested_pages','parallel_limit','reason','recovery','requires_user_choice','completion_scope') if key in output}
+    if isinstance(strategy := output.get('strategy'), dict):
+        result['strategy'] = {key: strategy[key] for key, kind in
+            (('kind', str), ('adaptive_browser_started', bool)) if isinstance(strategy.get(key), kind)}
     if isinstance(output.get('pages'),list):
         result['pages']=[{key:deepcopy(page[key]) for key in ('status','page_url','requested_url',
             'failure_reason','reason','status_code','requires_user_choice') if key in page}
@@ -31,10 +121,13 @@ def compact_native_page_history(output, *, max_chars):
     width=min(2000,max(32,max_chars//(4*len(documents))))
     while True:
         result['documents']=[{'url':d['url'],'text':d['text'][:width],'links':[],
+            **{key:d[key] for key in ('observed_title','observed_price') if isinstance(d.get(key), str)},
+            **({'observed_text':d['observed_text'][:width]} if isinstance(d.get('observed_text'), str) else {}),
             'history_projection':{'original_text_chars':len(d['text']),
                 'text_truncated':len(d['text'])>width,'original_link_count':len(d['links']),
+                'observed_text_truncated':isinstance(d.get('observed_text'),str) and len(d['observed_text'])>width,
                 'omitted_link_count':len(d['links']),
-                'omitted_fields':[k for k in d if k not in {'url','text','links'}]}}
+                'omitted_fields':[k for k in d if k not in {'url','text','links','observed_title','observed_price','observed_text'}]}}
             for d in documents]
         room=max_chars-len(json.dumps(result,ensure_ascii=False))-128
         if room>=0:break
@@ -56,9 +149,36 @@ def compact_native_page_history(output, *, max_chars):
     return result if len(json.dumps(result,ensure_ascii=False))<=max_chars else None
 
 
+def _compact_page_details(output, budget):
+    if output.get('result_kind') != 'browser_page_collection' or output.get('items') or output.get('documents'):
+        return None
+    details = output.get('details')
+    if not isinstance(details, list) or not details or not all(
+        isinstance(row, dict) and isinstance(row.get('source_page_url'), str)
+        and isinstance(row.get('title'), str) and isinstance(row.get('observed_text'), str)
+        and row['observed_text'] for row in details
+    ):
+        return None
+    sources = []
+    for row in details:
+        text = row['observed_text']
+        sources.append({'source_url': row['source_page_url'], 'title': row['title'],
+            'visible_text_segments': [text[offset:offset + 400] for offset in range(0, len(text), 400)],
+            **{key:row[key] for key in ('price', 'availability') if row.get(key)}})
+    result = {key:output[key] for key in ('result_kind', 'completed_pages', 'requested_pages', 'parallel_limit') if key in output}
+    result['detail_evidence'] = sources
+    result['evidence_guidance'] = ('Text segments are consecutive excerpts from each bound detail page. '
+        'Use these captured values to answer when they cover the request. Inspect retained evidence for a specific missing fact.')
+    result['page_outcomes'] = [{key:page[key] for key in ('status', 'page_url', 'failure_reason') if key in page}
+                               for page in output.get('pages', ()) if isinstance(page, dict)]
+    return result if len(json.dumps(result, ensure_ascii=False)) <= budget else None
+
+
 def compact_collections(output, *, budget=14000, preserve_identities=False):
     if not isinstance(output,dict) or len(json.dumps(output,ensure_ascii=False))<=budget:
         return output
+    if detail_view := _compact_page_details(output, budget):
+        return detail_view
     declarations=output.get('source_record_collections')
     if not isinstance(declarations,list):return output
     tables=[]
@@ -78,13 +198,15 @@ def compact_collections(output, *, budget=14000, preserve_identities=False):
         ))
         if not fields:continue
         pointer=''.join('/'+key.replace('~','~0').replace('/','~1') for key in path)
+        column_widths = declaration.get('context_widths')
         tables.append((pointer,rows,fields,declaration.get('cardinality')=='one',
-                       {key for key in (identities or ()) if isinstance(key, str)}))
+                       {key for key in (identities or ()) if isinstance(key, str)},
+                       column_widths if isinstance(column_widths, dict) else {}))
     if not tables:return output
     width=240;column_limit=1000
     while True:
         views=[]
-        for pointer,rows,fields,one,identities in tables:
+        for pointer,rows,fields,one,identities,column_widths in tables:
             shown_fields=fields[:column_limit]
             values=[];clipped=False
             for row in rows:
@@ -92,8 +214,10 @@ def compact_collections(output, *, budget=14000, preserve_identities=False):
                 for key in shown_fields:
                     value=row.get(key) if isinstance(row,dict) else None
                     if isinstance(value,(dict,list)):value=json.dumps(value,ensure_ascii=False,separators=(',',':'))
-                    if isinstance(value,str) and len(value)>width and not (preserve_identities and key in identities):
-                        value={'preview':value[:width],'truncated':True};clipped=True
+                    preferred_width = column_widths.get(key)
+                    cell_width = min(2000, preferred_width) * width // 240 if type(preferred_width) is int and preferred_width > 240 else width
+                    if isinstance(value,str) and len(value)>cell_width and not (preserve_identities and key in identities):
+                        value={'preview':value[:cell_width],'truncated':True};clipped=True
                     cells.append(value)
                 values.append(cells)
             views.append({'json_pointer':pointer,'cardinality':'one' if one else 'many',

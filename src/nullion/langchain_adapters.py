@@ -78,7 +78,7 @@ def nullion_tools_as_langchain_tools(
         policy_store=policy_store, tool_result_callback=tool_result_callback,
         prior_tool_results=shared_tool_results, tool_flow_context=tool_flow_context) for definition in definitions}
 
-    async def run_program(_saved_selection=None, **arguments):
+    async def execute_program(arguments, *, saved_selection=None, approved_call=None):
         from nullion.code_mode import execute_async
         current = {**state, "tool_results":list(shared_tool_results)}
         current.pop('result', None)
@@ -86,18 +86,25 @@ def nullion_tools_as_langchain_tools(
             for block in blocks:
                 if block['name'] not in direct:
                     raise ValueError('Tool is outside this harness scope')
+                resumed_invocation = None
+                if approved_call is not None and block['id'] == approved_call['tool_use_id']:
+                    if (block['name'] != approved_call['tool_name']
+                            or block['input'] != approved_call['arguments']):
+                        raise RuntimeError('The saved action no longer matches the approved call')
+                    resumed_invocation = approved_call['invocation_id']
                 definition = next(d for d in definitions if d['name'] == block['name'])
-                selected = set((_saved_selection['input'] if _saved_selection else arguments).get('tool_names') or ())
+                selected = set((saved_selection['input'] if saved_selection else arguments).get('tool_names') or ())
                 scoped_call = _make_langchain_tool_coroutine(name=block['name'],
                     fallback_tools=[tool for tool in fallbacks(definition) if tool in selected],
                     principal_id=principal_id, cleanup_scope=cleanup_scope, tool_registry=tool_registry,
                     policy_store=policy_store, tool_result_callback=tool_result_callback,
-                    prior_tool_results=shared_tool_results, tool_flow_context=tool_flow_context)
+                    prior_tool_results=shared_tool_results, tool_flow_context=tool_flow_context,
+                    render_model_result=False, invocation_id=resumed_invocation)
                 await scoped_call(**block['input'])
             return {'tool_results':list(shared_tool_results)}
-        selection = _saved_selection or {'type':'tool_use', 'name':code_mode.TOOL_NAME,
+        selection = saved_selection or {'type':'tool_use', 'name':code_mode.TOOL_NAME,
             'id':'lc-program-'+uuid4().hex, 'input':arguments}
-        update = await execute_async(current, [selection], execute=execute)
+        update = await execute_async(current, [selection], execute=execute, render_model_message=False)
         state.update(update)
         summary = update['tool_results'][-1]
         shared_tool_results.append(summary)
@@ -107,6 +114,11 @@ def nullion_tools_as_langchain_tools(
         payload = _tool_result_message_payload(summary)
         visuals = update.get('code_mode_visual_reference_blocks') or []
         return [{'type':'text','text':payload}, *visuals] if visuals else payload
+
+    async def run_program(**arguments):
+        if set(arguments) - {'code', 'tool_names', 'output_fields'}:
+            raise ValueError('Unexpected Code Mode arguments')
+        return await execute_program(arguments)
 
     def native_coroutine(name):
         async def run(**arguments):
@@ -124,20 +136,43 @@ def nullion_tools_as_langchain_tools(
         identity = state.get('code_mode_session_id')
         if not identity:
             return
-        from nullion.code_mode_sessions import SessionJournal
+        from nullion.approvals import ApprovalStatus, requires_exact_tool_review
+        from nullion.code_mode_sessions import SessionJournal, checkpoint_reference
+        from nullion.redaction import redact_value
+
         saved = SessionJournal(state).read(identity)
         if saved['phase'] != 'approval':
             raise RuntimeError('Saved Code Mode program is not resumable')
-        suspended = policy_store.get_suspended_turn(saved['approval_id']) if policy_store else None
-        for row in (suspended.pending_tool_calls if suspended else ()) or ():
-            if not any(r.invocation_id==row.get('invocation_id') for r in shared_tool_results):
-                retained = ToolResult(row['invocation_id'], row['tool_name'], row['status'],row['output'])
+        approval = policy_store.get_approval_request(saved['approval_id']) if policy_store else None
+        if approval is None or approval.status is not ApprovalStatus.APPROVED or approval.requested_by != principal_id:
+            raise RuntimeError('Saved Code Mode program is awaiting its approval')
+        suspended = policy_store.get_suspended_turn(approval.approval_id)
+        rows = (suspended.pending_tool_calls if suspended else ()) or ()
+        approved_call = None
+        if requires_exact_tool_review(approval):
+            context = approval.context or {}
+            if checkpoint_reference(rows) == identity:
+                approved_call = next((row for row in rows
+                    if row.get('tool_use_id') == saved['pending']['id']
+                    and row.get('status') == 'denied'
+                    and row.get('output', {}).get('approval_id') == approval.approval_id
+                    and row.get('invocation_id') == context.get('approval_invocation_id')
+                    and row.get('tool_name') == (context.get('tool_name') or approval.resource)
+                    and isinstance(row.get('arguments'), dict)
+                    and redact_value(row['arguments']) == context.get('tool_arguments')), None)
+            if approved_call is None:
+                raise RuntimeError('Saved Code Mode program has no matching approved action')
+        for row in rows:
+            if not any(r.invocation_id == row.get('invocation_id') for r in shared_tool_results):
+                retained = ToolResult(row['invocation_id'], row['tool_name'], row['status'], row['output'],
+                    row.get('error'), recovered_by=tuple(row.get('recovered_by') or ()),
+                    response_requirements=row.get('response_requirements'))
                 shared_tool_results.append(retained)
                 state.setdefault('invocation_metadata', {})[retained.invocation_id] = {
-                    'tool_use_id':row.get('tool_use_id'), 'arguments':row.get('arguments')}
+                    'tool_use_id': row.get('tool_use_id'), 'arguments': row.get('arguments')}
                 if tool_result_callback is not None:
                     tool_result_callback(retained)
-        await run_program(_saved_selection=saved['selected'])
+        await execute_program({}, saved_selection=saved['selected'], approved_call=approved_call)
 
     run_program._nullion_code_mode_resume = resume_program
     run_program._nullion_code_mode_finish = lambda: code_mode.finish_request(state)
@@ -254,20 +289,25 @@ def _make_langchain_tool_coroutine(
     tool_result_callback: Any,
     prior_tool_results: list[ToolResult],
     tool_flow_context: dict[str, Any] | None = None,
+    render_model_result: bool = True,
+    invocation_id: str | None = None,
 ):
     async def _run_direct(**kwargs: Any) -> str | list[dict[str, Any]]:
         invocation = ToolInvocation(
-            invocation_id=f"lc-{uuid4().hex[:12]}",
+            invocation_id=invocation_id or f"lc-{uuid4().hex[:12]}",
             tool_name=name,
             principal_id=principal_id,
             arguments=dict(kwargs),
             capsule_id=cleanup_scope,
             flow_context=dict(tool_flow_context) if tool_flow_context is not None else None,
         )
+        from nullion.code_mode import enabled as code_mode_enabled, remember_unconfirmed_write, unconfirmed_write_retry
         from nullion.tools import with_observed_artifact_reference_urls
         invocation = with_observed_artifact_reference_urls(invocation, prior_tool_results, registry=tool_registry)
-        result = artifact_media_plain_replacement_guard_result(invocation, prior_tool_results,
-            required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
+        result = unconfirmed_write_retry(invocation, kwargs, prior_tool_results) if code_mode_enabled() else None
+        if result is None:
+            result = artifact_media_plain_replacement_guard_result(invocation, prior_tool_results,
+                required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
         if result is None:
             from nullion.artifact_lifecycle import artifact_read_reference_recovery
             result = artifact_read_reference_recovery(invocation, prior_tool_results, registry=tool_registry)
@@ -276,7 +316,8 @@ def _make_langchain_tool_coroutine(
                 tool_registry=tool_registry, policy_store=policy_store)
         result = _with_replayable_artifact_arguments(result, invocation.arguments)
         emitted_results = [result]
-        if _result_allows_fallback(result):
+        unknown_write = code_mode_enabled() and remember_unconfirmed_write(result, tool_registry.get_spec(name), kwargs)
+        if not unknown_write and _result_allows_fallback(result):
             for fallback_name in fallback_tools:
                 fallback_invocation = ToolInvocation(
                     invocation_id=f"lc-{uuid4().hex[:12]}",
@@ -286,20 +327,24 @@ def _make_langchain_tool_coroutine(
                     capsule_id=cleanup_scope,
                     flow_context=dict(tool_flow_context) if tool_flow_context is not None else None,
                 )
-                fallback_result = artifact_media_plain_replacement_guard_result(fallback_invocation,
-                    [*prior_tool_results, *emitted_results],
-                    required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
+                prior = [*prior_tool_results, *emitted_results]
+                fallback_result = unconfirmed_write_retry(fallback_invocation, kwargs, prior) if code_mode_enabled() else None
+                if fallback_result is None:
+                    fallback_result = artifact_media_plain_replacement_guard_result(fallback_invocation, prior,
+                        required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
                 if fallback_result is None:
                     fallback_result = await asyncio.to_thread(_invoke_nullion_tool, fallback_invocation,
                         tool_registry=tool_registry, policy_store=policy_store)
                 fallback_result = _with_replayable_artifact_arguments(fallback_result, fallback_invocation.arguments)
                 emitted_results.append(fallback_result)
-                if not _result_allows_fallback(fallback_result):
+                unconfirmed = code_mode_enabled() and remember_unconfirmed_write(
+                    fallback_result, tool_registry.get_spec(fallback_name), kwargs)
+                if unconfirmed or not _result_allows_fallback(fallback_result):
                     if fallback_result.status == 'completed':
                         result.recovered_by = tuple(dict.fromkeys([*result.recovered_by,fallback_result.invocation_id]))
                     result = fallback_result
                     break
-        content = _tool_result_content(result)
+        content = _tool_result_content(result) if render_model_result else ''
         prior_tool_results.extend(emitted_results)
         if tool_result_callback is not None:
             for emitted_result in emitted_results:
@@ -374,7 +419,7 @@ def _result_allows_fallback(result: ToolResult) -> bool:
     from nullion.tool_repair_contract import tool_repair_kind
     if tool_repair_kind(result):
         return False
-    if output.get("reason") == "approval_required" or output.get("requires_approval"):
+    if output.get("reason") in {"approval_required", "code_mode_unknown_write_outcome"} or output.get("requires_approval"):
         return False
     if output.get("reason") == "request_plan_conflict" and output.get("executed") is False:
         # Preflight rejected the proposal, not this implementation. An

@@ -4,6 +4,44 @@ import pytest
 from scripts.live_stage_provider_guard import terminal_provider_event
 
 
+def test_evidence_bridge_loss_stops_pytest_before_another_case(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "conftest.py").write_text(
+        "from pathlib import Path\n"
+        "import pytest\n"
+        "from tests.e2e.conftest import stop_paid_live_tests_after_terminal_provider_failure\n"
+        "@pytest.fixture\n"
+        "def live_stage_provider_guard():\n"
+        "    class Guard:\n"
+        "        def check_boundary(self):\n"
+        "            if Path('first-completed').exists():\n"
+        "                raise ConnectionError('fixture connection gone')\n"
+        "    return Guard()\n"
+    )
+    (tmp_path / "test_live_stage_fixture.py").write_text(
+        "from pathlib import Path\n"
+        "def test_first():\n"
+        "    Path('first-completed').touch()\n"
+        "def test_next():\n"
+        "    Path('next-started').touch()\n"
+    )
+    monkeypatch.setenv("NULLION_LIVE_STAGE_E2E", "1")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(root), *sys.path]))
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-c", os.devnull, "-q", str(tmp_path)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == pytest.ExitCode.INTERNAL_ERROR
+    assert "Live stage evidence bridge unavailable" in result.stdout + result.stderr
+    assert (tmp_path / "first-completed").exists()
+    assert not (tmp_path / "next-started").exists()
+
+
 @pytest.mark.parametrize('message', ['上限に達しました', 'Límite; capacidad agotada', 'وصل الحد'])
 def test_guard_uses_provider_schema_and_never_returns_private_error_text(message):
     error = json.dumps({'error': {'type': 'usage_limit_reached', 'message': message, 'private': 'SECRET'}})

@@ -46,6 +46,152 @@ def setup(tmp_path, monkeypatch, approval=False, existing=False):
     return runtime, Guarded(), called
 
 
+@pytest.mark.parametrize("delivery", ["recover", "fallback", "exhausted", "handoff", "batch", "blocked_batch"])
+@pytest.mark.parametrize("program", [False, True])
+def test_scheduled_draft_waits_for_typed_browser_recovery(tmp_path, monkeypatch, delivery, program, record_property):
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.cron_delivery import run_single_agent_cron_turn
+    from nullion.crons import CronJob
+    from nullion.runtime_persistence import load_runtime_store
+    from nullion.tools import ToolRegistry, ToolRiskLevel, ToolSideEffectClass, ToolResult, ToolSpec
+    from tests.e2e.test_scheduled_report_completion import setup_runtime
+
+    monkeypatch.setenv("NULLION_CODE_MODE", "on")
+    runtime = setup_runtime(tmp_path, monkeypatch)
+    registry = ToolRegistry()
+    url = "https://search.example.test/results"
+    browser_calls = []
+    sent = []
+
+    def delegate(invocation):
+        browser_calls.append(invocation.arguments["pass"])
+        if len(browser_calls) == 1:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+                "result_kind": "source_observations", "goal_status": "blocked", "report_status": "blocked",
+                "next_action": "alternative_source", "observations": [], "blocker": "The form is unfinished.",
+                "continuation": {
+                    "kind": "alternate_tool" if delivery == "handoff" else "alternative_source",
+                    "tool_names": (["browser_navigate", "browser_extract_text"] if delivery == "handoff"
+                                   else ["browser_run_task"]),
+                    "source_url": url,
+                },
+            })
+        output = {"result_kind": "source_observations", "next_action": "report", "page_url": url}
+        if delivery in {"fallback", "blocked_batch"}:
+            output.update(goal_status="blocked", report_status="blocked", observations=[],
+                blocker="The results source refused access.")
+        else:
+            output.update(goal_status="answered", report_status="completed", observations=[
+                {"label": "Price", "value": "37 USD", "quote": "Total price 37 USD", "source_url": url},
+            ])
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", output)
+
+    def send(invocation):
+        sent.append(invocation.arguments)
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"ok": True})
+
+    registry.register(ToolSpec(
+        "browser_run_task", "Read current fares", ToolRiskLevel.MEDIUM, ToolSideEffectClass.WRITE, False, 5,
+        capability_tags=("source_step_context",), input_schema={"type":"object", "properties":{"pass":{"type":"integer"}}},
+    ), delegate)
+    registry.register(ToolSpec(
+        "browser_navigate", "Navigate the current browser", ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 5, capability_tags=("web",),
+    ), lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed",
+                                    {"session_id": "delegated-browser", "url": url}))
+    registry.register(ToolSpec(
+        "browser_extract_text", "Read the current results", ToolRiskLevel.LOW,
+        ToolSideEffectClass.READ, False, 5, capability_tags=("web",),
+    ), lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+        "result_kind": "browser_rendered_text", "text": "Total price 37 USD", "page_url": url,
+        "session_id": invocation.flow_context["browser_session_id"],
+    }))
+    registry.register(ToolSpec(
+        "send_fixture_mail", "Send the reviewed scheduled draft", ToolRiskLevel.HIGH,
+        ToolSideEffectClass.ACCOUNT_WRITE, True, 5, capability_tags=("connector", "fixture_mail"),
+        input_schema={"type":"object", "properties":{"body":{"type":"string"}}, "required":["body"]},
+    ), send)
+    monkeypatch.setattr("nullion.cron_execution_tools._connected_connector_provider_summaries",
+        lambda _: ({"provider_id":"fixture_mail", "permission_mode":"write"},))
+
+    def call(name, args, ident):
+        return {"stop_reason":"tool_use", "content":[{"type":"tool_use", "id":ident, "name":name, "input":args}]}
+
+    class Model:
+        rounds = 0
+        def create(self, **kw):
+            if not kw.get("tools") and "available_structured_write_tools" in kw["messages"][0]["content"][0]["text"]:
+                return response({"requires_account_connector":True, "provider_ids":["fixture_mail"],
+                    "confidence":1, "write_tool_names":["send_fixture_mail"], "delivery_mode":"report_each_run"})
+            protocol = workflow_provider_reply(kw, completion=True, action=True)
+            if protocol is not None:
+                return protocol
+            self.rounds += 1
+            if self.rounds == 1:
+                if program:
+                    return call("code_mode", {"tool_names":["browser_run_task"], "code":
+                        "call_tool('browser_run_task', {'pass': 1})['status']"}, "browser-program")
+                return call("browser_run_task", {"pass":1}, "browser-first")
+            if self.rounds == 2:
+                if program:
+                    return call("code_mode", {"tool_names":["send_fixture_mail"], "code":
+                        "call_tool('send_fixture_mail', {'body': 'Premature fallback'})"}, "premature-program")
+                return call("send_fixture_mail", {"body":"Premature fallback"}, "premature")
+            if self.rounds == 3:
+                messages = json.dumps(kw["messages"], ensure_ascii=False)
+                assert "scheduled_source_continuation_required" in messages
+                assert not runtime.store.list_approval_requests()
+                if delivery == "handoff":
+                    return call("browser_navigate", {}, "navigation")
+                if delivery in {"batch", "blocked_batch"}:
+                    read = call("browser_run_task", {"pass":2}, "browser-recovery")["content"]
+                    write = call("send_fixture_mail", {"body":"Prewritten fallback"}, "prewritten")["content"]
+                    return {"stop_reason":"tool_use", "content":[*read, *write]}
+                if delivery != "exhausted":
+                    return call("browser_run_task", {"pass":2}, "browser-recovery")
+            if delivery == "handoff" and self.rounds == 4:
+                return call("send_fixture_mail", {"body":"Draft after navigation only"}, "after-navigation")
+            if delivery == "handoff" and self.rounds == 5:
+                assert not runtime.store.list_approval_requests()
+                return call("browser_extract_text", {}, "native-results")
+            if delivery in {"batch", "blocked_batch"} and self.rounds == 4:
+                assert not runtime.store.list_approval_requests()
+                assert "Use the source result from this batch" in json.dumps(kw["messages"])
+            expected_body = "No fares verified" if delivery in {"fallback", "blocked_batch"} else "Verified fare: 37 USD"
+            return call("send_fixture_mail", {"body":expected_body}, "final-draft-" + str(self.rounds))
+
+    model = Model()
+    task = "ASU–CUZの運賃を確認してレポートをメール送信。検索に失敗した場合はその結果を送信。"
+    started = time.monotonic()
+    result = run_single_agent_cron_turn(CronJob("typed-flight", "運賃レポート", "0 * * * *", task),
+        "telegram:123", label="Scheduled task", orchestrator=AgentOrchestrator(model_client=model),
+        runtime=runtime, tool_registry=registry, model_client=model, settings=SimpleNamespace())
+    elapsed = time.monotonic() - started
+    record_property("scheduled_browser_recovery_seconds", elapsed)
+    assert elapsed < 8, elapsed
+    assert sent == []
+    approvals = load_runtime_store(runtime.checkpoint_path).list_approval_requests()
+    deferred = [row for row in result["tool_results"]
+                if row.output.get("reason") == "scheduled_source_continuation_required"]
+    assert model.rounds == (6 if delivery == "handoff" else 4) and deferred, (model.rounds, result)
+    if delivery in {"handoff", "batch", "blocked_batch"}:
+        assert len(deferred) == 2
+    if delivery == "handoff":
+        assert any(row.tool_name == "browser_extract_text" and row.output.get("text") == "Total price 37 USD"
+                   for row in result["tool_results"])
+    if delivery == "exhausted":
+        assert browser_calls == [1]
+        assert len(deferred) == 2 and not approvals
+        assert result["suspended_for_approval"] is False
+        assert "account action did not run" in result["text"]
+    else:
+        assert browser_calls == ([1] if delivery == "handoff" else [1, 2])
+        assert result["suspended_for_approval"] is True
+        assert len(approvals) == 1
+        assert approvals[0].context["tool_arguments"]["body"] == (
+            "No fares verified" if delivery in {"fallback", "blocked_batch"} else "Verified fare: 37 USD")
+
+
 @pytest.mark.parametrize('saved_request', ['Read records and create missing events.', '記録を確認して、未登録の予定を作成。'])
 @pytest.mark.parametrize('approval,existing', [(False,False),(True,False),(False,True)])
 @pytest.mark.parametrize('scope_response_seconds', [0, 6])

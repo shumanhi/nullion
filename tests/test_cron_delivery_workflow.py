@@ -1037,15 +1037,17 @@ def test_cron_run_delivery_workflow_attaches_completed_file_write_html_artifact(
     assert sent == [f"⏰ **SCHEDULED TASK: Morning brief**\n\nCreated the weekly trend report.\n\nMEDIA:{artifact}"]
 
 
-def test_cron_delivery_inlines_local_html_images_instead_of_attaching_support_files(tmp_path: Path) -> None:
+@pytest.mark.parametrize("encoding", ["utf-8", "windows-1252"])
+def test_cron_delivery_inlines_local_html_images_instead_of_attaching_support_files(tmp_path: Path, encoding: str) -> None:
     artifact_dir = tmp_path / "workspaces" / "workspace_admin" / "artifacts"
     report = artifact_dir / "provincetown-monitor.html"
     image = artifact_dir / "airbnb_cozy_commercial.png"
     artifact_dir.mkdir(parents=True)
     image.write_bytes(b"\x89PNG\r\n\x1a\nlisting-image")
     report.write_text(
-        '<!doctype html><html><body><h1>Report</h1><img src="airbnb_cozy_commercial.png"></body></html>',
-        encoding="utf-8",
+        f'<!doctype html><html><head><meta charset="{encoding}"></head><body>'
+        '<h1>Asunción · €</h1><img src="airbnb_cozy_commercial.png"></body></html>',
+        encoding=encoding,
     )
     result_payload = {
         "final_text": f"Report ready.\n\nMEDIA:{image}",
@@ -1069,6 +1071,7 @@ def test_cron_delivery_inlines_local_html_images_instead_of_attaching_support_fi
     html = report.read_text(encoding="utf-8")
     assert 'src="airbnb_cozy_commercial.png"' not in html
     assert 'src="data:image/png;base64,' in html
+    assert '<meta charset="utf-8">' in html and "Asunción · €" in html
 
 
 def test_cron_delivery_suppresses_text_marker_from_linked_asset_folder(tmp_path: Path) -> None:
@@ -3193,6 +3196,35 @@ def test_cron_run_delivery_workflow_allows_silent_no_change_runs() -> None:
     assert cleared == ["telegram:42"]
 
 
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_verified_report_gate_preserves_silence_despite_saved_html_requirement(manual):
+    from nullion.cron_delivery import _apply_report_delivery_gate, _cron_run_prepare_delivery_node
+
+    job = Job(task="No enviar si no hay cambios.", artifact_delivery_options={
+        "required_artifact_extensions": [".html"], "requires_attachment_delivery": True,
+    })
+    job.enabled = False
+    result = {"cron_report_delivery_gate": {"delivery_decision": "withhold"}}
+    _apply_report_delivery_gate(result)
+    callbacks = SimpleNamespace(
+        silent_delivery_text=manual_cron_silent_delivery_text if manual else None,
+        block_reason=cron_delivery_block_reason,
+    )
+    prepared = _cron_run_prepare_delivery_node({
+        "job": job, "result": result, "callbacks": callbacks, "label": "Scheduled task",
+    })
+
+    expected = "The saved delivery condition was not met, so no report was generated." if manual else ""
+    assert prepared["text"] == expected
+    assert prepared["result"]["cron_schedule_enabled"] is False
+    assert prepared["block_reason"] is None
+    assert prepared["artifacts"] == []
+    assert prepared["result"]["response_fulfilled"] is True
+    assert prepared["result"]["artifact_delivery_required"] is False
+    assert prepared["result"]["cron_alert_delivery_decision"] == "silent"
+
+
 def test_typed_verified_matches_only_policy_keeps_unfinished_check_failed() -> None:
     calls: list[dict[str, object]] = []
     stages: list[tuple[str, dict[str, object]]] = []
@@ -4373,10 +4405,16 @@ def test_cron_run_delivery_workflow_sends_failure_status_without_unfinished_find
     assert result["execution_outcome"]["execution_succeeded"] is False
 
 
-def test_cron_final_repair_can_recover_typed_model_timeout_from_completed_evidence() -> None:
+@pytest.mark.parametrize("prior_writer_expired", [False, True])
+def test_cron_final_repair_can_recover_typed_model_timeout_from_completed_evidence(prior_writer_expired, monkeypatch) -> None:
+    from nullion.research_budget import research_context
+
+    monkeypatch.setenv("NULLION_RESEARCH_WRITING_SECONDS", "60")
     class RepairClient:
         def create(self, **kwargs):  # noqa: ANN003
             assert "Verified compact tool evidence" in kwargs["messages"][0]["content"][0]["text"]
+            assert kwargs["tools"] == []
+            assert 1 < kwargs["timeout"] <= 60
             return {
                 "stop_reason": "end_turn",
                 "content": [
@@ -4403,11 +4441,19 @@ def test_cron_final_repair_can_recover_typed_model_timeout_from_completed_eviden
         ],
     }
 
-    _repair_cron_agent_final_text_if_needed(
-        Job(name="Market brief", task="Report verified closing prices."),
-        result,
-        model_client=RepairClient(),
-    )
+    with research_context() as budget:
+        if prior_writer_expired:
+            budget.activate()
+            budget.finish_research("prior_writer")
+            budget.writing_started -= 120
+            assert budget.writing_remaining() == 0
+        _repair_cron_agent_final_text_if_needed(
+            Job(name="Market brief", task="Report verified closing prices."),
+            result,
+            model_client=RepairClient(),
+        )
+        if prior_writer_expired:
+            assert budget.writing_remaining() == 0
 
     assert result["cron_agent_final_repaired"] is True
     assert result["model_timed_out"] is False

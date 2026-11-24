@@ -26,3 +26,26 @@ def test_missing_artifact_reports_latest_provider_payment_failure(tool, stored_m
     assert not delivery.attachments and delivery.unavailable_attachment_count
     assert '402' in delivery.text and 'credits' in delivery.text.lower(),delivery
     assert 'PRIVATE' not in delivery.text and 'token=secret' not in delivery.text
+
+
+@pytest.mark.parametrize("status, retryable", [(402, False), (429, True)])
+def test_image_tool_retains_status_from_sdk_provider_errors(tmp_path, status, retryable):
+    import httpx
+    from openai import APIStatusError
+
+    from nullion.tools import ToolInvocation, _build_image_generate_handler
+
+    def provider(*args):
+        response = httpx.Response(status, request=httpx.Request("POST", "https://provider.invalid/v1/images/generations"))
+        raise APIStatusError("Provider rejected generation", response=response, body=None)
+
+    path = tmp_path / "poster.png"
+    result = _build_image_generate_handler(provider)(ToolInvocation(
+        "image-sdk", "image_generate", "web:fixture", {"prompt": "湖のポスター", "output_path": str(path)},
+    ))
+
+    assert result.status == "failed"
+    assert result.output["http_status_code"] == status
+    assert result.output["retryable"] is retryable
+    assert (result.output.get("terminal_user_action_required") is True) is (status == 402)
+    assert not path.exists()

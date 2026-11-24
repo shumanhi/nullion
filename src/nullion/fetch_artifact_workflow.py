@@ -220,6 +220,10 @@ def _write_text_artifact(
             "error": None,
         }
     try:
+        if path.suffix.lower() in {".html", ".htm"}:
+            from nullion.artifacts import ensure_utf8_html_encoding
+
+            content = ensure_utf8_html_encoding(content, title=path.stem)
         path.write_text(content, encoding="utf-8")
         return {"created_path": str(path), "write_attempts": attempts, "error": None}
     except Exception as exc:

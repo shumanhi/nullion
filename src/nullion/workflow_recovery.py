@@ -60,6 +60,7 @@ class WorkflowCheckpoint:
     last_recovery_digest: str = ''
     revision: int = 0
     discovered_sources: dict = field(default_factory=dict)
+    browser_provider_snapshots: list = field(default_factory=list)
 
     def observe(self, results, metadata, registry):
         """A successful unrelated call never erases a failed prerequisite."""
@@ -80,6 +81,12 @@ class WorkflowCheckpoint:
             info = metadata.get(ident, {})
             signature = fingerprint([result.tool_name, info.get('arguments')]) if 'arguments' in info else ''
             output = result.output if isinstance(result.output, Mapping) else {}
+            if result.tool_name == "browser_read_pages" and output.get("verified_pages"):
+                from nullion.browser_verified_records import verified_browser_pages
+
+                self.browser_provider_snapshots = verified_browser_pages(
+                    (result,), previous=self.browser_provider_snapshots
+                )
             useful = status == 'completed' and output.get('goal_status') != 'blocked' and output.get('terminal_user_action_required') is not True
             self.observations[ident] = {'tool_name': result.tool_name, 'status': status,
                                        'signature': signature, 'useful': useful}
@@ -161,7 +168,9 @@ class WorkflowCheckpoint:
                 'goal_digest': self.goal_digest, 'phase': self.phase, 'observations': self.observations,
                 'issues': self.issues, 'recovery_rounds': self.recovery_rounds,
                 'last_recovery_digest': self.last_recovery_digest, 'revision': self.revision,
-                **({'discovered_sources': self.discovered_sources} if self.discovered_sources else {})}
+                **({'discovered_sources': self.discovered_sources} if self.discovered_sources else {}),
+                **({'browser_provider_snapshots': self.browser_provider_snapshots}
+                   if self.browser_provider_snapshots else {})}
 
     @classmethod
     def restore(cls, value, *, workflow_id, conversation_id, goal_digest):
@@ -184,7 +193,15 @@ class WorkflowCheckpoint:
                    or not isinstance(row.get('signature'), str)
                    for row in issues.values()):
                 raise ValueError('Invalid issues')
+            browser_snapshots = value.get("browser_provider_snapshots")
+            if isinstance(browser_snapshots, list) and browser_snapshots:
+                from nullion.browser_verified_records import verified_browser_pages
+
+                browser_snapshots = verified_browser_pages((), previous=browser_snapshots)
+            else:
+                browser_snapshots = []
             return cls(workflow_id, conversation_id, goal_digest, phase=str(value.get('phase', 'executing')),
+                       browser_provider_snapshots=browser_snapshots,
                        observations=dict(observations), issues={k: dict(v) for k, v in issues.items()},
                        recovery_rounds=min(MAX_RECOVERY_ROUNDS, max(0, int(value.get('recovery_rounds') or 0))),
                        last_recovery_digest=str(value.get('last_recovery_digest') or ''),

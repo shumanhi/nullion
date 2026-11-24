@@ -1889,6 +1889,39 @@ def _sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def check_runtime_checkpoint_readiness(path: str | Path) -> None:
+    """Rehearse the installed checkpoint's startup schema without committing changes."""
+    source = Path(path).expanduser()
+    if not source.exists():
+        return
+    if not _is_sqlite_runtime_path(source):
+        load_runtime_store(source)
+        return
+    with sqlite_connection(source.absolute().as_uri() + "?mode=rw", timeout=10, uri=True) as conn:
+        # Check the write lock without changing history or accepting a read-only fallback.
+        conn.execute("BEGIN IMMEDIATE")
+        objects = dict(conn.execute("SELECT name, type FROM sqlite_schema"))
+        for name in ("runtime_meta", *_SQLITE_TABLE_NAMES):
+            if name in objects and objects[name] != "table":
+                raise ValueError(f"Runtime database object {name} must be a table")
+        if "runtime_meta" in objects:
+            row = conn.execute("SELECT value FROM runtime_meta WHERE key = 'format_version'").fetchone()
+            if row is not None and int(row[0]) not in SUPPORTED_RUNTIME_STORE_FORMAT_VERSIONS:
+                raise ValueError(f"Unsupported runtime store format version: {row[0]}")
+        for table in _SQLITE_TABLE_NAMES:
+            if table in objects:
+                conn.execute(f"SELECT rowid, collection, item_key, payload, updated_at FROM {table} LIMIT 0")
+                # Read one table row identifier without reading a history payload.
+                conn.execute(f"SELECT rowid FROM {table} NOT INDEXED LIMIT 1").fetchone()
+        # Rehearse startup schema changes in the same rollback transaction.
+        # Existing indexes are no-ops. Building a missing expression index
+        # checks the actual stored rows using SQLite's own JSON semantics.
+        for statement in _sqlite_runtime_ddl().split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        conn.rollback()
+
+
 def _valid_auxiliary_sqlite_row(collection: str, payload: str) -> bool:
     if collection != "cron_jobs":
         return True

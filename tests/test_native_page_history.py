@@ -11,12 +11,14 @@ def test_native_page_history_keeps_facts_and_whole_links_with_explicit_omissions
     from nullion.startup_maintenance import _compact_tool_output
     url='https://source.example/item?opaque='+('A37'*60)+'&variant=blue'
     output={'result_kind':'browser_page_collection','completed_pages':1,'requested_pages':1,
+        'strategy':{'kind':'native_compound_browser_read','adaptive_browser_started':False},
         'documents':[{'url':'https://source.example/list','text':label+' 988\n'+'extra '*9000,
             'links':[{'url':url,'text':label},*[{'url':'https://source.example/item/'+str(i)+'?opaque='+'Q'*120,'text':'Item '+str(i)} for i in range(200)]]}],
         'source_record_collections':[{'path':['documents'],'identity_fields':['url'],'context_fields':['text','links']}]}
     before=deepcopy(output)
     compactors={'chat':_compact_tool_output_for_context,'web':_compact_web_tool_output_for_context,'startup':_compact_tool_output}
     compact=compactors[surface]('browser_read_pages',output)
+    assert compact['strategy']==output['strategy']
     doc=compact['documents'][0]
     assert label+' 988' in doc['text'] and doc['links'][0]=={'url':url,'text':label}
     assert doc['history_projection']['text_truncated'] is True

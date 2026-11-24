@@ -2070,6 +2070,9 @@ def test_browser_setup_repairs_scope_large_read_and_condition_then_delivers_new_
             receipt=json.loads(latest.split('Live tracking source preparation (runtime-verified):\n',1)[1])
             assert receipt['status']=='ready' and receipt['probe']==narrow;receipts.append(receipt)
             output=json.loads(latest.split('\n\nLive tracking',1)[0])['output']
+            assert output['observation_readiness']['verified'] is True
+            assert output['coverage']['selector']==narrow['arguments']['selector']
+            assert output['coverage']['truncated'] is False
             assert 'image_url' not in output['items'][0] and 'url' not in output['items'][0]
             assert output['source_record_collections'][0]['change_identity_fields']==['canonical_url']
             if phase==9:return use('browser_extract_items',{'selector':'#another-missing-region'})
@@ -2092,6 +2095,7 @@ def test_browser_setup_repairs_scope_large_read_and_condition_then_delivers_new_
             source.title='New published article'
             wait_for(lambda:store.get(jobs[0]['id'])['notification_status']=='sent',timeout=20)
             job=store.get(jobs[0]['id']);assert job['state']=='matched' and job['consecutive_errors']==0
+            assert job['probe']==[narrow]
             assert source.loads==2 and phase==setup_calls,'Polling restarted the page or agent instead of reusing the worker tab'
             alerts=[m for m in get_chat_store().load_messages(cid) if (m.get('metadata') or {}).get('source')=='live_tracker' and 'New article published.' in m.get('text','')]
             assert len(alerts)==1 and 'New published article' in alerts[0]['text'] and '/article' in alerts[0]['text']
@@ -2216,3 +2220,73 @@ def test_semantic_new_article_history_survives_edits_and_worker_restart(live_fix
             assert len(alerts)==1 and 'https://example.test/news/two' in alerts[0]['text'],alerts
     finally:
         if restarted:restarted.stop()
+
+
+def test_code_mode_tracker_prepares_exact_probe_before_creating(live_fixture, monkeypatch):
+    from fastapi.testclient import TestClient
+    from nullion.web_app import create_app
+
+    f = live_fixture
+    monkeypatch.setenv('NULLION_CODE_MODE', 'on')
+    original_model = f.model.create
+    broad_url = f.url + '?coverage=broad'
+    received = []
+    offers = []
+
+    def read_in_program(url, identity):
+        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use',
+            'name': 'code_mode', 'id': identity, 'input': {'tool_names': ['observation_read'],
+                'code': f"source = call_tool('observation_read', {{'url': {url!r}}})\n"
+                        "source['observation_preparation']"}}]}
+
+    def model(**kwargs):
+        protocol = workflow_provider_reply(kwargs, completion=True)
+        if protocol is not None:
+            return protocol
+        names = {row['name'] for row in kwargs.get('tools', [])}
+        offers.append(sorted(names))
+        if 'code_mode' not in names:
+            return original_model(**kwargs)
+        if f.model.prepared:
+            return text(fixture_action_acknowledgement(kwargs) or 'Tracking is active.')
+        tool_results = [block for message in kwargs['messages']
+                        for block in message.get('content', []) if isinstance(block, dict)
+                        and block.get('type') == 'tool_result']
+        last = tool_results[-1] if tool_results else {}
+        if last.get('tool_use_id') not in {'broad-read', 'narrow-read'}:
+            f.source.extra = {'unrelated': 'x' * 25_000}
+            return read_in_program(broad_url, 'broad-read')
+        result = json.loads(last['content'][0]['text'])['output']
+        preparation = result['value']
+        assert result['observation_preparations'] == [
+            {'invocation_id': result['operations'][0]['invocation_id'], **preparation}
+        ]
+        received.append(preparation['status'])
+        if last['tool_use_id'] == 'broad-read':
+            assert preparation['probe']['arguments'] == {'url': broad_url}
+            f.source.extra = {}
+            return read_in_program(f.url, 'narrow-read')
+        assert preparation['probe']['arguments'] == {'url': f.url}
+        f.model.prepared = True
+        arguments = {'name': 'Cedar slot watch', 'stop_after_match': True,
+                     'duration_seconds': 90, 'interval_seconds': 5,
+                     'probe': [preparation['probe']],
+                     'matcher': {'kind': 'structured', 'summary': 'The requested slot is available.',
+                                 'conditions': [{'step': 0, 'pointer': '/available',
+                                                 'op': 'equals', 'value': True},
+                                                {'step': 0, 'pointer': '/slot', 'op': 'exists', 'label': 'Slot'}]}}
+        return use('code_mode', {'tool_names': ['create_live_tracker'],
+                    'code': f"call_tool('create_live_tracker', {arguments!r})"})
+
+    f.model.create = model
+    with TestClient(create_app(f.runtime, f.orchestrator, f.registry)) as client:
+        reply = client.post('/api/chat', json={'text': '空きが出たら知らせてください。',
+                                              'conversation_id': 'web:prepared-code-watch'})
+        trackers = client.get('/api/live-trackers').json()['trackers']
+        assert len(trackers) == 1, (reply.json(), offers, received)
+        assert received == ['needs_narrower_source', 'ready']
+        f.source.available = True
+        f.source.slot = '18:30'
+        store = client.app.state.live_tracker_store
+        wait_for(lambda: store.get(trackers[0]['id'])['notification_status'] == 'sent')
+        assert store.get(trackers[0]['id'])['state'] == 'matched'

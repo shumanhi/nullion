@@ -164,7 +164,9 @@ def test_worker_handoff_reloads_source_and_delivers_one_rendered_web_alert(tmp_p
                 packet = json.loads(kw['messages'][0]['content'][0]['text'])
                 assert 'Original story' in json.dumps(packet['inspections'])
                 assert packet['original_observation']['arguments']['section_heading'] == '進展'
-                assert set(packet['repair_schema']['properties']['updates']['properties']) == {'selector'}
+                assert set(packet['repair_schema']['properties']['updates']['properties']) == {
+                    'selector', 'ready_selector', 'ready_text',
+                }
                 snapshot = next(row['evidence']['snapshot'] for row in packet['inspections'] if row['tool_name'] == 'browser_snapshot')
                 region = next(row for row in snapshot['regions'] if row['tag'] == 'section' and row['headings'] == ['進展'])
                 assert region['selector'] == '#updated-source' and region['link_count'] == 2

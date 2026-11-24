@@ -19,6 +19,8 @@ _PROGRESS_PHASE_IDS = frozenset({'prepare', 'source', 'operation', 'phase-check-
     'phase-start-model', 'phase-process-results', 'phase-prepare-artifacts', 'phase-save-conversation',
     'phase-resume-approval'})
 SOURCE_ACTIVITY_PHASES = {
+    'opening_browser': 'Opening the browser.',
+    'planning_browser_step': 'Planning the next browser step.',
     'reading_pages': 'Reading pages.',
     'reviewing_captured_evidence': 'Reviewing captured page details.',
     'recording_findings': 'Recording findings.',
@@ -144,11 +146,21 @@ class RequestProgress:
             key = event.get('operation_id')
             if (isinstance(key, str) and key and all(type(observed.get(k)) is int
                     and 0 <= observed[k] <= 100000 for k in ('pages_checked', 'findings_found'))):
-                self.observations[key] = dict(observed)
+                previous = self.observations.get(key, {})
+                self.observations[key] = {
+                    'pages_checked': max(observed['pages_checked'], previous.get('pages_checked', 0)),
+                    'findings_found': observed['findings_found'],
+                }
                 self.completion_fact = ''
                 phase = event.get('activity_phase')
                 self.phase = SOURCE_ACTIVITY_PHASES.get(phase if isinstance(phase, str) else None,
                     'Checking sources.')
+                browser_step = observed.get('browser_step')
+                if phase == 'planning_browser_step' and type(browser_step) is int and 1 <= browser_step <= 1000:
+                    self.phase = f'Planning browser step {browser_step}'
+                    waiting = observed.get('waiting_seconds')
+                    if type(waiting) is int and 12 <= waiting <= 1000:
+                        self.phase += f' ({waiting}s)'
                 self.phase_id = 'source'
         if isinstance(operation, dict) and isinstance(operation.get('id'), str):
             status = operation.get('status')

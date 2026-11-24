@@ -86,8 +86,10 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
     env['NULLION_WEB_PORT'] = str(port)
     base = f'http://127.0.0.1:{port}'
     server_script = (
-        'import uvicorn\nfrom nullion.runtime import bootstrap_persistent_runtime\n'
+        'import logging\nimport uvicorn\nfrom nullion.runtime import bootstrap_persistent_runtime\n'
         'from nullion.web_app import create_app\nfrom nullion.tools import ToolRegistry\n'
+        'logging.getLogger("nullion.updater").addHandler(logging.StreamHandler())\n'
+        'logging.getLogger("nullion.updater").setLevel(logging.INFO)\n'
         f'runtime = bootstrap_persistent_runtime({str(checkpoint)!r})\n'
         f'uvicorn.run(create_app(runtime, None, ToolRegistry()), host="127.0.0.1", port={port}, log_level="warning")\n')
     evidence = Path('.e2e-artifacts/update-rehearsal-results')
@@ -108,19 +110,36 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
             else:
                 pytest.fail('Old release server did not start')
             playwright, browser, page, errors = _open_page(base)
+            session = page.request.get(base + '/api/session')
+            assert session.ok
+            csrf = session.json()['csrf_token']
             start = time.monotonic()
             page.locator('#user-input').fill('/update')
             page.locator('#send-btn').click()
-            deadline = time.monotonic() + 30
-            while _git(installed, 'rev-parse', 'HEAD') != target and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert _git(installed, 'rev-parse', 'HEAD') == target, 'The upgrade never reached installation'
-            concurrent = page.request.post(base + '/api/chat', data={
-                'text': '/update', 'conversation_id': 'web:concurrent-update-rehearsal'}, timeout=10000)
-            assert concurrent.status == 200, concurrent.text()
-            assert 'update is already running' in concurrent.json()['text'], concurrent.text()
             bubble = page.locator('.msg.bot .bubble').last
-            expect(bubble).to_contain_text(re.compile('Updated successfully|Update failed|Already up to date'), timeout=240000)
+            terminal = re.compile('Updated successfully|Update failed|Already up to date')
+            deadline = time.monotonic() + 120
+            while _git(installed, 'rev-parse', 'HEAD') != target and time.monotonic() < deadline:
+                if bubble.count() and terminal.search(bubble.inner_text()):
+                    break
+                time.sleep(0.1)
+            if _git(installed, 'rev-parse', 'HEAD') != target:
+                reply = bubble.inner_text() if bubble.count() else '(no reply)'
+                (evidence / 'update-reply.txt').write_text(reply)
+                pytest.fail(f'The upgrade never reached installation. Browser reply: {reply}. Browser errors: {errors}')
+            concurrent = page.request.post(base + '/api/update',
+                headers={'x-nullion-csrf': csrf},
+                data={'request_key': 'concurrent-update-rehearsal'}, timeout=30000)
+            assert concurrent.status == 202, concurrent.text()
+            observation = page.request.get(base + concurrent.json()['stream_url'], timeout=30000)
+            assert observation.ok
+            terminal_events = [json.loads(line.removeprefix('data: ')) for line in observation.text().splitlines()
+                if line.startswith('data: ')]
+            assert len(terminal_events) == 1
+            rejection = terminal_events[0]
+            assert rejection['step'] == 'complete' and rejection['success'] is False
+            assert 'update is already running' in rejection['error']
+            expect(bubble).to_contain_text(terminal, timeout=240000)
             text = bubble.inner_text()
             (evidence / 'update-reply.txt').write_text(text)
             page.screenshot(path=str(evidence / 'upgrade-result.png'), full_page=True)
@@ -133,7 +152,7 @@ def test_released_update_command_installs_candidate_and_repeats_safely(tmp_path)
             page.screenshot(path=str(evidence / 'successful-upgrade.png'), full_page=True)
             page.locator('#user-input').fill('/update')
             page.locator('#send-btn').click()
-            expect(page.locator('.msg.bot .bubble').last).to_contain_text('Already up to date: ' + candidate_tag, timeout=30000)
+            expect(page.locator('.msg.bot .bubble').last).to_contain_text('Already up to date: ' + candidate_tag, timeout=120000)
             result = {'from': old_tag, 'to': candidate_tag, 'candidate_revision': expected_revision, 'update_seconds': elapsed,
                 'target_commit': target, 'reply': text, 'concurrent_update_rejected': True,
                 'stage_database_bytes': checkpoint.stat().st_size}

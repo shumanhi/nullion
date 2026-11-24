@@ -114,3 +114,18 @@ def report_receipt_matches(request: str, receipt: object, paths: list[str]) -> b
         return bool(actual) and actual == receipt.get("files")
     except (OSError, TypeError, ValueError):
         return False
+
+
+def project_report_receipt(request: str, receipt: object, paths: list[str]) -> dict | None:
+    """Carry a report receipt to a selected subset without blessing new bytes."""
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("files"), dict):
+        return None
+    files = receipt["files"]
+    try:
+        keys = {str(Path(path).resolve()) for path in paths}
+    except (OSError, ValueError):
+        return None
+    if not keys or not keys <= files.keys():
+        return None
+    projected = {**receipt, "files": {path: files[path] for path in keys}}
+    return projected if report_receipt_matches(request, projected, paths) else None
